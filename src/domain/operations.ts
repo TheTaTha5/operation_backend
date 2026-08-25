@@ -2,7 +2,10 @@ export type Deployment = {
   boat_id: string;
   route_id: string;
   service_date: string;
+  /** Normal-seat booking capacity. */
   capacity: number;
+  license_pax?: number;
+  total_capacity?: number;
 };
 
 export type BookingStatus = 'confirmed' | 'cancelled';
@@ -16,6 +19,16 @@ export type Booking = {
   created_at: string;
   updated_at: string;
   cancellation_reason?: string;
+  /** Source-system identifiers and commercial context. */
+  external_id?: string;
+  agent_id?: string;
+  voucher_ref?: string;
+  rate_type_ref?: string;
+  booking_mode?: string;
+  /** Seat categories; infants and FOC passengers are included in allocated pax. */
+  pax_breakdown?: Record<string, number>;
+  /** Original booking payload retained for operations, reconciliation, and audit import. */
+  booking_data?: Record<string, unknown>;
 };
 
 export type SeatLock = {
@@ -30,7 +43,7 @@ export type SeatLock = {
   released_at?: string;
 };
 
-type Capacity = { deployed_capacity: number; booked_pax: number; locked_pax: number; available_seats: number };
+type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
 export class OperationsStore {
@@ -55,17 +68,25 @@ export class OperationsStore {
     const deployed_capacity = this.deployments
       .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
       .reduce((sum, d) => sum + d.capacity, 0);
+    const total_capacity = this.deployments
+      .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
+      .reduce((sum, d) => sum + (d.total_capacity ?? d.capacity), 0);
     const booked_pax = [...this.bookings.values()]
-      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed')
+      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode !== 'charter')
       .reduce((sum, b) => sum + b.allocated_pax, 0);
+    const charter_pax = [...this.bookings.values()]
+      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode === 'charter')
+      .reduce((sum, b) => sum + b.pax, 0);
     const locked_pax = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active')
       .reduce((sum, l) => sum + l.pax, 0);
-    return { deployed_capacity, booked_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
+    return { deployed_capacity, total_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
   }
 
-  private assertCapacity(routeId: string, serviceDate: string, pax: number): void {
-    if (this.capacity(routeId, serviceDate).available_seats < pax) {
+  private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false): void {
+    const capacity = this.capacity(routeId, serviceDate);
+    const available = charter ? capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
+    if (available < pax) {
       const error = new Error('Insufficient available seats');
       (error as Error & { statusCode: number }).statusCode = 409;
       throw error;
@@ -91,9 +112,9 @@ export class OperationsStore {
   }
 
   createBooking(input: Omit<Booking, 'id' | 'allocated_pax' | 'status' | 'created_at' | 'updated_at'>): Booking {
-    this.assertCapacity(input.route_id, input.service_date, input.pax);
+    this.assertCapacity(input.route_id, input.service_date, input.pax, input.booking_mode === 'charter');
     const now = this.now();
-    const booking: Booking = { ...input, id: this.id('booking'), allocated_pax: input.pax, status: 'confirmed', created_at: now, updated_at: now };
+    const booking: Booking = { ...input, id: this.id('booking'), allocated_pax: input.booking_mode === 'charter' ? 0 : input.pax, status: 'confirmed', created_at: now, updated_at: now };
     this.bookings.set(booking.id, booking);
     return { ...booking };
   }

@@ -1,6 +1,6 @@
 # Operation Backend
 
-Fastify service for boat deployments, operational capacity, bookings, and agent seat locks. It currently uses an in-process serialized store; deploy it behind a durable database transaction adapter before running multiple application instances.
+Fastify service for boat deployments, operational capacity, bookings, and agent seat locks. Set `DATABASE_URL` to use PostgreSQL; without it, the service uses an in-process store for local testing.
 
 ## Requirements
 
@@ -10,6 +10,8 @@ Fastify service for boat deployments, operational capacity, bookings, and agent 
 
 ```bash
 npm install
+export DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DATABASE'
+npm run db:migrate
 npm run dev
 ```
 
@@ -46,7 +48,7 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 
 - `GET /v1/bookings` — optionally filter by `route_id` and `service_date` (or `date`).
 - `GET /v1/bookings/{id}`
-- `POST /v1/bookings` — `{ route_id, service_date, pax }`.
+- `POST /v1/bookings` — `{ route_id, service_date, pax }`. It also accepts a source booking with exactly one `trips` item: `trips[0].routeId`, `trips[0].date`, and its `pax` category object are normalized automatically. All categories, including infants and FOC, consume seats. The source payload is retained in `booking_data`, while its source ID, agent, voucher, rate type, booking mode, and pax breakdown are stored in dedicated fields.
 - `PATCH /v1/bookings/{id}` — amend `route_id`, `service_date`, and/or `pax`; capacity is checked only when one of these changes.
 - `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all allocated seats.
 - `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`); returns that many seats.
@@ -59,6 +61,6 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 - `PATCH /v1/seat-locks/{id}` — change `pax` and/or `agent_id`; a larger allocation is capacity checked.
 - `POST /v1/seat-locks/{id}/release` — idempotently releases a lock.
 
-Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
+Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 
 `GET /api/health` remains available for service health checks.
