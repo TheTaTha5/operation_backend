@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "task": "railway-deployment",
+  "title": "Deploy Operation Backend on Railway",
+  "status": "completed",
+  "agent": {
+    "sessionId": "01a037cf-ebd4-7eec-8a74-e0b6d9cf4bb5",
+    "model": "openai-codex/gpt-5.6-terra"
+  },
+  "git": {
+    "base": "main",
+    "branch": "chore/railway-deployment",
+    "worktree": "D:/projects/operation-backend-railway-deployment",
+    "commit": "9429acf1b1f99bd71155801b7d76ad258c82417d",
+    "pr": {
+      "number": null,
+      "url": "",
+      "state": "none"
+    }
+  },
+  "input": {
+    "requestedOutcome": "Add the supplied Operation Backend project to a worktree, configure Railway deployment, and merge it into main.",
+    "acceptanceCriteria": [
+      "The application source and Railway configuration are committed.",
+      "Railway builds TypeScript, starts the service, and probes /api/health.",
+      "Type checking, tests, and the production build pass."
+    ],
+    "allowedScope": [
+      "Supplied application files",
+      "railway.json",
+      "README.md",
+      "docs/development/tasks/railway-deployment.md",
+      ".agent-reports/railway-deployment.json"
+    ],
+    "constraints": [
+      "Preserve the Fastify PORT and 0.0.0.0 runtime behavior.",
+      "Do not commit node_modules, build output, or secrets."
+    ],
+    "assumptions": [
+      "Railway supplies PORT.",
+      "The repository root is the Railway service source."
+    ]
+  },
+  "output": {
+    "summary": "Committed the supplied Fastify application and added an explicit Railway Railpack build, start, and healthcheck configuration.",
+    "filesChanged": [
+      { "path": ".env.example", "change": "added", "purpose": "Document runtime environment defaults." },
+      { "path": ".gitignore", "change": "added", "purpose": "Exclude dependencies, build output, and secrets." },
+      { "path": "package-lock.json", "change": "added", "purpose": "Provide reproducible dependency installation." },
+      { "path": "package.json", "change": "added", "purpose": "Define build, start, test, and type-check commands." },
+      { "path": "README.md", "change": "modified", "purpose": "Document Railway deployment." },
+      { "path": "railway.json", "change": "added", "purpose": "Define Railway build, start, healthcheck, and restart behavior." },
+      { "path": "src/", "change": "added", "purpose": "Provide the Fastify application." },
+      { "path": "test/", "change": "added", "purpose": "Provide application test coverage." },
+      { "path": "tsconfig.json", "change": "added", "purpose": "Configure TypeScript compilation." },
+      { "path": "docs/development/tasks/railway-deployment.md", "change": "added", "purpose": "Record task input, output, and evidence." },
+      { "path": ".agent-reports/railway-deployment.json", "change": "added", "purpose": "Provide machine-readable task handoff." }
+    ],
+    "behaviorChanges": [
+      {
+        "area": "Railway deployment",
+        "before": "No deploy configuration or committed service source existed.",
+        "after": "Railway uses Railpack to run npm ci and npm run build, then npm start with /api/health readiness checks."
+      }
+    ],
+    "interfaces": {
+      "added": ["railway.json deployment configuration"],
+      "changed": ["README deployment instructions"],
+      "removed": []
+    },
+    "dataPersistence": {
+      "impact": "none",
+      "details": ["No schema, migration, or persistence behavior changed."],
+      "migrationRequired": false
+    }
+  },
+  "verification": [
+    { "command": "npm ci", "status": "passed", "evidence": "Installed 88 packages; npm reported one high-severity audit finding and a blocked optional esbuild install script." },
+    { "command": "npm run check", "status": "passed", "evidence": "TypeScript completed with no errors." },
+    { "command": "npm test", "status": "passed", "evidence": "4 tests passed, 0 failed." },
+    { "command": "npm run build", "status": "passed", "evidence": "TypeScript compiled successfully." },
+    { "command": "node -e JSON.parse(...) railway.json", "status": "passed", "evidence": "railway.json parsed successfully." }
+  ],
+  "decisions": ["Use Railpack with explicit npm ci && npm run build.", "Use the existing /api/health endpoint for Railway health checks."],
+  "risks": ["The in-process store is not durable across restarts or multiple instances.", "npm audit reported one high-severity dependency vulnerability."],
+  "blockers": [],
+  "dependencies": ["A Railway project must be created and connected to this repository in the Railway dashboard."],
+  "followUps": ["Replace the in-process store before scaling beyond one instance.", "Review and remediate npm audit findings."],
+  "rollback": "Revert the merge commit or remove the Railway service; no data migration is involved."
+}
