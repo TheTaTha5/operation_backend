@@ -24,12 +24,29 @@ npm run dev
 | `npm start` | Run the compiled service. |
 | `npm test` | Run HTTP route tests. |
 | `npm run check` | Type-check the source. |
+| `npm run db:migrate` | Apply PostgreSQL migrations. |
 
-## Railway deployment
+## Authentik OIDC authentication
 
-1. Create a new Railway project and deploy this repository.
-2. Railway uses `railway.json` to install dependencies, compile TypeScript, start `npm start`, and probe `/api/health` before marking a deployment healthy.
-3. Configure any required runtime environment variables in Railway. `PORT` is supplied by Railway; do not set a fixed port.
+Operational API routes are protected when all of these environment variables are configured:
+
+```text
+AUTH_REQUIRED=true
+OIDC_ISSUER=https://auth.example.com/application/o/operation-backend
+OIDC_AUDIENCE=operation-backend
+CORS_ORIGIN=https://app.example.com
+```
+
+`OIDC_ISSUER` is the issuer URL displayed by the Authentik OAuth2/OIDC provider; do not substitute the Authentik root URL. The API obtains the provider's JWKS URL from OIDC discovery and validates Bearer access tokens for the configured issuer and audience.
+
+The frontend must use Authorization Code with PKCE and send `Authorization: Bearer <access token>`. Configure the Authentik provider to emit either scopes or group names matching these permissions:
+
+| API area | Read permission | Write permission |
+| --- | --- | --- |
+| Bookings and seat locks | `booking:read` | `booking:write` |
+| Manifest, allotment, deployments | `operations:read` | `operations:write` |
+
+The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated). The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
 
 ## API
 

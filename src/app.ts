@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyStatic from '@fastify/static';
+import fastifyCors from '@fastify/cors';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { registerHealthRoutes } from './routes/health.js';
@@ -13,6 +14,9 @@ export function buildApp(): FastifyInstance {
       level: process.env.LOG_LEVEL ?? 'info',
     },
   });
+
+  const corsOrigins = process.env.CORS_ORIGIN?.split(',').map((origin) => origin.trim()).filter(Boolean);
+  app.register(fastifyCors, { origin: corsOrigins?.length ? corsOrigins : false });
 
   app.register(fastifyStatic, {
     root: join(__dirname, 'public'),

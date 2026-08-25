@@ -15,7 +15,7 @@ test('deployment capacity feeds availability, bookings, and manifest', async () 
   assert.equal(deployment.statusCode, 201);
 
   const availability = await request('GET', `/v1/availability?route_id=r-1&date=${date}`);
-  assert.deepEqual(availability.json(), { route_id: 'r-1', service_date: date, deployed_capacity: 10, booked_pax: 0, locked_pax: 0, available_seats: 10 });
+  assert.deepEqual(availability.json(), { route_id: 'r-1', service_date: date, deployed_capacity: 10, total_capacity: 10, booked_pax: 0, charter_pax: 0, locked_pax: 0, available_seats: 10 });
 
   const created = await request('POST', '/v1/bookings', { route_id: 'r-1', service_date: date, pax: 6 });
   assert.equal(created.statusCode, 201);

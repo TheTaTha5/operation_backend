@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { OperationsStore, type Booking, type Deployment, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
+import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 
 const badRequest = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };
 const notFound = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 404; throw error; };
@@ -52,7 +53,15 @@ function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at'
 
 export function registerOperationsRoutes(app: FastifyInstance, _options: object, done: () => void): void {
   const store = process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
+  const authenticator = new OidcAuthenticator();
   if (store instanceof PostgresOperationsStore) app.addHook('onClose', async () => store.close());
+  app.addHook('preHandler', async (request) => {
+    const path = request.url.split('?')[0];
+    const isOperations = path.startsWith('/operations/') || path === '/v1/manifest';
+    const isWrite = request.method !== 'GET';
+    const user = await authenticator.authenticate(request);
+    requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
+  });
 
   app.get('/v1/availability', async (request) => {
     const query = request.query as Record<string, unknown>;
