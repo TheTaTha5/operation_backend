@@ -11,7 +11,7 @@
     "base": "main",
     "branch": "chore/railway-deployment",
     "worktree": "D:/projects/operation-backend-railway-deployment",
-    "commit": "pending local commit",
+    "commit": "9429acf1b1f99bd71155801b7d76ad258c82417d",
     "pr": {
       "number": null,
       "url": "",
