@@ -29,6 +29,27 @@ test('deployment capacity feeds availability, bookings, and manifest', async () 
   assert.equal((await request('POST', `/v1/bookings/${booking.id}/cancel`)).json().status, 'cancelled');
 });
 
+test('the route calendar endpoint validates its range', async () => {
+  const catalogue = await request('GET', '/v1/routes');
+  assert.equal(catalogue.statusCode, 200);
+  assert.ok(Array.isArray(catalogue.json().routes), 'the catalogue is listable without a range');
+
+  assert.equal((await request('GET', '/v1/routes?from=2026-08-01')).statusCode, 400, 'from without to');
+  assert.equal((await request('GET', '/v1/routes?to=2026-08-31')).statusCode, 400, 'to without from');
+  assert.equal((await request('GET', '/v1/routes?from=01-08-2026&to=2026-08-31')).statusCode, 400, 'not ISO');
+  assert.equal((await request('GET', '/v1/routes?from=2026-08-31&to=2026-08-01')).statusCode, 400, 'reversed');
+  assert.equal((await request('GET', '/v1/routes?from=2026-01-01&to=2028-01-01')).statusCode, 400, 'over the day cap');
+
+  const month = await request('GET', '/v1/routes?from=2026-08-01&to=2026-08-31');
+  assert.equal(month.statusCode, 200);
+  assert.equal(month.json().from, '2026-08-01');
+  for (const route of month.json().routes) {
+    assert.equal(Object.keys(route.days).length, 31, `${route.id} resolves every day of the month`);
+    assert.ok(typeof route.days['2026-08-26'].open === 'boolean');
+    assert.ok(route.days['2026-08-26'].source, 'a day always says which rule decided it');
+  }
+});
+
 test('a reservation being edited does not compete with its own seats', async () => {
   const date = '2030-01-04';
   await request('POST', '/operations/deployments', { boat_id: 'boat-3', route_id: 'r-3', service_date: date, capacity: 20 });

@@ -1,3 +1,5 @@
+import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
+
 export type Deployment = {
   boat_id: string;
   route_id: string;
@@ -58,6 +60,20 @@ export class OperationsStore {
   private bookings = new Map<string, Booking>();
   private locks = new Map<string, SeatLock>();
   private tail: Promise<void> = Promise.resolve();
+  /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
+  private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[] } = { routes: [], seasons: [], overrides: [] };
+
+  /** Loads reference data that a PostgreSQL deployment gets from migrations instead. */
+  seedCatalogue(catalogue: Partial<{ routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[] }>): void {
+    if (catalogue.routes) this.catalogue.routes = catalogue.routes.map((route) => ({ ...route }));
+    if (catalogue.seasons) this.catalogue.seasons = catalogue.seasons.map((season) => ({ ...season }));
+    if (catalogue.overrides) this.catalogue.overrides = catalogue.overrides.map((override) => ({ ...override }));
+  }
+  listRoutes(): Route[] { return this.catalogue.routes.map((route) => ({ ...route })); }
+  listSeasons(): RouteSeason[] { return this.catalogue.seasons.map((season) => ({ ...season })); }
+  listDayOverrides(from?: string, to?: string): RouteDayOverride[] {
+    return this.catalogue.overrides.filter((o) => (!from || o.service_date >= from) && (!to || o.service_date <= to)).map((o) => ({ ...o }));
+  }
 
   async transaction<T>(work: () => T | Promise<T>): Promise<T> {
     const prior = this.tail;
