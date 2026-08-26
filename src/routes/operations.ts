@@ -2,6 +2,10 @@ import type { FastifyInstance } from 'fastify';
 import { OperationsStore, type Booking, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
+import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
+
+/** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
+const MAX_CALENDAR_DAYS = 400;
 
 const badRequest = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };
 const notFound = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 404; throw error; };
@@ -63,6 +67,30 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const isWrite = request.method !== 'GET';
     const user = await authenticator.authenticate(request);
     requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
+  });
+
+  /**
+   * The route catalogue, optionally with each route's operating calendar resolved per date.
+   *
+   * Without `from`/`to` this is the catalogue alone, which is what a client needs to label a
+   * booking row. With them, every date carries the open/closed decision and the rule that made it,
+   * so a closed day can explain itself rather than just refusing.
+   */
+  app.get('/v1/routes', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const from = optionalString(query.from), to = optionalString(query.to);
+    if ((from === undefined) !== (to === undefined)) badRequest('from and to must be supplied together');
+    const routes = await store.listRoutes();
+    if (from === undefined || to === undefined) return { routes };
+
+    if (!isIsoDate(from) || !isIsoDate(to)) badRequest('from and to must be YYYY-MM-DD dates');
+    if (to < from) badRequest('to must not precede from');
+    // A sweep is one query per table regardless of width, but the response grows with routes × days.
+    const days = [...eachDate(from, to)].length;
+    if (days > MAX_CALENDAR_DAYS) badRequest(`Range covers ${days} days; the maximum is ${MAX_CALENDAR_DAYS}`);
+
+    const calendar = routeCalendar(await store.listSeasons(), await store.listDayOverrides(from, to));
+    return { from, to, routes: routes.map((route) => ({ ...route, days: calendar.range(route.id, from, to) })) };
   });
 
   app.get('/v1/availability', async (request) => {

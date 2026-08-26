@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import type { Booking, Deployment, Exclusion, SeatLock } from './operations.js';
+import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
 
 type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 type BookingInput = Omit<Booking, 'id' | 'allocated_pax' | 'status' | 'created_at' | 'updated_at'>;
@@ -80,4 +81,20 @@ export class PostgresOperationsStore {
   async amendLock(id: string, changes: Partial<Pick<SeatLock, 'pax' | 'agent_id'>>): Promise<SeatLock | undefined> { const { rows: [existing] } = await this.client().query('SELECT * FROM seat_locks WHERE id = $1', [id]); if (!existing) return undefined; const current = lock(existing); const seats = changes.pax ?? current.pax; if (current.status === 'active' && seats !== current.pax) { await this.lockPool(current.route_id, current.service_date); if ((await this.capacity(current.route_id, current.service_date, { lockId: id })).available_seats < seats) unavailable(); } const { rows: [row] } = await this.client().query('UPDATE seat_locks SET pax=$2, agent_id=$3, updated_at=now() WHERE id=$1 RETURNING *', [id,seats,changes.agent_id ?? current.agent_id ?? null]); return lock(row); }
   async releaseLock(id: string): Promise<SeatLock | undefined> { const { rows: [row] } = await this.client().query("UPDATE seat_locks SET status='released', released_at=COALESCE(released_at, now()), updated_at=now() WHERE id=$1 RETURNING *", [id]); return row && lock(row); }
   async allotment(routeId: string, date: string, exclude: Exclusion = {}): Promise<Capacity & { route_id: string; service_date: string; deployments: Deployment[] }> { return { route_id: routeId, service_date: date, ...(await this.capacity(routeId,date,exclude)), deployments: await this.listDeployments(date,date,routeId) }; }
+
+  /** Reference data. Dates are cast in SQL so the driver never hands back a Date to re-render. */
+  async listRoutes(): Promise<Route[]> {
+    const { rows } = await this.client().query(`SELECT r.id, r.name, r.pier, r.family_id, r.color, r.islands, r.sort,
+      COALESCE((SELECT array_agg(t.departs_at ORDER BY t.idx) FROM route_times t WHERE t.route_id = r.id), '{}') AS times
+      FROM routes r ORDER BY r.sort NULLS LAST, r.id`);
+    return rows.map((row) => ({ id: String(row.id), name: String(row.name), pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [] }));
+  }
+  async listSeasons(): Promise<RouteSeason[]> {
+    const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');
+    return rows.map((row) => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) }));
+  }
+  async listDayOverrides(from?: string, to?: string): Promise<RouteDayOverride[]> {
+    const { rows } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) ORDER BY route_id, service_date', [from ?? null, to ?? null]);
+    return rows.map((row) => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] }));
+  }
 }
