@@ -23,8 +23,11 @@ npm run dev
 | `npm run build` | Compile TypeScript into `dist/`. |
 | `npm start` | Run the compiled service. |
 | `npm test` | Run HTTP route tests. |
+| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
+
+Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
 
 ## Authentik OIDC authentication
 
@@ -60,6 +63,8 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
 - `GET /v1/availability?route_id=&date=` — booking-form availability.
+
+`GET /operations/allotment` and `GET /v1/availability` also accept `exclude_booking_id` and `exclude_lock_id`. A reservation being edited still holds its seats, so an unqualified read counts them against it: raising a 6-pax booking to 8 on a full day looks refused even though the six seats it releases would cover it, and a no-op edit on a sold-out day looks unsavable. Pass the id being edited to read availability as it will be once that reservation is re-saved. Amendments apply the same exclusion internally, so a `PATCH` never rejects a booking on the strength of its own seats.
 
 ### Bookings
 
