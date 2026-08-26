@@ -23,13 +23,33 @@ npm run dev
 | `npm run build` | Compile TypeScript into `dist/`. |
 | `npm start` | Run the compiled service. |
 | `npm test` | Run HTTP route tests. |
+| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. |
 | `npm run check` | Type-check the source. |
+| `npm run db:migrate` | Apply PostgreSQL migrations. |
 
-## Railway deployment
+Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
 
-1. Create a new Railway project and deploy this repository.
-2. Railway uses `railway.json` to install dependencies, compile TypeScript, start `npm start`, and probe `/api/health` before marking a deployment healthy.
-3. Configure any required runtime environment variables in Railway. `PORT` is supplied by Railway; do not set a fixed port.
+## Authentik OIDC authentication
+
+Operational API routes are protected when all of these environment variables are configured:
+
+```text
+AUTH_REQUIRED=true
+OIDC_ISSUER=https://auth.example.com/application/o/operation-backend
+OIDC_AUDIENCE=operation-backend
+CORS_ORIGIN=https://app.example.com
+```
+
+`OIDC_ISSUER` is the issuer URL displayed by the Authentik OAuth2/OIDC provider; do not substitute the Authentik root URL. The API obtains the provider's JWKS URL from OIDC discovery and validates Bearer access tokens for the configured issuer and audience.
+
+The frontend must use Authorization Code with PKCE and send `Authorization: Bearer <access token>`. Configure the Authentik provider to emit either scopes or group names matching these permissions:
+
+| API area | Read permission | Write permission |
+| --- | --- | --- |
+| Bookings and seat locks | `booking:read` | `booking:write` |
+| Manifest, allotment, deployments | `operations:read` | `operations:write` |
+
+The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated). The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
 
 ## API
 
@@ -43,6 +63,8 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
 - `GET /v1/availability?route_id=&date=` — booking-form availability.
+
+`GET /operations/allotment` and `GET /v1/availability` also accept `exclude_booking_id` and `exclude_lock_id`. A reservation being edited still holds its seats, so an unqualified read counts them against it: raising a 6-pax booking to 8 on a full day looks refused even though the six seats it releases would cover it, and a no-op edit on a sold-out day looks unsavable. Pass the id being edited to read availability as it will be once that reservation is re-saved. Amendments apply the same exclusion internally, so a `PATCH` never rejects a booking on the strength of its own seats.
 
 ### Bookings
 

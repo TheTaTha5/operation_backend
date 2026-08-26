@@ -45,6 +45,13 @@ export type SeatLock = {
 
 type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 
+/**
+ * Seats already held by the reservation being edited. Excluding them stops a booking from competing
+ * with itself: without this, raising a 6-pax booking to 8 on a full day is refused even though the
+ * six seats it is about to release would cover it, and a no-op edit on a sold-out day cannot save.
+ */
+export type Exclusion = { bookingId?: string; lockId?: string };
+
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
 export class OperationsStore {
   private deployments: Deployment[] = [];
@@ -64,7 +71,7 @@ export class OperationsStore {
   private now(): string { return new Date().toISOString(); }
   private id(prefix: string): string { return `${prefix}_${crypto.randomUUID()}`; }
 
-  capacity(routeId: string, serviceDate: string): Capacity {
+  capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
     const deployed_capacity = this.deployments
       .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
       .reduce((sum, d) => sum + d.capacity, 0);
@@ -72,19 +79,19 @@ export class OperationsStore {
       .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
       .reduce((sum, d) => sum + (d.total_capacity ?? d.capacity), 0);
     const booked_pax = [...this.bookings.values()]
-      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode !== 'charter')
+      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode !== 'charter' && b.id !== exclude.bookingId)
       .reduce((sum, b) => sum + b.allocated_pax, 0);
     const charter_pax = [...this.bookings.values()]
-      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode === 'charter')
+      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode === 'charter' && b.id !== exclude.bookingId)
       .reduce((sum, b) => sum + b.pax, 0);
     const locked_pax = [...this.locks.values()]
-      .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active')
+      .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
       .reduce((sum, l) => sum + l.pax, 0);
     return { deployed_capacity, total_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
   }
 
-  private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false): void {
-    const capacity = this.capacity(routeId, serviceDate);
+  private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false, exclude: Exclusion = {}): void {
+    const capacity = this.capacity(routeId, serviceDate, exclude);
     const available = charter ? capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
     if (available < pax) {
       const error = new Error('Insufficient available seats');
@@ -131,9 +138,7 @@ export class OperationsStore {
     const service_date = typeof changes.service_date === 'string' ? changes.service_date : booking.service_date;
     const pax = typeof changes.pax === 'number' ? changes.pax : booking.pax;
     if (booking.status === 'confirmed' && (route_id !== booking.route_id || service_date !== booking.service_date || pax !== booking.pax)) {
-      // Temporarily remove its prior allocation so an unchanged/amended reservation does not compete with itself.
-      booking.allocated_pax = 0;
-      try { this.assertCapacity(route_id, service_date, pax); } catch (error) { booking.allocated_pax = booking.pax; throw error; }
+      this.assertCapacity(route_id, service_date, pax, false, { bookingId: id });
       booking.allocated_pax = pax;
     }
     Object.assign(booking, changes, { route_id, service_date, pax, updated_at: this.now() });
@@ -181,8 +186,7 @@ export class OperationsStore {
     if (!lock) return undefined;
     const pax = typeof changes.pax === 'number' ? changes.pax : lock.pax;
     if (lock.status === 'active' && pax !== lock.pax) {
-      const old = lock.pax; lock.pax = 0;
-      try { this.assertCapacity(lock.route_id, lock.service_date, pax); } catch (error) { lock.pax = old; throw error; }
+      this.assertCapacity(lock.route_id, lock.service_date, pax, false, { lockId: id });
       lock.pax = pax;
     }
     Object.assign(lock, changes, { pax, updated_at: this.now() });
@@ -195,7 +199,7 @@ export class OperationsStore {
     return { ...lock };
   }
 
-  allotment(routeId: string, serviceDate: string): Capacity & { route_id: string; service_date: string; deployments: Deployment[] } {
-    return { route_id: routeId, service_date: serviceDate, ...this.capacity(routeId, serviceDate), deployments: this.listDeployments(serviceDate, serviceDate, routeId) };
+  allotment(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity & { route_id: string; service_date: string; deployments: Deployment[] } {
+    return { route_id: routeId, service_date: serviceDate, ...this.capacity(routeId, serviceDate, exclude), deployments: this.listDeployments(serviceDate, serviceDate, routeId) };
   }
 }
