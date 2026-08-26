@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { OperationsStore, type Booking, type Deployment, type SeatLock } from '../domain/operations.js';
+import { OperationsStore, type Booking, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 
@@ -9,6 +9,8 @@ const record = (value: unknown): Record<string, unknown> => value !== null && ty
 const string = (value: unknown, name: string): string => typeof value === 'string' && value.length > 0 ? value : badRequest(`${name} is required`);
 const optionalString = (value: unknown): string | undefined => typeof value === 'string' && value.length > 0 ? value : undefined;
 const pax = (value: unknown, name = 'pax'): number => typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : badRequest(`${name} must be a positive integer`);
+/** Seats held by the reservation currently being edited, so an availability read does not count them against it. */
+const exclusion = (query: Record<string, unknown>): Exclusion => ({ bookingId: optionalString(query.exclude_booking_id), lockId: optionalString(query.exclude_lock_id) });
 
 function deployment(body: unknown): Deployment {
   const input = record(body);
@@ -65,7 +67,8 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
 
   app.get('/v1/availability', async (request) => {
     const query = request.query as Record<string, unknown>;
-    return { route_id: string(query.route_id, 'route_id'), service_date: string(query.service_date ?? query.date, 'date'), ...(await store.capacity(string(query.route_id, 'route_id'), string(query.service_date ?? query.date, 'date'))) };
+    const route_id = string(query.route_id, 'route_id'); const service_date = string(query.service_date ?? query.date, 'date');
+    return { route_id, service_date, ...(await store.capacity(route_id, service_date, exclusion(query))) };
   });
 
   app.get('/v1/bookings', async (request) => {
@@ -107,7 +110,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   });
   app.get('/operations/allotment', async (request) => {
     const query = request.query as Record<string, unknown>;
-    return await store.allotment(string(query.route_id, 'route_id'), string(query.service_date, 'service_date'));
+    return await store.allotment(string(query.route_id, 'route_id'), string(query.service_date, 'service_date'), exclusion(query));
   });
   app.get('/operations/deployments', async (request) => {
     const query = request.query as Record<string, unknown>;
