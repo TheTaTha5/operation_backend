@@ -1,7 +1,7 @@
 # Correctness bugs in the charter seat path
 
 Both found on 2026-08-26 while checking the legacy `allotment_v2` frontend against this
-backend. **Bug 1 was fixed on 2026-08-28 by migration 007; bug 2 is still live.**
+backend. **Both were fixed on 2026-08-28 — bug 1 by migration 007, bug 2 by migration 009.**
 
 The only booking in the production database is a charter booking, so it is the exact shape
 that triggers bug 1 and sits on the deployment that triggers bug 2:
@@ -71,7 +71,26 @@ boat, so removing two passengers returns no seats to the pool. The two defensibl
 Whichever is chosen, `allocated_pax` must never be driven below zero, and the two stores must
 agree. Add the charter case to `test/operations.test.ts` and run it against both.
 
-## 2. The charter ceiling is a crew-inclusive figure, so charters can be sold crew seats
+## 2. The charter ceiling is a crew-inclusive figure, so charters can be sold crew seats — FIXED
+
+Fixed on 2026-08-28. `deployments.total_capacity` is renamed `registered_persons` (migration
+009) and is read by nothing that sells. The passenger ceiling is now `license_pax`, falling back
+to capacity for the three Ranong boats that carry no licence, and a `boat_capacity_overrides`
+row may lower a boat for a day but never lift it above the licence.
+
+The clamp lives in `deploymentSeats` (`src/domain/capacity.ts`) and is called by both stores —
+not expressed a second time as `LEAST`/`COALESCE` in SQL, which is how the two would drift.
+Availability returns `deployed_capacity` (what the seat pool offers) and `licensed_capacity`
+(what a charter may fill the boat to); `total_capacity` is gone from that shape.
+
+Verified against the seeded catalogue: a b13 deployment claiming 60 seats clamps to 45, b10
+takes its live 47-seat override on 2026-07-26 and 44 otherwise, and Tri Star 01 with no licence
+falls back to 38 rather than 0. Covered by `test/capacity.test.ts` and the charter test in
+`test/booking-source.test.ts`, both passing against the two stores.
+
+The original report follows.
+
+---
 
 `total_capacity` is not a passenger capacity. Checked against the legacy production database
 on 2026-08-26, it is **passengers plus crew**, and the identity holds for all 15 boats that
