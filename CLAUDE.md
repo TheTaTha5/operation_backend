@@ -54,8 +54,17 @@ months because only one store was ever exercised.
 query.
 
 **Migrations are applied once and recorded in `schema_migrations`.** They need not be idempotent.
-Deploying does not migrate — `railway.json` runs build and start only, so `npm run db:migrate` is a
-deliberate step.
+Deploying migrates: `railway.json` runs `node dist/migrate.js` as `preDeployCommand`, so the schema
+moves before the new code takes traffic and a failed migration aborts the deploy with the old
+version still serving. It runs the *compiled* migrator deliberately — `npm run db:migrate` goes
+through `tsx`, a devDependency the build prunes.
+
+That makes a migration something that ships unwatched, which the runner is built for — each file and
+its ledger row commit together, an advisory lock serializes concurrent deploys, and a rerun is a
+no-op. What it cannot catch is a migration that succeeds and is wrong. **Rehearse anything
+destructive before merging it**: restore a copy, apply the migration, and check the rows, the way
+007 was checked against a reproduction of the production booking. Railway will not stop a clean
+mistake.
 
 **Capacity invariants belong in the schema.** `license_pax` is the registered *passenger* maximum;
 the legacy `totalcap` is `license_pax + crew` and must never be used as a selling ceiling.
