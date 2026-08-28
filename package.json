@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "test": "node --import tsx --test test/**/*.test.ts",
-    "check": "tsc --noEmit",
+    "check": "tsc --noEmit -p tsconfig.check.json",
     "db:migrate": "tsx src/migrate.ts"
   },
   "dependencies": {

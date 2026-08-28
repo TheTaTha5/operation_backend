@@ -4,6 +4,7 @@ import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
+import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -25,6 +26,10 @@ function deployment(body: unknown): Deployment {
   const registered = input.registered_persons ?? input.total_capacity ?? input.totalcap;
   return { boat_id: string(input.boat_id, 'boat_id'), route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), capacity, license_pax: input.license_pax === undefined && input.licensePax === undefined ? undefined : pax(input.license_pax ?? input.licensePax, 'license_pax'), registered_persons: registered === undefined ? undefined : pax(registered, 'registered_persons') };
 }
+/** An unrecognised status is refused by name; the CHECK behind it would only say "constraint". */
+const bookingStatus = (value: unknown): BookingStatus | undefined =>
+  value === undefined || value === null ? undefined : (isBookingStatus(value) ? value : badRequest(`status must be one of ${BOOKING_STATUSES.join(', ')}`));
+
 /** A bare count is one untiered cell; the frontend's `{ ad: 2, chd_fr: 1 }` grid is parsed as written. */
 const paxOf = (value: unknown, label: string): PaxRow[] => typeof value === 'number' ? paxRowsFromTotal(pax(value, label)) : parsePaxGrid(value, label);
 
@@ -58,6 +63,7 @@ function bookingInput(body: unknown): BookingInput {
   if (input.trips !== undefined && input.pax !== undefined && pax(input.pax) !== trips.reduce((sum, trip) => sum + paxTotal(trip.pax), 0)) badRequest('pax must equal the sum of trip.pax');
   return {
     trips,
+    status: bookingStatus(input.status),
     external_id: optionalString(input.external_id ?? input.id),
     agent_id: optionalString(input.agent_id ?? input.agentId),
     voucher_ref: optionalString(input.voucher_ref ?? input.voucherRef),
@@ -69,11 +75,13 @@ function bookingInput(body: unknown): BookingInput {
 /** An amendment either replaces the itinerary outright or moves the single departure it has. */
 function bookingChanges(body: unknown): BookingChanges {
   const input = record(body);
-  if (input.trips !== undefined) return { trips: tripsInput(input) };
+  const status = bookingStatus(input.status);
+  if (input.trips !== undefined) return { trips: tripsInput(input), ...(status === undefined ? {} : { status }) };
   return {
     ...(input.route_id === undefined ? {} : { route_id: string(input.route_id, 'route_id') }),
     ...(input.service_date === undefined ? {} : { service_date: string(input.service_date, 'service_date') }),
     ...(input.pax === undefined ? {} : { pax: pax(input.pax) }),
+    ...(status === undefined ? {} : { status }),
   };
 }
 function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'> {

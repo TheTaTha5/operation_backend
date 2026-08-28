@@ -116,6 +116,28 @@ Responses return `trips` with each trip's `pax` grid and `pax_total`, plus `rout
 trip's route and date, the total across every trip, and the seats that total currently holds — so a
 single-departure client can ignore trips entirely.
 
+#### Status, and which statuses hold seats
+
+`status` is one of `draft`, `quote`, `pending`, `pending_approval`, `pending_foc`, `confirmed`,
+`completed`, `rejected`, `cancelled`, `cancelled_weather`. It defaults to `confirmed` on create,
+may be set on create or changed with `PATCH`, and an unrecognised value is a `400` listing the
+valid ones.
+
+**Seats are released by `cancelled`, `rejected` and `cancelled_weather`. Every other status holds
+them** — including `quote` and `draft`. That is a denylist rather than an allowlist on purpose, and
+the direction matters more than the membership: a status nobody has classified yet holds its seats
+instead of releasing them. Over-holding is a day that looks fuller than it is and someone asks;
+under-holding is two parties sold the same seat, at the pier, on the day. It matches the rule the
+legacy frontend applies (`getSeatsConsumed`).
+
+Two consequences worth knowing:
+
+- A booking created in a released status **reserves nothing and is never capacity-checked**, so a
+  cancellation can be recorded against a day that is already full.
+- Changing status from a released one to a holding one **is** capacity-checked, even when the
+  itinerary has not moved — confirming a quote asks for those seats for the first time, and a day
+  that filled up in the meantime will refuse it with a `409`.
+
 - `GET /v1/bookings` — optionally filter by `route_id` and `service_date` (or `date`); a booking
   matches if any of its trips does.
 - `GET /v1/bookings/{id}`

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  // The build emits only `src`, so tsconfig.json includes only `src`. That left test files
+  // unchecked: a test importing a symbol that no longer existed compiled clean and failed at
+  // runtime. `npm run check` uses this config so the tests are type-checked too. `rootDir` is
+  // widened because nothing is emitted here — this config only ever type-checks.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "rootDir": "." },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

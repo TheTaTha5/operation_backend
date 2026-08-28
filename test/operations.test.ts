@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { buildApp } from '../src/app.js';
+import type { InjectOptions } from 'fastify';
 
 const app = buildApp();
 after(async () => app.close());
 
-async function request(method: string, url: string, payload?: unknown) {
-  return app.inject({ method, url, ...(payload === undefined ? {} : { payload }) });
+// Spreading into `inject` inline picks the chainable overload, whose result has no `.json()`. Naming
+// the options object resolves it. This matters because `npm run check` now covers the tests, which
+// is what catches one still importing a symbol that has since moved.
+async function request(method: InjectOptions['method'], url: string, payload?: object) {
+  return payload === undefined ? app.inject({ method, url }) : app.inject({ method, url, payload });
 }
 
 test('deployment capacity feeds availability, bookings, and manifest', async () => {

@@ -1,5 +1,6 @@
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
-import { formatPaxGrid, holdsSeats, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
+import { formatPaxGrid, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
+import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { deploymentSeats } from './capacity.js';
 
 export type Deployment = {
@@ -19,7 +20,7 @@ export type BoatCapacityOverride = { boat_id: string; service_date: string; capa
 /** The boat catalogue entry a deployment's licence is resolved from. */
 export type Boat = { id: string; name?: string; capacity?: number; license_pax?: number; crew?: number };
 
-export type BookingStatus = 'confirmed' | 'cancelled';
+
 
 /** One departure. Seats are consumed here, so this is what every capacity query reads. */
 export type BookingTripInput = { route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[] };
@@ -27,6 +28,8 @@ export type BookingTrip = { id: string; seq: number; route_id: string; service_d
 
 export type BookingInput = {
   trips: BookingTripInput[];
+  /** Defaults to `confirmed`. A status that releases seats is created without reserving any. */
+  status?: BookingStatus;
   external_id?: string;
   agent_id?: string;
   voucher_ref?: string;
@@ -60,7 +63,7 @@ export type Booking = {
   allocated_pax: number;
 };
 
-export type BookingChanges = { trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number };
+export type BookingChanges = { trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number; status?: BookingStatus };
 
 export type SeatLock = {
   id: string;
@@ -235,12 +238,15 @@ export class OperationsStore {
   }
 
   createBooking(input: BookingInput): Booking {
+    const status = input.status ?? 'confirmed';
     this.assertRoutes(input.trips);
-    this.assertTrips(input.trips);
+    // A booking created in a status that releases seats — a rejection being recorded, a cancelled
+    // import — reserves nothing, so a full day must not stop it being written down.
+    if (holdsSeats(status)) this.assertTrips(input.trips);
     const now = this.now();
     const id = this.id('booking');
     const { trips, ...rest } = input;
-    const booking: StoredBooking = { ...rest, id, status: 'confirmed', created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
+    const booking: StoredBooking = { ...rest, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
     this.bookings.set(id, booking);
     return this.view(booking);
   }
@@ -256,9 +262,11 @@ export class OperationsStore {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     const replacement = nextTrips(booking.trips, changes);
+    const status = changes.status ?? booking.status;
     this.assertRoutes(replacement);
-    if (holdsSeats(booking.status) && tripsChanged(booking.trips, replacement)) this.assertTrips(replacement, { bookingId: id });
+    if (claimsSeats(booking.status, status, tripsChanged(booking.trips, replacement))) this.assertTrips(replacement, { bookingId: id });
     booking.trips = this.storedTrips(id, replacement);
+    booking.status = status;
     booking.updated_at = this.now();
     return this.view(booking);
   }
@@ -266,7 +274,7 @@ export class OperationsStore {
   cancelBooking(id: string, reason?: string): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    if (booking.status === 'confirmed') Object.assign(booking, { status: 'cancelled', cancellation_reason: reason, updated_at: this.now() });
+    if (booking.status !== 'cancelled') Object.assign(booking, { status: 'cancelled', cancellation_reason: reason, updated_at: this.now() });
     return this.view(booking);
   }
 
@@ -345,7 +353,7 @@ export function partialCancelTrips(trips: readonly StoredTrip[], status: Booking
 }
 
 function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: string): StoredTrip {
-  if (status !== 'confirmed') fail('Cannot cancel more passengers than the active booking', 400);
+  if (!holdsSeats(status)) fail('Cannot cancel more passengers than the active booking', 400);
   if (trips.length !== 1) fail(message, 400);
   return trips[0];
 }
@@ -369,3 +377,14 @@ export function assertKnownRoutes(known: ReadonlySet<string>, trips: readonly Bo
   const missing = unknownRoutes(known, trips);
   if (missing.length > 0) fail(`Unknown route: ${missing.join(', ')}`, 400);
 }
+
+/**
+ * Whether an amendment asks the pool for seats it is not already holding.
+ *
+ * Two ways that happens: the itinerary moved while the booking was holding, or the status crossed
+ * from releasing to holding — a quote being confirmed asks for its seats for the first time, and a
+ * day that filled up in the meantime must be allowed to refuse it. An amendment that only shrinks
+ * the booking, or leaves a released booking released, is never checked.
+ */
+export const claimsSeats = (from: BookingStatus, to: BookingStatus, tripsMoved: boolean): boolean =>
+  holdsSeats(to) && (tripsMoved || !holdsSeats(from));
