@@ -20,7 +20,10 @@ const exclusion = (query: Record<string, unknown>): Exclusion => ({ bookingId: o
 function deployment(body: unknown): Deployment {
   const input = record(body);
   const capacity = pax(input.capacity ?? input.cap, 'capacity');
-  return { boat_id: string(input.boat_id, 'boat_id'), route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), capacity, license_pax: input.license_pax === undefined && input.licensePax === undefined ? undefined : pax(input.license_pax ?? input.licensePax, 'license_pax'), total_capacity: input.total_capacity === undefined && input.totalcap === undefined ? undefined : pax(input.total_capacity ?? input.totalcap, 'total_capacity') };
+  // `total_capacity`/`totalcap` are still accepted because that is what legacy sends, but they are
+  // the registration figure (passengers + crew) and are stored as such. Nothing sells against them.
+  const registered = input.registered_persons ?? input.total_capacity ?? input.totalcap;
+  return { boat_id: string(input.boat_id, 'boat_id'), route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), capacity, license_pax: input.license_pax === undefined && input.licensePax === undefined ? undefined : pax(input.license_pax ?? input.licensePax, 'license_pax'), registered_persons: registered === undefined ? undefined : pax(registered, 'registered_persons') };
 }
 /** A bare count is one untiered cell; the frontend's `{ ad: 2, chd_fr: 1 }` grid is parsed as written. */
 const paxOf = (value: unknown, label: string): PaxRow[] => typeof value === 'number' ? paxRowsFromTotal(pax(value, label)) : parsePaxGrid(value, label);

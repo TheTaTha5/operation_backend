@@ -57,7 +57,7 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 
 ### Operations
 
-- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity }`; creates or replaces a boat's deployment for that date.
+- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons? }`; creates or replaces a boat's deployment for that date. `license_pax` is taken from the boat catalogue when omitted.
 - `DELETE /operations/deployments/{service_date}/{boat_id}` — removes a deployment.
 - `GET /operations/deployments?from=&to=&route_id=` — lists deployments.
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
@@ -65,6 +65,29 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 - `GET /v1/availability?route_id=&date=` — booking-form availability.
 
 `GET /operations/allotment` and `GET /v1/availability` also accept `exclude_booking_id` and `exclude_lock_id`. A reservation being edited still holds its seats, so an unqualified read counts them against it: raising a 6-pax booking to 8 on a full day looks refused even though the six seats it releases would cover it, and a no-op edit on a sold-out day looks unsavable. Pass the id being edited to read availability as it will be once that reservation is re-saved. Amendments apply the same exclusion internally, so a `PATCH` never rejects a booking on the strength of its own seats.
+
+#### Capacity: three numbers, two ceilings
+
+Availability returns `deployed_capacity` and `licensed_capacity`, and they are not the same limit:
+
+| | meaning |
+| --- | --- |
+| `capacity` | seats the company sells. A commercial decision, set per deployment. |
+| `license_pax` | the registered maximum **passengers**. The legal ceiling. |
+| `registered_persons` | `license_pax + crew` — total persons the vessel may carry. **Never a selling ceiling.** |
+
+`deployed_capacity` is what the seat pool offers: the deployment's capacity, replaced by a
+`boat_capacity_overrides` row when the day has one, then clamped by the licence. `licensed_capacity`
+is the passenger ceiling a **charter** may fill the boat to — higher than the selling cap on
+purpose, because a charter buys the whole boat.
+
+A boat with no licence on file — three Ranong boats have none — falls back to its capacity. A
+missing licence is not a licence of zero.
+
+`registered_persons` is stored for the record and read by nothing. It was previously called
+`total_capacity` and was used as the charter ceiling, which meant a boat registered for 45
+passengers and 3 crew could be sold 48 charter seats. `total_capacity`/`totalcap` are still accepted
+on input, since that is what legacy sends, and stored as `registered_persons`.
 
 ### Bookings
 

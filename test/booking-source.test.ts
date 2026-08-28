@@ -114,3 +114,28 @@ test('partial-cancelling a charter reduces the head count without touching the s
   assert.equal((await app.inject({ method: 'POST', url: `/v1/bookings/${id}/partial-cancel`, payload: { pax_to_cancel: 99 } })).statusCode, 400);
   assert.equal((await app.inject({ method: 'GET', url: `/v1/bookings/${id}` })).json().pax, 11, 'a refused cancel changes nothing');
 });
+
+test('a charter may fill the boat to its licence but never past it', async () => {
+  // Oceanus is registered for 45 passengers and 3 crew, and the company sells 38 of those seats.
+  // Legacy imported totalcap (48) into total_capacity, and the charter path used it as a ceiling —
+  // so a charter could be sold 48 seats, the last three being the crew's.
+  const date = '2030-05-05';
+  const deployed = await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-oceanus', route_id: 'r7', service_date: date, capacity: 38, license_pax: 45, total_capacity: 48 } });
+  assert.equal(deployed.statusCode, 201);
+
+  const availability = (await app.inject({ method: 'GET', url: `/v1/availability?route_id=r7&date=${date}` })).json();
+  assert.equal(availability.deployed_capacity, 38, 'seats on sale are the commercial cap');
+  assert.equal(availability.licensed_capacity, 45, 'the charter ceiling is the registered passenger maximum');
+  assert.equal(availability.total_capacity, undefined, 'the crew-inclusive figure is no longer part of this shape');
+
+  const charter = (pax: number) => app.inject({ method: 'POST', url: '/v1/bookings', payload: { trips: [{ routeId: 'r7', date, bookingMode: 'charter', pax }] } });
+  assert.equal((await charter(46)).statusCode, 409, 'one past the licence');
+  assert.equal((await charter(48)).statusCode, 409, 'and the old crew-inclusive number is refused too');
+  assert.equal((await charter(45)).statusCode, 201, 'a charter buys the boat, so it may exceed the 38-seat selling cap');
+
+  // A seat booking still answers to the smaller commercial cap, not the licence.
+  const other = '2030-05-06';
+  await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-oceanus', route_id: 'r7', service_date: other, capacity: 38, license_pax: 45 } });
+  assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 39 } })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 38 } })).statusCode, 201);
+});

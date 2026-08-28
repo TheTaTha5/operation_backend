@@ -1,15 +1,23 @@
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
 import { formatPaxGrid, holdsSeats, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
+import { deploymentSeats } from './capacity.js';
 
 export type Deployment = {
   boat_id: string;
   route_id: string;
   service_date: string;
-  /** Normal-seat booking capacity. */
+  /** Normal-seat booking capacity — the commercial decision, clamped by `license_pax` when selling. */
   capacity: number;
+  /** Registered passenger maximum. Filled from the boat catalogue when the caller omits it. */
   license_pax?: number;
-  total_capacity?: number;
+  /** Registered total persons aboard (passengers + crew). A vessel fact, never a selling ceiling. */
+  registered_persons?: number;
 };
+
+/** A per-day capacity change for one boat, from `boat_capacity_overrides`. */
+export type BoatCapacityOverride = { boat_id: string; service_date: string; capacity: number; reason?: string };
+/** The boat catalogue entry a deployment's licence is resolved from. */
+export type Boat = { id: string; name?: string; capacity?: number; license_pax?: number; crew?: number };
 
 export type BookingStatus = 'confirmed' | 'cancelled';
 
@@ -66,7 +74,12 @@ export type SeatLock = {
   released_at?: string;
 };
 
-type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
+/**
+ * `deployed_capacity` is what may be sold as seats; `licensed_capacity` is the registered passenger
+ * ceiling a charter may fill the boat to. The old `total_capacity` was `license_pax + crew` and is
+ * gone from this shape deliberately — it was never a limit anyone could sell against.
+ */
+type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 
 /**
  * Seats already held by the reservation being edited. Excluding them stops a booking from competing
@@ -116,13 +129,19 @@ export class OperationsStore {
   private locks = new Map<string, SeatLock>();
   private tail: Promise<void> = Promise.resolve();
   /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
-  private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[] } = { routes: [], seasons: [], overrides: [] };
+  private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] } =
+    { routes: [], seasons: [], overrides: [], boats: [], boatOverrides: [] };
 
   /** Loads reference data that a PostgreSQL deployment gets from migrations instead. */
-  seedCatalogue(catalogue: Partial<{ routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[] }>): void {
+  seedCatalogue(catalogue: Partial<{ routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] }>): void {
     if (catalogue.routes) this.catalogue.routes = catalogue.routes.map((route) => ({ ...route }));
     if (catalogue.seasons) this.catalogue.seasons = catalogue.seasons.map((season) => ({ ...season }));
     if (catalogue.overrides) this.catalogue.overrides = catalogue.overrides.map((override) => ({ ...override }));
+    if (catalogue.boats) this.catalogue.boats = catalogue.boats.map((boat) => ({ ...boat }));
+    if (catalogue.boatOverrides) this.catalogue.boatOverrides = catalogue.boatOverrides.map((override) => ({ ...override }));
+  }
+  private boatOverride(boatId: string, serviceDate: string): number | undefined {
+    return this.catalogue.boatOverrides.find((o) => o.boat_id === boatId && o.service_date === serviceDate)?.capacity;
   }
   listRoutes(): Route[] { return this.catalogue.routes.map((route) => ({ ...route })); }
   listSeasons(): RouteSeason[] { return this.catalogue.seasons.map((season) => ({ ...season })); }
@@ -145,8 +164,9 @@ export class OperationsStore {
 
   capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
     const onDay = this.deployments.filter((d) => d.route_id === routeId && d.service_date === serviceDate);
-    const deployed_capacity = onDay.reduce((sum, d) => sum + d.capacity, 0);
-    const total_capacity = onDay.reduce((sum, d) => sum + (d.total_capacity ?? d.capacity), 0);
+    const seats = onDay.map((d) => deploymentSeats({ capacity: d.capacity, license_pax: d.license_pax, override_capacity: this.boatOverride(d.boat_id, serviceDate) }));
+    const deployed_capacity = seats.reduce((sum, s) => sum + s.sellable, 0);
+    const licensed_capacity = seats.reduce((sum, s) => sum + s.licensed, 0);
     let booked_pax = 0, charter_pax = 0;
     for (const booking of this.bookings.values()) {
       if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
@@ -158,12 +178,12 @@ export class OperationsStore {
     const locked_pax = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
       .reduce((sum, l) => sum + l.pax, 0);
-    return { deployed_capacity, total_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
+    return { deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
   }
 
   private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false, exclude: Exclusion = {}): void {
     const capacity = this.capacity(routeId, serviceDate, exclude);
-    const available = charter ? capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
+    const available = charter ? capacity.licensed_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
     if (available < pax) unavailable();
   }
 
@@ -175,11 +195,19 @@ export class OperationsStore {
     }
   }
 
+  /**
+   * The licence is resolved once, here, from the boat catalogue when the caller does not supply it.
+   * Reading it at capacity time instead would mean the seat pool answered differently depending on
+   * whether a catalogue happened to be loaded; resolved on write, a deployment carries its own
+   * ceiling and both stores compute from the same row.
+   */
   createDeployment(input: Deployment): Deployment {
+    const boat = this.catalogue.boats.find((b) => b.id === input.boat_id);
+    const deployment: Deployment = { ...input, license_pax: input.license_pax ?? boat?.license_pax };
     const existing = this.deployments.findIndex((d) => d.boat_id === input.boat_id && d.service_date === input.service_date);
-    if (existing >= 0) this.deployments[existing] = { ...input };
-    else this.deployments.push({ ...input });
-    return { ...input };
+    if (existing >= 0) this.deployments[existing] = deployment;
+    else this.deployments.push(deployment);
+    return { ...deployment };
   }
 
   deleteDeployment(serviceDate: string, boatId: string): boolean {

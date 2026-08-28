@@ -6,9 +6,11 @@ import {
   type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
 } from './operations.js';
 import { holdsSeats, SEAT_HOLDING_STATUSES, type PaxCategory, type PaxResidency } from './pax.js';
+import { deploymentSeats } from './capacity.js';
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
 
-type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
+type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
+const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
 const unavailable = (): never => { const error = new Error('Insufficient available seats'); (error as Error & { statusCode: number }).statusCode = 409; throw error; };
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
@@ -88,9 +90,19 @@ export class PostgresOperationsStore {
   async capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Promise<Capacity> {
     // `id IS DISTINCT FROM NULL` is true for every row, so an absent exclusion needs no query variant.
     // The seat-holding status list is passed in rather than written here: `pax.ts` owns that rule.
+    // The licence clamp is not written in SQL. A day's deployments are a handful of rows, and
+    // `deploymentSeats` is the one place that decides what a boat may sell — expressing it a second
+    // time as LEAST/COALESCE here is exactly how the two stores would come to disagree.
+    const { rows: deployed } = await this.client().query(
+      `SELECT d.capacity, d.license_pax, o.capacity AS override_capacity
+       FROM deployments d
+       LEFT JOIN boat_capacity_overrides o ON o.boat_id = d.boat_id AND o.service_date = d.service_date
+       WHERE d.route_id = $1 AND d.service_date = $2`, [routeId, serviceDate]);
+    const seats = deployed.map((row) => deploymentSeats({ capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), override_capacity: optionalInt(row.override_capacity) }));
+    const deployed_capacity = seats.reduce((sum, s) => sum + s.sellable, 0);
+    const licensed_capacity = seats.reduce((sum, s) => sum + s.licensed, 0);
+
     const { rows: [row] } = await this.client().query(`SELECT
-      COALESCE((SELECT SUM(capacity) FROM deployments WHERE route_id = $1 AND service_date = $2), 0)::int AS deployed_capacity,
-      COALESCE((SELECT SUM(total_capacity) FROM deployments WHERE route_id = $1 AND service_date = $2), 0)::int AS total_capacity,
       COALESCE((SELECT SUM(p.count) FROM booking_trips t
                 JOIN bookings b ON b.id = t.booking_id
                 JOIN booking_trip_pax p ON p.booking_trip_id = t.id
@@ -103,10 +115,10 @@ export class PostgresOperationsStore {
                   AND t.booking_mode = 'charter' AND t.booking_id IS DISTINCT FROM $3), 0)::int AS charter_pax,
       COALESCE((SELECT SUM(pax) FROM seat_locks WHERE route_id = $1 AND service_date = $2 AND status = 'active' AND id IS DISTINCT FROM $4), 0)::int AS locked_pax`,
       [routeId, serviceDate, exclude.bookingId ?? null, exclude.lockId ?? null, [...SEAT_HOLDING_STATUSES]]);
-    const deployed_capacity = Number(row.deployed_capacity); const total_capacity = Number(row.total_capacity); const booked_pax = Number(row.booked_pax); const charter_pax = Number(row.charter_pax); const locked_pax = Number(row.locked_pax);
-    return { deployed_capacity, total_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
+    const booked_pax = Number(row.booked_pax); const charter_pax = Number(row.charter_pax); const locked_pax = Number(row.locked_pax);
+    return { deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
   }
-  private async assertCapacity(routeId: string, date: string, seats: number, charter = false, exclude: Exclusion = {}): Promise<void> { await this.lockPool(routeId, date); const capacity = await this.capacity(routeId, date, exclude); const available = charter ? capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats; if (available < seats) unavailable(); }
+  private async assertCapacity(routeId: string, date: string, seats: number, charter = false, exclude: Exclusion = {}): Promise<void> { await this.lockPool(routeId, date); const capacity = await this.capacity(routeId, date, exclude); const available = charter ? capacity.licensed_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats; if (available < seats) unavailable(); }
 
   /**
    * Weighs every day a booking touches, so a multi-day booking is refused as a whole or not at all.
@@ -124,19 +136,24 @@ export class PostgresOperationsStore {
     for (const day of days) {
       const capacity = await this.capacity(day.route_id, day.service_date, exclude);
       if (day.seat > 0 && capacity.available_seats < day.seat) unavailable();
-      if (day.charter > 0 && capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax < day.charter) unavailable();
+      if (day.charter > 0 && capacity.licensed_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax < day.charter) unavailable();
     }
   }
 
   async createDeployment(input: Deployment): Promise<Deployment> {
-    await this.client().query(`INSERT INTO deployments (boat_id, route_id, service_date, capacity, license_pax, total_capacity) VALUES ($1,$2,$3,$4,$5,$6)
-      ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, total_capacity = EXCLUDED.total_capacity`, [input.boat_id, input.route_id, input.service_date, input.capacity, input.license_pax ?? null, input.total_capacity ?? input.capacity]);
-    return input;
+    // The licence is resolved from the catalogue on write, so the seat pool never has to reach for
+    // it at read time and a deployment row always carries its own ceiling.
+    const { rows: [row] } = await this.client().query(`INSERT INTO deployments (boat_id, route_id, service_date, capacity, license_pax, registered_persons)
+      VALUES ($1,$2,$3,$4, COALESCE($5, (SELECT license_pax FROM boats WHERE id = $1)), $6)
+      ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, registered_persons = EXCLUDED.registered_persons
+      RETURNING boat_id, route_id, service_date::text, capacity, license_pax, registered_persons`,
+      [input.boat_id, input.route_id, input.service_date, input.capacity, input.license_pax ?? null, input.registered_persons ?? input.capacity]);
+    return { boat_id: String(row.boat_id), route_id: String(row.route_id), service_date: String(row.service_date), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) };
   }
   async deleteDeployment(date: string, boat: string): Promise<boolean> { return (await this.client().query('DELETE FROM deployments WHERE service_date = $1 AND boat_id = $2', [date, boat])).rowCount === 1; }
   async listDeployments(from?: string, to?: string, routeId?: string): Promise<Deployment[]> {
-    const { rows } = await this.client().query('SELECT boat_id, route_id, service_date::text, capacity, license_pax, total_capacity FROM deployments WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) AND ($3::text IS NULL OR route_id = $3) ORDER BY service_date, boat_id', [from ?? null, to ?? null, routeId ?? null]);
-    return rows.map((row) => ({ ...row, capacity: Number(row.capacity), license_pax: row.license_pax === null ? undefined : Number(row.license_pax), total_capacity: Number(row.total_capacity) }));
+    const { rows } = await this.client().query('SELECT boat_id, route_id, service_date::text, capacity, license_pax, registered_persons FROM deployments WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) AND ($3::text IS NULL OR route_id = $3) ORDER BY service_date, boat_id', [from ?? null, to ?? null, routeId ?? null]);
+    return rows.map((row) => ({ ...row, capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) }));
   }
 
   private async writeTrips(bookingId: string, trips: readonly BookingTripInput[]): Promise<void> {
