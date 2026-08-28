@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify';
-import { OperationsStore, type Booking, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
+import { OperationsStore, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
+import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -21,35 +22,55 @@ function deployment(body: unknown): Deployment {
   const capacity = pax(input.capacity ?? input.cap, 'capacity');
   return { boat_id: string(input.boat_id, 'boat_id'), route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), capacity, license_pax: input.license_pax === undefined && input.licensePax === undefined ? undefined : pax(input.license_pax ?? input.licensePax, 'license_pax'), total_capacity: input.total_capacity === undefined && input.totalcap === undefined ? undefined : pax(input.total_capacity ?? input.totalcap, 'total_capacity') };
 }
-function paxBreakdown(value: unknown): Record<string, number> {
-  const input = record(value);
-  const result: Record<string, number> = {};
-  for (const [key, count] of Object.entries(input)) {
-    if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) badRequest(`pax.${key} must be a non-negative integer`);
-    result[key] = count as number;
-  }
-  return result;
-}
-function bookingInput(body: unknown): Omit<Booking, 'id' | 'allocated_pax' | 'status' | 'created_at' | 'updated_at'> {
-  const input = record(body);
-  const trips = input.trips === undefined ? undefined : (Array.isArray(input.trips) && input.trips.length === 1 ? input.trips : badRequest('Exactly one trip is required; create one booking per departure'));
-  const trip = trips ? record(trips[0]) : undefined;
-  const breakdown = trip?.pax === undefined ? undefined : paxBreakdown(trip.pax);
-  const calculatedPax = breakdown ? Object.values(breakdown).reduce((total, count) => total + count, 0) : undefined;
-  const suppliedPax = input.pax === undefined ? undefined : pax(input.pax);
-  if (suppliedPax !== undefined && calculatedPax !== undefined && suppliedPax !== calculatedPax) badRequest('pax must equal the sum of trip.pax');
-  const totalPax = suppliedPax ?? (calculatedPax && calculatedPax > 0 ? calculatedPax : badRequest('pax or trip.pax is required'));
+/** A bare count is one untiered cell; the frontend's `{ ad: 2, chd_fr: 1 }` grid is parsed as written. */
+const paxOf = (value: unknown, label: string): PaxRow[] => typeof value === 'number' ? paxRowsFromTotal(pax(value, label)) : parsePaxGrid(value, label);
+
+function tripInput(value: unknown, index: number): BookingTripInput {
+  const trip = record(value);
+  const label = `trips[${index}]`;
+  const rows = trip.pax === undefined ? badRequest(`${label}.pax is required`) : paxOf(trip.pax, `${label}.pax`);
+  if (paxTotal(rows) === 0) badRequest(`${label}.pax must carry at least one passenger`);
   return {
-    route_id: string(input.route_id ?? trip?.routeId, 'route_id'),
-    service_date: string(input.service_date ?? input.date ?? trip?.date, 'service_date'),
-    pax: totalPax,
+    route_id: string(trip.route_id ?? trip.routeId, `${label}.route_id`),
+    service_date: string(trip.service_date ?? trip.date, `${label}.service_date`),
+    booking_mode: optionalString(trip.booking_mode ?? trip.bookingMode),
+    pax: rows,
+  };
+}
+
+/** Parses an itinerary, accepting either the frontend's `trips` array or a single flat departure. */
+function tripsInput(input: Record<string, unknown>): BookingTripInput[] {
+  if (input.trips !== undefined) {
+    if (!Array.isArray(input.trips) || input.trips.length === 0) badRequest('trips must be a non-empty array');
+    return (input.trips as unknown[]).map(tripInput);
+  }
+  return [tripInput({ route_id: input.route_id, service_date: input.service_date ?? input.date, pax: input.pax, booking_mode: input.booking_mode }, 0)];
+}
+
+function bookingInput(body: unknown): BookingInput {
+  const input = record(body);
+  const trips = tripsInput(input);
+  // A supplied top-level `pax` is a claim about the whole itinerary; disagreeing with the trips it
+  // describes is a client bug worth reporting rather than silently resolving in favour of one side.
+  if (input.trips !== undefined && input.pax !== undefined && pax(input.pax) !== trips.reduce((sum, trip) => sum + paxTotal(trip.pax), 0)) badRequest('pax must equal the sum of trip.pax');
+  return {
+    trips,
     external_id: optionalString(input.external_id ?? input.id),
     agent_id: optionalString(input.agent_id ?? input.agentId),
     voucher_ref: optionalString(input.voucher_ref ?? input.voucherRef),
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
-    booking_mode: optionalString(input.booking_mode ?? trip?.bookingMode),
-    pax_breakdown: breakdown,
     booking_data: input,
+  };
+}
+
+/** An amendment either replaces the itinerary outright or moves the single departure it has. */
+function bookingChanges(body: unknown): BookingChanges {
+  const input = record(body);
+  if (input.trips !== undefined) return { trips: tripsInput(input) };
+  return {
+    ...(input.route_id === undefined ? {} : { route_id: string(input.route_id, 'route_id') }),
+    ...(input.service_date === undefined ? {} : { service_date: string(input.service_date, 'service_date') }),
+    ...(input.pax === undefined ? {} : { pax: pax(input.pax) }),
   };
 }
 function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'> {
@@ -109,11 +130,8 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     return reply.code(201).send(result);
   });
   app.patch('/v1/bookings/:id', async (request) => {
-    const changes = record(request.body);
-    if (changes.route_id !== undefined) string(changes.route_id, 'route_id');
-    if (changes.service_date !== undefined) string(changes.service_date, 'service_date');
-    if (changes.pax !== undefined) pax(changes.pax);
-    return store.transaction(async () => (await store.amendBooking((request.params as { id: string }).id, changes as Partial<Booking>)) ?? notFound('Booking not found'));
+    const changes = bookingChanges(request.body);
+    return store.transaction(async () => (await store.amendBooking((request.params as { id: string }).id, changes)) ?? notFound('Booking not found'));
   });
   app.post('/v1/bookings/:id/cancel', async (request) => {
     const body = record(request.body ?? {});
