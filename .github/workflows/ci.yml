@@ -1,0 +1,85 @@
+# The in-process store and the PostgreSQL store are two implementations of one interface, and the
+# bugs live in the gap between them. `npm test` alone exercises only the in-process one — the store
+# that never runs in production — so this runs the same suite twice, once against each.
+#
+# Everything that has actually broken here was invisible to the in-process run: a row mapper that
+# stringified a DATE into "Wed Jan 04 2030 00:00:00 GMT+0700", a SERIALIZABLE read/write dependency
+# that 500'd every amendment, and migrations, which the in-process store has no schema for at all.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ops_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - name: Type-check
+        run: npm run check
+
+      # The store is chosen by DATABASE_URL, so its absence is what selects the in-process store.
+      - name: Test against the in-process store
+        run: npm test
+
+      - name: Apply migrations
+        run: npm run db:migrate
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/ops_test
+
+      # The service container is new for every job, so the database is clean without being reset.
+      - name: Test against PostgreSQL
+        run: npm test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/ops_test
+
+      # A migration that is not recorded, or is recorded twice, would show up here and nowhere else.
+      - name: Re-running migrations changes nothing
+        run: |
+          output=$(npm run db:migrate 2>&1)
+          echo "$output"
+          echo "$output" | grep -q '(0 applied' || { echo "::error::a second migration run was not a no-op"; exit 1; }
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/ops_test
+
+      # railway.json runs `node dist/migrate.js` as preDeployCommand, so a deploy fails if the build
+      # stops emitting it or it grows a devDependency the production image prunes. Run it the way
+      # Railway does — compiled, from an empty database, with no tsx in the path.
+      - name: The deploy's migration path works from an empty database
+        run: |
+          npm run build
+          psql -c 'CREATE DATABASE ops_deploy'
+          node dist/migrate.js
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/ops_deploy
