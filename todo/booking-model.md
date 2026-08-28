@@ -315,3 +315,42 @@ Still outstanding from stage 1:
 - **007 and 008 are not applied to production.** `railway.json` runs build and start only.
 - **The PostgreSQL suite is not in CI** and needs a clean database per run. Every real defect this
   week came out of that run — the `40001` retry gap and, before it, the seat-lock date mapper.
+
+## The status enum, and a correction — 2026-08-28
+
+Migration 010 widens the CHECK to all ten statuses the frontend writes. Six are in the legacy data:
+confirmed 2929, cancelled 215, cancelled_weather 24, pending_approval 7, quote 5, rejected 2.
+
+**The seat rule I had written was wrong in two ways.** `holdsSeats` was an allowlist of
+`confirmed, pending_approval, pending_foc`. Legacy (`getSeatsConsumed`) is a denylist —
+`cancelled`, `rejected`, `cancelled_weather` release, everything else holds — plus a conditional
+for `pending_approval` (`bkPendHoldsSeat`). So my version would have silently released the five
+quotes and any status added later.
+
+The direction is the substance. A denylist means an unclassified status holds its seats. Over-holding
+surfaces as a day that looks fuller than it is and someone asks; under-holding surfaces as two
+parties sold the same seat, at the pier, on the day. Adopted as-is, on the user's call, so nothing
+changes at cutover — with one known cost: `BK-26080643-US7A` holds 25 seats on r6 for 2026-12-13
+for a booking that is not a sale.
+
+`claimsSeats(from, to, tripsMoved)` is new and covers a hole: an amendment used to be checked only
+when trips moved, so a `cancelled` booking flipped to `confirmed` with an unchanged itinerary would
+have taken seats without asking. Confirming a quote asks for its seats for the first time.
+
+### Also corrected
+
+**`b2c_` is a live channel, not demo data** — 177 bookings, 96 confirmed, the most recent created
+on 2026-08-28. An earlier note here called those rows demo. The five malformed rows are all `b2c_`
+*and* all `cancelled`, so they hold no seats and cannot distort capacity; repair them for audit
+history rather than dropping them.
+
+**All 7 `pending_approval` bookings carry an empty approval record** — no `approval_totover`, no
+`approval_over` — so `bkPendHoldsSeat` reads them as holding, and all 7 are in the past.
+`pendingApprovalHoldsSeats` is written and unit-tested but not yet wired, because the approval
+record arrives with `booking_approvals` in stage 3. Until then every `pending_approval` holds,
+which is the correct answer for all seven live rows.
+
+### Left over
+
+`npm run check` now type-checks `test/` as well as `src/` (`tsconfig.check.json`). It wasn't before,
+which is why a test importing `holdsSeats` from its old module compiled clean and failed at runtime.

@@ -2,10 +2,11 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownRoutes, bookingView, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
+  assertKnownRoutes, bookingView, claimsSeats, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
   type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
 } from './operations.js';
-import { holdsSeats, SEAT_HOLDING_STATUSES, type PaxCategory, type PaxResidency } from './pax.js';
+import { type PaxCategory, type PaxResidency } from './pax.js';
+import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { deploymentSeats } from './capacity.js';
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
 
@@ -89,7 +90,8 @@ export class PostgresOperationsStore {
 
   async capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Promise<Capacity> {
     // `id IS DISTINCT FROM NULL` is true for every row, so an absent exclusion needs no query variant.
-    // The seat-holding status list is passed in rather than written here: `pax.ts` owns that rule.
+    // The list of statuses that release their seats is passed in rather than written here, and it is
+    // a denylist: `booking-status.ts` owns that rule and its direction.
     // The licence clamp is not written in SQL. A day's deployments are a handful of rows, and
     // `deploymentSeats` is the one place that decides what a boat may sell — expressing it a second
     // time as LEAST/COALESCE here is exactly how the two stores would come to disagree.
@@ -106,15 +108,15 @@ export class PostgresOperationsStore {
       COALESCE((SELECT SUM(p.count) FROM booking_trips t
                 JOIN bookings b ON b.id = t.booking_id
                 JOIN booking_trip_pax p ON p.booking_trip_id = t.id
-                WHERE t.route_id = $1 AND t.service_date = $2 AND b.status = ANY($5::text[])
+                WHERE t.route_id = $1 AND t.service_date = $2 AND b.status <> ALL($5::text[])
                   AND t.booking_mode <> 'charter' AND t.booking_id IS DISTINCT FROM $3), 0)::int AS booked_pax,
       COALESCE((SELECT SUM(p.count) FROM booking_trips t
                 JOIN bookings b ON b.id = t.booking_id
                 JOIN booking_trip_pax p ON p.booking_trip_id = t.id
-                WHERE t.route_id = $1 AND t.service_date = $2 AND b.status = ANY($5::text[])
+                WHERE t.route_id = $1 AND t.service_date = $2 AND b.status <> ALL($5::text[])
                   AND t.booking_mode = 'charter' AND t.booking_id IS DISTINCT FROM $3), 0)::int AS charter_pax,
       COALESCE((SELECT SUM(pax) FROM seat_locks WHERE route_id = $1 AND service_date = $2 AND status = 'active' AND id IS DISTINCT FROM $4), 0)::int AS locked_pax`,
-      [routeId, serviceDate, exclude.bookingId ?? null, exclude.lockId ?? null, [...SEAT_HOLDING_STATUSES]]);
+      [routeId, serviceDate, exclude.bookingId ?? null, exclude.lockId ?? null, [...SEAT_RELEASING_STATUSES]]);
     const booked_pax = Number(row.booked_pax); const charter_pax = Number(row.charter_pax); const locked_pax = Number(row.locked_pax);
     return { deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
   }
@@ -176,12 +178,15 @@ export class PostgresOperationsStore {
   }
 
   async createBooking(input: BookingInput): Promise<Booking> {
+    const status = input.status ?? 'confirmed';
     await this.assertRoutes(input.trips);
-    await this.assertTrips(input.trips);
+    // A booking created in a status that releases seats — a rejection being recorded, a cancelled
+    // import — reserves nothing, so a full day must not stop it being written down.
+    if (holdsSeats(status)) await this.assertTrips(input.trips);
     const id = `booking_${randomUUID()}`;
     await this.client().query(`INSERT INTO bookings (id, status, external_id, agent_id, voucher_ref, rate_type_ref, booking_mode, booking_data)
-      VALUES ($1,'confirmed',$2,$3,$4,$5,$6,$7::jsonb)`,
-      [id, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null, JSON.stringify(input.booking_data ?? {})]);
+      VALUES ($1,$8,$2,$3,$4,$5,$6,$7::jsonb)`,
+      [id, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null, JSON.stringify(input.booking_data ?? {}), status]);
     await this.writeTrips(id, input.trips);
     return (await this.booking(id))!;
   }
@@ -198,10 +203,11 @@ export class PostgresOperationsStore {
   async amendBooking(id: string, changes: BookingChanges): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     const replacement = nextTrips(current.trips, changes);
+    const status = changes.status ?? current.status;
     await this.assertRoutes(replacement);
-    if (holdsSeats(current.status) && tripsChanged(current.trips, replacement)) await this.assertTrips(replacement, { bookingId: id }, current.trips);
+    if (claimsSeats(current.status, status, tripsChanged(current.trips, replacement))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
     await this.writeTrips(id, replacement);
-    await this.client().query('UPDATE bookings SET booking_mode = $2, updated_at = now() WHERE id = $1', [id, replacement[0]?.booking_mode ?? null]);
+    await this.client().query('UPDATE bookings SET booking_mode = $2, status = $3, updated_at = now() WHERE id = $1', [id, replacement[0]?.booking_mode ?? null, status]);
     return this.booking(id);
   }
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { formatPaxGrid, holdsSeats, parsePaxGrid, paxRowsFromTotal, paxTotal, retargetPax } from '../src/domain/pax.js';
+import { formatPaxGrid, parsePaxGrid, paxRowsFromTotal, paxTotal, retargetPax } from '../src/domain/pax.js';
 
 test('the frontend grid parses into category × residency cells', () => {
   assert.deepEqual(parsePaxGrid({ ad: 2, chd_fr: 1, foc_th: 3 }), [
@@ -34,14 +34,6 @@ test('a grid round-trips through storage unchanged', () => {
 test('a bare count is one untiered adult cell', () => {
   assert.deepEqual(formatPaxGrid(paxRowsFromTotal(6)), { ad: 6 });
   assert.deepEqual(paxRowsFromTotal(0), []);
-});
-
-test('only statuses that occupy a seat count against the pool', () => {
-  assert.equal(holdsSeats('confirmed'), true);
-  assert.equal(holdsSeats('pending_approval'), true, 'saved over capacity, still holding the seats');
-  assert.equal(holdsSeats('pending_foc'), true);
-  assert.equal(holdsSeats('cancelled'), false);
-  assert.equal(holdsSeats('draft'), false);
 });
 
 test('an untiered count moves to any new total', () => {

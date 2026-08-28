@@ -24,17 +24,6 @@ const RESIDENCY_BY_SUFFIX = new Map<string, PaxResidency>(PAX_RESIDENCIES.map((r
 
 export const paxKey = (category: PaxCategory, residency: PaxResidency): string => `${category}${SUFFIX[residency]}`;
 
-/**
- * Statuses that occupy a seat.
- *
- * A booking awaiting a manager or an FOC approval is already holding its seats — that is the whole
- * point of saving it before it is confirmed — so the pool must count it. Exported as an array too
- * because the SQL store passes it as a parameter rather than repeating the list in a query.
- */
-export const SEAT_HOLDING_STATUSES = ['confirmed', 'pending_approval', 'pending_foc'] as const;
-const SEAT_HOLDING = new Set<string>(SEAT_HOLDING_STATUSES);
-export const holdsSeats = (status: string): boolean => SEAT_HOLDING.has(status);
-
 const invalid = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };
 
 /** Parses the frontend's flat grid into rows, rejecting keys we cannot store rather than dropping them. */
