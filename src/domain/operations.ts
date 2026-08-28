@@ -1,4 +1,5 @@
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
+import { formatPaxGrid, holdsSeats, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 
 export type Deployment = {
   boat_id: string;
@@ -11,12 +12,23 @@ export type Deployment = {
 };
 
 export type BookingStatus = 'confirmed' | 'cancelled';
+
+/** One departure. Seats are consumed here, so this is what every capacity query reads. */
+export type BookingTripInput = { route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[] };
+export type BookingTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number };
+
+export type BookingInput = {
+  trips: BookingTripInput[];
+  external_id?: string;
+  agent_id?: string;
+  voucher_ref?: string;
+  rate_type_ref?: string;
+  /** Original booking payload retained for operations, reconciliation, and audit import. */
+  booking_data?: Record<string, unknown>;
+};
+
 export type Booking = {
   id: string;
-  route_id: string;
-  service_date: string;
-  pax: number;
-  allocated_pax: number;
   status: BookingStatus;
   created_at: string;
   updated_at: string;
@@ -26,12 +38,21 @@ export type Booking = {
   agent_id?: string;
   voucher_ref?: string;
   rate_type_ref?: string;
-  booking_mode?: string;
-  /** Seat categories; infants and FOC passengers are included in allocated pax. */
-  pax_breakdown?: Record<string, number>;
-  /** Original booking payload retained for operations, reconciliation, and audit import. */
   booking_data?: Record<string, unknown>;
+  trips: BookingTrip[];
+  /**
+   * The first trip's route and date, the total pax across every trip, and the seats that total is
+   * currently holding. All four are derived from `trips` and the status — they are not stored, and
+   * they exist so a single-departure client needs to know nothing about trips.
+   */
+  route_id: string;
+  service_date: string;
+  booking_mode?: string;
+  pax: number;
+  allocated_pax: number;
 };
+
+export type BookingChanges = { trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number };
 
 export type SeatLock = {
   id: string;
@@ -54,10 +75,44 @@ type Capacity = { deployed_capacity: number; total_capacity: number; booked_pax:
  */
 export type Exclusion = { bookingId?: string; lockId?: string };
 
+/** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
+export type StoredTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax'> & { trips: StoredTrip[] };
+
+/**
+ * The wire shape of a stored booking.
+ *
+ * Every derived field is computed here and nowhere else — pax totals, the first trip's route and
+ * date, and the seats the booking is holding. Deriving them in SQL for one store and in JavaScript
+ * for the other is how the two drift, so the SQL side returns rows and calls this.
+ */
+export function bookingView(stored: StoredBooking): Booking {
+  const trips = stored.trips.map((trip) => ({ ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax) }));
+  const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
+  const first = stored.trips[0];
+  const seats = stored.trips.filter((trip) => trip.booking_mode !== 'charter').reduce((sum, trip) => sum + paxTotal(trip.pax), 0);
+  return { ...stored, trips, route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax, allocated_pax: holdsSeats(stored.status) ? seats : 0 };
+}
+
+const fail = (message: string, statusCode: number): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
+const unavailable = (): never => fail('Insufficient available seats', 409);
+
+/** Seat demand a set of trips places on each route/day, so two trips on one day are weighed together. */
+export function demandByDay(trips: readonly BookingTripInput[]): { route_id: string; service_date: string; seat: number; charter: number }[] {
+  const days = new Map<string, { route_id: string; service_date: string; seat: number; charter: number }>();
+  for (const trip of trips) {
+    const key = `${trip.route_id}\u0000${trip.service_date}`;
+    const day = days.get(key) ?? { route_id: trip.route_id, service_date: trip.service_date, seat: 0, charter: 0 };
+    day[trip.booking_mode === 'charter' ? 'charter' : 'seat'] += paxTotal(trip.pax);
+    days.set(key, day);
+  }
+  return [...days.values()];
+}
+
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
 export class OperationsStore {
   private deployments: Deployment[] = [];
-  private bookings = new Map<string, Booking>();
+  private bookings = new Map<string, StoredBooking>();
   private locks = new Map<string, SeatLock>();
   private tail: Promise<void> = Promise.resolve();
   /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
@@ -83,23 +138,23 @@ export class OperationsStore {
     try { return await work(); } finally { release(); }
   }
 
-  private key(routeId: string, serviceDate: string): string { return `${routeId}\u0000${serviceDate}`; }
   private now(): string { return new Date().toISOString(); }
   private id(prefix: string): string { return `${prefix}_${crypto.randomUUID()}`; }
 
+  private view(stored: StoredBooking): Booking { return bookingView(stored); }
+
   capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
-    const deployed_capacity = this.deployments
-      .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
-      .reduce((sum, d) => sum + d.capacity, 0);
-    const total_capacity = this.deployments
-      .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
-      .reduce((sum, d) => sum + (d.total_capacity ?? d.capacity), 0);
-    const booked_pax = [...this.bookings.values()]
-      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode !== 'charter' && b.id !== exclude.bookingId)
-      .reduce((sum, b) => sum + b.allocated_pax, 0);
-    const charter_pax = [...this.bookings.values()]
-      .filter((b) => b.route_id === routeId && b.service_date === serviceDate && b.status === 'confirmed' && b.booking_mode === 'charter' && b.id !== exclude.bookingId)
-      .reduce((sum, b) => sum + b.pax, 0);
+    const onDay = this.deployments.filter((d) => d.route_id === routeId && d.service_date === serviceDate);
+    const deployed_capacity = onDay.reduce((sum, d) => sum + d.capacity, 0);
+    const total_capacity = onDay.reduce((sum, d) => sum + (d.total_capacity ?? d.capacity), 0);
+    let booked_pax = 0, charter_pax = 0;
+    for (const booking of this.bookings.values()) {
+      if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
+      for (const trip of booking.trips) {
+        if (trip.route_id !== routeId || trip.service_date !== serviceDate) continue;
+        if (trip.booking_mode === 'charter') charter_pax += paxTotal(trip.pax); else booked_pax += paxTotal(trip.pax);
+      }
+    }
     const locked_pax = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
       .reduce((sum, l) => sum + l.pax, 0);
@@ -109,10 +164,14 @@ export class OperationsStore {
   private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false, exclude: Exclusion = {}): void {
     const capacity = this.capacity(routeId, serviceDate, exclude);
     const available = charter ? capacity.total_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
-    if (available < pax) {
-      const error = new Error('Insufficient available seats');
-      (error as Error & { statusCode: number }).statusCode = 409;
-      throw error;
+    if (available < pax) unavailable();
+  }
+
+  /** Weighs every day a booking touches, so a multi-day booking is refused as a whole or not at all. */
+  private assertTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}): void {
+    for (const day of demandByDay(trips)) {
+      if (day.seat > 0) this.assertCapacity(day.route_id, day.service_date, day.seat, false, exclude);
+      if (day.charter > 0) this.assertCapacity(day.route_id, day.service_date, day.charter, true, exclude);
     }
   }
 
@@ -134,57 +193,50 @@ export class OperationsStore {
     return this.deployments.filter((d) => (!from || d.service_date >= from) && (!to || d.service_date <= to) && (!routeId || d.route_id === routeId));
   }
 
-  createBooking(input: Omit<Booking, 'id' | 'allocated_pax' | 'status' | 'created_at' | 'updated_at'>): Booking {
-    this.assertCapacity(input.route_id, input.service_date, input.pax, input.booking_mode === 'charter');
+  private storedTrips(bookingId: string, trips: readonly BookingTripInput[]): StoredTrip[] {
+    return trips.map((trip, seq) => ({ id: `trip_${bookingId}_${seq}`, seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode === 'charter' ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })) }));
+  }
+
+  createBooking(input: BookingInput): Booking {
+    this.assertTrips(input.trips);
     const now = this.now();
-    const booking: Booking = { ...input, id: this.id('booking'), allocated_pax: input.booking_mode === 'charter' ? 0 : input.pax, status: 'confirmed', created_at: now, updated_at: now };
-    this.bookings.set(booking.id, booking);
-    return { ...booking };
+    const id = this.id('booking');
+    const { trips, ...rest } = input;
+    const booking: StoredBooking = { ...rest, id, status: 'confirmed', created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
+    this.bookings.set(id, booking);
+    return this.view(booking);
   }
 
   listBookings(routeId?: string, serviceDate?: string): Booking[] {
-    return [...this.bookings.values()].filter((b) => (!routeId || b.route_id === routeId) && (!serviceDate || b.service_date === serviceDate)).map((b) => ({ ...b }));
+    return [...this.bookings.values()]
+      .filter((b) => b.trips.some((t) => (!routeId || t.route_id === routeId) && (!serviceDate || t.service_date === serviceDate)))
+      .map((b) => this.view(b));
   }
-  booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && { ...value }; }
+  booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 
-  amendBooking(id: string, changes: Partial<Pick<Booking, 'route_id' | 'service_date' | 'pax'>> & Record<string, unknown>): Booking | undefined {
+  amendBooking(id: string, changes: BookingChanges): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    const route_id = typeof changes.route_id === 'string' ? changes.route_id : booking.route_id;
-    const service_date = typeof changes.service_date === 'string' ? changes.service_date : booking.service_date;
-    const pax = typeof changes.pax === 'number' ? changes.pax : booking.pax;
-    if (booking.status === 'confirmed' && (route_id !== booking.route_id || service_date !== booking.service_date || pax !== booking.pax)) {
-      this.assertCapacity(route_id, service_date, pax, false, { bookingId: id });
-      booking.allocated_pax = pax;
-    }
-    Object.assign(booking, changes, { route_id, service_date, pax, updated_at: this.now() });
-    return { ...booking };
+    const replacement = nextTrips(booking.trips, changes);
+    if (holdsSeats(booking.status) && tripsChanged(booking.trips, replacement)) this.assertTrips(replacement, { bookingId: id });
+    booking.trips = this.storedTrips(id, replacement);
+    booking.updated_at = this.now();
+    return this.view(booking);
   }
 
   cancelBooking(id: string, reason?: string): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    if (booking.status === 'confirmed') {
-      booking.status = 'cancelled';
-      booking.allocated_pax = 0;
-      booking.cancellation_reason = reason;
-      booking.updated_at = this.now();
-    }
-    return { ...booking };
+    if (booking.status === 'confirmed') Object.assign(booking, { status: 'cancelled', cancellation_reason: reason, updated_at: this.now() });
+    return this.view(booking);
   }
 
   partialCancel(id: string, paxToCancel: number): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    if (booking.status !== 'confirmed' || paxToCancel > booking.pax) {
-      const error = new Error('Cannot cancel more passengers than the active booking');
-      (error as Error & { statusCode: number }).statusCode = 400;
-      throw error;
-    }
-    booking.pax -= paxToCancel;
-    booking.allocated_pax = booking.pax;
+    booking.trips = this.storedTrips(id, partialCancelTrips(booking.trips, booking.status, paxToCancel));
     booking.updated_at = this.now();
-    return { ...booking };
+    return this.view(booking);
   }
 
   createLock(input: Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>): SeatLock {
@@ -219,3 +271,46 @@ export class OperationsStore {
     return { route_id: routeId, service_date: serviceDate, ...this.capacity(routeId, serviceDate, exclude), deployments: this.listDeployments(serviceDate, serviceDate, routeId) };
   }
 }
+
+/**
+ * The trips an amendment leaves behind.
+ *
+ * `trips` replaces the itinerary outright. The older single-departure fields still work, but only on
+ * a booking that has one departure — on a multi-trip booking "the route" is ambiguous, and guessing
+ * would move seats the caller never mentioned.
+ */
+export function nextTrips(current: readonly StoredTrip[], changes: BookingChanges): BookingTripInput[] {
+  if (changes.trips) return changes.trips.map((trip) => ({ ...trip, pax: trip.pax.map((row) => ({ ...row })) }));
+  if (changes.route_id === undefined && changes.service_date === undefined && changes.pax === undefined) return current.map(asInput);
+  const trip = onlyTrip(current, 'confirmed', 'Amend a multi-trip booking by sending trips');
+  return [{
+    route_id: changes.route_id ?? trip.route_id,
+    service_date: changes.service_date ?? trip.service_date,
+    booking_mode: trip.booking_mode,
+    pax: changes.pax === undefined ? trip.pax.map((row) => ({ ...row })) : retargetPax(trip.pax, changes.pax),
+  }];
+}
+
+const asInput = (trip: StoredTrip): BookingTripInput => ({ route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode, pax: trip.pax.map((row) => ({ ...row })) });
+
+/**
+ * Cancelling a count rather than named passengers. Only a single-departure booking can do this: on a
+ * multi-trip booking a bare number does not say which day loses the seats, and `reducePax` decides
+ * which cells shrink. A caller that knows both should amend the trips instead.
+ */
+export function partialCancelTrips(trips: readonly StoredTrip[], status: BookingStatus, count: number): BookingTripInput[] {
+  const trip = onlyTrip(trips, status, 'Partial-cancel a multi-trip booking by sending trips');
+  const total = paxTotal(trip.pax);
+  if (count > total) fail('Cannot cancel more passengers than the active booking', 400);
+  return [{ ...asInput(trip), pax: retargetPax(trip.pax, total - count) }];
+}
+
+function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: string): StoredTrip {
+  if (status !== 'confirmed') fail('Cannot cancel more passengers than the active booking', 400);
+  if (trips.length !== 1) fail(message, 400);
+  return trips[0];
+}
+
+/** Whether an amendment moves seats at all; an unchanged itinerary must not be re-checked against the pool. */
+export const tripsChanged = (current: readonly StoredTrip[], next: readonly BookingTripInput[]): boolean =>
+  current.length !== next.length || current.some((trip, index) => trip.route_id !== next[index].route_id || trip.service_date !== next[index].service_date || paxTotal(trip.pax) !== paxTotal(next[index].pax) || trip.booking_mode !== (next[index].booking_mode === 'charter' ? 'charter' : 'seat'));

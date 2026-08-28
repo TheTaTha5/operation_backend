@@ -68,13 +68,48 @@ Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` a
 
 ### Bookings
 
-- `GET /v1/bookings` — optionally filter by `route_id` and `service_date` (or `date`).
+A booking is a sale; a **trip** is one departure. Seats are consumed per departure, so a booking
+carries a `trips` array and one booking may span several days.
+
+```jsonc
+{
+  "trips": [
+    { "routeId": "r-1", "date": "2030-01-02", "pax": { "ad": 2, "chd_fr": 1 } },
+    { "routeId": "r-1", "date": "2030-01-03", "pax": { "ad": 2 }, "bookingMode": "charter" }
+  ]
+}
+```
+
+`pax` is a grid of category × pricing tier: categories are `ad`, `chd`, `inf`, `foc`, and a bare key
+is untiered while `_fr` and `_th` are the foreign and Thai tiers (`ad`, `ad_fr`, `ad_th`, …). Every
+category consumes a seat, infants and FOC included. An unrecognised key is rejected rather than
+dropped — a silently ignored count is a passenger who is not on the boat. A plain `pax: 6` is
+accepted and stored as one untiered cell.
+
+Responses return `trips` with each trip's `pax` grid and `pax_total`, plus `route_id`,
+`service_date`, `pax` and `allocated_pax` at the top level. Those four are **derived** — the first
+trip's route and date, the total across every trip, and the seats that total currently holds — so a
+single-departure client can ignore trips entirely.
+
+- `GET /v1/bookings` — optionally filter by `route_id` and `service_date` (or `date`); a booking
+  matches if any of its trips does.
 - `GET /v1/bookings/{id}`
-- `POST /v1/bookings` — `{ route_id, service_date, pax }`. It also accepts a source booking with exactly one `trips` item: `trips[0].routeId`, `trips[0].date`, and its `pax` category object are normalized automatically. All categories, including infants and FOC, consume seats. The source payload is retained in `booking_data`, while its source ID, agent, voucher, rate type, booking mode, and pax breakdown are stored in dedicated fields.
-- `PATCH /v1/bookings/{id}` — amend `route_id`, `service_date`, and/or `pax`; capacity is checked only when one of these changes.
-- `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all allocated seats.
-- `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`); returns that many seats.
-- `POST /v1/bookings/{id}/reschedule` — `{ route_id, service_date, pax? }`; checks target capacity before moving allocation.
+- `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
+  single departure. A supplied top-level `pax` must equal the sum across trips. The whole payload is
+  retained in `booking_data`, while source ID, agent, voucher and rate type are stored in dedicated
+  fields. **The itinerary is weighed as a whole**: if any day is short of seats the booking is
+  refused entirely and no day is left holding part of it. Two trips on the same departure are
+  counted together.
+- `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
+  `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
+  something actually moves, and days being vacated are released in the same transaction.
+- `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all seats.
+- `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`). Requires a
+  single departure whose passengers are untiered: on a booking split across categories a bare number
+  does not say who left, and any rule for choosing would cancel the wrong people. Send `trips` with
+  the intended grid instead.
+- `POST /v1/bookings/{id}/reschedule` — `{ route_id, service_date, pax? }`; checks target capacity
+  before moving allocation. Single-departure only, on the same grounds.
 
 ### Agent seat locks
 

@@ -1,7 +1,7 @@
-# Two live correctness bugs in the charter seat path
+# Correctness bugs in the charter seat path
 
 Both found on 2026-08-26 while checking the legacy `allotment_v2` frontend against this
-backend. Both are reachable in production today. Neither is covered by a test.
+backend. **Bug 1 was fixed on 2026-08-28 by migration 007; bug 2 is still live.**
 
 The only booking in the production database is a charter booking, so it is the exact shape
 that triggers bug 1 and sits on the deployment that triggers bug 2:
@@ -16,7 +16,23 @@ deployments
 
 ---
 
-## 1. `partial-cancel` on a charter booking returns 500, and the two stores disagree
+## 1. `partial-cancel` on a charter booking returns 500, and the two stores disagree — FIXED
+
+Fixed on 2026-08-28, not by patching either store but by removing what they disagreed about.
+`allocated_pax` was a second copy of the passenger count, and migration 007 deleted the column:
+the seats a booking holds are now derived from its trip rows and its status, in `bookingView`,
+which both stores call. There is no stored number left to drive negative and no second
+implementation to diverge from.
+
+Partial-cancel now reduces the head count and leaves the charter drawing on the charter ceiling,
+which was the second of the two options weighed below. Locked in by *"partial-cancelling a charter
+reduces the head count without touching the seat pool"* in `test/booking-source.test.ts`, which
+passes against both stores.
+
+The original report follows, since the reasoning about what partial-cancel means for a charter is
+still the reason the current behaviour is what it is.
+
+---
 
 `POST /v1/bookings/{id}/partial-cancel` crashes for any charter booking.
 
