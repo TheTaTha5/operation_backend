@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  bookingView, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
+  assertKnownRoutes, bookingView, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
   type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
 } from './operations.js';
 import { holdsSeats, SEAT_HOLDING_STATUSES, type PaxCategory, type PaxResidency } from './pax.js';
@@ -151,7 +151,15 @@ export class PostgresOperationsStore {
     }
   }
 
+  /** Answers 400 before `booking_trips_route_fk` can answer 500. */
+  private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
+    const ids = [...new Set(trips.map((trip) => trip.route_id))];
+    const { rows } = await this.client().query('SELECT id FROM routes WHERE id = ANY($1::text[])', [ids]);
+    assertKnownRoutes(new Set(rows.map((row) => String(row.id))), trips);
+  }
+
   async createBooking(input: BookingInput): Promise<Booking> {
+    await this.assertRoutes(input.trips);
     await this.assertTrips(input.trips);
     const id = `booking_${randomUUID()}`;
     await this.client().query(`INSERT INTO bookings (id, status, external_id, agent_id, voucher_ref, rate_type_ref, booking_mode, booking_data)
@@ -173,6 +181,7 @@ export class PostgresOperationsStore {
   async amendBooking(id: string, changes: BookingChanges): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     const replacement = nextTrips(current.trips, changes);
+    await this.assertRoutes(replacement);
     if (holdsSeats(current.status) && tripsChanged(current.trips, replacement)) await this.assertTrips(replacement, { bookingId: id }, current.trips);
     await this.writeTrips(id, replacement);
     await this.client().query('UPDATE bookings SET booking_mode = $2, updated_at = now() WHERE id = $1', [id, replacement[0]?.booking_mode ?? null]);

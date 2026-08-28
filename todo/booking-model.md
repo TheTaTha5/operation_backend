@@ -292,3 +292,26 @@ prefixed and look like demo rows, but that should be confirmed before an import 
   fields, `zone`, `pickup_time`, `subtotal` and the `seats_locked`/`seats_general` split are still
   to come. Nothing reads them yet, so nothing is broken by their absence, but the sketch above
   describes the destination rather than what exists.
+
+## Stage 1 closed out — 2026-08-28
+
+Migration 008 adds `booking_trips_route_fk`, the foreign key the `booking_trips` sketch above
+always called for and 007 did not create. The dry run had already proved all 3,183 legacy trips
+resolve against the catalogue, so it went on clean.
+
+The constraint is a backstop rather than the error path. A foreign key violation reaches the caller
+as a 500 naming a constraint, which tells them nothing, so both stores check the route first and
+answer `400 Unknown route: <id>` from one shared function (`assertKnownRoutes`).
+
+**A store divergence to keep in view.** The in-process store's catalogue is empty unless seeded —
+"with no database there is no catalogue to read" — so with nothing to check against it accepts any
+route, while PostgreSQL always enforces. This is the one place the two stores knowingly differ. It
+is not testable end to end for that reason: `assertKnownRoutes` is covered by unit tests in
+`test/booking-routes.test.ts`, and the constraint itself was verified by direct SQL. If the
+in-process store ever gains a default catalogue, the divergence should go with it.
+
+Still outstanding from stage 1:
+
+- **007 and 008 are not applied to production.** `railway.json` runs build and start only.
+- **The PostgreSQL suite is not in CI** and needs a clean database per run. Every real defect this
+  week came out of that run — the `40001` retry gap and, before it, the seat-lock date mapper.

@@ -99,7 +99,8 @@ single-departure client can ignore trips entirely.
   retained in `booking_data`, while source ID, agent, voucher and rate type are stored in dedicated
   fields. **The itinerary is weighed as a whole**: if any day is short of seats the booking is
   refused entirely and no day is left holding part of it. Two trips on the same departure are
-  counted together.
+  counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an unknown one is
+  a `400` naming the route, and `booking_trips_route_fk` is the database backstop behind it.
 - `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
   something actually moves, and days being vacated are released in the same transaction.
