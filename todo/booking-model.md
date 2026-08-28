@@ -75,9 +75,12 @@ INDEX (route_id, service_date)
 `seats_locked + seats_general` must equal the trip's total pax — a CHECK we cannot write today
 because the numbers live in a blob.
 
-This table is what removes the one-trip-per-booking restriction. All 18,648 legacy multi-trip
-bookings are blocked on it, and `bookingInput()` currently rejects them outright
-(`src/routes/operations.ts:35`).
+This table is what removes the one-trip-per-booking restriction, which `bookingInput()` used to
+enforce outright. Measured against the legacy database on 2026-08-28: that restriction blocks
+**3 bookings out of 3,180**, and all three are the same thing — an overnight trip, outbound plus
+return leg. An earlier draft of this note claimed 18,648, which was wrong and came from a count of
+something else entirely. The reason to remove the restriction is that the shape is wrong, not that
+thousands of rows are waiting behind it.
 
 ### `booking_trip_pax` — the 4×3 grid
 
@@ -233,3 +236,59 @@ Stage 1 was the one with a correctness story. The rest is mechanical now the tri
 - `trip.ops.van_splits` — shape unknown.
 - Both stores must implement all of this identically. The in-process store has no joins, so the
   trip-total and status-holds-seats rules go in `src/domain/` pure functions first.
+
+## Dry run against the legacy database — 2026-08-28
+
+Read-only extract of `operation_schemas.sb_bookings` and `sb_bookings__trips` (3,180 bookings,
+3,183 trips) transformed into `bookings` / `booking_trips` / `booking_trip_pax` in a throwaway
+database. This is the first time the model met real data rather than rows written to agree with it.
+
+**The model holds.** 8,740 passengers in, 8,740 out, and not one trip's total changed. Every
+route-day the capacity query produces matches the figure computed independently from the legacy
+columns: 311 route-days compared, 0 differing. No CHECK or foreign key was violated by real data.
+
+Confirmations worth keeping:
+
+- **`booking_mode` really is only `seat` and `charter`** — 3,169 and 14. The CHECK is right.
+- **Every `routeid` resolves** against the catalogue seeded by migration 006. 7 distinct routes.
+- **The 4×3 grid is right, and legacy is missing two of the cells.** `sb_bookings__trips` has ten
+  wide pax columns and no `pax_chd` or `pax_inf` — the untiered child and infant were simply never
+  needed, so the column was never added. That is the wide-column failure mode in miniature: the
+  schema encodes which combinations have occurred so far.
+- **The untiered tier is nearly dead.** `pax_ad` is used by 0 trips of 3,183 and `pax_foc` by 1.
+  Real bookings are all `_fr`/`_th`. `residency = 'unknown'` earns its place for imports and bare
+  `pax: 6` requests, not for anything the frontend writes.
+
+### What does not fit, and what it costs
+
+**38 bookings cannot keep their status** — 24 `cancelled_weather`, 7 `pending_approval`, 5 `quote`,
+2 `rejected` — because the CHECK still allows only `confirmed` and `cancelled`. Seven of those are
+`pending_approval`, which `holdsSeats()` already counts as occupying seats; collapsing them to
+`cancelled` would silently release 7 bookings' worth. Collapsing `quote` to `cancelled` is storable
+but wrong in the other direction. **This is the strongest argument for pulling the status enum
+forward in stage 2** — it is not cosmetic, it decides whether seats are held.
+
+**5 trips are unrepresentable** and their bookings were held back whole:
+
+| id | problem |
+| --- | --- |
+| `b2c_BK-001`, `b2c_BK-002` | `date` is `Sat Jul 04` / `Fri Nov 20` |
+| `b2c_BK-003` | both — bad date and no `routeid` |
+| `b2c_LOV-0542142_1`, `b2c_LOV-7358225_1` | no `routeid` |
+
+The dates are a stringified JS `Date` truncated into a text column — the exact failure the date
+convention in `CLAUDE.md` exists to prevent, preserved in production data. All five are `b2c_`
+prefixed and look like demo rows, but that should be confirmed before an import drops them.
+
+### Corrections to the design
+
+- **`ovn_of` is an index, not an id.** It holds the `idx` of the outbound trip within the same
+  booking, so it maps onto `booking_trips.seq`, and a self-reference on `(booking_id, seq)` will
+  enforce it. Joining it against `row_pk` finds nothing.
+- **`ovn` is an enum**: `return` (3) and `self` (2). Not free text.
+- **Two `ops` fields were missed** in the table sketch above: `ops_boatsplits` and `ops_piernote`.
+- **Stage 1's migration is narrower than the `booking_trips` sketch in this note.** 007 created
+  `id, booking_id, seq, route_id, service_date, booking_mode` only. The charter fields, the OVN
+  fields, `zone`, `pickup_time`, `subtotal` and the `seats_locked`/`seats_general` split are still
+  to come. Nothing reads them yet, so nothing is broken by their absence, but the sketch above
+  describes the destination rather than what exists.
