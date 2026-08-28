@@ -197,7 +197,17 @@ export class OperationsStore {
     return trips.map((trip, seq) => ({ id: `trip_${bookingId}_${seq}`, seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode === 'charter' ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })) }));
   }
 
+  /**
+   * With no catalogue seeded there is nothing to validate against, so an unseeded in-process store
+   * accepts any route. A PostgreSQL deployment always has a catalogue and always enforces this.
+   */
+  private assertRoutes(trips: readonly BookingTripInput[]): void {
+    if (this.catalogue.routes.length === 0) return;
+    assertKnownRoutes(new Set(this.catalogue.routes.map((route) => route.id)), trips);
+  }
+
   createBooking(input: BookingInput): Booking {
+    this.assertRoutes(input.trips);
     this.assertTrips(input.trips);
     const now = this.now();
     const id = this.id('booking');
@@ -218,6 +228,7 @@ export class OperationsStore {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     const replacement = nextTrips(booking.trips, changes);
+    this.assertRoutes(replacement);
     if (holdsSeats(booking.status) && tripsChanged(booking.trips, replacement)) this.assertTrips(replacement, { bookingId: id });
     booking.trips = this.storedTrips(id, replacement);
     booking.updated_at = this.now();
@@ -314,3 +325,19 @@ function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: 
 /** Whether an amendment moves seats at all; an unchanged itinerary must not be re-checked against the pool. */
 export const tripsChanged = (current: readonly StoredTrip[], next: readonly BookingTripInput[]): boolean =>
   current.length !== next.length || current.some((trip, index) => trip.route_id !== next[index].route_id || trip.service_date !== next[index].service_date || paxTotal(trip.pax) !== paxTotal(next[index].pax) || trip.booking_mode !== (next[index].booking_mode === 'charter' ? 'charter' : 'seat'));
+
+/**
+ * Trip routes that are not in the catalogue.
+ *
+ * The database has a foreign key for this, but a constraint violation reaches the caller as a 500
+ * naming a constraint. Checking up front is what turns it into a 400 naming the route, and putting
+ * the check here is what stops the two stores from wording it differently.
+ */
+export function unknownRoutes(known: ReadonlySet<string>, trips: readonly BookingTripInput[]): string[] {
+  return [...new Set(trips.map((trip) => trip.route_id).filter((id) => !known.has(id)))];
+}
+
+export function assertKnownRoutes(known: ReadonlySet<string>, trips: readonly BookingTripInput[]): void {
+  const missing = unknownRoutes(known, trips);
+  if (missing.length > 0) fail(`Unknown route: ${missing.join(', ')}`, 400);
+}
