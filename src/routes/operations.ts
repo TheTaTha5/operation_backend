@@ -5,6 +5,7 @@ import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
+import { charterCeiling } from '../domain/capacity.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -124,6 +125,22 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const calendar = routeCalendar(await store.listSeasons(), await store.listDayOverrides(from, to));
     return { from, to, routes: routes.map((route) => ({ ...route, days: calendar.range(route.id, from, to) })) };
   });
+
+  /**
+   * The boat catalogue, as a static reference list.
+   *
+   * Deliberately not date-aware: `boat_capacity_overrides` changes a boat's seats for one day, but
+   * `/v1/availability` already resolves that against the day's deployment, and answering it twice
+   * invites the two answers to disagree.
+   *
+   * `charter_ceiling` is the resolved answer to how many passengers a charter may fill this boat to,
+   * computed here so no client re-implements the fallback. `license_pax` is null for a boat with no
+   * licence on file: claiming a registration the vessel does not hold would be worse than saying
+   * there is none, and a missing licence is not a licence of zero.
+   */
+  app.get('/v1/boats', async () => ({
+    boats: (await store.listBoats()).map((boat) => ({ ...boat, license_pax: boat.license_pax ?? null, charter_ceiling: charterCeiling(boat) })),
+  }));
 
   app.get('/v1/availability', async (request) => {
     const query = request.query as Record<string, unknown>;

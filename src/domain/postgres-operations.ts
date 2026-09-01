@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   assertKnownRoutes, bookingView, claimsSeats, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
-  type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
 } from './operations.js';
 import { type PaxCategory, type PaxResidency } from './pax.js';
 import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
@@ -236,6 +236,19 @@ export class PostgresOperationsStore {
       COALESCE((SELECT array_agg(t.departs_at ORDER BY t.idx) FROM route_times t WHERE t.route_id = r.id), '{}') AS times
       FROM routes r ORDER BY r.sort NULLS LAST, r.id`);
     return rows.map((row) => ({ id: String(row.id), name: String(row.name), pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [] }));
+  }
+  /**
+   * The boat catalogue. `license_pax` stays undefined for a boat with no licence on file rather
+   * than borrowing `capacity`, so the fallback stays in `charterCeiling` and nothing downstream can
+   * mistake a resolved number for a registration the vessel does not hold.
+   */
+  async listBoats(): Promise<Boat[]> {
+    const { rows } = await this.client().query('SELECT id, name, type, pier, capacity, license_pax, crew FROM boats ORDER BY name, id');
+    return rows.map((row) => ({
+      id: String(row.id), name: String(row.name), type: row.type ?? undefined, pier: row.pier ?? undefined,
+      capacity: Number(row.capacity), license_pax: row.license_pax === null ? undefined : Number(row.license_pax),
+      crew: row.crew === null ? undefined : Number(row.crew),
+    }));
   }
   async listSeasons(): Promise<RouteSeason[]> {
     const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');

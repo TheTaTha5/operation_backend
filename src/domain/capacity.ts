@@ -26,6 +26,17 @@ export type DeploymentLimits = {
 };
 
 /**
+ * The passenger ceiling a charter may fill a boat to.
+ *
+ * A boat with no licence on file falls back to its capacity — three Ranong boats have none, and a
+ * missing licence is not a licence of zero. This is the only place that fallback is written, so the
+ * seat pool and the boat catalogue cannot answer it differently.
+ */
+export function charterCeiling(limits: { capacity: number; license_pax?: number }): number {
+  return limits.license_pax ?? limits.capacity;
+}
+
+/**
  * `sellable` is what the seat pool offers; `licensed` is the passenger ceiling a charter may fill
  * the boat to, which is higher than the selling cap by design — a charter buys the whole boat.
  *
@@ -34,6 +45,6 @@ export type DeploymentLimits = {
  */
 export function deploymentSeats(limits: DeploymentLimits): { sellable: number; licensed: number } {
   const operational = limits.override_capacity ?? limits.capacity;
-  const licensed = limits.license_pax ?? operational;
+  const licensed = charterCeiling({ capacity: operational, license_pax: limits.license_pax });
   return { sellable: Math.min(operational, licensed), licensed };
 }
