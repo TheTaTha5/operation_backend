@@ -183,6 +183,37 @@ who drives, which boat, did they show up — and it is written by the ops board,
 form. It gets its own table so it can later get its own endpoints without another migration.
 `van_splits` is the one genuinely open-ended piece and needs its own look before modelling.
 
+## The blob is being deleted, not kept as an overflow — decided 2026-09-01
+
+The note and the code disagreed. This note's "What this deletes" always said `booking_data` goes;
+the create path meanwhile writes the entire request body into it (`src/routes/operations.ts`), and
+`README.md` documents that as intended — unrecognised fields "retained in `booking_data`". So the
+column had quietly become a junk drawer for anything unmodelled, which is the opposite of deleting
+it.
+
+**Decided: delete it.** No overflow column survives stage 2. A field the frontend sends is either
+modelled or dropped on the floor, and dropping it is the signal that it needs modelling.
+
+The reason to close this now is that the blob has already stopped being merely redundant and become
+*wrong*. `UPDATE bookings` touches `booking_mode`, `status` and `updated_at` only, so an amendment
+never rewrites `booking_data`: edit a booking and the blob keeps answering with what the client sent
+at create time, beside columns that have moved on. Every response carries both. An integrator who
+reads `booking_data.leadPax` instead of the column gets the right answer until someone amends, which
+is the worst shape a bug can have.
+
+Deleting it is expand/contract, not one commit, and the destructive half needs the rehearsal
+`CLAUDE.md` asks for:
+
+1. **Add** the header columns. Additive, nothing reads them.
+2. **Dual-write** — the create and patch paths fill columns *and* the blob. Both stores.
+3. **Backfill** existing rows from the blob into the columns. This is the destructive step: rehearse
+   it against a restored copy and diff the rows, the way 007 was checked.
+4. **Stop returning `booking_data`** in responses. This is an API contract change, not an internal
+   one — it is the step that needs the frontend told, and it wants its own note in `README.md`.
+5. **Drop the column**, once nothing reads it and step 4 has been out long enough to trust.
+
+Steps 1–3 are reversible. Step 5 is not, and there is no hurry to reach it.
+
 ## What this deletes
 
 - `bookings.booking_data` — the blob
@@ -220,13 +251,20 @@ Stage 1 was the one with a correctness story. The rest is mechanical now the tri
 
 ## Still open from stage 1
 
-- The status enum is still the two values `confirmed` and `cancelled`. `holdsSeats()` in `pax.ts`
-  already knows about `pending_approval` and `pending_foc` and is the single place the rule lives,
-  but the CHECK constraint and the API do not accept them yet. That lands with the header columns
-  in stage 2.
-- `PATCH /v1/bookings/{id}` no longer passes unrecognised fields through to storage. That was
-  accidental before; the header columns in stage 2 are what should be patchable.
-- The Postgres suite needs a clean database per run and is still not in CI.
+*Reviewed 2026-09-01. Two of the three below are closed; struck through rather than deleted, because
+what was open when and what closed it is the useful part.*
+
+- ~~The status enum is still the two values `confirmed` and `cancelled`.~~ **Closed** — migration 010
+  widened the CHECK to all ten, and it did not wait for the header columns as this line predicted;
+  the dry run's 38 unstorable statuses pulled it forward. The rule moved to
+  `src/domain/booking-status.ts`, not `pax.ts`, and it is a denylist rather than the allowlist this
+  line assumed. See "The status enum, and a correction" below.
+- `PATCH /v1/bookings/{id}` no longer passes unrecognised fields through to storage. **Still open,
+  and now a defect rather than an accident.** `UPDATE bookings` writes `booking_mode`, `status` and
+  `updated_at` only, so `booking_data` is frozen at create time while the columns beside it move on.
+  Fixed by the header columns landing in stage 2, per the delete-the-blob decision above.
+- ~~The Postgres suite needs a clean database per run and is still not in CI.~~ **Closed** —
+  `.github/workflows/ci.yml` runs the suite against `postgres:18-alpine` on a per-run database.
 
 ## Open
 
@@ -310,11 +348,14 @@ is not testable end to end for that reason: `assertKnownRoutes` is covered by un
 `test/booking-routes.test.ts`, and the constraint itself was verified by direct SQL. If the
 in-process store ever gains a default catalogue, the divergence should go with it.
 
-Still outstanding from stage 1:
+Still outstanding from stage 1 *(both closed 2026-09-01)*:
 
-- **007 and 008 are not applied to production.** `railway.json` runs build and start only.
-- **The PostgreSQL suite is not in CI** and needs a clean database per run. Every real defect this
-  week came out of that run — the `40001` retry gap and, before it, the seat-lock date mapper.
+- ~~**007 and 008 are not applied to production.** `railway.json` runs build and start only.~~
+  **Closed** — `railway.json` now runs `node dist/migrate.js` as `preDeployCommand`, so the schema
+  moves before new code takes traffic and a failed migration aborts the deploy.
+- ~~**The PostgreSQL suite is not in CI**~~ **Closed** — CI stands up `postgres:18-alpine` and runs
+  the suite against it. The observation that earned it stands: every real defect that week came out
+  of that run — the `40001` retry gap and, before it, the seat-lock date mapper.
 
 ## The status enum, and a correction — 2026-08-28
 
