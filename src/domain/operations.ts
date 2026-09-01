@@ -17,8 +17,14 @@ export type Deployment = {
 
 /** A per-day capacity change for one boat, from `boat_capacity_overrides`. */
 export type BoatCapacityOverride = { boat_id: string; service_date: string; capacity: number; reason?: string };
-/** The boat catalogue entry a deployment's licence is resolved from. */
-export type Boat = { id: string; name?: string; capacity?: number; license_pax?: number; crew?: number };
+/**
+ * The boat catalogue entry a deployment's licence is resolved from.
+ *
+ * `name` and `capacity` are required because the `boats` table declares them NOT NULL. Leaving them
+ * optional let the in-process store hold a boat PostgreSQL would reject, which is the divergence
+ * shape that kept the seat-lock `service_date` bug alive: only one store was ever exercised.
+ */
+export type Boat = { id: string; name: string; type?: string; pier?: string; capacity: number; license_pax?: number; crew?: number };
 
 
 
@@ -147,6 +153,8 @@ export class OperationsStore {
     return this.catalogue.boatOverrides.find((o) => o.boat_id === boatId && o.service_date === serviceDate)?.capacity;
   }
   listRoutes(): Route[] { return this.catalogue.routes.map((route) => ({ ...route })); }
+  /** Empty unless seeded, like the rest of the catalogue: with no database there is nothing to read. */
+  listBoats(): Boat[] { return this.catalogue.boats.map((boat) => ({ ...boat })); }
   listSeasons(): RouteSeason[] { return this.catalogue.seasons.map((season) => ({ ...season })); }
   listDayOverrides(from?: string, to?: string): RouteDayOverride[] {
     return this.catalogue.overrides.filter((o) => (!from || o.service_date >= from) && (!to || o.service_date <= to)).map((o) => ({ ...o }));

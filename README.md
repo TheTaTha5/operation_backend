@@ -57,6 +57,27 @@ The `admin` group grants every permission. `CORS_ORIGIN` must contain the fronte
 
 Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A deployment is required before seats become available.
 
+### Catalogue
+
+Reference data every other endpoint refers to by id.
+
+- `GET /v1/routes` — the route catalogue. With `from=&to=` each route also carries its operating
+  calendar resolved per date, as `days[date] = { open, source }`, where `source` names the rule that
+  decided it. The range is capped at 400 days, and `from`/`to` must be supplied together.
+- `GET /v1/boats` — the boat catalogue: `{ id, name, type?, pier?, capacity, license_pax,
+  charter_ceiling, crew? }`.
+
+`GET /v1/boats` is deliberately **not** date-aware. `boat_capacity_overrides` changes one boat's
+seats for one day, but `GET /v1/availability` already resolves that against the day's deployment,
+and answering the same question in two places invites the two answers to disagree.
+
+`charter_ceiling` is how many passengers a charter may fill the boat to, resolved for you.
+`license_pax` is `null` for a boat with no licence on file — three Ranong boats have none — and in
+that case `charter_ceiling` falls back to `capacity`. **A missing licence is not a licence of zero.**
+The null is reported rather than quietly replaced by `capacity`, because claiming a registration a
+vessel does not hold is worse than saying it has none; read `charter_ceiling` for the number and
+`license_pax` for whether it is a legal figure or a fallback.
+
 ### Operations
 
 - `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons? }`; creates or replaces a boat's deployment for that date. `license_pax` is taken from the boat catalogue when omitted.
