@@ -25,6 +25,23 @@ From 2027-01-01, any date on r7–r11 resolves to closed. Whatever the service d
 day — refuse the booking, mark it pending approval, hide it from the calendar — starts happening
 to five of the fourteen routes at once, on New Year's Day.
 
+**Correction, 2026-09-07: the service does nothing with a closed day on the write path.**
+`routeCalendar` is called in one place, `GET /v1/routes` (`src/routes/operations.ts:127`). Neither
+`createBooking` nor `amendBooking` consults it. Both check that a route *exists* — `assertRoutes`,
+and the `booking_trips_route_fk` behind it — and never whether it *operates* on the date asked for.
+
+So the cliff is not a refusal, which is worse than the sentence above assumed. From 2027-01-01 the
+calendar endpoint will report r7–r11 closed on every date while `POST /v1/bookings` and
+`PATCH /v1/bookings/{id}` keep accepting bookings onto them. A frontend that greys out the day
+stops anyone going that way; anything reaching the API directly — an import, an agent integration,
+a reschedule — goes straight through. The two answers disagree and nothing reconciles them.
+
+That is a defect independent of the 2027 data question, and it does not wait for it: a route closed
+for a genuine monsoon season today is already bookable through the API. Whether the write path
+should refuse a closed day outright, or mark it `pending_approval` the way legacy does for an
+override, is a decision to make before it is written — the seat rule was got wrong in exactly this
+direction once already (see `todo/booking-model.md`, "The status enum, and a correction").
+
 Legacy has the identical cliff today, from the same rows. It is not a defect this service
 introduced, and extending the windows there fixes both.
 
