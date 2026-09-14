@@ -1,0 +1,310 @@
+// operation-backend — schema through migration 011
+//
+// Enums below are TEXT + CHECK in PostgreSQL, not PG enum types. They are
+// written as enums here because dbdiagram renders them legibly; the DDL in
+// migrations/ is the authority.
+//
+// Not modelled yet (todo/booking-model.md stages 2-4): booking_passengers,
+// booking_addons, booking_adjustments, booking_alt_pickups, booking_attachments,
+// booking_special_meal_allergies, booking_approvals, booking_trip_lock_draws,
+// booking_trip_ops.
+
+Project operation_backend {
+  database_type: 'PostgreSQL'
+  Note: 'System of record for boat operations: deployments, seat inventory, bookings, seat locks, and the route/boat catalogue.'
+}
+
+Enum booking_status {
+  draft
+  quote
+  pending
+  pending_approval
+  pending_foc
+  confirmed
+  completed
+  rejected
+  cancelled
+  cancelled_weather
+}
+
+Enum booking_mode {
+  seat
+  charter
+}
+
+Enum pax_category {
+  ad
+  chd
+  inf
+  foc
+}
+
+Enum pax_residency {
+  unknown
+  foreign
+  thai
+}
+
+Enum season_kind {
+  open
+  closed
+}
+
+Enum lock_status {
+  active
+  released
+}
+
+// ─────────────────────────────── bookings ───────────────────────────────
+
+Table bookings {
+  id                 text [pk]
+  status             booking_status [not null, note: 'cancelled, rejected and cancelled_weather release seats; every other status holds them. src/domain/booking-status.ts']
+  cancellation_reason text
+  created_at         timestamptz [not null, default: `now()`]
+  updated_at         timestamptz [not null, default: `now()`]
+
+  external_id        text [note: 'unique when not null']
+  agent_id           text
+  voucher_ref        text
+  rate_type_ref      text
+  booking_mode       booking_mode [note: 'denormalized from trip 0']
+  booking_data       jsonb [not null, note: 'DEPRECATED, DEFAULT {}. Frozen at create; not rewritten by PATCH. Being deleted — expand/contract steps 3-5.']
+
+  // ── migration 011: the header scalars. All nullable on purpose —
+  // absent means never given, and a DEFAULT would invent a claim nobody made.
+  schema_ver               integer
+
+  sold_by                  text
+  purpose                  text [note: 'separates a sale from a staff welfare or inspection booking']
+  staff_id                 text
+  staff_purpose            text
+
+  lead_pax                 text
+  lead_nationality         text
+  lead_type                text
+  lead_foc                 boolean
+  lead_phone               text
+  lead_email               text
+
+  pickup_area_id           text
+  pickup_self              boolean
+  pickup_area              text [note: 'snapshot of the area name at booking time; renaming an area must not rewrite history']
+  pickup_zone              text
+  hotel_name               text
+  room_number              text
+
+  dropoff_same             boolean
+  dropoff_area_id          text
+  dropoff_area             text
+  dropoff_hotel_name       text
+
+  guide_english            boolean
+  guide_russian            boolean
+  guide_chinese            boolean
+  guide_other_lang         text
+
+  pax_type                 text
+  special_meals_veg        integer
+  special_meals_vegan      integer
+  special_meals_halal      integer
+  special_meals_allergies  text [note: 'free text; the structured allergyList becomes booking_special_meal_allergies in stage 3']
+  large_luggage            integer
+
+  cash_on_tour_amount      "numeric(12,2)"
+  cash_on_tour_currency    text
+  cash_on_tour_handling    text
+  cash_on_tour_note        text
+
+  price_mode               text
+  manual_total             "numeric(12,2)"
+  total                    "numeric(12,2)" [note: 'grand total at save time; the price_* columns explain how it was reached']
+  price_seat               "numeric(12,2)"
+  price_addon              "numeric(12,2)"
+  price_foc_discount       "numeric(12,2)"
+  price_discount           "numeric(12,2)"
+  price_extra              "numeric(12,2)"
+
+  payment_method           text
+  payment_net_days         integer
+  payment_source           text
+  payment_contract_version text
+
+  market                   text [note: 'snapshot at booking time, never recomputed']
+  market_sub               text
+  market_agent_id          text
+  market_at                date
+
+  booking_date             date [note: 'operational date of sale, editable on the form']
+  booked_at                timestamptz [note: 'instant the row was first written; legitimately disagrees with booking_date']
+  created_by               text
+  updated_by               text
+  confirmed_at             timestamptz
+  confirmed_by             text
+
+  notes                    text
+  note                     text
+
+  indexes {
+    external_id [unique, name: 'bookings_external_id_unique', note: 'partial: WHERE external_id IS NOT NULL']
+  }
+
+  Note: 'PATCH writes booking_mode, status and updated_at only. The 59 header columns above are filled at create and never amended — todo/booking-model.md, stage 2 step 2.'
+}
+
+Table booking_trips {
+  id           text [pk, note: 'trip_<booking_id>_<seq>']
+  booking_id   text [not null]
+  seq          integer [not null, note: 'CHECK (seq >= 0)']
+  route_id     text [not null]
+  service_date date [not null]
+  booking_mode booking_mode [not null, default: 'seat']
+
+  indexes {
+    (booking_id, seq) [unique, name: 'booking_trips_booking_id_seq_key']
+    (route_id, service_date) [name: 'booking_trips_allotment_idx']
+    booking_id [name: 'booking_trips_booking_idx']
+  }
+
+  Note: 'THE CAPACITY TABLE. Every allotment, availability and manifest query reads this. Rewritten wholesale on amend: DELETE by booking_id, then re-INSERT with seq renumbered from 0.'
+}
+
+Table booking_trip_pax {
+  booking_trip_id text [not null]
+  category        pax_category [not null]
+  residency       pax_residency [not null]
+  count           integer [not null, note: 'CHECK (count > 0)']
+
+  indexes {
+    (booking_trip_id, category, residency) [pk]
+  }
+
+  Note: 'The 4x3 grid. Trip pax total is SUM(count) — the only definition of a trip pax count. Cascades away when booking_trips rows are deleted.'
+}
+
+// ─────────────────────────────── catalogue ───────────────────────────────
+
+Table routes {
+  id        text [pk]
+  name      text [not null]
+  pier      text
+  family_id text [note: 'programme grouping the booking calendar renders chips by']
+  color     text
+  islands   text
+  sort      bigint
+}
+
+Table route_times {
+  route_id   text [not null]
+  idx        integer [not null]
+  departs_at text [not null]
+
+  indexes {
+    (route_id, idx) [pk]
+  }
+}
+
+Table route_seasons {
+  id        text [pk]
+  route_id  text [not null]
+  kind      season_kind [not null]
+  from_date date [not null]
+  to_date   date [not null, note: 'CHECK (from_date <= to_date)']
+
+  indexes {
+    (route_id, from_date, to_date) [name: 'route_seasons_lookup_idx']
+  }
+
+  Note: 'A route declaring any open season is closed outside all of them. Every route has a finite last window — r7-r11 end 2026-12-31. See todo/route-season-calendars-expire.md.'
+}
+
+Table route_day_overrides {
+  route_id     text [not null]
+  service_date date [not null]
+  kind         season_kind [not null]
+
+  indexes {
+    (route_id, service_date) [pk]
+  }
+}
+
+Table boats {
+  id          text [pk]
+  name        text [not null]
+  type        text
+  pier        text
+  capacity    integer [not null, note: 'seats the company sells. CHECK (capacity > 0) and CHECK (capacity <= license_pax)']
+  license_pax integer [note: 'registered PASSENGER maximum — the legal ceiling. NULL when no licence is on file.']
+  crew        integer
+
+  Note: 'The legacy totalcap is license_pax + crew and is deliberately not carried over: using it as a selling ceiling is what let charters be sold the crew seats.'
+}
+
+Table boat_capacity_overrides {
+  boat_id      text [not null]
+  service_date date [not null]
+  capacity     integer [not null, note: 'CHECK (capacity >= 0)']
+  reason       text
+
+  indexes {
+    (boat_id, service_date) [pk]
+  }
+}
+
+// ─────────────────────────────── inventory ───────────────────────────────
+
+Table deployments {
+  boat_id            text [not null]
+  route_id           text [not null]
+  service_date       date [not null]
+  capacity           integer [not null, note: 'CHECK (capacity > 0)']
+  license_pax        integer
+  registered_persons integer [not null, note: 'registered total persons aboard (passengers + crew). NOT a selling ceiling — use license_pax.']
+
+  indexes {
+    (service_date, boat_id) [pk]
+  }
+
+  Note: 'No foreign keys. boat_id and route_id are plain TEXT — a deployment can name a boat or route that does not exist.'
+}
+
+Table seat_locks {
+  id           text [pk]
+  route_id     text [not null]
+  service_date date [not null]
+  pax          integer [not null, note: 'CHECK (pax > 0)']
+  agent_id     text
+  status       lock_status [not null]
+  created_at   timestamptz [not null, default: `now()`]
+  updated_at   timestamptz [not null, default: `now()`]
+  released_at  timestamptz
+
+  indexes {
+    (route_id, service_date) [name: 'seat_locks_allotment_idx', note: 'partial: WHERE status = active']
+  }
+
+  Note: 'No foreign keys. The link to a booking is still a {lockId: qty} map inside booking_data — booking_trip_lock_draws in stage 3 is what makes it real.'
+}
+
+Table schema_migrations {
+  name       text [pk]
+  checksum   text [not null, note: 'sha256 of the file; editing an applied migration is refused']
+  applied_at timestamptz [not null, default: `now()`]
+}
+
+// ─────────────────────────────── references ───────────────────────────────
+
+Ref: booking_trips.booking_id            > bookings.id      [delete: cascade]
+Ref: booking_trips.route_id              > routes.id                             // migration 008
+Ref: booking_trip_pax.booking_trip_id    > booking_trips.id [delete: cascade]
+Ref: route_times.route_id                > routes.id        [delete: cascade]
+Ref: route_seasons.route_id              > routes.id        [delete: cascade]
+Ref: route_day_overrides.route_id        > routes.id        [delete: cascade]
+Ref: boat_capacity_overrides.boat_id     > boats.id         [delete: cascade]
+
+// Joined by convention, NOT by a constraint. Uncomment to draw the lines,
+// but the database does not enforce any of these:
+//
+// Ref: deployments.route_id > routes.id
+// Ref: deployments.boat_id  > boats.id
+// Ref: seat_locks.route_id  > routes.id

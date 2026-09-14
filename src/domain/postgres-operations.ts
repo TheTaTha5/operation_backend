@@ -9,6 +9,10 @@ import { type PaxCategory, type PaxResidency } from './pax.js';
 import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { deploymentSeats } from './capacity.js';
 import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
+import {
+  BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
+  type BookingHeader,
+} from './booking-header.js';
 
 type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
@@ -27,7 +31,14 @@ const dateOnly = (value: unknown): string => value instanceof Date ? `${value.ge
  * re-render. Nothing is aggregated or derived here — totals and seat holdings come from
  * `bookingView`, which the in-process store calls too.
  */
-const BOOKING_SELECT = `SELECT b.*, COALESCE((
+/**
+ * `DATE` columns are cast in the query and aliased, rather than relying on `b.*` being overridden
+ * by a later duplicate name. `pg` builds its row object by field name, so a duplicate would work by
+ * position — a rule nothing in the file states and a reader could reasonably reorder.
+ */
+const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${column}::text AS ${column}_text`).join(', ');
+
+const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode,
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
@@ -36,7 +47,23 @@ const BOOKING_SELECT = `SELECT b.*, COALESCE((
     FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips
   FROM bookings b`;
 
+const NUMERIC_HEADER = new Set<string>(BOOKING_HEADER_NUMERIC_COLUMNS);
+const TIMESTAMP_HEADER = new Set<string>(BOOKING_HEADER_TIMESTAMP_COLUMNS);
+const DATE_HEADER = new Set<string>(BOOKING_HEADER_DATE_COLUMNS);
+
+/** Reads the header columns off a row, converting the three types `pg` does not hand back as-is. */
+const header = (row: QueryResultRow): BookingHeader => {
+  const values: Record<string, unknown> = {};
+  for (const column of BOOKING_HEADER_COLUMNS) {
+    const raw = DATE_HEADER.has(column) ? row[`${column}_text`] : row[column];
+    if (raw === null || raw === undefined) continue;
+    values[column] = NUMERIC_HEADER.has(column) ? Number(raw) : TIMESTAMP_HEADER.has(column) ? asIso(raw) : raw;
+  }
+  return values as BookingHeader;
+};
+
 const stored = (row: QueryResultRow): StoredBooking => ({
+  ...header(row),
   id: String(row.id), status: row.status as Booking['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
   cancellation_reason: row.cancellation_reason ?? undefined, external_id: row.external_id ?? undefined, agent_id: row.agent_id ?? undefined,
   voucher_ref: row.voucher_ref ?? undefined, rate_type_ref: row.rate_type_ref ?? undefined, booking_data: row.booking_data ?? undefined,
@@ -184,9 +211,23 @@ export class PostgresOperationsStore {
     // import — reserves nothing, so a full day must not stop it being written down.
     if (holdsSeats(status)) await this.assertTrips(input.trips);
     const id = `booking_${randomUUID()}`;
-    await this.client().query(`INSERT INTO bookings (id, status, external_id, agent_id, voucher_ref, rate_type_ref, booking_mode, booking_data)
-      VALUES ($1,$8,$2,$3,$4,$5,$6,$7::jsonb)`,
-      [id, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null, JSON.stringify(input.booking_data ?? {}), status]);
+    // Only the header columns the caller actually supplied are written, so a NULL keeps meaning
+    // "never given" rather than "explicitly blanked". The column list is generated rather than
+    // typed out: a statement maintained by hand is one that silently stops writing a new field.
+    const columns = ['id', 'status', 'external_id', 'agent_id', 'voucher_ref', 'rate_type_ref', 'booking_mode'];
+    const values: unknown[] = [id, status, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null];
+    for (const column of BOOKING_HEADER_COLUMNS) {
+      const value = input.header?.[column];
+      if (value === undefined) continue;
+      columns.push(column);
+      values.push(value);
+    }
+    const placeholders = values.map((_, index) => `$${index + 1}`);
+    // The blob is still written beside the columns: this is the dual-write step, not the drop.
+    columns.push('booking_data');
+    values.push(JSON.stringify(input.booking_data ?? {}));
+    placeholders.push(`$${values.length}::jsonb`);
+    await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
     await this.writeTrips(id, input.trips);
     return (await this.booking(id))!;
   }
@@ -207,7 +248,20 @@ export class PostgresOperationsStore {
     await this.assertRoutes(replacement);
     if (claimsSeats(current.status, status, tripsChanged(current.trips, replacement))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
     await this.writeTrips(id, replacement);
-    await this.client().query('UPDATE bookings SET booking_mode = $2, status = $3, updated_at = now() WHERE id = $1', [id, replacement[0]?.booking_mode ?? null, status]);
+    // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
+    // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
+    // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
+    const assignments = ['booking_mode = $2', 'status = $3', 'updated_at = now()'];
+    const values: unknown[] = [id, replacement[0]?.booking_mode ?? null, status];
+    for (const column of BOOKING_HEADER_COLUMNS) {
+      const value = changes.header?.[column];
+      if (value === undefined) continue;
+      values.push(value);
+      assignments.push(`${column} = $${values.length}`);
+    }
+    await this.client().query(`UPDATE bookings SET ${assignments.join(', ')} WHERE id = $1`, values);
+    // `booking_data` is deliberately left as it was written at create time. The blob is on its way
+    // out, and re-serialising an amendment into it would grow the thing being deleted.
     return this.booking(id);
   }
 

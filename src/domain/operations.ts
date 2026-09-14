@@ -2,6 +2,7 @@ import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
 import { formatPaxGrid, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { deploymentSeats } from './capacity.js';
+import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 
 export type Deployment = {
   boat_id: string;
@@ -40,11 +41,21 @@ export type BookingInput = {
   agent_id?: string;
   voucher_ref?: string;
   rate_type_ref?: string;
-  /** Original booking payload retained for operations, reconciliation, and audit import. */
+  /**
+   * The header scalars, already read out of the caller's document by `bookingHeader()`. Both stores
+   * persist these as columns; neither parses the document itself.
+   */
+  header?: BookingHeader;
+  /**
+   * Original booking payload retained for operations, reconciliation, and audit import.
+   *
+   * Written beside the header columns during the dual-write step, and on its way out — a field that
+   * is not modelled is dropped rather than kept here. See `todo/booking-model.md`.
+   */
   booking_data?: Record<string, unknown>;
 };
 
-export type Booking = {
+export type Booking = BookingHeader & {
   id: string;
   status: BookingStatus;
   created_at: string;
@@ -69,7 +80,15 @@ export type Booking = {
   allocated_pax: number;
 };
 
-export type BookingChanges = { trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number; status?: BookingStatus };
+/**
+ * An amendment. `header` merges: a column it does not mention keeps the value it had, and one it
+ * mentions with no value is cleared — see `BookingHeaderPatch`. The itinerary fields are the
+ * exception and replace outright, because a trip list is one fact rather than fifty-seven.
+ */
+export type BookingChanges = {
+  trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number; status?: BookingStatus;
+  header?: BookingHeaderPatch;
+};
 
 export type SeatLock = {
   id: string;
@@ -253,8 +272,10 @@ export class OperationsStore {
     if (holdsSeats(status)) this.assertTrips(input.trips);
     const now = this.now();
     const id = this.id('booking');
-    const { trips, ...rest } = input;
-    const booking: StoredBooking = { ...rest, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
+    // The header is flattened onto the booking, not nested under a `header` key: these are columns
+    // in PostgreSQL, and a store that held them one level down would answer a different shape.
+    const { trips, header, ...rest } = input;
+    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
     this.bookings.set(id, booking);
     return this.view(booking);
   }
@@ -275,6 +296,8 @@ export class OperationsStore {
     if (claimsSeats(booking.status, status, tripsChanged(booking.trips, replacement))) this.assertTrips(replacement, { bookingId: id });
     booking.trips = this.storedTrips(id, replacement);
     booking.status = status;
+    // Applied after the capacity check, so a refused amendment leaves the header as it was too.
+    if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
     booking.updated_at = this.now();
     return this.view(booking);
   }

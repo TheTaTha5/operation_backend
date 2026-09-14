@@ -205,9 +205,19 @@ Deleting it is expand/contract, not one commit, and the destructive half needs t
 `CLAUDE.md` asks for:
 
 1. **Add** the header columns. Additive, nothing reads them.
-2. **Dual-write** — the create and patch paths fill columns *and* the blob. Both stores.
+2. **Dual-write** — the create path fills columns *and* the blob. Both stores. *Amended 2026-09-10:
+   the patch path writes columns **only**.* Re-serialising an amendment into the blob would grow the
+   thing being deleted, and the blob has no answer for a cleared field. So `booking_data` is now
+   precisely a record of what was sent at create time and nothing else, which is a narrower and more
+   defensible claim than "the payload, sort of, until someone amends".
 3. **Backfill** existing rows from the blob into the columns. This is the destructive step: rehearse
    it against a restored copy and diff the rows, the way 007 was checked.
+
+   **The backfill must not touch a row whose columns have already moved.** Since step 2, an amended
+   booking has correct columns beside a stale blob; a naive `UPDATE … FROM booking_data` would
+   overwrite a corrected phone number with the wrong one it was corrected from, silently, on every
+   booking anyone has ever edited. Scope it to rows the columns were never written for — created
+   before 011, or with the header columns still entirely NULL — and let the diff prove it.
 4. **Stop returning `booking_data`** in responses. This is an API contract change, not an internal
    one — it is the step that needs the frontend told, and it wants its own note in `README.md`.
 5. **Drop the column**, once nothing reads it and step 4 has been out long enough to trust.
@@ -274,6 +284,37 @@ what was open when and what closed it is the useful part.*
 - `trip.ops.van_splits` — shape unknown.
 - Both stores must implement all of this identically. The in-process store has no joins, so the
   trip-total and status-holds-seats rules go in `src/domain/` pure functions first.
+- **`pickup_area_id` and `dropoff_area_id` point at nothing.** See below.
+
+## The area catalogue does not exist — raised 2026-09-07
+
+Migration 011 lands `pickup_area_id`, `pickup_zone`, `dropoff_area_id` and the two snapshot name
+columns beside them, but there is no `areas` table anywhere in the schema. Both id columns are
+plain `TEXT` holding ids that reference nothing, which puts them in the same bucket as
+`deployments.route_id` and `seat_locks.route_id` — joined by convention, unenforced. A booking may
+carry `dropoff_area_id = 'area_99'` and nothing objects.
+
+**The name columns are not the problem and must not be "fixed".** `pickup_area`, `pickup_zone` and
+`dropoff_area` are snapshots of what the area was called on the day, exactly like `market` and for
+the same reason. They stay denormalized whatever happens to the ids. The FK answers *which area is
+this*; the text answers *what did we call it that day*; they are allowed to disagree, and a rename
+must not rewrite either.
+
+`route_id` was in this position and the way out is already worn:
+
+1. **005** created the `routes` catalogue.
+2. **006** seeded it from the legacy production database.
+3. **008** added the foreign key, once the dry run had proved all 3,183 legacy trips resolved.
+
+Areas want the same three steps. What blocks step 1 is that we do not own the list: areas are a
+frontend/legacy concept today, and this repo does not know whether the ids are stable, who edits
+them, or whether an id is unique across zones. Seeding a catalogue from a list someone else can
+edit out from under us is how a foreign key becomes a failed deploy.
+
+**Next step is the dry run, not the migration.** Extract the distinct `pickup_area_id` and
+`dropoff_area_id` values from the legacy bookings and check them against whatever the frontend
+treats as the area list, the way the booking model was checked on 2026-08-28. If they all resolve,
+this is three migrations and no drama. If they do not, the gaps are the actual finding.
 
 ## Dry run against the legacy database — 2026-08-28
 

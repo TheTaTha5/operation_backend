@@ -6,6 +6,7 @@ import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { charterCeiling } from '../domain/capacity.js';
+import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -69,20 +70,33 @@ function bookingInput(body: unknown): BookingInput {
     agent_id: optionalString(input.agent_id ?? input.agentId),
     voucher_ref: optionalString(input.voucher_ref ?? input.voucherRef),
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
+    header: bookingHeader(input),
     booking_data: input,
   };
 }
 
-/** An amendment either replaces the itinerary outright or moves the single departure it has. */
+/**
+ * An amendment either replaces the itinerary outright or moves the single departure it has, and
+ * either way carries whichever header fields the caller mentioned.
+ *
+ * The header is read from the same body by the same table the create path uses, so a field
+ * `POST /v1/bookings` accepts is a field `PATCH` accepts. It is read on both branches: an
+ * amendment that rewrites the trips may correct the lead passenger in the same call.
+ */
 function bookingChanges(body: unknown): BookingChanges {
   const input = record(body);
   const status = bookingStatus(input.status);
-  if (input.trips !== undefined) return { trips: tripsInput(input), ...(status === undefined ? {} : { status }) };
+  const header = bookingHeaderPatch(input);
+  const common = {
+    ...(status === undefined ? {} : { status }),
+    ...(Object.keys(header).length === 0 ? {} : { header }),
+  };
+  if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
     ...(input.route_id === undefined ? {} : { route_id: string(input.route_id, 'route_id') }),
     ...(input.service_date === undefined ? {} : { service_date: string(input.service_date, 'service_date') }),
     ...(input.pax === undefined ? {} : { pax: pax(input.pax) }),
-    ...(status === undefined ? {} : { status }),
+    ...common,
   };
 }
 function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'> {

@@ -163,15 +163,18 @@ Two consequences worth knowing:
   matches if any of its trips does.
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
-  single departure. A supplied top-level `pax` must equal the sum across trips. The whole payload is
-  retained in `booking_data`, while source ID, agent, voucher and rate type are stored in dedicated
-  fields. **The itinerary is weighed as a whole**: if any day is short of seats the booking is
+  single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
+  are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
+  below. **The itinerary is weighed as a whole**: if any day is short of seats the booking is
   refused entirely and no day is left holding part of it. Two trips on the same departure are
   counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an unknown one is
   a `400` naming the route, and `booking_trips_route_fk` is the database backstop behind it.
 - `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
-  something actually moves, and days being vacated are released in the same transaction.
+  something actually moves, and days being vacated are released in the same transaction. Any
+  [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:
+  a field you do not mention keeps the value it had. An amendment refused for capacity changes
+  nothing, header included.
 - `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all seats.
 - `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`). Requires a
   single departure whose passengers are untiered: on a booking split across categories a bare number
@@ -179,6 +182,65 @@ Two consequences worth knowing:
   the intended grid instead.
 - `POST /v1/bookings/{id}/reschedule` — `{ route_id, service_date, pax? }`; checks target capacity
   before moving allocation. Single-departure only, on the same grounds.
+
+#### Booking header fields
+
+The scalar fields of a booking are stored as columns and returned as columns. Send them in the
+frontend's camelCase (`leadPax`) or in the response's snake_case (`lead_pax`) — both are accepted,
+the way `routeId` is accepted beside `route_id`. Fixed-size structs are flattened on the way in:
+send `guides: {english, russian, chinese, otherLang}` and read back `guide_english`,
+`guide_russian`, `guide_chinese`, `guide_other_lang`. The same applies to `specialMeals`,
+`cashOnTour`, `priceBreakdown`, `paymentSnapshot` and `marketSnapshot`.
+
+| Group | Fields |
+| --- | --- |
+| identity | `schema_ver`, `external_id`, `voucher_ref` |
+| commercial | `agent_id`, `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` |
+| lead | `lead_pax`, `lead_nationality`, `lead_type`, `lead_foc`, `lead_phone`, `lead_email` |
+| pickup | `pickup_area_id`, `pickup_self`, `pickup_area`, `pickup_zone`, `hotel_name`, `room_number` |
+| dropoff | `dropoff_same`, `dropoff_area_id`, `dropoff_area`, `dropoff_hotel_name` |
+| guides | `guide_english`, `guide_russian`, `guide_chinese`, `guide_other_lang` |
+| service | `pax_type`, `special_meals_veg`, `special_meals_vegan`, `special_meals_halal`, `special_meals_allergies`, `large_luggage` |
+| cash on tour | `cash_on_tour_amount`, `cash_on_tour_currency`, `cash_on_tour_handling`, `cash_on_tour_note` |
+| price | `price_mode`, `manual_total`, `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`, `price_extra` |
+| payment | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version` |
+| market | `market`, `market_sub`, `market_agent_id`, `market_at` |
+| lifecycle | `status`, `booking_date`, `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
+| free text | `notes`, `note` |
+
+A field you do not send is **absent from the response**, not `null` — absence means never given,
+which is not the same claim as an explicit blank. `booking_date` and `market_at` are plain
+`YYYY-MM-DD` days; `booked_at` and `confirmed_at` are ISO instants. Money fields are numbers, never
+strings.
+
+**A field that is not in this table is dropped.** It is not retained anywhere. If you need one
+stored, that is a request for a column, not a payload change.
+
+##### Amending the header
+
+`PATCH /v1/bookings/{id}` merges. Three cases, and the difference between the last two matters:
+
+| You send | What happens |
+| --- | --- |
+| nothing for a field | it keeps the value it had |
+| `"leadPhone": "0899999999"` | it is set |
+| `"leadPhone": null` or `""` | it is **cleared**, and reads back absent |
+
+So correcting one field is a one-field request — you need not read the booking, merge locally and
+send all fifty-seven back. Clearing has to be said out loud, because a merge has no other way to
+tell "I have no opinion on the hotel name" from "there is no hotel name". An empty or
+whitespace-only string clears, which is what a form sends when someone deletes the text in a box;
+on `POST` it simply means the field was never filled in, since there is nothing yet to clear.
+
+`false` and `0` are values, not clears. Nested structs work on `PATCH` exactly as on `POST`, and
+partially: `{"guides": {"english": true}}` sets `guide_english` and leaves the other three guide
+columns alone.
+
+> **`booking_data` is deprecated and will be removed.** It still appears on responses and still
+> holds the payload exactly as it was sent at create time. It is deliberately *not* rewritten by
+> `PATCH` — the columns are the ones that move — so on any amended booking the blob is a record of
+> what was first sent, not of what the booking now says. Read the columns. A future release stops
+> returning it, and a later one drops it.
 
 ### Agent seat locks
 

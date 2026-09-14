@@ -1,0 +1,194 @@
+{
+  "version": "3.0.0",
+  "darkMode": true,
+  "gridEnabling": false,
+  "currentViewName": null,
+  "defaultView": {
+    "detailLevel": "All",
+    "relationshipMode": "All",
+    "tablePositions": [
+      {
+        "name": "bookings",
+        "schemaName": "public",
+        "x": 12,
+        "y": 418
+      },
+      {
+        "name": "booking_trips",
+        "schemaName": "public",
+        "x": 574.205078125,
+        "y": 418
+      },
+      {
+        "name": "booking_trip_pax",
+        "schemaName": "public",
+        "x": 1122.01220703125,
+        "y": 418
+      },
+      {
+        "name": "routes",
+        "schemaName": "public",
+        "x": 12,
+        "y": 2736
+      },
+      {
+        "name": "route_times",
+        "schemaName": "public",
+        "x": 574.205078125,
+        "y": 688
+      },
+      {
+        "name": "route_seasons",
+        "schemaName": "public",
+        "x": 574.205078125,
+        "y": 862
+      },
+      {
+        "name": "route_day_overrides",
+        "schemaName": "public",
+        "x": 574.205078125,
+        "y": 1100
+      },
+      {
+        "name": "boats",
+        "schemaName": "public",
+        "x": 1059.3896484375,
+        "y": 12
+      },
+      {
+        "name": "boat_capacity_overrides",
+        "schemaName": "public",
+        "x": 1517.69384765625,
+        "y": 12
+      },
+      {
+        "name": "deployments",
+        "schemaName": "public",
+        "x": 348.98681640625,
+        "y": 12
+      },
+      {
+        "name": "seat_locks",
+        "schemaName": "public",
+        "x": 716.150390625,
+        "y": 12
+      },
+      {
+        "name": "schema_migrations",
+        "schemaName": "public",
+        "x": 12,
+        "y": 12
+      }
+    ],
+    "tableGroupCollapseStates": [],
+    "stickyNoteLayouts": [],
+    "referencePaths": [
+      {
+        "firstFieldNames": [
+          "booking_id"
+        ],
+        "firstTableName": "booking_trips",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "bookings",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "route_id"
+        ],
+        "firstTableName": "booking_trips",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "routes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "booking_trip_id"
+        ],
+        "firstTableName": "booking_trip_pax",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "booking_trips",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "route_id"
+        ],
+        "firstTableName": "route_times",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "routes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "route_id"
+        ],
+        "firstTableName": "route_seasons",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "routes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "route_id"
+        ],
+        "firstTableName": "route_day_overrides",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "routes",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      },
+      {
+        "firstFieldNames": [
+          "boat_id"
+        ],
+        "firstTableName": "boat_capacity_overrides",
+        "firstSchemaName": "public",
+        "firstRelation": "*",
+        "secondFieldNames": [
+          "id"
+        ],
+        "secondTableName": "boats",
+        "secondSchemaName": "public",
+        "secondRelation": "1",
+        "checkPoints": []
+      }
+    ]
+  },
+  "views": {}
+}
