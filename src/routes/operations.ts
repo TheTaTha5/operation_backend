@@ -7,6 +7,7 @@ import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
+import { parseBookingPassengers } from '../domain/booking-passengers.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -71,6 +72,7 @@ function bookingInput(body: unknown): BookingInput {
     voucher_ref: optionalString(input.voucher_ref ?? input.voucherRef),
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
     header: bookingHeader(input),
+    passengers: parseBookingPassengers(input.passengers),
     booking_data: input,
   };
 }
@@ -90,6 +92,7 @@ function bookingChanges(body: unknown): BookingChanges {
   const common = {
     ...(status === undefined ? {} : { status }),
     ...(Object.keys(header).length === 0 ? {} : { header }),
+    ...(input.passengers === undefined ? {} : { passengers: parseBookingPassengers(input.passengers) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {

@@ -30,6 +30,15 @@ test('source booking payload is normalized while retaining its booking data', as
   assert.equal(created.external_id, 'BK-source-1');
   assert.equal(created.booking_mode, 'charter');
   assert.equal(created.booking_data.passengers[0].name, 'Example passenger');
+  assert.deepEqual(created.passengers, [{ seq: 0, name: 'Example passenger' }], 'the passenger list is a real column, not just retained in the blob');
+
+  const amended = await app.inject({
+    method: 'PATCH', url: `/v1/bookings/${created.id}`,
+    payload: { passengers: [{ name: 'Replacement passenger', nationality: 'DE' }] },
+  });
+  assert.equal(amended.statusCode, 200);
+  assert.equal(amended.json().passengers.length, 1, 'passengers replace outright, the same way trips do');
+  assert.equal(amended.json().passengers[0].name, 'Replacement passenger');
 });
 
 test('a booking spans several departures and is refused as a whole', async () => {

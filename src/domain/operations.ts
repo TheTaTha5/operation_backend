@@ -3,6 +3,7 @@ import { formatPaxGrid, paxTotal, retargetPax, type PaxGrid, type PaxRow } from 
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { deploymentSeats } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
+import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 
 export type Deployment = {
   boat_id: string;
@@ -46,6 +47,8 @@ export type BookingInput = {
    * persist these as columns; neither parses the document itself.
    */
   header?: BookingHeader;
+  /** The passenger list, already parsed by `parseBookingPassengers()`. Defaults to none. */
+  passengers?: BookingPassengerInput[];
   /**
    * Original booking payload retained for operations, reconciliation, and audit import.
    *
@@ -67,6 +70,7 @@ export type Booking = BookingHeader & {
   voucher_ref?: string;
   rate_type_ref?: string;
   booking_data?: Record<string, unknown>;
+  passengers: BookingPassenger[];
   trips: BookingTrip[];
   /**
    * The first trip's route and date, the total pax across every trip, and the seats that total is
@@ -88,6 +92,8 @@ export type Booking = BookingHeader & {
 export type BookingChanges = {
   trips?: BookingTripInput[]; route_id?: string; service_date?: string; pax?: number; status?: BookingStatus;
   header?: BookingHeaderPatch;
+  /** Present replaces the whole list outright, the same way `trips` does. Absent leaves it alone. */
+  passengers?: BookingPassengerInput[];
 };
 
 export type SeatLock = {
@@ -274,8 +280,8 @@ export class OperationsStore {
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, ...rest } = input;
-    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips) };
+    const { trips, header, passengers, ...rest } = input;
+    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips), passengers: withSeq(passengers ?? []) };
     this.bookings.set(id, booking);
     return this.view(booking);
   }
@@ -298,6 +304,7 @@ export class OperationsStore {
     booking.status = status;
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
+    if (changes.passengers) booking.passengers = withSeq(changes.passengers);
     booking.updated_at = this.now();
     return this.view(booking);
   }

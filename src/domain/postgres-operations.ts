@@ -13,6 +13,7 @@ import {
   BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
   type BookingHeader,
 } from './booking-header.js';
+import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
 
 type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
@@ -44,7 +45,10 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb)
     ) ORDER BY t.seq)
-    FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips
+    FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
+    FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers
   FROM bookings b`;
 
 const NUMERIC_HEADER = new Set<string>(BOOKING_HEADER_NUMERIC_COLUMNS);
@@ -71,6 +75,11 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     id: String(trip.id), seq: Number(trip.seq), route_id: String(trip.route_id), service_date: String(trip.service_date), booking_mode: String(trip.booking_mode),
     pax: (trip.pax as Record<string, unknown>[]).map((cell) => ({ category: cell.category as PaxCategory, residency: cell.residency as PaxResidency, count: Number(cell.count) })),
   })),
+  passengers: (row.passengers as Record<string, unknown>[]).map((passenger) => ({
+    seq: Number(passenger.seq), name: String(passenger.name),
+    nationality: passenger.nationality ?? undefined, type: passenger.type ?? undefined,
+    foc: passenger.foc ?? undefined,
+  })) as BookingPassenger[],
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined });
@@ -197,6 +206,14 @@ export class PostgresOperationsStore {
     }
   }
 
+  private async writePassengers(bookingId: string, passengers: readonly BookingPassengerInput[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_passengers WHERE booking_id = $1', [bookingId]);
+    for (const [seq, passenger] of passengers.entries()) {
+      await this.client().query('INSERT INTO booking_passengers (booking_id, seq, name, nationality, type, foc) VALUES ($1,$2,$3,$4,$5,$6)',
+        [bookingId, seq, passenger.name, passenger.nationality ?? null, passenger.type ?? null, passenger.foc ?? null]);
+    }
+  }
+
   /** Answers 400 before `booking_trips_route_fk` can answer 500. */
   private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
     const ids = [...new Set(trips.map((trip) => trip.route_id))];
@@ -229,6 +246,7 @@ export class PostgresOperationsStore {
     placeholders.push(`$${values.length}::jsonb`);
     await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
     await this.writeTrips(id, input.trips);
+    await this.writePassengers(id, input.passengers ?? []);
     return (await this.booking(id))!;
   }
 
@@ -262,6 +280,7 @@ export class PostgresOperationsStore {
     await this.client().query(`UPDATE bookings SET ${assignments.join(', ')} WHERE id = $1`, values);
     // `booking_data` is deliberately left as it was written at create time. The blob is on its way
     // out, and re-serialising an amendment into it would grow the thing being deleted.
+    if (changes.passengers) await this.writePassengers(id, changes.passengers);
     return this.booking(id);
   }
 

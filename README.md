@@ -165,16 +165,19 @@ Two consequences worth knowing:
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
   are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
-  below. **The itinerary is weighed as a whole**: if any day is short of seats the booking is
-  refused entirely and no day is left holding part of it. Two trips on the same departure are
-  counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an unknown one is
-  a `400` naming the route, and `booking_trips_route_fk` is the database backstop behind it.
+  below. An optional `passengers` array is stored as columns too — see
+  [Passengers](#passengers). **The itinerary is weighed as a whole**: if any day is short of seats
+  the booking is refused entirely and no day is left holding part of it. Two trips on the same
+  departure are counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an
+  unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
+  behind it.
 - `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
   something actually moves, and days being vacated are released in the same transaction. Any
   [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:
-  a field you do not mention keeps the value it had. An amendment refused for capacity changes
-  nothing, header included.
+  a field you do not mention keeps the value it had. Sending `passengers` **replaces the whole
+  list**, the same way `trips` replaces the itinerary — see [Passengers](#passengers). An amendment
+  refused for capacity changes nothing, header and passengers included.
 - `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all seats.
 - `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`). Requires a
   single departure whose passengers are untiered: on a booking split across categories a bare number
@@ -241,6 +244,22 @@ columns alone.
 > `PATCH` — the columns are the ones that move — so on any amended booking the blob is a record of
 > what was first sent, not of what the booking now says. Read the columns. A future release stops
 > returning it, and a later one drops it.
+
+#### Passengers
+
+Every booking response carries `passengers`, an ordered array:
+
+```json
+"passengers": [{ "seq": 0, "name": "Jane Doe", "nationality": "DE", "type": "AD", "foc": false }]
+```
+
+`name` is the only required field on the way in; `nationality`, `type` and `foc` are optional and
+absent (not `null`) when not given, the same convention as the header fields. `seq` is assigned by
+array position and is not something you send.
+
+Unlike the header, **`passengers` does not merge on `PATCH`** — sending it replaces the whole list,
+the same way `trips` replaces the itinerary. Omitting it on an amendment leaves the existing list
+untouched. There is no way to add or edit one passenger without resending the full list.
 
 ### Agent seat locks
 
