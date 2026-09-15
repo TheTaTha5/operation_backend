@@ -8,8 +8,32 @@ const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error('DATABASE_URL is required');
 const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), '../migrations');
 const files = (await readdir(migrationsDir)).filter((file) => file.endsWith('.sql')).sort();
-const client = new Client({ connectionString });
-await client.connect();
+
+const CONNECT_ATTEMPTS = 5;
+const CONNECT_RETRY_DELAY_MS = 2000;
+
+/**
+ * `preDeployCommand` can start before Railway's private network is routable, so the first dial to
+ * `*.railway.internal` sometimes gets torn down mid-connect ("Connection terminated unexpectedly")
+ * rather than refused outright. A fresh `Client` per attempt, since one that failed to connect is
+ * not safe to retry on.
+ */
+async function connectWithRetry(): Promise<Client> {
+  for (let attempt = 1; ; attempt++) {
+    const client = new Client({ connectionString });
+    try {
+      await client.connect();
+      return client;
+    } catch (error) {
+      await client.end().catch(() => {});
+      if (attempt >= CONNECT_ATTEMPTS) throw error;
+      console.warn(`  ! database connection attempt ${attempt}/${CONNECT_ATTEMPTS} failed (${(error as Error).message}) — retrying in ${CONNECT_RETRY_DELAY_MS}ms`);
+      await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAY_MS));
+    }
+  }
+}
+
+const client = await connectWithRetry();
 let applied = 0;
 try {
   // One migrator at a time: a second instance deploying concurrently waits here instead of racing.
