@@ -51,6 +51,34 @@ The frontend must use Authorization Code with PKCE and send `Authorization: Bear
 | Bookings and seat locks | `booking:read` | `booking:write` |
 | Manifest, allotment, deployments | `operations:read` | `operations:write` |
 
+## Temporary password login (testing only)
+
+`POST /v1/login` exchanges a username/password for a short-lived Bearer token this service will
+itself accept. It is a deliberate, narrow exception to the "validate tokens, do not issue them"
+boundary above, meant for testing before a frontend integration exists — not a replacement for
+OIDC, and not meant to stay configured indefinitely.
+
+```text
+AUTH_JWT_SECRET=<random string, e.g. `openssl rand -base64 32`>
+AUTH_PASSWORD_USERS=[{"username":"ops","password":"...","groups":["admin"]}]
+```
+
+`AUTH_PASSWORD_USERS` is a JSON array; `groups` follows the same permission table above (`admin`
+grants everything). Both variables can be set alongside `OIDC_ISSUER`/`OIDC_AUDIENCE` — a request's
+Bearer token is checked against whichever of the two are configured. `POST /v1/login` itself is
+always public.
+
+```bash
+curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
+  -d '{"username":"ops","password":"..."}'
+# {"access_token":"...","token_type":"Bearer","expires_in":43200}
+```
+
+The token is HS256, signed with `AUTH_JWT_SECRET`, expires after 12 hours, and is otherwise an
+ordinary Bearer token: `Authorization: Bearer <access_token>` on any request. Rotate
+`AUTH_JWT_SECRET` (which invalidates every outstanding token) and remove these two variables once
+testing is done.
+
 The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated). The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
 
 ## API

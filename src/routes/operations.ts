@@ -113,10 +113,22 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   if (store instanceof PostgresOperationsStore) app.addHook('onClose', async () => store.close());
   app.addHook('preHandler', async (request) => {
     const path = request.url.split('?')[0];
+    if (path === '/v1/login') return;
     const isOperations = path.startsWith('/operations/') || path === '/v1/manifest';
     const isWrite = request.method !== 'GET';
     const user = await authenticator.authenticate(request);
     requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
+  });
+
+  /**
+   * Temporary testing login — exchanges `AUTH_PASSWORD_USERS` credentials for a short-lived Bearer
+   * token this service will itself accept. Deliberate, scoped exception to "validate tokens, do not
+   * issue them" (CLAUDE.md); not part of the OIDC contract and not meant to outlive testing.
+   */
+  app.post('/v1/login', async (request) => {
+    const body = record(request.body);
+    const { token, expiresIn } = await authenticator.issuePasswordToken(string(body.username, 'username'), string(body.password, 'password'));
+    return { access_token: token, token_type: 'Bearer', expires_in: expiresIn };
   });
 
   /**
