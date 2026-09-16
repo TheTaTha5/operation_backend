@@ -34,6 +34,13 @@ async function connectWithRetry(): Promise<Client> {
 }
 
 const client = await connectWithRetry();
+// pg.Client emits 'error' on an unexpected disconnect after connect() resolved (e.g. the
+// private network dropping mid-migration). Without a listener that's an unhandled EventEmitter
+// error and crashes the process outright, bypassing every try/catch below.
+client.on('error', (error) => {
+  console.error(`  ! database connection lost: ${(error as Error).message}`);
+});
+
 let applied = 0;
 try {
   // One migrator at a time: a second instance deploying concurrently waits here instead of racing.
