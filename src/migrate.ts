@@ -21,6 +21,10 @@ const CONNECT_RETRY_DELAY_MS = 2000;
 async function connectWithRetry(): Promise<Client> {
   for (let attempt = 1; ; attempt++) {
     const client = new Client({ connectionString });
+    // pg emits 'error' on the client even for a failure during connect() itself; with no
+    // listener that's an unhandled EventEmitter error that crashes the process before the
+    // catch below ever runs. A no-op listener routes it through the rejected connect() promise.
+    client.on('error', () => {});
     try {
       await client.connect();
       return client;
