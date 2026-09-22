@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   assertKnownRoutes, bookingView, claimsSeats, demandByDay, nextTrips, partialCancelTrips, tripsChanged,
-  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type SeatLock, type StoredBooking,
+  decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxResidency } from './pax.js';
 import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
@@ -250,11 +251,20 @@ export class PostgresOperationsStore {
     return (await this.booking(id))!;
   }
 
-  async listBookings(routeId?: string, date?: string): Promise<Booking[]> {
+  async listBookings(query: BookingListQuery) {
+    const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
     const { rows } = await this.client().query(`${BOOKING_SELECT}
-      WHERE EXISTS (SELECT 1 FROM booking_trips t WHERE t.booking_id = b.id AND ($1::text IS NULL OR t.route_id = $1) AND ($2::date IS NULL OR t.service_date = $2))
-      ORDER BY b.created_at`, [routeId ?? null, date ?? null]);
-    return rows.map(booking);
+      WHERE EXISTS (SELECT 1 FROM booking_trips t
+        WHERE t.booking_id = b.id
+          AND ($1::text IS NULL OR t.route_id = $1)
+          AND ($2::date IS NULL OR t.service_date = $2)
+          AND ($3::date IS NULL OR t.service_date >= $3)
+          AND ($4::date IS NULL OR t.service_date <= $4))
+        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) > ($5::timestamptz, $6::text))
+      ORDER BY b.created_at, b.id
+      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]);
+    const page = rows.slice(0, query.limit);
+    return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}) };
   }
   async booking(id: string): Promise<Booking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && booking(row); }
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }

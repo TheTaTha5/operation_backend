@@ -122,6 +122,17 @@ type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_p
  */
 export type Exclusion = { bookingId?: string; lockId?: string };
 
+export type BookingListQuery = {
+  routeId?: string;
+  serviceDate?: string;
+  from?: string;
+  to?: string;
+  limit: number;
+  cursor?: string;
+};
+
+export type BookingPage = { bookings: Booking[]; next_cursor?: string };
+
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 export type StoredTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[] };
 export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax'> & { trips: StoredTrip[] };
@@ -133,6 +144,16 @@ export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' 
  * date, and the seats the booking is holding. Deriving them in SQL for one store and in JavaScript
  * for the other is how the two drift, so the SQL side returns rows and calls this.
  */
+type BookingCursor = { created_at: string; id: string };
+export const encodeBookingCursor = (booking: { created_at: string; id: string }): string => Buffer.from(JSON.stringify({ created_at: booking.created_at, id: booking.id }), 'utf8').toString('base64url');
+export const decodeBookingCursor = (value: string): BookingCursor => {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<BookingCursor>;
+    if (typeof parsed.created_at !== 'string' || typeof parsed.id !== 'string') throw new Error();
+    return { created_at: parsed.created_at, id: parsed.id };
+  } catch { return fail('Invalid cursor', 400); }
+};
+
 export function bookingView(stored: StoredBooking): Booking {
   const trips = stored.trips.map((trip) => ({ ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax) }));
   const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
@@ -286,10 +307,18 @@ export class OperationsStore {
     return this.view(booking);
   }
 
-  listBookings(routeId?: string, serviceDate?: string): Booking[] {
-    return [...this.bookings.values()]
-      .filter((b) => b.trips.some((t) => (!routeId || t.route_id === routeId) && (!serviceDate || t.service_date === serviceDate)))
-      .map((b) => this.view(b));
+  listBookings(query: BookingListQuery): BookingPage {
+    const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
+    const matches = [...this.bookings.values()]
+      .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
+        && (!query.serviceDate || t.service_date === query.serviceDate)
+        && (!query.from || t.service_date >= query.from)
+        && (!query.to || t.service_date <= query.to)))
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+      .filter((b) => !cursor || b.created_at > cursor.created_at || (b.created_at === cursor.created_at && b.id > cursor.id));
+    const page = matches.slice(0, query.limit);
+    const hasMore = matches.length > query.limit;
+    return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}) };
   }
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 

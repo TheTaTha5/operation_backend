@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { OperationsStore, type BookingChanges, type BookingInput, type BookingTripInput, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
+import { OperationsStore, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
@@ -73,7 +73,7 @@ function bookingInput(body: unknown): BookingInput {
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
     header: bookingHeader(input),
     passengers: parseBookingPassengers(input.passengers),
-    booking_data: input,
+    // booking_data: input,
   };
 }
 
@@ -85,6 +85,20 @@ function bookingInput(body: unknown): BookingInput {
  * `POST /v1/bookings` accepts is a field `PATCH` accepts. It is read on both branches: an
  * amendment that rewrites the trips may correct the lead passenger in the same call.
  */
+function bookingListQuery(query: Record<string, unknown>): BookingListQuery {
+  const serviceDate = optionalString(query.service_date ?? query.date);
+  const from = optionalString(query.from);
+  const to = optionalString(query.to);
+  if (serviceDate !== undefined && (from !== undefined || to !== undefined)) badRequest('service_date cannot be combined with from or to');
+  if ((from === undefined) !== (to === undefined)) badRequest('from and to must be supplied together');
+  if (from !== undefined && (!isIsoDate(from) || !isIsoDate(to!))) badRequest('from and to must be YYYY-MM-DD dates');
+  if (from !== undefined && to! < from) badRequest('to must not precede from');
+  const rawLimit = query.limit === undefined ? 50 : Number(query.limit);
+  if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) badRequest('limit must be an integer between 1 and 100');
+  const cursor = optionalString(query.cursor);
+  return { routeId: optionalString(query.route_id), serviceDate, from, to, limit: rawLimit, cursor };
+}
+
 function bookingChanges(body: unknown): BookingChanges {
   const input = record(body);
   const status = bookingStatus(input.status);
@@ -179,7 +193,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
 
   app.get('/v1/bookings', async (request) => {
     const query = request.query as Record<string, unknown>;
-    return { bookings: await store.listBookings(optionalString(query.route_id), optionalString(query.service_date ?? query.date)) };
+    return await store.listBookings(bookingListQuery(query));
   });
   app.get('/v1/bookings/:id', async (request) => (await store.booking((request.params as { id: string }).id)) ?? notFound('Booking not found'));
   app.post('/v1/bookings', async (request, reply) => {
@@ -209,7 +223,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   app.get('/v1/manifest', async (request) => {
     const query = request.query as Record<string, unknown>;
     const route_id = string(query.route_id, 'route_id'); const service_date = string(query.date ?? query.service_date, 'date');
-    return { ...(await store.allotment(route_id, service_date)), bookings: await store.listBookings(route_id, service_date) };
+    return { ...(await store.allotment(route_id, service_date)), bookings: (await store.listBookings({ routeId: route_id, serviceDate: service_date, limit: 100 })).bookings };
   });
   app.get('/operations/allotment', async (request) => {
     const query = request.query as Record<string, unknown>;

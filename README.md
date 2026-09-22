@@ -2,6 +2,13 @@
 
 Fastify service for boat deployments, operational capacity, bookings, and agent seat locks. Set `DATABASE_URL` to use PostgreSQL; without it, the service uses an in-process store for local testing.
 
+## Live API documentation
+
+When the service is running, the interactive Swagger UI is available at `/docs` (for example,
+`http://localhost:3000/docs`). It is generated from the deployed Fastify routes, so frontend
+integrators can view the current API and try requests without maintaining a separate OpenAPI file.
+The raw generated OpenAPI document is available at `/docs/json`.
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -187,8 +194,11 @@ Two consequences worth knowing:
   itinerary has not moved — confirming a quote asks for those seats for the first time, and a day
   that filled up in the meantime will refuse it with a `409`.
 
-- `GET /v1/bookings` — optionally filter by `route_id` and `service_date` (or `date`); a booking
-  matches if any of its trips does.
+- `GET /v1/bookings` — optionally filter by `route_id` and an exact `service_date` (or `date`),
+  or by an inclusive trip-date range using `from` and `to`; a booking matches if any of its trips
+  does. Results use cursor pagination: `limit` defaults to 50 and may be 1–100, and `cursor` is
+  returned as `next_cursor` when another page exists. `service_date` cannot be combined with
+  `from`/`to`.
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
