@@ -1,16 +1,18 @@
 import type { FastifyInstance } from 'fastify';
-import { OperationsStore, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type SeatLock } from '../domain/operations.js';
+import { OperationsStore, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, routeCalendar } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
-import { charterCeiling } from '../domain/capacity.js';
+import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
+/** Every route over a range grows with routes × days, so the sweep across all of them is kept to about two months. */
+const MAX_ALL_ROUTES_DAYS = 62;
 
 const badRequest = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };
 const notFound = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 404; throw error; };
@@ -36,16 +38,31 @@ const bookingStatus = (value: unknown): BookingStatus | undefined =>
 /** A bare count is one untiered cell; the frontend's `{ ad: 2, chd_fr: 1 }` grid is parsed as written. */
 const paxOf = (value: unknown, label: string): PaxRow[] => typeof value === 'number' ? paxRowsFromTotal(pax(value, label)) : parsePaxGrid(value, label);
 
+/** `{ lock_id: qty }`, the shape the frontend writes as `lockDraws`. An empty map draws nothing. */
+function lockDraws(value: unknown, label: string): LockDraw[] {
+  if (value === undefined || value === null) return [];
+  const draws = value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : badRequest(`${label} must be an object of lock id to seats`);
+  return Object.entries(draws).map(([lock_id, qty]) => ({ lock_id, qty: pax(qty, `${label}.${lock_id}`) }));
+}
+
 function tripInput(value: unknown, index: number): BookingTripInput {
   const trip = record(value);
   const label = `trips[${index}]`;
   const rows = trip.pax === undefined ? badRequest(`${label}.pax is required`) : paxOf(trip.pax, `${label}.pax`);
   if (paxTotal(rows) === 0) badRequest(`${label}.pax must carry at least one passenger`);
+  const booking_mode = optionalString(trip.booking_mode ?? trip.bookingMode);
+  const charter_boat_id = optionalString(trip.charter_boat_id ?? trip.charterBoatId);
+  const draws = lockDraws(trip.lock_draws ?? trip.lockDraws, `${label}.lock_draws`);
+  // A charter takes a whole boat, so it must say which; the seat pool cannot give one up otherwise.
+  if (booking_mode === 'charter') {
+    if (charter_boat_id === undefined) badRequest(`${label}.charter_boat_id is required for a charter`);
+    if (draws.length > 0) badRequest(`${label}.lock_draws does not apply to a charter`);
+  } else if (charter_boat_id !== undefined) badRequest(`${label}.charter_boat_id applies only to a charter`);
+  if (draws.reduce((sum, draw) => sum + draw.qty, 0) > paxTotal(rows)) badRequest(`${label}.lock_draws cannot exceed the trip's pax`);
   return {
     route_id: string(trip.route_id ?? trip.routeId, `${label}.route_id`),
     service_date: string(trip.service_date ?? trip.date, `${label}.service_date`),
-    booking_mode: optionalString(trip.booking_mode ?? trip.bookingMode),
-    pax: rows,
+    booking_mode, pax: rows, charter_boat_id, lock_draws: draws,
   };
 }
 
@@ -55,7 +72,10 @@ function tripsInput(input: Record<string, unknown>): BookingTripInput[] {
     if (!Array.isArray(input.trips) || input.trips.length === 0) badRequest('trips must be a non-empty array');
     return (input.trips as unknown[]).map(tripInput);
   }
-  return [tripInput({ route_id: input.route_id, service_date: input.service_date ?? input.date, pax: input.pax, booking_mode: input.booking_mode }, 0)];
+  return [tripInput({
+    route_id: input.route_id, service_date: input.service_date ?? input.date, pax: input.pax, booking_mode: input.booking_mode,
+    charter_boat_id: input.charter_boat_id, lock_draws: input.lock_draws,
+  }, 0)];
 }
 
 function bookingInput(body: unknown): BookingInput {
@@ -185,10 +205,44 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     boats: (await store.listBoats()).map((boat) => ({ ...boat, license_pax: boat.license_pax ?? null, charter_ceiling: charterCeiling(boat) })),
   }));
 
+  /**
+   * One route on one day (`route_id` + `date`), or a list of route-days over `from..to` for one route
+   * or, without `route_id`, every route in the catalogue — so a month grid asks once, not per cell.
+   *
+   * Each range entry carries the calendar's `open` beside the seat numbers: a closed day with no
+   * boat and an open day nobody has staffed yet both have zero seats, and only `open` tells them
+   * apart. `deployments[].capacity` is the boat's sellable seats that day, after any override and
+   * the licence clamp, so the entries sum to `deployed_capacity`.
+   */
   app.get('/v1/availability', async (request) => {
     const query = request.query as Record<string, unknown>;
-    const route_id = string(query.route_id, 'route_id'); const service_date = string(query.service_date ?? query.date, 'date');
-    return { route_id, service_date, ...(await store.capacity(route_id, service_date, exclusion(query))) };
+    const from = optionalString(query.from); const to = optionalString(query.to);
+    const date = optionalString(query.service_date ?? query.date);
+    if (from === undefined && to === undefined) {
+      const route_id = string(query.route_id, 'route_id');
+      const service_date = date ?? badRequest('date is required, or from and to for a range');
+      return { route_id, service_date, ...(await store.capacity(route_id, service_date, exclusion(query))) };
+    }
+
+    if (date !== undefined) badRequest('Pass either date or from and to, not both');
+    if (from === undefined || to === undefined) return badRequest('from and to must be supplied together');
+    if (!isIsoDate(from) || !isIsoDate(to)) badRequest('from and to must be YYYY-MM-DD dates');
+    if (to < from) badRequest('to must not precede from');
+    const routeId = optionalString(query.route_id);
+    const limit = routeId === undefined ? MAX_ALL_ROUTES_DAYS : MAX_CALENDAR_DAYS;
+    const span = [...eachDate(from, to)].length;
+    if (span > limit) badRequest(`Range covers ${span} days; the maximum is ${limit}${routeId === undefined ? ' without route_id' : ''}`);
+
+    const routeIds = routeId === undefined ? (await store.listRoutes()).map((route) => route.id) : [routeId];
+    const calendar = routeCalendar(await store.listSeasons(), await store.listDayOverrides(from, to));
+    const days = await store.dayRange(routeIds, from, to, exclusion(query));
+    return {
+      days: days.map((day) => ({
+        route_id: day.route_id, service_date: day.service_date, open: calendar.isOpen(day.route_id, day.service_date),
+        ...capacityNumbers(day),
+        deployments: day.boats.map((boat) => ({ boat_id: boat.boat_id, capacity: boat.sellable, license_pax: boat.license_pax ?? null, chartered: boat.chartered })),
+      })),
+    };
   });
 
   app.get('/v1/bookings', async (request) => {

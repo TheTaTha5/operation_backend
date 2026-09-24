@@ -372,6 +372,21 @@ prefixed and look like demo rows, but that should be confirmed before an import 
   to come. Nothing reads them yet, so nothing is broken by their absence, but the sketch above
   describes the destination rather than what exists.
 
+## Charter boats and lock draws landed — 2026-09-24
+
+Migration 014 adds `booking_trips.charter_boat_id` and the `booking_trip_lock_draws` table sketched
+above, and `dayCapacity` (`src/domain/capacity.ts`) now uses both: a chartered boat's sellable seats
+leave the pool whole, and a lock holds only `pax − drawn`. Deliberately not done:
+
+- **No FK from `charter_boat_id` to `boats`.** The rule enforced is "deployed on that route and day",
+  which is stronger, and `deployments.boat_id` has no key either; the two should gain one together.
+- **Historical charters on multi-boat days stay `NULL`.** The backfill fills only days with exactly
+  one boat. The rest subtract their passengers from the pool instead — an undercount, never an
+  overcount. Count them on production before deciding whether to repair them by hand.
+- **A draw does not check the lock's `agent_id` against the booking's agent.** Legacy's
+  `holderType`/`holderId` suggests it should; the seat-lock model gap is the place to decide it.
+- The OVN fields, `zone`, `pickup_time`, `subtotal` and the charter pricing fields remain unbuilt.
+
 ## Stage 1 closed out — 2026-08-28
 
 Migration 008 adds `booking_trips_route_fk`, the foreign key the `booking_trips` sketch above

@@ -120,7 +120,28 @@ vessel does not hold is worse than saying it has none; read `charter_ceiling` fo
 - `GET /operations/deployments?from=&to=&route_id=` — lists deployments.
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
-- `GET /v1/availability?route_id=&date=` — booking-form availability.
+- `GET /v1/availability?route_id=&date=` — booking-form availability for one route on one day:
+  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats }`.
+- `GET /v1/availability?from=&to=[&route_id=]` — the same numbers for a range, both ends inclusive,
+  for one route or, without `route_id`, every route in the catalogue:
+
+  ```jsonc
+  { "days": [
+    { "route_id": "r1", "service_date": "2031-03-01", "open": true,
+      "deployed_capacity": 40, "licensed_capacity": 45, "booked_pax": 8, "charter_pax": 4,
+      "locked_pax": 0, "available_seats": 22,
+      "deployments": [
+        { "boat_id": "b1", "capacity": 30, "license_pax": 35, "chartered": false },
+        { "boat_id": "b2", "capacity": 10, "license_pax": null, "chartered": true } ] } ] }
+  ```
+
+  Ordered by date, then by route in catalogue order; boats are ordered by id. Every route-day is
+  present, and a day with no deployment is all zeros, not missing. `open` is the route calendar's
+  answer for that date (see `GET /v1/routes?from=&to=`), and is what tells a closed day apart from
+  an open one nobody has staffed yet — both have zero seats. `deployments[].capacity` is the boat's
+  sellable seats that day after any override and the licence clamp, so they sum to
+  `deployed_capacity`. `from`/`to` must be supplied together and may not be combined with `date`.
+  The range is capped at 400 days for one route and 62 without `route_id`.
 
 `GET /operations/allotment` and `GET /v1/availability` also accept `exclude_booking_id` and `exclude_lock_id`. A reservation being edited still holds its seats, so an unqualified read counts them against it: raising a 6-pax booking to 8 on a full day looks refused even though the six seats it releases would cover it, and a no-op edit on a sold-out day looks unsavable. Pass the id being edited to read availability as it will be once that reservation is re-saved. Amendments apply the same exclusion internally, so a `PATCH` never rejects a booking on the strength of its own seats.
 
@@ -142,6 +163,27 @@ purpose, because a charter buys the whole boat.
 A boat with no licence on file — three Ranong boats have none — falls back to its capacity. A
 missing licence is not a licence of zero.
 
+#### What `available_seats` subtracts
+
+```
+available_seats = sellable seats on boats not chartered
+                − booked_pax                 (seat trips, including seats drawn from locks)
+                − locked_pax                 (what locks still hold: pax − drawn, per lock)
+                − passengers of any charter whose boat is unknown
+```
+
+- **A charter takes its whole boat.** The chartered boat's sellable seats leave the pool, however
+  few passengers the charter carries; `deployments[].chartered` marks it. `charter_pax` is reported
+  for information and is not subtracted again. A charter recorded before boats were tracked, on a
+  day with more than one boat, cannot say which boat it took, so its passengers come out of the
+  pool instead — the last line above.
+- **A lock holds only what has not been drawn from it.** Seats a booking draws from a lock are
+  counted once, in `booked_pax`; the lock's own contribution to `locked_pax` shrinks by the same
+  amount. A cancelled booking returns its draws to the lock.
+
+`available_seats` can be negative on a day that was oversold before these rules existed. It is
+reported as it is rather than clamped to zero, so the oversell is visible.
+
 `registered_persons` is stored for the record and read by nothing. It was previously called
 `total_capacity` and was used as the charter ceiling, which meant a boat registered for 45
 passengers and 3 crew could be sold 48 charter seats. `total_capacity`/`totalcap` are still accepted
@@ -155,11 +197,28 @@ carries a `trips` array and one booking may span several days.
 ```jsonc
 {
   "trips": [
-    { "routeId": "r-1", "date": "2030-01-02", "pax": { "ad": 2, "chd_fr": 1 } },
-    { "routeId": "r-1", "date": "2030-01-03", "pax": { "ad": 2 }, "bookingMode": "charter" }
+    { "routeId": "r-1", "date": "2030-01-02", "pax": { "ad": 2, "chd_fr": 1 }, "lockDraws": { "lock_123": 2 } },
+    { "routeId": "r-1", "date": "2030-01-03", "pax": { "ad": 2 }, "bookingMode": "charter", "charterBoatId": "b13" }
   ]
 }
 ```
+
+- **`charter_boat_id`** (`charterBoatId`) is **required on a charter** and refused on anything else.
+  The boat must be deployed on that route and day (`400` otherwise) and not already chartered
+  (`409`). The charter's passengers must fit that boat's licence (`409`). The day must still have
+  room for the seats already sold once the boat leaves the pool (`409`), because taking a boat must
+  not strand passengers already booked on it.
+- **`lock_draws`** (`lockDraws`) is `{ lock_id: seats }`: the part of a seat trip sold from an
+  agent's lock. The draws may not add up to more than the trip's `pax` and do not apply to a
+  charter (`400`). Each lock must be active on the same route and day (`400`) and have that many
+  seats left (`409`); a lock id that does not exist is a `400`. Only `pax − drawn` needs general
+  seats. Responses return `lock_draws` in the same map shape, `{}` when there are none.
+- Moving a single-departure booking to another route or day (`PATCH` with `route_id`/
+  `service_date`, or `reschedule`) **drops its lock draws**, because a lock belongs to one departure,
+  and the moved trip takes general seats. To draw on a lock on the new day, send `trips`. Reducing
+  the head count (`PATCH` with `pax`, or `partial-cancel`) keeps the lock seats and gives back
+  general seats first. Which passengers left isn't recorded, and this way an agent is never handed
+  back lock seats they had already sold.
 
 `pax` is a grid of category × pricing tier: categories are `ad`, `chd`, `inf`, `foc`, and a bare key
 is untiered while `_fr` and `_th` are the foreign and Thai tiers (`ad`, `ad_fr`, `ad_th`, …). Every
@@ -303,8 +362,13 @@ untouched. There is no way to add or edit one passenger without resending the fu
 
 - `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).
 - `POST /v1/seat-locks` — `{ route_id, service_date, pax, agent_id? }`.
-- `PATCH /v1/seat-locks/{id}` — change `pax` and/or `agent_id`; a larger allocation is capacity checked.
-- `POST /v1/seat-locks/{id}/release` — idempotently releases a lock.
+- `PATCH /v1/seat-locks/{id}` — change `pax` and/or `agent_id`; a larger allocation is capacity
+  checked, and a lock cannot shrink below `drawn_pax` (`409`) — those seats are sold.
+- `POST /v1/seat-locks/{id}/release` — idempotently releases a lock. Seats already drawn from it stay
+  with their bookings; only the undrawn remainder goes back to the pool.
+
+Every lock response carries `drawn_pax`: the seats bookings that hold seats have drawn from it. The
+lock itself holds `pax − drawn_pax`, and that is what a new draw may take.
 
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 

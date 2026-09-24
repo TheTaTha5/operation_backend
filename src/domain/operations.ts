@@ -1,7 +1,7 @@
-import type { Route, RouteDayOverride, RouteSeason } from './calendar.js';
+import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import { formatPaxGrid, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
-import { deploymentSeats } from './capacity.js';
+import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 
@@ -30,9 +30,17 @@ export type Boat = { id: string; name: string; type?: string; pier?: string; cap
 
 
 
-/** One departure. Seats are consumed here, so this is what every capacity query reads. */
-export type BookingTripInput = { route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[] };
-export type BookingTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number };
+/** Seats a trip takes from an agent's lock rather than from the general pool. */
+export type LockDraw = { lock_id: string; qty: number };
+
+/**
+ * One departure. Seats are consumed here, so this is what every capacity query reads.
+ *
+ * `charter_boat_id` is the boat a charter takes whole, and only a charter carries one.
+ * `lock_draws` are the seats a seat trip takes from locks; they never exceed the trip's pax.
+ */
+export type BookingTripInput = { route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[] };
+export type BookingTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number> };
 
 export type BookingInput = {
   trips: BookingTripInput[];
@@ -106,14 +114,9 @@ export type SeatLock = {
   created_at: string;
   updated_at: string;
   released_at?: string;
+  /** Seats drawn from this lock by bookings that hold seats. The lock itself still holds `pax - drawn_pax`. */
+  drawn_pax?: number;
 };
-
-/**
- * `deployed_capacity` is what may be sold as seats; `licensed_capacity` is the registered passenger
- * ceiling a charter may fill the boat to. The old `total_capacity` was `license_pax + crew` and is
- * gone from this shape deliberately — it was never a limit anyone could sell against.
- */
-type Capacity = { deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number; available_seats: number };
 
 /**
  * Seats already held by the reservation being edited. Excluding them stops a booking from competing
@@ -133,8 +136,11 @@ export type BookingListQuery = {
 
 export type BookingPage = { bookings: Booking[]; next_cursor?: string };
 
+/** One route on one date, as the availability range returns it. */
+export type RouteDay = DayState & { route_id: string; service_date: string };
+
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
-export type StoredTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[] };
+export type StoredTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[] };
 export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax'> & { trips: StoredTrip[] };
 
 /**
@@ -155,7 +161,7 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 };
 
 export function bookingView(stored: StoredBooking): Booking {
-  const trips = stored.trips.map((trip) => ({ ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax) }));
+  const trips = stored.trips.map((trip) => ({ ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])) }));
   const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
   const first = stored.trips[0];
   const seats = stored.trips.filter((trip) => trip.booking_mode !== 'charter').reduce((sum, trip) => sum + paxTotal(trip.pax), 0);
@@ -163,18 +169,29 @@ export function bookingView(stored: StoredBooking): Booking {
 }
 
 const fail = (message: string, statusCode: number): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
-const unavailable = (): never => fail('Insufficient available seats', 409);
 
-/** Seat demand a set of trips places on each route/day, so two trips on one day are weighed together. */
-export function demandByDay(trips: readonly BookingTripInput[]): { route_id: string; service_date: string; seat: number; charter: number }[] {
-  const days = new Map<string, { route_id: string; service_date: string; seat: number; charter: number }>();
+/** What a set of trips asks of each route/day, so two trips on one day are weighed together. */
+export function demandByDay(trips: readonly BookingTripInput[]): DayDemand[] {
+  const days = new Map<string, DayDemand>();
   for (const trip of trips) {
     const key = `${trip.route_id}\u0000${trip.service_date}`;
-    const day = days.get(key) ?? { route_id: trip.route_id, service_date: trip.service_date, seat: 0, charter: 0 };
-    day[trip.booking_mode === 'charter' ? 'charter' : 'seat'] += paxTotal(trip.pax);
+    const day: DayDemand = days.get(key) ?? { route_id: trip.route_id, service_date: trip.service_date, seat: 0, draws: new Map(), charters: [] };
+    if (trip.booking_mode === 'charter') day.charters.push({ boat_id: trip.charter_boat_id, pax: paxTotal(trip.pax) });
+    else day.seat += paxTotal(trip.pax);
+    for (const draw of trip.lock_draws ?? []) day.draws.set(draw.lock_id, (day.draws.get(draw.lock_id) ?? 0) + draw.qty);
     days.set(key, day);
   }
   return [...days.values()];
+}
+
+/** Seats each lock has given to bookings that hold seats, the booking being edited aside. */
+export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusion = {}): Map<string, number> {
+  const drawn = new Map<string, number>();
+  for (const booking of bookings) {
+    if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
+    for (const trip of booking.trips) for (const draw of trip.lock_draws) drawn.set(draw.lock_id, (drawn.get(draw.lock_id) ?? 0) + draw.qty);
+  }
+  return drawn;
 }
 
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
@@ -219,37 +236,44 @@ export class OperationsStore {
 
   private view(stored: StoredBooking): Booking { return bookingView(stored); }
 
-  capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
-    const onDay = this.deployments.filter((d) => d.route_id === routeId && d.service_date === serviceDate);
-    const seats = onDay.map((d) => deploymentSeats({ capacity: d.capacity, license_pax: d.license_pax, override_capacity: this.boatOverride(d.boat_id, serviceDate) }));
-    const deployed_capacity = seats.reduce((sum, s) => sum + s.sellable, 0);
-    const licensed_capacity = seats.reduce((sum, s) => sum + s.licensed, 0);
-    let booked_pax = 0, charter_pax = 0;
+  /** One route's day, with per-boat and per-lock detail. The rules are `dayCapacity`'s; this only gathers rows. */
+  day(routeId: string, serviceDate: string, exclude: Exclusion = {}): DayState {
+    const deployments = this.deployments
+      .filter((d) => d.route_id === routeId && d.service_date === serviceDate)
+      .map((d) => ({ boat_id: d.boat_id, capacity: d.capacity, license_pax: d.license_pax, override_capacity: this.boatOverride(d.boat_id, serviceDate) }));
+    const trips: HeldTrip[] = [];
     for (const booking of this.bookings.values()) {
       if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
       for (const trip of booking.trips) {
         if (trip.route_id !== routeId || trip.service_date !== serviceDate) continue;
-        if (trip.booking_mode === 'charter') charter_pax += paxTotal(trip.pax); else booked_pax += paxTotal(trip.pax);
+        trips.push({ booking_mode: trip.booking_mode, pax: paxTotal(trip.pax), charter_boat_id: trip.charter_boat_id });
       }
     }
-    const locked_pax = [...this.locks.values()]
+    const drawn = drawnByLock(this.bookings.values(), exclude);
+    const locks = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
-      .reduce((sum, l) => sum + l.pax, 0);
-    return { deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats: deployed_capacity - booked_pax - locked_pax };
+      .map((l) => ({ id: l.id, pax: l.pax, drawn: drawn.get(l.id) ?? 0 }));
+    return dayCapacity(deployments, trips, locks);
   }
 
-  private assertCapacity(routeId: string, serviceDate: string, pax: number, charter = false, exclude: Exclusion = {}): void {
-    const capacity = this.capacity(routeId, serviceDate, exclude);
-    const available = charter ? capacity.licensed_capacity - capacity.booked_pax - capacity.charter_pax - capacity.locked_pax : capacity.available_seats;
-    if (available < pax) unavailable();
+  capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
+    return capacityNumbers(this.day(routeId, serviceDate, exclude));
+  }
+
+  /** `day` for every route in `routeIds` on every date in `from..to`: date first, then routes in the order given. */
+  dayRange(routeIds: readonly string[], from: string, to: string, exclude: Exclusion = {}): RouteDay[] {
+    const days: RouteDay[] = [];
+    for (const date of eachDate(from, to)) for (const routeId of routeIds) days.push({ route_id: routeId, service_date: date, ...this.day(routeId, date, exclude) });
+    return days;
   }
 
   /** Weighs every day a booking touches, so a multi-day booking is refused as a whole or not at all. */
   private assertTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}): void {
-    for (const day of demandByDay(trips)) {
-      if (day.seat > 0) this.assertCapacity(day.route_id, day.service_date, day.seat, false, exclude);
-      if (day.charter > 0) this.assertCapacity(day.route_id, day.service_date, day.charter, true, exclude);
-    }
+    for (const demand of demandByDay(trips)) assertDayFits(this.day(demand.route_id, demand.service_date, exclude), demand);
+  }
+
+  private lockView(lock: SeatLock): SeatLock {
+    return { ...lock, drawn_pax: drawnByLock(this.bookings.values()).get(lock.id) ?? 0 };
   }
 
   /**
@@ -279,7 +303,14 @@ export class OperationsStore {
   }
 
   private storedTrips(bookingId: string, trips: readonly BookingTripInput[]): StoredTrip[] {
-    return trips.map((trip, seq) => ({ id: `trip_${bookingId}_${seq}`, seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode === 'charter' ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })) }));
+    return trips.map((trip, seq) => {
+      const charter = trip.booking_mode === 'charter';
+      return {
+        id: `trip_${bookingId}_${seq}`, seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: charter ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })),
+        ...(charter && trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
+        lock_draws: charter ? [] : sortedDraws(trip.lock_draws ?? []),
+      };
+    });
   }
 
   /**
@@ -287,8 +318,8 @@ export class OperationsStore {
    * accepts any route. A PostgreSQL deployment always has a catalogue and always enforces this.
    */
   private assertRoutes(trips: readonly BookingTripInput[]): void {
-    if (this.catalogue.routes.length === 0) return;
-    assertKnownRoutes(new Set(this.catalogue.routes.map((route) => route.id)), trips);
+    if (this.catalogue.routes.length > 0) assertKnownRoutes(new Set(this.catalogue.routes.map((route) => route.id)), trips);
+    assertKnownLocks(new Set(this.locks.keys()), trips);
   }
 
   createBooking(input: BookingInput): Booking {
@@ -354,31 +385,31 @@ export class OperationsStore {
   }
 
   createLock(input: Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>): SeatLock {
-    this.assertCapacity(input.route_id, input.service_date, input.pax);
+    assertLockFits(this.day(input.route_id, input.service_date), input.pax, 0);
     const now = this.now();
     const lock: SeatLock = { ...input, id: this.id('lock'), status: 'active', created_at: now, updated_at: now };
     this.locks.set(lock.id, lock);
-    return { ...lock };
+    return this.lockView(lock);
   }
   listLocks(routeId?: string, serviceDate?: string): SeatLock[] {
-    return [...this.locks.values()].filter((l) => (!routeId || l.route_id === routeId) && (!serviceDate || l.service_date === serviceDate)).map((l) => ({ ...l }));
+    return [...this.locks.values()].filter((l) => (!routeId || l.route_id === routeId) && (!serviceDate || l.service_date === serviceDate)).map((l) => this.lockView(l));
   }
   amendLock(id: string, changes: Partial<Pick<SeatLock, 'pax' | 'agent_id'>>): SeatLock | undefined {
     const lock = this.locks.get(id);
     if (!lock) return undefined;
     const pax = typeof changes.pax === 'number' ? changes.pax : lock.pax;
     if (lock.status === 'active' && pax !== lock.pax) {
-      this.assertCapacity(lock.route_id, lock.service_date, pax, false, { lockId: id });
+      assertLockFits(this.day(lock.route_id, lock.service_date, { lockId: id }), pax, drawnByLock(this.bookings.values()).get(id) ?? 0);
       lock.pax = pax;
     }
     Object.assign(lock, changes, { pax, updated_at: this.now() });
-    return { ...lock };
+    return this.lockView(lock);
   }
   releaseLock(id: string): SeatLock | undefined {
     const lock = this.locks.get(id);
     if (!lock) return undefined;
     if (lock.status === 'active') Object.assign(lock, { status: 'released', released_at: this.now(), updated_at: this.now() });
-    return { ...lock };
+    return this.lockView(lock);
   }
 
   allotment(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity & { route_id: string; service_date: string; deployments: Deployment[] } {
@@ -397,15 +428,38 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
   if (changes.trips) return changes.trips.map((trip) => ({ ...trip, pax: trip.pax.map((row) => ({ ...row })) }));
   if (changes.route_id === undefined && changes.service_date === undefined && changes.pax === undefined) return current.map(asInput);
   const trip = onlyTrip(current, 'confirmed', 'Amend a multi-trip booking by sending trips');
-  return [{
-    route_id: changes.route_id ?? trip.route_id,
-    service_date: changes.service_date ?? trip.service_date,
-    booking_mode: trip.booking_mode,
-    pax: changes.pax === undefined ? trip.pax.map((row) => ({ ...row })) : retargetPax(trip.pax, changes.pax),
-  }];
+  const route_id = changes.route_id ?? trip.route_id;
+  const service_date = changes.service_date ?? trip.service_date;
+  const pax = changes.pax === undefined ? trip.pax.map((row) => ({ ...row })) : retargetPax(trip.pax, changes.pax);
+  // A lock belongs to one departure, so moving the trip leaves its draws behind and the moved trip
+  // takes general seats. A caller drawing on a lock on the new day sends `trips`.
+  const moved = route_id !== trip.route_id || service_date !== trip.service_date;
+  return [{ ...asInput(trip), route_id, service_date, pax, lock_draws: moved ? [] : clampDraws(trip.lock_draws, paxTotal(pax)) }];
 }
 
-const asInput = (trip: StoredTrip): BookingTripInput => ({ route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode, pax: trip.pax.map((row) => ({ ...row })) });
+const asInput = (trip: StoredTrip): BookingTripInput => ({
+  route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode, pax: trip.pax.map((row) => ({ ...row })),
+  ...(trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
+  lock_draws: trip.lock_draws.map((draw) => ({ ...draw })),
+});
+
+const sortedDraws = (draws: readonly LockDraw[]): LockDraw[] => draws.map((draw) => ({ ...draw })).sort((a, b) => a.lock_id.localeCompare(b.lock_id));
+
+/**
+ * Draws cut down to fit a smaller head count. General seats go first, lock seats only once those
+ * are gone: which passengers were dropped is not recorded, and keeping the lock seats used is the
+ * reading that never hands an agent back seats they had already sold.
+ */
+export function clampDraws(draws: readonly LockDraw[], pax: number): LockDraw[] {
+  let left = pax;
+  const kept: LockDraw[] = [];
+  for (const draw of sortedDraws(draws)) {
+    const qty = Math.min(draw.qty, left);
+    if (qty > 0) kept.push({ lock_id: draw.lock_id, qty });
+    left -= qty;
+  }
+  return kept;
+}
 
 /**
  * Cancelling a count rather than named passengers. Only a single-departure booking can do this: on a
@@ -416,7 +470,7 @@ export function partialCancelTrips(trips: readonly StoredTrip[], status: Booking
   const trip = onlyTrip(trips, status, 'Partial-cancel a multi-trip booking by sending trips');
   const total = paxTotal(trip.pax);
   if (count > total) fail('Cannot cancel more passengers than the active booking', 400);
-  return [{ ...asInput(trip), pax: retargetPax(trip.pax, total - count) }];
+  return [{ ...asInput(trip), pax: retargetPax(trip.pax, total - count), lock_draws: clampDraws(trip.lock_draws, total - count) }];
 }
 
 function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: string): StoredTrip {
@@ -425,9 +479,13 @@ function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: 
   return trips[0];
 }
 
+const drawsKey = (draws: readonly LockDraw[] = []): string => sortedDraws(draws).map((draw) => `${draw.lock_id}:${draw.qty}`).join(',');
+
 /** Whether an amendment moves seats at all; an unchanged itinerary must not be re-checked against the pool. */
 export const tripsChanged = (current: readonly StoredTrip[], next: readonly BookingTripInput[]): boolean =>
-  current.length !== next.length || current.some((trip, index) => trip.route_id !== next[index].route_id || trip.service_date !== next[index].service_date || paxTotal(trip.pax) !== paxTotal(next[index].pax) || trip.booking_mode !== (next[index].booking_mode === 'charter' ? 'charter' : 'seat'));
+  current.length !== next.length || current.some((trip, index) => trip.route_id !== next[index].route_id || trip.service_date !== next[index].service_date
+    || paxTotal(trip.pax) !== paxTotal(next[index].pax) || trip.booking_mode !== (next[index].booking_mode === 'charter' ? 'charter' : 'seat')
+    || (trip.charter_boat_id ?? '') !== (next[index].charter_boat_id ?? '') || drawsKey(trip.lock_draws) !== drawsKey(next[index].lock_draws));
 
 /**
  * Trip routes that are not in the catalogue.
@@ -443,6 +501,14 @@ export function unknownRoutes(known: ReadonlySet<string>, trips: readonly Bookin
 export function assertKnownRoutes(known: ReadonlySet<string>, trips: readonly BookingTripInput[]): void {
   const missing = unknownRoutes(known, trips);
   if (missing.length > 0) fail(`Unknown route: ${missing.join(', ')}`, 400);
+}
+
+/** Every lock a draw names. Checked even when no seats are claimed, so a quote cannot name a lock that does not exist. */
+export const drawnLockIds = (trips: readonly BookingTripInput[]): string[] => [...new Set(trips.flatMap((trip) => (trip.lock_draws ?? []).map((draw) => draw.lock_id)))];
+
+export function assertKnownLocks(known: ReadonlySet<string>, trips: readonly BookingTripInput[]): void {
+  const missing = drawnLockIds(trips).filter((id) => !known.has(id));
+  if (missing.length > 0) fail(`Unknown seat lock: ${missing.join(', ')}`, 400);
 }
 
 /**

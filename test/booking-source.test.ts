@@ -11,7 +11,7 @@ test('source booking payload is normalized while retaining its booking data', as
   const response = await app.inject({
     method: 'POST', url: '/v1/bookings', payload: {
       id: 'BK-source-1', agentId: 'a_b2c', voucherRef: '007592',
-      trips: [{ routeId: 'r4', date, bookingMode: 'charter', pax: { ad_fr: 10, inf_fr: 1, foc_fr: 2 } }],
+      trips: [{ routeId: 'r4', date, bookingMode: 'charter', charterBoatId: 'boat-source', pax: { ad_fr: 10, inf_fr: 1, foc_fr: 2 } }],
       passengers: [{ name: 'Example passenger' }],
     },
   });
@@ -96,14 +96,14 @@ test('a booking spans several departures and is refused as a whole', async () =>
   assert.equal(await seatsOn(second), 8);
 });
 
-test('partial-cancelling a charter reduces the head count without touching the seat pool', async () => {
+test('partial-cancelling a charter reduces the head count and keeps the boat', async () => {
   // This crashed with a 500 before trips existed: a charter stored allocated_pax = 0, partial-cancel
   // decremented it, and CHECK (allocated_pax >= 0) rejected the write. The in-process store instead
   // set allocated_pax = pax and quietly turned the charter into a seat consumer. Nothing is stored
   // now — the seats a booking holds are read off its trips — so neither outcome is reachable.
   const date = '2030-04-10';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-charter', route_id: 'r6', service_date: date, capacity: 38, license_pax: 45, total_capacity: 48 } });
-  const created = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { trips: [{ routeId: 'r6', date, bookingMode: 'charter', pax: 13 }] } });
+  const created = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { trips: [{ routeId: 'r6', date, bookingMode: 'charter', charterBoatId: 'boat-charter', pax: 13 }] } });
   assert.equal(created.statusCode, 201);
   const id = created.json().id;
   assert.equal(created.json().allocated_pax, 0, 'a charter takes the boat, not seats from the pool');
@@ -117,7 +117,7 @@ test('partial-cancelling a charter reduces the head count without touching the s
   const availability = (await app.inject({ method: 'GET', url: `/v1/availability?route_id=r6&date=${date}` })).json();
   assert.equal(availability.charter_pax, 11);
   assert.equal(availability.booked_pax, 0);
-  assert.equal(availability.available_seats, 38, 'the seat pool never saw the charter');
+  assert.equal(availability.available_seats, 0, 'the charter took the only boat, however few passengers it carries');
 
   // Cancelling more passengers than are on the booking is a 400, not a negative count.
   assert.equal((await app.inject({ method: 'POST', url: `/v1/bookings/${id}/partial-cancel`, payload: { pax_to_cancel: 99 } })).statusCode, 400);
@@ -137,7 +137,7 @@ test('a charter may fill the boat to its licence but never past it', async () =>
   assert.equal(availability.licensed_capacity, 45, 'the charter ceiling is the registered passenger maximum');
   assert.equal(availability.total_capacity, undefined, 'the crew-inclusive figure is no longer part of this shape');
 
-  const charter = (pax: number) => app.inject({ method: 'POST', url: '/v1/bookings', payload: { trips: [{ routeId: 'r7', date, bookingMode: 'charter', pax }] } });
+  const charter = (pax: number) => app.inject({ method: 'POST', url: '/v1/bookings', payload: { trips: [{ routeId: 'r7', date, bookingMode: 'charter', charterBoatId: 'boat-oceanus', pax }] } });
   assert.equal((await charter(46)).statusCode, 409, 'one past the licence');
   assert.equal((await charter(48)).statusCode, 409, 'and the old crew-inclusive number is refused too');
   assert.equal((await charter(45)).statusCode, 201, 'a charter buys the boat, so it may exceed the 38-seat selling cap');
