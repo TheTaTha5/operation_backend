@@ -8,6 +8,7 @@ import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
+import type { AgentListQuery } from '../domain/agents.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -152,7 +153,14 @@ function bookingListQuery(query: Record<string, unknown>): BookingListQuery {
   const rawLimit = query.limit === undefined ? 50 : Number(query.limit);
   if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) badRequest('limit must be an integer between 1 and 100');
   const cursor = optionalString(query.cursor);
-  return { routeId: optionalString(query.route_id), serviceDate, from, to, limit: rawLimit, cursor };
+  const order = query.order === undefined ? undefined : query.order === 'asc' || query.order === 'desc' ? query.order : badRequest('order must be asc or desc');
+  return { routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor, ...(order ? { order } : {}) };
+}
+
+/** `?active=` on the agent list: active agents by default, `false` for inactive ones, `all` for both. */
+function agentListQuery(query: Record<string, unknown>): AgentListQuery {
+  const active = query.active === undefined || query.active === 'true' ? true : query.active === 'false' ? false : query.active === 'all' ? undefined : badRequest('active must be true, false or all');
+  return { marketId: optionalString(query.market), salesId: optionalString(query.sales), q: optionalString(query.q), active };
 }
 
 function bookingChanges(body: unknown): BookingChanges {
@@ -329,6 +337,22 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const removed = await store.transaction(async () => await store.deleteDeployment(params.service_date, params.boat_id));
     if (!removed) notFound('Deployment not found');
     return reply.code(204).send();
+  });
+
+  /**
+   * Agents and their reference lists. Read-only for now: agents arrive through the legacy import.
+   * Under `booking:read` like the rest of `/v1`. Every caller sees every agent — scoping a salesperson
+   * to their own agents needs their salesperson id in the token, which is not decided yet.
+   */
+  app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));
+  app.get('/v1/sales', async () => ({ sales: await store.listSalesPeople() }));
+  app.get('/v1/agents', async (request) => ({ agents: await store.listAgents(agentListQuery(request.query as Record<string, unknown>)) }));
+  app.get('/v1/agents/:id', async (request) => (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found'));
+  app.get('/v1/agents/:id/activity', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const limit = query.limit === undefined ? 50 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) badRequest('limit must be an integer between 1 and 200');
+    return { activity: (await store.agentActivity((request.params as { id: string }).id, limit)) ?? notFound('Agent not found') };
   });
 
   app.get('/v1/seat-locks', async (request) => {

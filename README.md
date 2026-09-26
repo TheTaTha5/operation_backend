@@ -55,7 +55,7 @@ The frontend must use Authorization Code with PKCE and send `Authorization: Bear
 
 | API area | Read permission | Write permission |
 | --- | --- | --- |
-| Bookings and seat locks | `booking:read` | `booking:write` |
+| Bookings, seat locks, agents, markets, salespeople | `booking:read` | `booking:write` |
 | Manifest, allotment, deployments | `operations:read` | `operations:write` |
 
 ## Temporary password login (testing only)
@@ -112,6 +112,65 @@ that case `charter_ceiling` falls back to `capacity`. **A missing licence is not
 The null is reported rather than quietly replaced by `capacity`, because claiming a registration a
 vessel does not hold is worse than saying it has none; read `charter_ceiling` for the number and
 `license_pax` for whether it is a legal figure or a fallback.
+
+### Agents
+
+Resellers, the markets they sell into, and the salespeople who own them. **Read-only for now.**
+Agents arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids (`a01`,
+`a_b2c`, …), which are the ids `bookings.agent_id` and `seat_locks.agent_id` already hold. Creating
+and editing agents comes later. All of these are under `booking:read`.
+
+**Every caller sees every agent.** Legacy hid other salespeople's agents only in the browser. Doing
+it here needs the caller's salesperson id in the token, and that has not been decided yet.
+
+- `GET /v1/markets`: `{ markets: [{ id, name, color, sort, subs: [name…] }] }`, by `sort` (unsorted
+  last), then id.
+- `GET /v1/sales`: `{ sales: [{ id, code, name, full_name, designation, email, tel, color, active }] }`,
+  by name. An inactive salesperson can still own agents.
+- `GET /v1/agents?market=&sales=&q=&active=`: summary rows for the list, its filters and header
+  counts, A–Z by name (case-insensitive), then id.
+  - `market` and `sales` are ids.
+  - `q` matches name, code, sub-market, market name and salesperson name, case-insensitively.
+  - `active` is `true` (the default), `false`, or `all`.
+
+  ```jsonc
+  { "agents": [ { "id": "a12", "code": "SUNTOUR", "name": "Sun Tour", "market_id": "ru",
+    "sub_market": "Moscow", "sales_id": "s3", "color": null, "pay_type": "invoice",
+    "vat_mode": "exclude", "credit_limit": 200000, "rate_type_id": "rt007",
+    "program_route_ids": ["r5", "r6"], "contract_status": "active", "contract_end": "2026-12-31",
+    "incomplete": [], "house": false, "active": true } ] }
+  ```
+- `GET /v1/agents/{id}`: the whole agent, `404` if unknown. It has the summary's fields except
+  `program_route_ids`, plus `credit_days`, `contact`, `email`, `phone`, `note`,
+  `contract_template_id`, `contract_version`, `contract_start`, `created_at` and `updated_at`. It
+  also has these groups:
+  - `company`: `{ legal_name, tax_id, tat_license, address, tel, hotline, fax, website }`
+  - `signatory`: `{ name, designation, tel, signed_date }`
+  - `booking_channel`: `{ method, cutoff, cancel_policy, email, phone }`
+  - `programs`: `[{ route_id, book_from, book_to, note }]` in the agent's order
+- `GET /v1/agents/{id}/activity?limit=`: the audit log, newest first:
+  `{ activity: [{ at, by, kind, text }] }`. `limit` defaults to 50 and may be 1–200. `404` if the
+  agent is unknown.
+
+Field notes:
+
+- **Every field is always present.** A value that is not set is `null`, never omitted.
+- **`pay_type`** is `invoice`, `proforma`, `bt` or `cot`, or `null` when legacy had none. Legacy's
+  edit form wrote `bank`; the import maps it to `bt`.
+- **`vat_mode`** is `none`, `include` or `exclude`. It is never null, because legacy reads a
+  missing VAT mode as `none`.
+- **`incomplete`** lists what the profile lacks before the agent can be sold correctly, in this
+  order: `market`, `sales`, `pay_type`, `rate_type`, `programs`, `contact`. This is legacy's
+  `agIncompleteFields`. Any one of email, phone or contact counts as contact.
+- **`programs`** are the routes the agent may sell. `book_from`/`book_to` is the booking window sales
+  entered, and `null` means open. Travel dates are not stored: they come from the rate type, which
+  has no endpoint yet.
+- **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
+- **`rate_type_id`** is the rate type the agent is priced with. It is not validated yet, because
+  there is no rate type table. `GET /v1/rate-types` comes with the Rate Types port.
+- **Not here yet:** credit used and available (needs invoices and payments, which this service
+  doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
+  contract history (the Contracts port).
 
 ### Operations
 
@@ -336,7 +395,11 @@ Two consequences worth knowing:
   or by an inclusive trip-date range using `from` and `to`; a booking matches if any of its trips
   does. Results use cursor pagination: `limit` defaults to 50 and may be 1–100, and `cursor` is
   returned as `next_cursor` when another page exists. `service_date` cannot be combined with
-  `from`/`to`.
+  `from`/`to`. `agent_id` narrows the list to one agent's bookings. Pages are ordered by creation
+  time, then id, oldest first. `order=desc` gives newest first, which is what an agent's Recent
+  Bookings tab wants. A cursor carries on in the direction it was issued in, so send the same
+  `order` with it. Imported bookings were created at legacy's `bookedAt`, so creation order is
+  booking-date order.
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields

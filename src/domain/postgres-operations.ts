@@ -15,6 +15,10 @@ import {
   type BookingHeader,
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
+import {
+  agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
+  type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
+} from './agents.js';
 
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
@@ -95,6 +99,40 @@ const stored = (row: QueryResultRow): StoredBooking => ({
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
+
+const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
+const num = (value: unknown): number | null => value === null || value === undefined ? null : Number(value);
+
+/**
+ * Every `agents` column with its `DATE`s cast to text, and the programmes in order. The row is read
+ * into `StoredAgent` and nothing else; `agents.ts` decides everything the API says about it.
+ */
+const AGENT_SELECT = `SELECT a.*, a.contract_start::text AS contract_start_text, a.contract_end::text AS contract_end_text,
+    a.signatory_signed_date::text AS signatory_signed_date_text,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('route_id', p.route_id, 'book_from', p.book_from::text, 'book_to', p.book_to::text, 'note', p.note) ORDER BY p.idx, p.route_id)
+              FROM agent_programs p WHERE p.agent_id = a.id), '[]'::jsonb) AS programs
+  FROM agents a`;
+
+const storedAgent = (row: QueryResultRow): StoredAgent => ({
+  id: String(row.id), code: text(row.code), name: String(row.name),
+  market_id: text(row.market_id), sub_market: text(row.sub_market), sales_id: text(row.sales_id), color: text(row.color),
+  pay_type: text(row.pay_type) as PayType | null, vat_mode: String(row.vat_mode) as VatMode,
+  credit_days: num(row.credit_days), credit_limit: num(row.credit_limit),
+  contact: text(row.contact), email: text(row.email), phone: text(row.phone), note: text(row.note),
+  rate_type_id: text(row.rate_type_id), contract_template_id: text(row.contract_template_id),
+  contract_status: text(row.contract_status), contract_version: text(row.contract_version),
+  contract_start: text(row.contract_start_text), contract_end: text(row.contract_end_text),
+  legal_name: text(row.legal_name), tax_id: text(row.tax_id), tat_license: text(row.tat_license), address: text(row.address),
+  company_tel: text(row.company_tel), hotline: text(row.hotline), fax: text(row.fax), website: text(row.website),
+  signatory_name: text(row.signatory_name), signatory_designation: text(row.signatory_designation), signatory_tel: text(row.signatory_tel),
+  signatory_signed_date: text(row.signatory_signed_date_text),
+  booking_method: text(row.booking_method), booking_cutoff: text(row.booking_cutoff), booking_cancel_policy: text(row.booking_cancel_policy),
+  booking_email: text(row.booking_email), booking_phone: text(row.booking_phone),
+  house: row.house === true, active: row.active === true, created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
+  programs: (row.programs as Record<string, unknown>[]).map((program) => ({
+    route_id: String(program.route_id), book_from: text(program.book_from), book_to: text(program.book_to), note: text(program.note),
+  })),
+});
 
 /** Groups rows under a route-and-date key, so assembling a range is a lookup per cell rather than a scan. */
 const byDay = <T extends QueryResultRow>(rows: T[]): Map<string, T[]> => {
@@ -335,6 +373,8 @@ export class PostgresOperationsStore {
 
   async listBookings(query: BookingListQuery) {
     const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
+    // The direction is one of two fixed strings, never caller text, so it is safe to splice in.
+    const [after, order] = query.order === 'desc' ? ['<', 'DESC'] : ['>', 'ASC'];
     const { rows } = await this.client().query(`${BOOKING_SELECT}
       WHERE EXISTS (SELECT 1 FROM booking_trips t
         WHERE t.booking_id = b.id
@@ -342,9 +382,10 @@ export class PostgresOperationsStore {
           AND ($2::date IS NULL OR t.service_date = $2)
           AND ($3::date IS NULL OR t.service_date >= $3)
           AND ($4::date IS NULL OR t.service_date <= $4))
-        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) > ($5::timestamptz, $6::text))
-      ORDER BY b.created_at, b.id
-      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]);
+        AND ($8::text IS NULL OR b.agent_id = $8)
+        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($5::timestamptz, $6::text))
+      ORDER BY b.created_at ${order}, b.id ${order}
+      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1, query.agentId ?? null]);
     const page = rows.slice(0, query.limit);
     return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}) };
   }
@@ -453,6 +494,38 @@ export class PostgresOperationsStore {
     const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');
     return rows.map((row) => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) }));
   }
+  /**
+   * Agents, markets and salespeople. There are about 130 agents, so the list is read whole and handed
+   * to `selectAgents`: filtering and sorting in SQL would be a second copy of that rule to keep in step.
+   */
+  async listMarkets(): Promise<Market[]> {
+    const { rows } = await this.client().query(`SELECT m.id, m.name, m.color, m.sort,
+      COALESCE((SELECT array_agg(s.name ORDER BY s.idx, s.name) FROM market_subs s WHERE s.market_id = m.id), '{}') AS subs FROM markets m`);
+    return sortMarkets(rows.map((row) => ({ id: String(row.id), name: String(row.name), color: text(row.color), sort: num(row.sort), subs: (row.subs as string[]).map(String) })));
+  }
+  async listSalesPeople(): Promise<SalesPerson[]> {
+    const { rows } = await this.client().query('SELECT id, code, name, full_name, designation, email, tel, color, active FROM sales_people');
+    return sortSalesPeople(rows.map((row) => ({
+      id: String(row.id), code: text(row.code), name: String(row.name), full_name: text(row.full_name), designation: text(row.designation),
+      email: text(row.email), tel: text(row.tel), color: text(row.color), active: row.active === true,
+    })));
+  }
+  async listAgents(query: AgentListQuery): Promise<AgentSummary[]> {
+    const { rows } = await this.client().query(AGENT_SELECT);
+    return selectAgents(rows.map(storedAgent), await this.listMarkets(), await this.listSalesPeople(), query).map(agentSummary);
+  }
+  async agent(id: string): Promise<Agent | undefined> {
+    const { rows: [row] } = await this.client().query(`${AGENT_SELECT} WHERE a.id = $1`, [id]);
+    return row && agentView(storedAgent(row));
+  }
+  /** Undefined for an unknown agent. The serial id orders two entries written at the same instant. */
+  async agentActivity(id: string, limit: number): Promise<AgentActivity[] | undefined> {
+    const { rows: [known] } = await this.client().query('SELECT 1 FROM agents WHERE id = $1', [id]);
+    if (!known) return undefined;
+    const { rows } = await this.client().query('SELECT id, at, by, kind, text FROM agent_activity WHERE agent_id = $1', [id]);
+    return latestActivity(rows.map((row) => ({ at: asIso(row.at), by: text(row.by), kind: String(row.kind), text: String(row.text), seq: Number(row.id) })), limit);
+  }
+
   async listDayOverrides(from?: string, to?: string): Promise<RouteDayOverride[]> {
     const { rows } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) ORDER BY route_id, service_date', [from ?? null, to ?? null]);
     return rows.map((row) => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] }));

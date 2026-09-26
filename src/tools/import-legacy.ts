@@ -9,7 +9,9 @@
  * Imported rows are owned by the `lg_` id prefix, and a run first deletes every `lg_` booking, lock
  * and van group, so running it twice leaves one copy. Deployments, capacity overrides and vans are
  * upserted on their natural keys, and an imported van's dated rows (month matrix, status, drivers)
- * are replaced. Nothing else is touched except the bookings named in `--remove`.
+ * are replaced. Agents, markets and salespeople keep legacy's ids and are upserted too; an agent's
+ * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
+ * bookings named in `--remove`.
  *
  * Rows go in as SQL, not through the API, so the capacity check is skipped on purpose: legacy days
  * that were oversold arrive oversold rather than half-imported. The mapping itself reuses the domain
@@ -22,6 +24,7 @@ import { holdsSeats, isBookingStatus } from '../domain/booking-status.js';
 import { parsePaxGrid, type PaxRow } from '../domain/pax.js';
 import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/operations.js';
 import { isIsoTime } from '../domain/calendar.js';
+import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -148,6 +151,14 @@ async function main() {
     const vanRanges = await read('SELECT * FROM sb_vehicles__statusranges ORDER BY sb_vehicles_id, idx');
     const vanDrivers = await read('SELECT key, driver, phone, plate FROM vanjob_driver');
     const vanSent = await read('SELECT key, value FROM vanjob_sent');
+    const legacyMarkets = await read('SELECT * FROM sb_markets');
+    const legacyMarketSubs = await read('SELECT sb_markets_id, idx, value FROM sb_markets__subs ORDER BY sb_markets_id, idx');
+    const legacySales = await read('SELECT * FROM sb_sales');
+    const legacyAgents = await read('SELECT * FROM sb_agents');
+    const legacyAgentPrograms = await read('SELECT sb_agents_id, idx, value FROM sb_agents__programs ORDER BY sb_agents_id, idx');
+    const legacyAgentPeriods = await read('SELECT * FROM sb_agents__programperiods ORDER BY sb_agents_id, idx');
+    const legacyAgentActivity = await read('SELECT * FROM sb_agents__activity ORDER BY sb_agents_id, idx');
+    const rateBindings = await read('SELECT id, ratetypeid FROM sb_agents_rate_bindings');
     const routes = new Set((await target.query('SELECT id FROM routes')).rows.map((r) => String(r.id)));
     const boats = new Map((await target.query('SELECT id, capacity, license_pax FROM boats')).rows.map((b) => [String(b.id), b]));
     const totalcap = new Map(legacyBoats.map((b) => [str(b.id), int(b.totalcap)]));
@@ -466,6 +477,151 @@ async function main() {
     }
     for (const a of allocations) { a.van_group_id = a.group_key ? groupIdOf.get(String(a.group_key)) ?? null : null; delete a.group_key; }
 
+    // ── Agents, their markets and salespeople. Legacy ids are kept, because bookings and seat locks
+    //    already carry them in `agent_id`. Upserted like vans; an agent's programmes and activity are
+    //    replaced. An agent that has left legacy is not deleted: bookings may still point at it. ──
+    const agentData: string[] = []; // per-agent values dropped or changed, listed in the report
+    const agentNote = (agentId: string, what: string) => agentData.push(`${agentId.padEnd(14)} ${what}`);
+    const isoDay = (value: unknown, agentId: string, what: string): string | null => {
+      const s = str(value);
+      if (!s) return null;
+      if (ISO_DAY.test(s) && !Number.isNaN(Date.parse(s))) return s;
+      agentNote(agentId, `${what} "${s}" dropped, not a YYYY-MM-DD date`);
+      return null;
+    };
+    const numberOrNull = (value: unknown): number | null => { if (value == null || str(value) === '') return null; const n = Number(value); return Number.isFinite(n) ? n : null; };
+
+    const markets: Row[] = [];
+    for (const m of legacyMarkets) {
+      const id = str(m.id);
+      if (!id) { skip('market', '(no id)', 'no id'); continue; }
+      if (!str(m.name)) note('markets with no name: named by id');
+      markets.push({ id, name: str(m.name) || id, color: str(m.color) || null, sort: m.sort == null || str(m.sort) === '' ? null : int(m.sort) });
+    }
+    const salesPeople: Row[] = [];
+    for (const s of legacySales) {
+      const id = str(s.id);
+      if (!id) { skip('salesperson', '(no id)', 'no id'); continue; }
+      if (!str(s.name)) note('salespeople with no name: named by code or id');
+      salesPeople.push({
+        id, code: str(s.code) || null, name: str(s.name) || str(s.code) || id, full_name: str(s.fullname) || null,
+        designation: str(s.designation) || null, email: str(s.email) || null, tel: str(s.tel) || null, color: str(s.color) || null, active: true,
+      });
+    }
+    const marketIds = new Set(markets.map((m) => String(m.id)));
+    const salesIds = new Set(salesPeople.map((s) => String(s.id)));
+    const placeholders: string[] = [];
+
+    // Legacy re-seeds three house accounts on every load (08-app.js:436-466); they are ours, not resellers.
+    const HOUSE_AGENTS = new Set(['a_walkin', 'a_staff', 'a_b2c']);
+    // Legacy's `_seedContractExpiryVariety` (agents.js:43-110) overwrote these on every load with demo
+    // values computed from 2026-09-02, and they were persisted. The real dates are gone from legacy, so a
+    // value matching the demo exactly is dropped rather than imported as a contract that expires tomorrow.
+    const DEMO_CONTRACT_END: Record<string, string> = { a01: '2026-09-27', a10: '2026-09-27', a30: '2026-09-27', a40: '2026-08-28' };
+    const bindingOf = new Map(rateBindings.map((b) => [str(b.id), str(b.ratetypeid) || null]));
+    const programsOf = new Map<string, string[]>();
+    for (const p of legacyAgentPrograms) { const k = str(p.sb_agents_id); (programsOf.get(k) ?? programsOf.set(k, []).get(k)!).push(str(p.value)); }
+    const periodsOf = new Map<string, Row[]>();
+    for (const p of legacyAgentPeriods) { const k = str(p.sb_agents_id); (periodsOf.get(k) ?? periodsOf.set(k, []).get(k)!).push(p); }
+
+    const agents: Row[] = [], agentPrograms: Row[] = [];
+    const codes = new Map<string, string[]>();
+    for (const a of legacyAgents) {
+      const id = str(a.id);
+      if (!id) { skip('agent', '(no id)', 'no id'); continue; }
+      const code = str(a.code) || null;
+      if (code) (codes.get(code) ?? codes.set(code, []).get(code)!).push(id);
+      else note('agents with no code');
+      if (!str(a.name)) agentNote(id, 'no name: named by code or id');
+
+      // Legacy's edit form writes `bank` for Bank Transfer, which SB_PAYMENT_TYPES calls `bt`.
+      let payType: string | null = str(a.paytype).toLowerCase() || null;
+      if (payType === 'bank') { payType = 'bt'; note('pay_type bank → bt'); }
+      if (payType && !isPayType(payType)) { agentNote(id, `pay_type "${payType}" dropped, not one of ${PAY_TYPES.join(', ')}`); payType = null; }
+      // Legacy reads a missing VAT mode as none everywhere (`a.vatMode || 'none'`).
+      let vatMode = str(a.vatmode).toLowerCase();
+      if (!vatMode) { vatMode = 'none'; note('vat_mode blank → none, as legacy reads it'); }
+      if (!isVatMode(vatMode)) { agentNote(id, `vat_mode "${vatMode}" read as none`); vatMode = 'none'; }
+
+      // The bindings sidecar wins over the agent's own column, as it does when legacy loads (08-app.js:6269-6284).
+      let rateTypeId = str(a.ratetypeid) || null;
+      if (bindingOf.has(id) && bindingOf.get(id) !== rateTypeId) { note('rate_type_id taken from sb_agents_rate_bindings'); rateTypeId = bindingOf.get(id)!; }
+
+      let contractEnd = isoDay(a.contractend, id, 'contract_end');
+      let contractStatus = str(a.contractstatus) || null;
+      if (contractEnd !== null && DEMO_CONTRACT_END[id] === contractEnd) {
+        agentNote(id, `contract_end ${contractEnd} dropped: legacy's demo seed value, the real date is lost`);
+        contractEnd = null;
+        if (id === 'a40' && contractStatus === 'expired') { agentNote(id, 'contract_status expired dropped: set by the same demo seed'); contractStatus = null; }
+      }
+
+      const marketId = str(a.market) || null;
+      if (marketId && !marketIds.has(marketId)) {
+        marketIds.add(marketId);
+        markets.push({ id: marketId, name: marketId, color: null, sort: null });
+        placeholders.push(`market ${marketId}: used by agents but not in sb_markets, created with its id as its name`);
+      }
+      const salesId = str(a.sales) || null;
+      if (salesId && !salesIds.has(salesId)) {
+        salesIds.add(salesId);
+        salesPeople.push({ id: salesId, code: null, name: salesId, full_name: null, designation: null, email: null, tel: null, color: null, active: false });
+        placeholders.push(`salesperson ${salesId}: owns agents but not in sb_sales, created inactive with its id as its name`);
+      }
+
+      agents.push({
+        id, code, name: str(a.name) || code || id, market_id: marketId, sub_market: str(a.sub) || null, sales_id: salesId, color: str(a.color) || null,
+        pay_type: payType, vat_mode: vatMode, credit_days: numberOrNull(a.creditdays), credit_limit: numberOrNull(a.creditlimit),
+        contact: str(a.contact) || null, email: str(a.email) || null, phone: str(a.phone) || null, note: str(a.note) || null,
+        rate_type_id: rateTypeId, contract_template_id: str(a.contracttemplateid) || null,
+        contract_status: contractStatus, contract_version: str(a.contractversion) || null,
+        contract_start: isoDay(a.contractstart, id, 'contract_start'), contract_end: contractEnd,
+        legal_name: str(a.companyinfo_legalname) || null, tax_id: str(a.companyinfo_taxid) || null, tat_license: str(a.companyinfo_tatlicense) || null,
+        address: str(a.companyinfo_address) || null, company_tel: str(a.companyinfo_tel) || null, hotline: str(a.companyinfo_hotline) || null,
+        fax: str(a.companyinfo_fax) || null, website: str(a.companyinfo_website) || null,
+        signatory_name: str(a.agentsignatory_name) || null, signatory_designation: str(a.agentsignatory_designation) || null,
+        signatory_tel: str(a.agentsignatory_tel) || null, signatory_signed_date: isoDay(a.agentsignatory_signeddate, id, 'signatory_signed_date'),
+        booking_method: str(a.bookingchannel_method) || null, booking_cutoff: str(a.bookingchannel_cutoff) || null,
+        booking_cancel_policy: str(a.bookingchannel_cancelpolicy) || null, booking_email: str(a.bookingchannel_email) || null,
+        booking_phone: str(a.bookingchannel_phone) || null,
+        house: HOUSE_AGENTS.has(id), active: true,
+      });
+
+      // `programs[]` is what legacy sells from: the list, the incomplete flag and the header counts all
+      // read it. `programPeriods` only adds the booking window, and drifted because the table view and
+      // import edited `programs[]` alone. So membership comes from `programs[]` and dates from the period.
+      const periods = new Map<string, Row>();
+      for (const p of periodsOf.get(id) ?? []) if (!periods.has(str(p.routeid))) periods.set(str(p.routeid), p);
+      const listed = [...new Set((programsOf.get(id) ?? []).filter(Boolean))];
+      for (const routeId of periods.keys()) if (routeId && !listed.includes(routeId)) note('programme periods dropped: route not in the agent\'s programs[]');
+      for (const routeId of listed) {
+        if (!routes.has(routeId)) { agentNote(id, `programme ${routeId} dropped: route not in catalogue`); continue; }
+        const period = periods.get(routeId);
+        if (!period) note('programmes with no period: imported with open booking dates');
+        let bookFrom = period ? isoDay(period.bookfrom, id, `${routeId} book_from`) : null;
+        let bookTo = period ? isoDay(period.bookto, id, `${routeId} book_to`) : null;
+        if (bookFrom && bookTo && bookTo < bookFrom) { agentNote(id, `${routeId} booking window ${bookFrom}..${bookTo} dropped: ends before it starts`); bookFrom = bookTo = null; }
+        agentPrograms.push({ agent_id: id, route_id: routeId, idx: agentPrograms.filter((p) => p.agent_id === id).length, book_from: bookFrom, book_to: bookTo, note: period ? str(period.note) || null : null });
+      }
+    }
+    for (const [code, ids] of codes) if (ids.length > 1) agentData.push(`${'(code)'.padEnd(14)} ${code} is shared by ${ids.join(', ')}`);
+
+    const agentIds = new Set(agents.map((a) => String(a.id)));
+    const agentActivity: Row[] = [];
+    for (const e of legacyAgentActivity) {
+      const agentId = str(e.sb_agents_id), at = instant(e.at), text = str(e.text);
+      if (!agentIds.has(agentId)) continue;
+      if (!at) { note('agent activity dropped: no readable time'); continue; }
+      if (!text) { note('agent activity dropped: no text'); continue; }
+      agentActivity.push({ agent_id: agentId, at, by: str(e.by) || null, kind: str(e.kind) || 'edit', text });
+    }
+    const subs: Row[] = [];
+    for (const s of legacyMarketSubs) {
+      const marketId = str(s.sb_markets_id), name = str(s.value);
+      if (!marketIds.has(marketId) || !name) continue;
+      if (subs.some((x) => x.market_id === marketId && x.name === name)) { note('market sub-markets dropped: repeated'); continue; }
+      subs.push({ market_id: marketId, idx: int(s.idx), name });
+    }
+
     // ── Write, in one transaction ──
     await target.query('BEGIN');
     const insert = async (table: string, rows: Row[], conflict = '') => {
@@ -485,7 +641,20 @@ async function main() {
     for (const table of ['van_day_routes', 'van_status_ranges', 'van_days']) {
       await target.query(`DELETE FROM ${table} WHERE van_id = ANY($1::text[])`, [importedVans]);
     }
-    await insert('vans', vans, `ON CONFLICT (id) DO UPDATE SET ${Object.keys(vans[0] ?? { name: 0 }).filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).join(', ')}`);
+    const upsert = (rows: Row[], extra = '') => `ON CONFLICT (id) DO UPDATE SET ${Object.keys(rows[0] ?? { id: 0 }).filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).concat(extra ? [extra] : []).join(', ')}`;
+    await insert('vans', vans, upsert(vans));
+    // Agents before their children; programmes, activity and sub-markets are replaced, not merged.
+    await insert('markets', markets, upsert(markets));
+    await target.query('DELETE FROM market_subs WHERE market_id = ANY($1::text[])', [[...marketIds]]);
+    await insert('market_subs', subs);
+    await insert('sales_people', salesPeople, upsert(salesPeople));
+    await insert('agents', agents, upsert(agents, 'updated_at = now()'));
+    await target.query('DELETE FROM agent_programs WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
+    await target.query('DELETE FROM agent_activity WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
+    await insert('agent_programs', agentPrograms);
+    // In legacy's order, oldest first, so the serial id breaks ties between entries at the same instant.
+    await target.query(`INSERT INTO agent_activity (agent_id, at, by, kind, text)
+      SELECT r.agent_id, r.at, r.by, r.kind, r.text FROM jsonb_populate_recordset(NULL::agent_activity, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(agentActivity)]);
     await insert('van_day_routes', dayRoutes);
     await insert('van_status_ranges', statusRanges);
     await insert('van_days', [...vanDays.values()]);
@@ -509,7 +678,9 @@ async function main() {
       (SELECT count(*) FROM deployments)::int deployments, (SELECT count(*) FROM boat_capacity_overrides)::int capacity_overrides,
       (SELECT count(*) FROM vans)::int vans, (SELECT count(*) FROM van_day_routes)::int van_day_routes, (SELECT count(*) FROM van_days)::int van_days,
       (SELECT count(*) FROM van_groups)::int van_groups, (SELECT count(*) FROM booking_trip_van_allocations)::int van_allocations,
-      (SELECT count(*) FROM booking_trip_operations)::int trip_operations`);
+      (SELECT count(*) FROM booking_trip_operations)::int trip_operations,
+      (SELECT count(*) FROM agents)::int agents, (SELECT count(*) FROM agent_programs)::int agent_programs, (SELECT count(*) FROM agent_activity)::int agent_activity,
+      (SELECT count(*) FROM markets)::int markets, (SELECT count(*) FROM sales_people)::int sales_people`);
 
     console.log(`\n${commit ? 'COMMIT' : 'DRY RUN (rolled back)'}`);
     console.log(`read from legacy: ${legacyBookings.length} bookings, ${legacyTrips.length} trips, ${legacyPassengers.length} passengers, ${boatDays.length} boat-days, ${legacyLocks.length} locks, ${capOverrides.length} overrides`);
@@ -517,7 +688,12 @@ async function main() {
     console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
+    console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
     console.log('target now holds:', after);
+    console.log(`\nplaceholders created (${placeholders.length}):`);
+    for (const p of placeholders) console.log(`  ${p}`);
+    console.log(`\nagent data to check (${agentData.length}):`);
+    for (const d of agentData) console.log(`  ${d}`);
     console.log(`\nvan group conflicts (${conflicts.length}):`);
     for (const c of conflicts) console.log(`  ${c}`);
     console.log('\nnotes:');

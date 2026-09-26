@@ -4,6 +4,10 @@ import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
+import {
+  agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
+  type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type SalesPerson, type StoredActivity, type StoredAgent,
+} from './agents.js';
 
 export type Deployment = {
   boat_id: string;
@@ -132,11 +136,14 @@ export type Exclusion = { bookingId?: string; lockId?: string };
 
 export type BookingListQuery = {
   routeId?: string;
+  agentId?: string;
   serviceDate?: string;
   from?: string;
   to?: string;
   limit: number;
   cursor?: string;
+  /** By `created_at`, then id. `desc` is newest first, which an agent's recent bookings want. Defaults to `asc`. */
+  order?: 'asc' | 'desc';
 };
 
 export type BookingPage = { bookings: Booking[]; next_cursor?: string };
@@ -260,6 +267,35 @@ export class OperationsStore {
   /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
   private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] } =
     { routes: [], seasons: [], overrides: [], boats: [], boatOverrides: [] };
+
+  /** Agents and what they point at. Empty unless seeded: a PostgreSQL deployment gets these from the import. */
+  private directory: { markets: Market[]; sales: SalesPerson[]; agents: StoredAgent[]; activity: Map<string, StoredActivity[]> } =
+    { markets: [], sales: [], agents: [], activity: new Map() };
+
+  /**
+   * Loads agents, markets, salespeople and activity, as `import-legacy.ts` does for PostgreSQL.
+   * Activity is given oldest first; its position is what orders two entries at the same instant.
+   */
+  seedAgents(data: Partial<{ markets: Market[]; sales: SalesPerson[]; agents: StoredAgent[]; activity: Record<string, AgentActivity[]> }>): void {
+    if (data.markets) this.directory.markets = data.markets.map((market) => ({ ...market, subs: [...market.subs] }));
+    if (data.sales) this.directory.sales = data.sales.map((person) => ({ ...person }));
+    if (data.agents) this.directory.agents = data.agents.map((agent) => ({ ...agent, programs: agent.programs.map((program) => ({ ...program })) }));
+    if (data.activity) {
+      this.directory.activity = new Map(Object.entries(data.activity).map(([agentId, entries]) =>
+        [agentId, entries.map((entry, seq) => ({ ...entry, at: new Date(entry.at).toISOString(), seq }))]));
+    }
+  }
+  listMarkets(): Market[] { return sortMarkets(this.directory.markets).map((market) => ({ ...market, subs: [...market.subs] })); }
+  listSalesPeople(): SalesPerson[] { return sortSalesPeople(this.directory.sales).map((person) => ({ ...person })); }
+  listAgents(query: AgentListQuery): AgentSummary[] {
+    return selectAgents(this.directory.agents, this.directory.markets, this.directory.sales, query).map(agentSummary);
+  }
+  agent(id: string): Agent | undefined { const found = this.directory.agents.find((agent) => agent.id === id); return found && agentView(found); }
+  /** Undefined for an unknown agent, so the route can answer 404 rather than an empty log. */
+  agentActivity(id: string, limit: number): AgentActivity[] | undefined {
+    if (!this.directory.agents.some((agent) => agent.id === id)) return undefined;
+    return latestActivity(this.directory.activity.get(id) ?? [], limit);
+  }
 
   /** Loads reference data that a PostgreSQL deployment gets from migrations instead. */
   seedCatalogue(catalogue: Partial<{ routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] }>): void {
@@ -387,13 +423,18 @@ export class OperationsStore {
 
   listBookings(query: BookingListQuery): BookingPage {
     const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
+    // The page order, and "comes after the cursor" read in that same order, whichever direction.
+    const direction = query.order === 'desc' ? -1 : 1;
+    const compare = (a: { created_at: string; id: string }, b: { created_at: string; id: string }): number =>
+      direction * (a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
     const matches = [...this.bookings.values()]
+      .filter((b) => !query.agentId || b.agent_id === query.agentId)
       .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
         && (!query.serviceDate || t.service_date === query.serviceDate)
         && (!query.from || t.service_date >= query.from)
         && (!query.to || t.service_date <= query.to)))
-      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
-      .filter((b) => !cursor || b.created_at > cursor.created_at || (b.created_at === cursor.created_at && b.id > cursor.id));
+      .sort(compare)
+      .filter((b) => !cursor || compare(b, cursor) > 0);
     const page = matches.slice(0, query.limit);
     const hasMore = matches.length > query.limit;
     return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}) };
