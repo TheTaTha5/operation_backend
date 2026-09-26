@@ -55,7 +55,7 @@ The frontend must use Authorization Code with PKCE and send `Authorization: Bear
 
 | API area | Read permission | Write permission |
 | --- | --- | --- |
-| Bookings and seat locks | `booking:read` | `booking:write` |
+| Bookings, seat locks, agents, markets, salespeople | `booking:read` | `booking:write` |
 | Manifest, allotment, deployments | `operations:read` | `operations:write` |
 
 ## Temporary password login (testing only)
@@ -112,6 +112,65 @@ that case `charter_ceiling` falls back to `capacity`. **A missing licence is not
 The null is reported rather than quietly replaced by `capacity`, because claiming a registration a
 vessel does not hold is worse than saying it has none; read `charter_ceiling` for the number and
 `license_pax` for whether it is a legal figure or a fallback.
+
+### Agents
+
+Resellers, the markets they sell into, and the salespeople who own them. **Read-only for now.**
+Agents arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids (`a01`,
+`a_b2c`, …), which are the ids `bookings.agent_id` and `seat_locks.agent_id` already hold. Creating
+and editing agents comes later. All of these are under `booking:read`.
+
+**Every caller sees every agent.** Legacy hid other salespeople's agents only in the browser. Doing
+it here needs the caller's salesperson id in the token, and that has not been decided yet.
+
+- `GET /v1/markets`: `{ markets: [{ id, name, color, sort, subs: [name…] }] }`, by `sort` (unsorted
+  last), then id.
+- `GET /v1/sales`: `{ sales: [{ id, code, name, full_name, designation, email, tel, color, active }] }`,
+  by name. An inactive salesperson can still own agents.
+- `GET /v1/agents?market=&sales=&q=&active=`: summary rows for the list, its filters and header
+  counts, A–Z by name (case-insensitive), then id.
+  - `market` and `sales` are ids.
+  - `q` matches name, code, sub-market, market name and salesperson name, case-insensitively.
+  - `active` is `true` (the default), `false`, or `all`.
+
+  ```jsonc
+  { "agents": [ { "id": "a12", "code": "SUNTOUR", "name": "Sun Tour", "market_id": "ru",
+    "sub_market": "Moscow", "sales_id": "s3", "color": null, "pay_type": "invoice",
+    "vat_mode": "exclude", "credit_limit": 200000, "rate_type_id": "rt007",
+    "program_route_ids": ["r5", "r6"], "contract_status": "active", "contract_end": "2026-12-31",
+    "incomplete": [], "house": false, "active": true } ] }
+  ```
+- `GET /v1/agents/{id}`: the whole agent, `404` if unknown. It has the summary's fields except
+  `program_route_ids`, plus `credit_days`, `contact`, `email`, `phone`, `note`,
+  `contract_template_id`, `contract_version`, `contract_start`, `created_at` and `updated_at`. It
+  also has these groups:
+  - `company`: `{ legal_name, tax_id, tat_license, address, tel, hotline, fax, website }`
+  - `signatory`: `{ name, designation, tel, signed_date }`
+  - `booking_channel`: `{ method, cutoff, cancel_policy, email, phone }`
+  - `programs`: `[{ route_id, book_from, book_to, note }]` in the agent's order
+- `GET /v1/agents/{id}/activity?limit=`: the audit log, newest first:
+  `{ activity: [{ at, by, kind, text }] }`. `limit` defaults to 50 and may be 1–200. `404` if the
+  agent is unknown.
+
+Field notes:
+
+- **Every field is always present.** A value that is not set is `null`, never omitted.
+- **`pay_type`** is `invoice`, `proforma`, `bt` or `cot`, or `null` when legacy had none. Legacy's
+  edit form wrote `bank`; the import maps it to `bt`.
+- **`vat_mode`** is `none`, `include` or `exclude`. It is never null, because legacy reads a
+  missing VAT mode as `none`.
+- **`incomplete`** lists what the profile lacks before the agent can be sold correctly, in this
+  order: `market`, `sales`, `pay_type`, `rate_type`, `programs`, `contact`. This is legacy's
+  `agIncompleteFields`. Any one of email, phone or contact counts as contact.
+- **`programs`** are the routes the agent may sell. `book_from`/`book_to` is the booking window sales
+  entered, and `null` means open. Travel dates are not stored: they come from the rate type, which
+  has no endpoint yet.
+- **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
+- **`rate_type_id`** is the rate type the agent is priced with. It is not validated yet, because
+  there is no rate type table. `GET /v1/rate-types` comes with the Rate Types port.
+- **Not here yet:** credit used and available (needs invoices and payments, which this service
+  doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
+  contract history (the Contracts port).
 
 ### Operations
 
@@ -231,6 +290,85 @@ Responses return `trips` with each trip's `pax` grid and `pax_total`, plus `rout
 trip's route and date, the total across every trip, and the seats that total currently holds — so a
 single-departure client can ignore trips entirely.
 
+#### Pickup and overnight fields
+
+Each trip may also carry these fields. All are optional; `null` or `""` means not set. Responses
+leave out any field that isn't set, except `ovn_leg`, which is always present.
+
+| Field (alias) | Meaning |
+|---|---|
+| `zone` | Transfer zone code, e.g. `PK`, or `NoTransfer` for a self-arrival. Free text. |
+| `pickup_time` (`pickupTime`) | Hotel pickup time, `HH:MM`, 24-hour, local time. |
+| `ovn` | Marks an **overnight outbound** trip: `return` (we bring them back on `ovn_return_date`) or `self` (they make their own way back). |
+| `ovn_return_date` (`ovnReturnDate`) | The day they come back, `YYYY-MM-DD`. Required when `ovn` is `return`, refused otherwise, and must be after the trip's own date. |
+| `ovn_leg` (`ovnLeg`) | `true` on the **return leg**: the trip that brings them back. It holds seats on that day like any seat trip. |
+| `ovn_of` (`ovnOf`) | On a return leg: the **index in this `trips` list** of its outbound trip. |
+
+These rules match the legacy booking screen. A return leg must:
+- have `ovn_of` pointing at a *different* trip in the list whose `ovn` is `return`
+- be on that trip's route, dated its `ovn_return_date`
+- be a seat trip, not a charter
+- carry no `ovn` of its own
+
+`ovn_of` is refused on any trip that is not a leg. Every violation is a `400` naming the trip.
+
+`ovn_of` is an index on the way in and on the way out. The link is stored against the outbound
+trip's id, so reordering the list keeps it pointing at the right trip. The response gives the
+outbound's *current* index.
+
+```jsonc
+{ "trips": [
+  { "routeId": "r-1", "date": "2030-01-02", "pax": { "ad": 2 }, "zone": "PK", "pickupTime": "08:30",
+    "ovn": "return", "ovnReturnDate": "2030-01-04" },
+  { "routeId": "r-1", "date": "2030-01-04", "pax": { "ad": 2 }, "zone": "PK", "ovnLeg": true, "ovnOf": 0 }
+] }
+```
+
+These rules are checked when a request sends `trips`, and when a single-departure move
+(`reschedule`, or `PATCH` with `route_id`/`service_date`) would put an overnight trip on or after
+its return date. An edit that leaves the trips alone is not re-checked. That way a booking imported
+before these rules existed can still have its header edited.
+
+#### Trip ids
+
+Every trip in a response has an **`id`** that stays the same for as long as the trip exists.
+Day-of-operations data (van, pickup, check-in) is attached to that id, so it must survive edits.
+
+On `PATCH` with `trips`, each trip you send is matched to a stored trip like this:
+
+1. **With an `id`:** it is that stored trip, updated in place, even if its route, date or pax
+   change. Sending an `id` with a new date is how you *move* a trip.
+2. **Without an `id`:** it is the stored trip on the **same route and date**, if one exists and no
+   other trip in the request claimed it by `id`. So a client that never sends ids still keeps them,
+   as long as it doesn't move trips.
+3. **Otherwise** it is a new trip with a fresh id.
+
+A stored trip that nothing matched is removed, along with anything attached to it.
+
+**Moving a trip clears its day-of-operations data.** When a kept trip's route or date changes, its
+van group, allocations and trip operations are deleted, because they were arranged for the old
+departure. The trip keeps its id. Without an `id`, a trip on a new day is a new trip, so the old
+trip's data goes when that trip is removed. Both paths end the same way.
+
+- An `id` that is not one of this booking's trips, or the same `id` twice, is a `400`, and nothing
+  changes. `POST` takes no trip ids, because a new booking has no trips yet.
+- An `id` that is not one of this booking's trips, or the same `id` twice, is a `400`, and nothing
+  changes. `POST` takes no trip ids, because a new booking has no trips yet.
+- Edits that don't send `trips` keep every trip's id: header or `passengers` changes, `PATCH` with
+  `route_id`/`service_date`/`pax`, `reschedule` and `partial-cancel`.
+- `seq` is the trip's position in the list, and changes when you reorder. Don't use it as an id.
+- Treat ids as opaque strings. New ones look like `trip_<uuid>`, older ones differ.
+
+```jsonc
+// Stored: [A (trip_a), B (trip_b)]. Remove A, keep B, add a new day:
+{ "trips": [
+  { "id": "trip_b", "routeId": "r-1", "date": "2030-01-03", "pax": { "ad": 2 } },
+  { "routeId": "r-1", "date": "2030-01-04", "pax": { "ad": 2 } }
+] }
+// → B keeps trip_b (now seq 0), the new trip gets a new id, trip_a is removed.
+// Leaving out "id": "trip_b" gives the same result, because B's route and date are unchanged.
+```
+
 #### Status, and which statuses hold seats
 
 `status` is one of `draft`, `quote`, `pending`, `pending_approval`, `pending_foc`, `confirmed`,
@@ -257,18 +395,23 @@ Two consequences worth knowing:
   or by an inclusive trip-date range using `from` and `to`; a booking matches if any of its trips
   does. Results use cursor pagination: `limit` defaults to 50 and may be 1–100, and `cursor` is
   returned as `next_cursor` when another page exists. `service_date` cannot be combined with
-  `from`/`to`.
+  `from`/`to`. `agent_id` narrows the list to one agent's bookings. Pages are ordered by creation
+  time, then id, oldest first. `order=desc` gives newest first, which is what an agent's Recent
+  Bookings tab wants. A cursor carries on in the direction it was issued in, so send the same
+  `order` with it. Imported bookings were created at legacy's `bookedAt`, so creation order is
+  booking-date order.
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
   are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
   below. An optional `passengers` array is stored as columns too — see
   [Passengers](#passengers). **The itinerary is weighed as a whole**: if any day is short of seats
-  the booking is refused entirely and no day is left holding part of it. Two trips on the same
-  departure are counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an
+  the booking is refused entirely and no day is left holding part of it. A booking has **at most one
+  trip per route per day** (`400` otherwise); send one trip with the combined pax. A trip must name a route in the catalogue (`GET /v1/routes`); an
   unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
   behind it.
-- `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
+- `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright (echo each kept trip's
+  `id`, see [Trip ids](#trip-ids)), or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
   something actually moves, and days being vacated are released in the same transaction. Any
   [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:

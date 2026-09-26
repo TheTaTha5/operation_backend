@@ -21,6 +21,7 @@ const text = (value: unknown): string | undefined => {
  * one — but a value that is present and malformed is refused rather than silently dropped, the
  * same choice `parsePaxGrid` makes for the pax grid.
  */
+
 export function parseBookingPassengers(input: unknown, label = 'passengers'): BookingPassengerInput[] {
   if (input === undefined) return [];
   if (!Array.isArray(input)) invalid(`${label} must be an array`);

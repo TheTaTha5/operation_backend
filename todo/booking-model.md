@@ -386,6 +386,27 @@ leave the pool whole, and a lock holds only `pax − drawn`. Deliberately not do
 - **A draw does not check the lock's `agent_id` against the booking's agent.** Legacy's
   `holderType`/`holderId` suggests it should; the seat-lock model gap is the place to decide it.
 - The OVN fields, `zone`, `pickup_time`, `subtotal` and the charter pricing fields remain unbuilt.
+  *(Update: migration 015 lands `zone`, `pickup_time` and the OVN fields except `ovn_charge` — see
+  below.)*
+
+## Trip pickup and overnight fields landed
+
+Migration 015 adds `zone`, `pickup_time`, `ovn`, `ovn_return_date`, `ovn_leg` and `ovn_of` to
+`booking_trips`, and `assertItinerary` (`src/domain/operations.ts`) enforces one trip per route per
+day, plus legacy's return-leg rules. `ovn_of` is stored as the outbound trip's **id**, not the
+legacy index, because trip ids now survive edits and indexes do not survive reordering. Deliberately
+not done:
+
+- **No `UNIQUE (booking_id, route_id, service_date)` in the schema.** The rule is enforced by the
+  API and by the import. Count the violations on production before adding the constraint: a
+  dry run of `src/tools/import-legacy.ts` lists them as skipped bookings.
+- **The import skips any booking that breaks the itinerary rules**, rather than repairing it. Run a
+  dry run and read the skipped list before `--commit`. A skipped booking holds no seats in the
+  new system.
+- Legacy allows a return date equal to the outbound date; we require it to be later, because a
+  same-day leg would be a second trip on the same route and day.
+- `ovn_charge`, `subtotal`, the charter pricing fields and `seats_locked`/`seats_general` remain
+  unbuilt.
 
 ## Stage 1 closed out — 2026-08-28
 

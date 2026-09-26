@@ -2,8 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsSeats, demandByDay, drawnLockIds, nextTrips, partialCancelTrips, tripsChanged,
-  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type RouteDay, type SeatLock, type StoredBooking,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsSeats, demandByDay, drawnLockIds, movedTripIds, nextTrips, partialCancelTrips, planTrips, tripsChanged,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxResidency } from './pax.js';
@@ -15,6 +15,10 @@ import {
   type BookingHeader,
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
+import {
+  agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
+  type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
+} from './agents.js';
 
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
@@ -41,6 +45,7 @@ const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${colu
 const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode, 'charter_boat_id', t.charter_boat_id,
+      'zone', t.zone, 'pickup_time', t.pickup_time, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -57,6 +62,8 @@ const TIMESTAMP_HEADER = new Set<string>(BOOKING_HEADER_TIMESTAMP_COLUMNS);
 const DATE_HEADER = new Set<string>(BOOKING_HEADER_DATE_COLUMNS);
 
 /** Reads the header columns off a row, converting the three types `pg` does not hand back as-is. */
+const newTripId = (): string => `trip_${randomUUID()}`;
+
 const header = (row: QueryResultRow): BookingHeader => {
   const values: Record<string, unknown> = {};
   for (const column of BOOKING_HEADER_COLUMNS) {
@@ -77,6 +84,12 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     pax: (trip.pax as Record<string, unknown>[]).map((cell) => ({ category: cell.category as PaxCategory, residency: cell.residency as PaxResidency, count: Number(cell.count) })),
     ...(trip.charter_boat_id ? { charter_boat_id: String(trip.charter_boat_id) } : {}),
     lock_draws: (trip.lock_draws as Record<string, unknown>[]).map((draw): LockDraw => ({ lock_id: String(draw.lock_id), qty: Number(draw.qty) })),
+    ...(trip.zone ? { zone: String(trip.zone) } : {}),
+    ...(trip.pickup_time ? { pickup_time: String(trip.pickup_time) } : {}),
+    ...(trip.ovn ? { ovn: trip.ovn as OvnMode } : {}),
+    ...(trip.ovn_return_date ? { ovn_return_date: String(trip.ovn_return_date) } : {}),
+    ovn_leg: trip.ovn_leg === true,
+    ...(trip.ovn_of ? { ovn_of: String(trip.ovn_of) } : {}),
   })),
   passengers: (row.passengers as Record<string, unknown>[]).map((passenger) => ({
     seq: Number(passenger.seq), name: String(passenger.name),
@@ -86,6 +99,40 @@ const stored = (row: QueryResultRow): StoredBooking => ({
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
+
+const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
+const num = (value: unknown): number | null => value === null || value === undefined ? null : Number(value);
+
+/**
+ * Every `agents` column with its `DATE`s cast to text, and the programmes in order. The row is read
+ * into `StoredAgent` and nothing else; `agents.ts` decides everything the API says about it.
+ */
+const AGENT_SELECT = `SELECT a.*, a.contract_start::text AS contract_start_text, a.contract_end::text AS contract_end_text,
+    a.signatory_signed_date::text AS signatory_signed_date_text,
+    COALESCE((SELECT jsonb_agg(jsonb_build_object('route_id', p.route_id, 'book_from', p.book_from::text, 'book_to', p.book_to::text, 'note', p.note) ORDER BY p.idx, p.route_id)
+              FROM agent_programs p WHERE p.agent_id = a.id), '[]'::jsonb) AS programs
+  FROM agents a`;
+
+const storedAgent = (row: QueryResultRow): StoredAgent => ({
+  id: String(row.id), code: text(row.code), name: String(row.name),
+  market_id: text(row.market_id), sub_market: text(row.sub_market), sales_id: text(row.sales_id), color: text(row.color),
+  pay_type: text(row.pay_type) as PayType | null, vat_mode: String(row.vat_mode) as VatMode,
+  credit_days: num(row.credit_days), credit_limit: num(row.credit_limit),
+  contact: text(row.contact), email: text(row.email), phone: text(row.phone), note: text(row.note),
+  rate_type_id: text(row.rate_type_id), contract_template_id: text(row.contract_template_id),
+  contract_status: text(row.contract_status), contract_version: text(row.contract_version),
+  contract_start: text(row.contract_start_text), contract_end: text(row.contract_end_text),
+  legal_name: text(row.legal_name), tax_id: text(row.tax_id), tat_license: text(row.tat_license), address: text(row.address),
+  company_tel: text(row.company_tel), hotline: text(row.hotline), fax: text(row.fax), website: text(row.website),
+  signatory_name: text(row.signatory_name), signatory_designation: text(row.signatory_designation), signatory_tel: text(row.signatory_tel),
+  signatory_signed_date: text(row.signatory_signed_date_text),
+  booking_method: text(row.booking_method), booking_cutoff: text(row.booking_cutoff), booking_cancel_policy: text(row.booking_cancel_policy),
+  booking_email: text(row.booking_email), booking_phone: text(row.booking_phone),
+  house: row.house === true, active: row.active === true, created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
+  programs: (row.programs as Record<string, unknown>[]).map((program) => ({
+    route_id: String(program.route_id), book_from: text(program.book_from), book_to: text(program.book_to), note: text(program.note),
+  })),
+});
 
 /** Groups rows under a route-and-date key, so assembling a range is a lookup per cell rather than a scan. */
 const byDay = <T extends QueryResultRow>(rows: T[]): Map<string, T[]> => {
@@ -233,18 +280,46 @@ export class PostgresOperationsStore {
     return rows.map((row) => ({ ...row, capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) }));
   }
 
-  private async writeTrips(bookingId: string, trips: readonly BookingTripInput[]): Promise<void> {
-    await this.client().query('DELETE FROM booking_trips WHERE booking_id = $1', [bookingId]);
-    for (const [seq, trip] of trips.entries()) {
-      const id = `trip_${bookingId}_${seq}`;
-      const charter = trip.booking_mode === 'charter';
-      await this.client().query('INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-        [id, bookingId, seq, trip.route_id, trip.service_date, charter ? 'charter' : 'seat', charter ? trip.charter_boat_id ?? null : null]);
-      for (const cell of trip.pax) {
-        await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [id, cell.category, cell.residency, cell.count]);
+  /**
+   * Moves the stored itinerary from `current` to `planned` (see `planTrips`) without deleting any
+   * trip that is kept. A kept trip's row is updated in place, because rows in other tables hang off
+   * its id and a delete would cascade through them. Only its pax cells and lock draws — which belong
+   * to the trip and have no identity of their own — are rewritten. A kept trip that moved to another
+   * route or day loses its van data, which was arranged for the old departure (`movedTripIds`).
+   */
+  private async writeTrips(bookingId: string, current: readonly StoredTrip[], planned: readonly StoredTrip[]): Promise<void> {
+    const keep = new Set(planned.map((trip) => trip.id));
+    const removed = current.filter((trip) => !keep.has(trip.id)).map((trip) => trip.id);
+    if (removed.length > 0) await this.client().query('DELETE FROM booking_trips WHERE booking_id = $1 AND id = ANY($2::text[])', [bookingId, removed]);
+    const moved = movedTripIds(current, planned);
+    if (moved.length > 0) {
+      await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+      await this.client().query('DELETE FROM booking_trip_operations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+    }
+    const existing = new Set(current.map((trip) => trip.id).filter((id) => keep.has(id)));
+    // `UNIQUE (booking_id, seq)` is checked row by row, so reordering in place would collide halfway
+    // through a swap. The kept rows are first moved above every position the new list uses.
+    if (existing.size > 0) {
+      const clear = Math.max(planned.length, ...current.map((trip) => trip.seq + 1));
+      await this.client().query('UPDATE booking_trips SET seq = seq + $2 WHERE booking_id = $1', [bookingId, clear]);
+    }
+    for (const trip of planned) {
+      const values = [trip.id, bookingId, trip.seq, trip.route_id, trip.service_date, trip.booking_mode, trip.charter_boat_id ?? null,
+        trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null];
+      if (existing.has(trip.id)) {
+        await this.client().query(`UPDATE booking_trips SET seq = $3, route_id = $4, service_date = $5, booking_mode = $6, charter_boat_id = $7,
+          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13 WHERE id = $1 AND booking_id = $2`, values);
+        await this.client().query('DELETE FROM booking_trip_pax WHERE booking_trip_id = $1', [trip.id]);
+        await this.client().query('DELETE FROM booking_trip_lock_draws WHERE booking_trip_id = $1', [trip.id]);
+      } else {
+        await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
       }
-      for (const draw of charter ? [] : trip.lock_draws ?? []) {
-        await this.client().query('INSERT INTO booking_trip_lock_draws (booking_trip_id, seat_lock_id, qty) VALUES ($1,$2,$3)', [id, draw.lock_id, draw.qty]);
+      for (const cell of trip.pax) {
+        await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [trip.id, cell.category, cell.residency, cell.count]);
+      }
+      for (const draw of trip.lock_draws) {
+        await this.client().query('INSERT INTO booking_trip_lock_draws (booking_trip_id, seat_lock_id, qty) VALUES ($1,$2,$3)', [trip.id, draw.lock_id, draw.qty]);
       }
     }
   }
@@ -268,6 +343,7 @@ export class PostgresOperationsStore {
 
   async createBooking(input: BookingInput): Promise<Booking> {
     const status = input.status ?? 'confirmed';
+    const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
     // A booking created in a status that releases seats — a rejection being recorded, a cancelled
     // import — reserves nothing, so a full day must not stop it being written down.
@@ -290,13 +366,15 @@ export class PostgresOperationsStore {
     values.push(JSON.stringify(input.booking_data ?? {}));
     placeholders.push(`$${values.length}::jsonb`);
     await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
-    await this.writeTrips(id, input.trips);
+    await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
     return (await this.booking(id))!;
   }
 
   async listBookings(query: BookingListQuery) {
     const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
+    // The direction is one of two fixed strings, never caller text, so it is safe to splice in.
+    const [after, order] = query.order === 'desc' ? ['<', 'DESC'] : ['>', 'ASC'];
     const { rows } = await this.client().query(`${BOOKING_SELECT}
       WHERE EXISTS (SELECT 1 FROM booking_trips t
         WHERE t.booking_id = b.id
@@ -304,9 +382,10 @@ export class PostgresOperationsStore {
           AND ($2::date IS NULL OR t.service_date = $2)
           AND ($3::date IS NULL OR t.service_date >= $3)
           AND ($4::date IS NULL OR t.service_date <= $4))
-        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) > ($5::timestamptz, $6::text))
-      ORDER BY b.created_at, b.id
-      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]);
+        AND ($8::text IS NULL OR b.agent_id = $8)
+        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($5::timestamptz, $6::text))
+      ORDER BY b.created_at ${order}, b.id ${order}
+      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1, query.agentId ?? null]);
     const page = rows.slice(0, query.limit);
     return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}) };
   }
@@ -316,10 +395,11 @@ export class PostgresOperationsStore {
   async amendBooking(id: string, changes: BookingChanges): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     const replacement = nextTrips(current.trips, changes);
+    const planned = planTrips(current.trips, replacement, newTripId);
     const status = changes.status ?? current.status;
     await this.assertRoutes(replacement);
     if (claimsSeats(current.status, status, tripsChanged(current.trips, replacement))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
-    await this.writeTrips(id, replacement);
+    await this.writeTrips(id, current.trips, planned);
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
     // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
     // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
@@ -346,7 +426,7 @@ export class PostgresOperationsStore {
 
   async partialCancel(id: string, count: number): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
-    await this.writeTrips(id, partialCancelTrips(current.trips, current.status, count));
+    await this.writeTrips(id, current.trips, planTrips(current.trips, partialCancelTrips(current.trips, current.status, count), newTripId));
     await this.client().query('UPDATE bookings SET updated_at=now() WHERE id=$1', [id]);
     return this.booking(id);
   }
@@ -414,6 +494,38 @@ export class PostgresOperationsStore {
     const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');
     return rows.map((row) => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) }));
   }
+  /**
+   * Agents, markets and salespeople. There are about 130 agents, so the list is read whole and handed
+   * to `selectAgents`: filtering and sorting in SQL would be a second copy of that rule to keep in step.
+   */
+  async listMarkets(): Promise<Market[]> {
+    const { rows } = await this.client().query(`SELECT m.id, m.name, m.color, m.sort,
+      COALESCE((SELECT array_agg(s.name ORDER BY s.idx, s.name) FROM market_subs s WHERE s.market_id = m.id), '{}') AS subs FROM markets m`);
+    return sortMarkets(rows.map((row) => ({ id: String(row.id), name: String(row.name), color: text(row.color), sort: num(row.sort), subs: (row.subs as string[]).map(String) })));
+  }
+  async listSalesPeople(): Promise<SalesPerson[]> {
+    const { rows } = await this.client().query('SELECT id, code, name, full_name, designation, email, tel, color, active FROM sales_people');
+    return sortSalesPeople(rows.map((row) => ({
+      id: String(row.id), code: text(row.code), name: String(row.name), full_name: text(row.full_name), designation: text(row.designation),
+      email: text(row.email), tel: text(row.tel), color: text(row.color), active: row.active === true,
+    })));
+  }
+  async listAgents(query: AgentListQuery): Promise<AgentSummary[]> {
+    const { rows } = await this.client().query(AGENT_SELECT);
+    return selectAgents(rows.map(storedAgent), await this.listMarkets(), await this.listSalesPeople(), query).map(agentSummary);
+  }
+  async agent(id: string): Promise<Agent | undefined> {
+    const { rows: [row] } = await this.client().query(`${AGENT_SELECT} WHERE a.id = $1`, [id]);
+    return row && agentView(storedAgent(row));
+  }
+  /** Undefined for an unknown agent. The serial id orders two entries written at the same instant. */
+  async agentActivity(id: string, limit: number): Promise<AgentActivity[] | undefined> {
+    const { rows: [known] } = await this.client().query('SELECT 1 FROM agents WHERE id = $1', [id]);
+    if (!known) return undefined;
+    const { rows } = await this.client().query('SELECT id, at, by, kind, text FROM agent_activity WHERE agent_id = $1', [id]);
+    return latestActivity(rows.map((row) => ({ at: asIso(row.at), by: text(row.by), kind: String(row.kind), text: String(row.text), seq: Number(row.id) })), limit);
+  }
+
   async listDayOverrides(from?: string, to?: string): Promise<RouteDayOverride[]> {
     const { rows } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) ORDER BY route_id, service_date', [from ?? null, to ?? null]);
     return rows.map((row) => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] }));
