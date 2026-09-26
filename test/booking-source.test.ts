@@ -73,13 +73,14 @@ test('a booking spans several departures and is refused as a whole', async () =>
   assert.equal(await seatsOn(first), 6, 'the day that fit must not have been charged');
   assert.equal(await seatsOn(second), 6);
 
-  // Two trips landing on the same departure are weighed together, not one at a time.
+  // One trip per departure: two trips on the same route and day are refused outright, before any
+  // capacity is weighed, even though eight seats against six remaining would also have failed.
   const doubled = await app.inject({
     method: 'POST', url: '/v1/bookings', payload: {
-      trips: [{ routeId: 'r5', date: first, pax: { ad: 4 } }, { routeId: 'r5', date: first, pax: { ad: 4 } }],
+      trips: [{ routeId: 'r5', date: first, pax: { ad: 1 } }, { routeId: 'r5', date: first, pax: { ad: 1 } }],
     },
   });
-  assert.equal(doubled.statusCode, 409, 'eight seats against six remaining');
+  assert.equal(doubled.statusCode, 400, 'send one trip with the combined pax instead');
 
   // A bare count cannot say which day loses passengers.
   const ambiguous = await app.inject({ method: 'POST', url: `/v1/bookings/${booking.id}/partial-cancel`, payload: { pax_to_cancel: 1 } });

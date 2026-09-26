@@ -38,9 +38,14 @@ export type LockDraw = { lock_id: string; qty: number };
  *
  * `charter_boat_id` is the boat a charter takes whole, and only a charter carries one.
  * `lock_draws` are the seats a seat trip takes from locks; they never exceed the trip's pax.
+ * `id` names the stored trip an amendment is editing; a trip without one is new. See `planTrips`.
+ * The pickup and overnight fields are described in migration 015 and checked by `assertItinerary`.
  */
-export type BookingTripInput = { route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[] };
-export type BookingTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number> };
+export type TripDetails = { zone?: string; pickup_time?: string; ovn?: OvnMode; ovn_return_date?: string; ovn_leg?: boolean };
+export type OvnMode = 'return' | 'self';
+/** `ovn_of` is an index into the same trip list, on input and on the wire. */
+export type BookingTripInput = TripDetails & { id?: string; route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[]; ovn_of?: number };
+export type BookingTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number>; ovn_leg: boolean; ovn_of?: number };
 
 export type BookingInput = {
   trips: BookingTripInput[];
@@ -140,7 +145,8 @@ export type BookingPage = { bookings: Booking[]; next_cursor?: string };
 export type RouteDay = DayState & { route_id: string; service_date: string };
 
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
-export type StoredTrip = { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[] };
+/** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
+export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
 export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax'> & { trips: StoredTrip[] };
 
 /**
@@ -161,7 +167,10 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 };
 
 export function bookingView(stored: StoredBooking): Booking {
-  const trips = stored.trips.map((trip) => ({ ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])) }));
+  const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
+    ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
+    ...ovnOfIndex(stored.trips, ovn_of),
+  }));
   const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
   const first = stored.trips[0];
   const seats = stored.trips.filter((trip) => trip.booking_mode !== 'charter').reduce((sum, trip) => sum + paxTotal(trip.pax), 0);
@@ -169,6 +178,54 @@ export function bookingView(stored: StoredBooking): Booking {
 }
 
 const fail = (message: string, statusCode: number): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
+
+/** A stored `ovn_of` id as the index the API speaks, or nothing when the trip has none. */
+const ovnOfIndex = (trips: readonly StoredTrip[], id: string | undefined): { ovn_of?: number } => {
+  const index = id === undefined ? -1 : trips.findIndex((trip) => trip.id === id);
+  return index < 0 ? {} : { ovn_of: index };
+};
+
+/**
+ * The rules an itinerary must meet as a whole, checked whenever a client sends `trips`.
+ *
+ * - One trip per route per day. The van board, the manifest and every day-of-operations screen
+ *   address a booking's passengers by route and day; a second trip on the same departure would be
+ *   a second row nobody can tell apart from the first. Send one trip with the combined pax.
+ * - Overnight trips follow legacy's booking screen (`bkV2CreateOvnReturnLeg`): an outbound
+ *   `ovn: 'return'` names the day it comes back, and its return leg is a seat trip on that route and
+ *   that day, pointing back at it with `ovn_of`.
+ *
+ * Not applied to an amendment that leaves the trips alone, so a booking imported before these rules
+ * existed can still have its header edited.
+ */
+export function assertItinerary(trips: readonly BookingTripInput[]): void {
+  const seen = new Map<string, number>();
+  trips.forEach((trip, index) => {
+    const label = `trips[${index}]`;
+    const key = `${trip.route_id} ${trip.service_date}`;
+    const earlier = seen.get(key);
+    if (earlier !== undefined) fail(`${label} repeats trips[${earlier}]: one trip per route per day (${trip.route_id} on ${trip.service_date})`, 400);
+    seen.set(key, index);
+
+    if (trip.ovn === 'return' && trip.ovn_return_date === undefined) fail(`${label}.ovn_return_date is required when ovn is return`, 400);
+    if (trip.ovn !== 'return' && trip.ovn_return_date !== undefined) fail(`${label}.ovn_return_date applies only when ovn is return`, 400);
+    if (trip.ovn_return_date !== undefined && trip.ovn_return_date <= trip.service_date) fail(`${label}.ovn_return_date must be after the trip's date`, 400);
+
+    if (!trip.ovn_leg) {
+      if (trip.ovn_of !== undefined) fail(`${label}.ovn_of applies only to a return leg (ovn_leg)`, 400);
+      return;
+    }
+    if (trip.ovn !== undefined) fail(`${label} is a return leg and cannot itself be an overnight outbound`, 400);
+    if (trip.booking_mode === 'charter') fail(`${label} is a return leg and must be a seat trip`, 400);
+    if (trip.ovn_of === undefined) fail(`${label}.ovn_of is required on a return leg`, 400);
+    const outbound = trip.ovn_of === index ? undefined : trips[trip.ovn_of as number];
+    if (!outbound) fail(`${label}.ovn_of must be the index of another trip in this list`, 400);
+    if (outbound!.ovn !== 'return') fail(`${label}.ovn_of must point at a trip with ovn return`, 400);
+    if (outbound!.route_id !== trip.route_id || outbound!.ovn_return_date !== trip.service_date) {
+      fail(`${label} must be on its outbound's route (${outbound!.route_id}) and return date (${outbound!.ovn_return_date})`, 400);
+    }
+  });
+}
 
 /** What a set of trips asks of each route/day, so two trips on one day are weighed together. */
 export function demandByDay(trips: readonly BookingTripInput[]): DayDemand[] {
@@ -302,17 +359,6 @@ export class OperationsStore {
     return this.deployments.filter((d) => (!from || d.service_date >= from) && (!to || d.service_date <= to) && (!routeId || d.route_id === routeId));
   }
 
-  private storedTrips(bookingId: string, trips: readonly BookingTripInput[]): StoredTrip[] {
-    return trips.map((trip, seq) => {
-      const charter = trip.booking_mode === 'charter';
-      return {
-        id: `trip_${bookingId}_${seq}`, seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: charter ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })),
-        ...(charter && trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
-        lock_draws: charter ? [] : sortedDraws(trip.lock_draws ?? []),
-      };
-    });
-  }
-
   /**
    * With no catalogue seeded there is nothing to validate against, so an unseeded in-process store
    * accepts any route. A PostgreSQL deployment always has a catalogue and always enforces this.
@@ -324,6 +370,7 @@ export class OperationsStore {
 
   createBooking(input: BookingInput): Booking {
     const status = input.status ?? 'confirmed';
+    const planned = planTrips([], input.trips, () => this.id('trip'));
     this.assertRoutes(input.trips);
     // A booking created in a status that releases seats — a rejection being recorded, a cancelled
     // import — reserves nothing, so a full day must not stop it being written down.
@@ -333,7 +380,7 @@ export class OperationsStore {
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
     const { trips, header, passengers, ...rest } = input;
-    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: this.storedTrips(id, trips), passengers: withSeq(passengers ?? []) };
+    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []) };
     this.bookings.set(id, booking);
     return this.view(booking);
   }
@@ -357,10 +404,11 @@ export class OperationsStore {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     const replacement = nextTrips(booking.trips, changes);
+    const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
     const status = changes.status ?? booking.status;
     this.assertRoutes(replacement);
     if (claimsSeats(booking.status, status, tripsChanged(booking.trips, replacement))) this.assertTrips(replacement, { bookingId: id });
-    booking.trips = this.storedTrips(id, replacement);
+    booking.trips = planned;
     booking.status = status;
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
@@ -379,7 +427,7 @@ export class OperationsStore {
   partialCancel(id: string, paxToCancel: number): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    booking.trips = this.storedTrips(id, partialCancelTrips(booking.trips, booking.status, paxToCancel));
+    booking.trips = planTrips(booking.trips, partialCancelTrips(booking.trips, booking.status, paxToCancel), () => this.id('trip'));
     booking.updated_at = this.now();
     return this.view(booking);
   }
@@ -426,7 +474,7 @@ export class OperationsStore {
  */
 export function nextTrips(current: readonly StoredTrip[], changes: BookingChanges): BookingTripInput[] {
   if (changes.trips) return changes.trips.map((trip) => ({ ...trip, pax: trip.pax.map((row) => ({ ...row })) }));
-  if (changes.route_id === undefined && changes.service_date === undefined && changes.pax === undefined) return current.map(asInput);
+  if (changes.route_id === undefined && changes.service_date === undefined && changes.pax === undefined) return current.map((trip) => asInput(trip, current));
   const trip = onlyTrip(current, 'confirmed', 'Amend a multi-trip booking by sending trips');
   const route_id = changes.route_id ?? trip.route_id;
   const service_date = changes.service_date ?? trip.service_date;
@@ -434,14 +482,90 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
   // A lock belongs to one departure, so moving the trip leaves its draws behind and the moved trip
   // takes general seats. A caller drawing on a lock on the new day sends `trips`.
   const moved = route_id !== trip.route_id || service_date !== trip.service_date;
-  return [{ ...asInput(trip), route_id, service_date, pax, lock_draws: moved ? [] : clampDraws(trip.lock_draws, paxTotal(pax)) }];
+  const next = [{ ...asInput(trip, current), route_id, service_date, pax, lock_draws: moved ? [] : clampDraws(trip.lock_draws, paxTotal(pax)) }];
+  // Moving an overnight outbound past its return date is refused here rather than by the database.
+  if (moved) assertItinerary(next);
+  return next;
 }
 
-const asInput = (trip: StoredTrip): BookingTripInput => ({
-  route_id: trip.route_id, service_date: trip.service_date, booking_mode: trip.booking_mode, pax: trip.pax.map((row) => ({ ...row })),
-  ...(trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
-  lock_draws: trip.lock_draws.map((draw) => ({ ...draw })),
+/** The input a stored trip would have come from, id included, so an edit derived from it stays that trip. */
+const asInput = (trip: StoredTrip, all: readonly StoredTrip[]): BookingTripInput => {
+  const { id, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of } = trip;
+  return {
+    id, route_id, service_date, booking_mode, pax: trip.pax.map((row) => ({ ...row })),
+    ...(charter_boat_id ? { charter_boat_id } : {}),
+    lock_draws: trip.lock_draws.map((draw) => ({ ...draw })),
+    ...tripDetails({ zone, pickup_time, ovn, ovn_return_date, ovn_leg }),
+    ...ovnOfIndex(all, ovn_of),
+  };
+};
+
+/** The pickup and overnight fields with the unset ones left out, so both stores return the same keys. */
+const tripDetails = (trip: TripDetails): TripDetails => ({
+  ...(trip.zone ? { zone: trip.zone } : {}),
+  ...(trip.pickup_time ? { pickup_time: trip.pickup_time } : {}),
+  ...(trip.ovn ? { ovn: trip.ovn } : {}),
+  ...(trip.ovn_return_date ? { ovn_return_date: trip.ovn_return_date } : {}),
+  ...(trip.ovn_leg ? { ovn_leg: true } : {}),
 });
+
+/**
+ * The itinerary as it will be stored: each trip with its id and its position.
+ *
+ * A trip naming an `id` is that stored trip, edited in place; one without is new and gets
+ * `newId()`. A stored trip the list does not mention is removed. Ids are what day-of-operations
+ * rows hang off, so they must survive every edit that keeps the trip — a position-derived id would
+ * renumber the second trip when the first is removed. New ids are never positional for the same
+ * reason: a fresh trip must not inherit an id a removed one had.
+ *
+ * An id this booking does not hold, or one named twice, is refused rather than treated as new:
+ * either is a client working from a stale or mangled copy, and guessing would move the wrong trip.
+ *
+ * A trip without an id is matched on route and day to a stored trip no other trip claimed by id,
+ * so a client that never echoes ids still keeps them on every edit that does not move a trip. That
+ * match is unambiguous only because `assertItinerary` allows one trip per route per day. With an id
+ * the id wins, which is how a trip is moved to another day and stays the same trip.
+ */
+export function planTrips(current: readonly StoredTrip[], next: readonly BookingTripInput[], newId: () => string): StoredTrip[] {
+  const held = new Set(current.map((trip) => trip.id));
+  const claimed = new Set<string>();
+  next.forEach((trip, index) => {
+    if (trip.id === undefined) return;
+    if (!held.has(trip.id)) fail(`trips[${index}].id ${trip.id} is not a trip of this booking`, 400);
+    if (claimed.has(trip.id)) fail(`trips[${index}].id ${trip.id} appears more than once`, 400);
+    claimed.add(trip.id);
+  });
+  const byDay = (trip: BookingTripInput): string | undefined => {
+    const match = current.find((stored) => !claimed.has(stored.id) && stored.route_id === trip.route_id && stored.service_date === trip.service_date);
+    if (match) claimed.add(match.id);
+    return match?.id;
+  };
+  // Ids first, so a leg's `ovn_of` index can become its outbound's id whichever comes first.
+  const ids = next.map((trip) => trip.id ?? byDay(trip) ?? newId());
+  return next.map((trip, seq) => {
+    const charter = trip.booking_mode === 'charter';
+    return {
+      id: ids[seq], seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: charter ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })),
+      ...(charter && trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
+      lock_draws: charter ? [] : sortedDraws(trip.lock_draws ?? []),
+      ...tripDetails(trip), ovn_leg: trip.ovn_leg === true,
+      ...(trip.ovn_of === undefined || ids[trip.ovn_of] === undefined ? {} : { ovn_of: ids[trip.ovn_of] }),
+    };
+  });
+}
+
+/**
+ * Kept trips whose route or day changed. Their day-of-operations data belonged to the old
+ * departure — the van that was booked to collect them then — so it is cleared, as legacy's
+ * `bkOpsClear` does when a trip's date moves. The trip itself, and its id, stay.
+ */
+export function movedTripIds(current: readonly StoredTrip[], planned: readonly StoredTrip[]): string[] {
+  const before = new Map(current.map((trip) => [trip.id, trip]));
+  return planned.filter((trip) => {
+    const old = before.get(trip.id);
+    return old !== undefined && (old.route_id !== trip.route_id || old.service_date !== trip.service_date);
+  }).map((trip) => trip.id);
+}
 
 const sortedDraws = (draws: readonly LockDraw[]): LockDraw[] => draws.map((draw) => ({ ...draw })).sort((a, b) => a.lock_id.localeCompare(b.lock_id));
 
@@ -470,7 +594,7 @@ export function partialCancelTrips(trips: readonly StoredTrip[], status: Booking
   const trip = onlyTrip(trips, status, 'Partial-cancel a multi-trip booking by sending trips');
   const total = paxTotal(trip.pax);
   if (count > total) fail('Cannot cancel more passengers than the active booking', 400);
-  return [{ ...asInput(trip), pax: retargetPax(trip.pax, total - count), lock_draws: clampDraws(trip.lock_draws, total - count) }];
+  return [{ ...asInput(trip, trips), pax: retargetPax(trip.pax, total - count), lock_draws: clampDraws(trip.lock_draws, total - count) }];
 }
 
 function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: string): StoredTrip {

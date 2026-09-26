@@ -2,8 +2,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsSeats, demandByDay, drawnLockIds, nextTrips, partialCancelTrips, tripsChanged,
-  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type RouteDay, type SeatLock, type StoredBooking,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsSeats, demandByDay, drawnLockIds, movedTripIds, nextTrips, partialCancelTrips, planTrips, tripsChanged,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxResidency } from './pax.js';
@@ -41,6 +41,7 @@ const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${colu
 const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode, 'charter_boat_id', t.charter_boat_id,
+      'zone', t.zone, 'pickup_time', t.pickup_time, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -57,6 +58,8 @@ const TIMESTAMP_HEADER = new Set<string>(BOOKING_HEADER_TIMESTAMP_COLUMNS);
 const DATE_HEADER = new Set<string>(BOOKING_HEADER_DATE_COLUMNS);
 
 /** Reads the header columns off a row, converting the three types `pg` does not hand back as-is. */
+const newTripId = (): string => `trip_${randomUUID()}`;
+
 const header = (row: QueryResultRow): BookingHeader => {
   const values: Record<string, unknown> = {};
   for (const column of BOOKING_HEADER_COLUMNS) {
@@ -77,6 +80,12 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     pax: (trip.pax as Record<string, unknown>[]).map((cell) => ({ category: cell.category as PaxCategory, residency: cell.residency as PaxResidency, count: Number(cell.count) })),
     ...(trip.charter_boat_id ? { charter_boat_id: String(trip.charter_boat_id) } : {}),
     lock_draws: (trip.lock_draws as Record<string, unknown>[]).map((draw): LockDraw => ({ lock_id: String(draw.lock_id), qty: Number(draw.qty) })),
+    ...(trip.zone ? { zone: String(trip.zone) } : {}),
+    ...(trip.pickup_time ? { pickup_time: String(trip.pickup_time) } : {}),
+    ...(trip.ovn ? { ovn: trip.ovn as OvnMode } : {}),
+    ...(trip.ovn_return_date ? { ovn_return_date: String(trip.ovn_return_date) } : {}),
+    ovn_leg: trip.ovn_leg === true,
+    ...(trip.ovn_of ? { ovn_of: String(trip.ovn_of) } : {}),
   })),
   passengers: (row.passengers as Record<string, unknown>[]).map((passenger) => ({
     seq: Number(passenger.seq), name: String(passenger.name),
@@ -233,18 +242,46 @@ export class PostgresOperationsStore {
     return rows.map((row) => ({ ...row, capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) }));
   }
 
-  private async writeTrips(bookingId: string, trips: readonly BookingTripInput[]): Promise<void> {
-    await this.client().query('DELETE FROM booking_trips WHERE booking_id = $1', [bookingId]);
-    for (const [seq, trip] of trips.entries()) {
-      const id = `trip_${bookingId}_${seq}`;
-      const charter = trip.booking_mode === 'charter';
-      await this.client().query('INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-        [id, bookingId, seq, trip.route_id, trip.service_date, charter ? 'charter' : 'seat', charter ? trip.charter_boat_id ?? null : null]);
-      for (const cell of trip.pax) {
-        await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [id, cell.category, cell.residency, cell.count]);
+  /**
+   * Moves the stored itinerary from `current` to `planned` (see `planTrips`) without deleting any
+   * trip that is kept. A kept trip's row is updated in place, because rows in other tables hang off
+   * its id and a delete would cascade through them. Only its pax cells and lock draws — which belong
+   * to the trip and have no identity of their own — are rewritten. A kept trip that moved to another
+   * route or day loses its van data, which was arranged for the old departure (`movedTripIds`).
+   */
+  private async writeTrips(bookingId: string, current: readonly StoredTrip[], planned: readonly StoredTrip[]): Promise<void> {
+    const keep = new Set(planned.map((trip) => trip.id));
+    const removed = current.filter((trip) => !keep.has(trip.id)).map((trip) => trip.id);
+    if (removed.length > 0) await this.client().query('DELETE FROM booking_trips WHERE booking_id = $1 AND id = ANY($2::text[])', [bookingId, removed]);
+    const moved = movedTripIds(current, planned);
+    if (moved.length > 0) {
+      await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+      await this.client().query('DELETE FROM booking_trip_operations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+    }
+    const existing = new Set(current.map((trip) => trip.id).filter((id) => keep.has(id)));
+    // `UNIQUE (booking_id, seq)` is checked row by row, so reordering in place would collide halfway
+    // through a swap. The kept rows are first moved above every position the new list uses.
+    if (existing.size > 0) {
+      const clear = Math.max(planned.length, ...current.map((trip) => trip.seq + 1));
+      await this.client().query('UPDATE booking_trips SET seq = seq + $2 WHERE booking_id = $1', [bookingId, clear]);
+    }
+    for (const trip of planned) {
+      const values = [trip.id, bookingId, trip.seq, trip.route_id, trip.service_date, trip.booking_mode, trip.charter_boat_id ?? null,
+        trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null];
+      if (existing.has(trip.id)) {
+        await this.client().query(`UPDATE booking_trips SET seq = $3, route_id = $4, service_date = $5, booking_mode = $6, charter_boat_id = $7,
+          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13 WHERE id = $1 AND booking_id = $2`, values);
+        await this.client().query('DELETE FROM booking_trip_pax WHERE booking_trip_id = $1', [trip.id]);
+        await this.client().query('DELETE FROM booking_trip_lock_draws WHERE booking_trip_id = $1', [trip.id]);
+      } else {
+        await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
       }
-      for (const draw of charter ? [] : trip.lock_draws ?? []) {
-        await this.client().query('INSERT INTO booking_trip_lock_draws (booking_trip_id, seat_lock_id, qty) VALUES ($1,$2,$3)', [id, draw.lock_id, draw.qty]);
+      for (const cell of trip.pax) {
+        await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [trip.id, cell.category, cell.residency, cell.count]);
+      }
+      for (const draw of trip.lock_draws) {
+        await this.client().query('INSERT INTO booking_trip_lock_draws (booking_trip_id, seat_lock_id, qty) VALUES ($1,$2,$3)', [trip.id, draw.lock_id, draw.qty]);
       }
     }
   }
@@ -268,6 +305,7 @@ export class PostgresOperationsStore {
 
   async createBooking(input: BookingInput): Promise<Booking> {
     const status = input.status ?? 'confirmed';
+    const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
     // A booking created in a status that releases seats — a rejection being recorded, a cancelled
     // import — reserves nothing, so a full day must not stop it being written down.
@@ -290,7 +328,7 @@ export class PostgresOperationsStore {
     values.push(JSON.stringify(input.booking_data ?? {}));
     placeholders.push(`$${values.length}::jsonb`);
     await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
-    await this.writeTrips(id, input.trips);
+    await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
     return (await this.booking(id))!;
   }
@@ -316,10 +354,11 @@ export class PostgresOperationsStore {
   async amendBooking(id: string, changes: BookingChanges): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     const replacement = nextTrips(current.trips, changes);
+    const planned = planTrips(current.trips, replacement, newTripId);
     const status = changes.status ?? current.status;
     await this.assertRoutes(replacement);
     if (claimsSeats(current.status, status, tripsChanged(current.trips, replacement))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
-    await this.writeTrips(id, replacement);
+    await this.writeTrips(id, current.trips, planned);
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
     // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
     // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
@@ -346,7 +385,7 @@ export class PostgresOperationsStore {
 
   async partialCancel(id: string, count: number): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
-    await this.writeTrips(id, partialCancelTrips(current.trips, current.status, count));
+    await this.writeTrips(id, current.trips, planTrips(current.trips, partialCancelTrips(current.trips, current.status, count), newTripId));
     await this.client().query('UPDATE bookings SET updated_at=now() WHERE id=$1', [id]);
     return this.booking(id);
   }

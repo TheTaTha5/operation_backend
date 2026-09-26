@@ -83,13 +83,15 @@ export const BOOKING_HEADER_COLUMNS = [
  *   Returned unconverted, `total` would be a string for one store and a number for the other.
  * - `TIMESTAMPTZ` arrives as a `Date` and is rendered the way `created_at` already is.
  */
+
 export const BOOKING_HEADER_DATE_COLUMNS = ['market_at', 'booking_date'] as const;
 export const BOOKING_HEADER_NUMERIC_COLUMNS = [
   'cash_on_tour_amount', 'manual_total', 'total',
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
 ] as const;
-export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at'] as const;
 
+export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at'] as const;
+//example ISO_DATE: 2024-06-01
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
 /** An absent value and an empty string are the same thing here: the field was not filled in. */

@@ -231,6 +231,85 @@ Responses return `trips` with each trip's `pax` grid and `pax_total`, plus `rout
 trip's route and date, the total across every trip, and the seats that total currently holds — so a
 single-departure client can ignore trips entirely.
 
+#### Pickup and overnight fields
+
+Each trip may also carry these fields. All are optional; `null` or `""` means not set. Responses
+leave out any field that isn't set, except `ovn_leg`, which is always present.
+
+| Field (alias) | Meaning |
+|---|---|
+| `zone` | Transfer zone code, e.g. `PK`, or `NoTransfer` for a self-arrival. Free text. |
+| `pickup_time` (`pickupTime`) | Hotel pickup time, `HH:MM`, 24-hour, local time. |
+| `ovn` | Marks an **overnight outbound** trip: `return` (we bring them back on `ovn_return_date`) or `self` (they make their own way back). |
+| `ovn_return_date` (`ovnReturnDate`) | The day they come back, `YYYY-MM-DD`. Required when `ovn` is `return`, refused otherwise, and must be after the trip's own date. |
+| `ovn_leg` (`ovnLeg`) | `true` on the **return leg**: the trip that brings them back. It holds seats on that day like any seat trip. |
+| `ovn_of` (`ovnOf`) | On a return leg: the **index in this `trips` list** of its outbound trip. |
+
+These rules match the legacy booking screen. A return leg must:
+- have `ovn_of` pointing at a *different* trip in the list whose `ovn` is `return`
+- be on that trip's route, dated its `ovn_return_date`
+- be a seat trip, not a charter
+- carry no `ovn` of its own
+
+`ovn_of` is refused on any trip that is not a leg. Every violation is a `400` naming the trip.
+
+`ovn_of` is an index on the way in and on the way out. The link is stored against the outbound
+trip's id, so reordering the list keeps it pointing at the right trip. The response gives the
+outbound's *current* index.
+
+```jsonc
+{ "trips": [
+  { "routeId": "r-1", "date": "2030-01-02", "pax": { "ad": 2 }, "zone": "PK", "pickupTime": "08:30",
+    "ovn": "return", "ovnReturnDate": "2030-01-04" },
+  { "routeId": "r-1", "date": "2030-01-04", "pax": { "ad": 2 }, "zone": "PK", "ovnLeg": true, "ovnOf": 0 }
+] }
+```
+
+These rules are checked when a request sends `trips`, and when a single-departure move
+(`reschedule`, or `PATCH` with `route_id`/`service_date`) would put an overnight trip on or after
+its return date. An edit that leaves the trips alone is not re-checked. That way a booking imported
+before these rules existed can still have its header edited.
+
+#### Trip ids
+
+Every trip in a response has an **`id`** that stays the same for as long as the trip exists.
+Day-of-operations data (van, pickup, check-in) is attached to that id, so it must survive edits.
+
+On `PATCH` with `trips`, each trip you send is matched to a stored trip like this:
+
+1. **With an `id`:** it is that stored trip, updated in place, even if its route, date or pax
+   change. Sending an `id` with a new date is how you *move* a trip.
+2. **Without an `id`:** it is the stored trip on the **same route and date**, if one exists and no
+   other trip in the request claimed it by `id`. So a client that never sends ids still keeps them,
+   as long as it doesn't move trips.
+3. **Otherwise** it is a new trip with a fresh id.
+
+A stored trip that nothing matched is removed, along with anything attached to it.
+
+**Moving a trip clears its day-of-operations data.** When a kept trip's route or date changes, its
+van group, allocations and trip operations are deleted, because they were arranged for the old
+departure. The trip keeps its id. Without an `id`, a trip on a new day is a new trip, so the old
+trip's data goes when that trip is removed. Both paths end the same way.
+
+- An `id` that is not one of this booking's trips, or the same `id` twice, is a `400`, and nothing
+  changes. `POST` takes no trip ids, because a new booking has no trips yet.
+- An `id` that is not one of this booking's trips, or the same `id` twice, is a `400`, and nothing
+  changes. `POST` takes no trip ids, because a new booking has no trips yet.
+- Edits that don't send `trips` keep every trip's id: header or `passengers` changes, `PATCH` with
+  `route_id`/`service_date`/`pax`, `reschedule` and `partial-cancel`.
+- `seq` is the trip's position in the list, and changes when you reorder. Don't use it as an id.
+- Treat ids as opaque strings. New ones look like `trip_<uuid>`, older ones differ.
+
+```jsonc
+// Stored: [A (trip_a), B (trip_b)]. Remove A, keep B, add a new day:
+{ "trips": [
+  { "id": "trip_b", "routeId": "r-1", "date": "2030-01-03", "pax": { "ad": 2 } },
+  { "routeId": "r-1", "date": "2030-01-04", "pax": { "ad": 2 } }
+] }
+// → B keeps trip_b (now seq 0), the new trip gets a new id, trip_a is removed.
+// Leaving out "id": "trip_b" gives the same result, because B's route and date are unchanged.
+```
+
 #### Status, and which statuses hold seats
 
 `status` is one of `draft`, `quote`, `pending`, `pending_approval`, `pending_foc`, `confirmed`,
@@ -264,11 +343,12 @@ Two consequences worth knowing:
   are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
   below. An optional `passengers` array is stored as columns too — see
   [Passengers](#passengers). **The itinerary is weighed as a whole**: if any day is short of seats
-  the booking is refused entirely and no day is left holding part of it. Two trips on the same
-  departure are counted together. A trip must name a route in the catalogue (`GET /v1/routes`); an
+  the booking is refused entirely and no day is left holding part of it. A booking has **at most one
+  trip per route per day** (`400` otherwise); send one trip with the combined pax. A trip must name a route in the catalogue (`GET /v1/routes`); an
   unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
   behind it.
-- `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright, or `route_id`,
+- `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright (echo each kept trip's
+  `id`, see [Trip ids](#trip-ids)), or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
   something actually moves, and days being vacated are released in the same transaction. Any
   [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:
