@@ -5,6 +5,10 @@
 Build the backend that becomes the system of record for boat operations: deployments, seat
 inventory, bookings, seat locks, and the route/boat catalogue with its operating calendar.
 
+The end state is that the legacy monolith's `server.js` can be switched off: every piece of data it
+stores has a home here, behind a domain endpoint rather than its whole-state sync.
+`todo/legacy-replacement.md` is the target endpoint list, what exists, and what is still undecided.
+
 **This project is the API. It is not a frontend project.**
 
 Frontends consume this API; they are not developed here. When a frontend needs something, the
