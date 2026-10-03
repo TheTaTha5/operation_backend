@@ -400,12 +400,27 @@ Two consequences worth knowing:
   Bookings tab wants. A cursor carries on in the direction it was issued in, so send the same
   `order` with it. Imported bookings were created at legacy's `bookedAt`, so creation order is
   booking-date order.
+
+  Three more filters, all combinable with the above:
+  - `status=pending_approval` — any of a comma-separated list (`status=cancelled,cancelled_weather`),
+    or the key repeated. An unknown status is a `400`, not an empty list.
+  - `voucher_ref=` — the whole voucher reference, ignoring case and surrounding spaces. This is the
+    duplicate-voucher check.
+  - `q=` — a case-insensitive substring of the booking id, `voucher_ref` or `lead_pax`. `%` and `_`
+    are ordinary characters, not wildcards.
+
+  Every page carries `total`: how many bookings the filters match, ignoring `cursor` and `limit`, so
+  it is the same on every page. A badge count is `?status=pending_approval&limit=1`, read `total`.
+
+  ```json
+  { "bookings": [ … ], "next_cursor": "…", "total": 7 }
+  ```
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
   are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
   below. An optional `passengers` array is stored as columns too — see
-  [Passengers](#passengers). **The itinerary is weighed as a whole**: if any day is short of seats
+  [Passengers](#passengers) — and so is an optional `addOns` array, see [Add-ons](#add-ons). **The itinerary is weighed as a whole**: if any day is short of seats
   the booking is refused entirely and no day is left holding part of it. A booking has **at most one
   trip per route per day** (`400` otherwise); send one trip with the combined pax. A trip must name a route in the catalogue (`GET /v1/routes`); an
   unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
@@ -416,8 +431,9 @@ Two consequences worth knowing:
   something actually moves, and days being vacated are released in the same transaction. Any
   [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:
   a field you do not mention keeps the value it had. Sending `passengers` **replaces the whole
-  list**, the same way `trips` replaces the itinerary — see [Passengers](#passengers). An amendment
-  refused for capacity changes nothing, header and passengers included.
+  list**, the same way `trips` replaces the itinerary — see [Passengers](#passengers). `addOns`
+  works the same way — see [Add-ons](#add-ons). An amendment refused for capacity changes nothing,
+  header, passengers and add-ons included.
 - `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all seats.
 - `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`). Requires a
   single departure whose passengers are untiered: on a booking split across categories a bare number
@@ -500,6 +516,60 @@ array position and is not something you send.
 Unlike the header, **`passengers` does not merge on `PATCH`** — sending it replaces the whole list,
 the same way `trips` replaces the itinerary. Omitting it on an amendment leaves the existing list
 untouched. There is no way to add or edit one passenger without resending the full list.
+
+#### Add-ons
+
+Longtail join/charter, private transfers and B2C extras. Send them on `POST /v1/bookings` or
+`PATCH /v1/bookings/{id}` as `addOns` (the frontend's spelling) or `add_ons`; every booking response
+— `GET /v1/bookings`, `GET /v1/bookings/{id}`, and the response to each write — carries `add_ons`,
+ordered, `[]` when there are none.
+
+```json
+POST /v1/bookings
+{
+  "route_id": "r10", "service_date": "2030-01-04", "pax": 4,
+  "addOns": [
+    { "type": "longtail-join", "label": "Longtail Join (2A + 0C)", "amount": 800, "qty": 1, "note": "", "jAd": 2, "jChd": 0 },
+    { "type": "transfer-r10-PK-van", "amount": 1200 }
+  ]
+}
+```
+
+```json
+"add_ons": [
+  { "seq": 0, "type": "longtail-join", "label": "Longtail Join (2A + 0C)", "amount": 800, "qty": 1, "join_adults": 2, "join_children": 0 },
+  { "seq": 1, "type": "transfer-r10-PK-van", "amount": 1200 }
+]
+```
+
+| Field | In | Out | Meaning |
+| --- | --- | --- | --- |
+| `type` | required string | `type` | The code operations matches on (`longtail-join`, `longtail-charter`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). Any string: there is no catalogue to check it against. |
+| `label` | optional string | `label` | What the line was called when sold. Stored as sent, never recomputed. |
+| `amount` | optional number ≥ 0 | `amount` | The **line total** (unit price × qty), not a unit price. A number, never a string. Not guaranteed to add up to `price_addon`, which stays the booking's charged add-on total. |
+| `qty` | optional integer ≥ 1 | `qty` | Boats, vehicles or people, depending on `type`. |
+| `note` | optional string | `note` | |
+| `jAd` / `join_adults` | optional integer ≥ 0 | `join_adults` | Longtail join only: adults actually taking the longtail. |
+| `jChd` / `join_children` | optional integer ≥ 0 | `join_children` | Same, for children. |
+
+**Nothing is filled in.** A field you do not send is absent from the response, not `null`, and is
+never defaulted: a missing `qty` is not 1, and a missing join count is not 0. For a longtail join
+that difference matters — absent means nobody narrowed it down and every passenger is counted,
+while `0` means none of them go. Blank `label`/`note` strings are stored as absent. `seq` is assigned
+by array position and is not something you send.
+
+Like `passengers`, **add-ons do not merge on `PATCH`**:
+
+| You send | What happens |
+| --- | --- |
+| no `addOns` / `add_ons` key | the stored list is kept |
+| `"addOns": [ … ]` | the whole list is replaced |
+| `"addOns": []` or `null` | the list is cleared |
+
+Validation errors are `400` and name the key you used and the position, for example
+`addOns[2].amount must be a number`, `addOns[1].type is required`, `addOns[0].amount must not be
+negative`, `addOns[0].qty must be a positive integer`, `addOns[0].jAd must be a non-negative
+integer`. A refused request writes nothing.
 
 ### Agent seat locks
 

@@ -4,6 +4,7 @@ import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
+import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type SalesPerson, type StoredActivity, type StoredAgent,
@@ -66,6 +67,8 @@ export type BookingInput = {
   header?: BookingHeader;
   /** The passenger list, already parsed by `parseBookingPassengers()`. Defaults to none. */
   passengers?: BookingPassengerInput[];
+  /** The add-on list, already parsed by `parseBookingAddOns()`. Defaults to none. */
+  add_ons?: BookingAddOnInput[];
   /**
    * Original booking payload retained for operations, reconciliation, and audit import.
    *
@@ -88,6 +91,7 @@ export type Booking = BookingHeader & {
   rate_type_ref?: string;
   booking_data?: Record<string, unknown>;
   passengers: BookingPassenger[];
+  add_ons: BookingAddOn[];
   trips: BookingTrip[];
   /**
    * The first trip's route and date, the total pax across every trip, and the seats that total is
@@ -111,6 +115,8 @@ export type BookingChanges = {
   header?: BookingHeaderPatch;
   /** Present replaces the whole list outright, the same way `trips` does. Absent leaves it alone. */
   passengers?: BookingPassengerInput[];
+  /** Same rule as `passengers`: present replaces outright, `[]` clears, absent leaves it alone. */
+  add_ons?: BookingAddOnInput[];
 };
 
 export type SeatLock = {
@@ -144,9 +150,16 @@ export type BookingListQuery = {
   cursor?: string;
   /** By `created_at`, then id. `desc` is newest first, which an agent's recent bookings want. Defaults to `asc`. */
   order?: 'asc' | 'desc';
+  /** Any of these statuses. Absent means every status. */
+  statuses?: BookingStatus[];
+  /** Already lower-cased: a substring of the id, `voucher_ref` or `lead_pax`, compared lower-cased. */
+  q?: string;
+  /** Already lower-cased: the whole `voucher_ref`, compared lower-cased. */
+  voucherRef?: string;
 };
 
-export type BookingPage = { bookings: Booking[]; next_cursor?: string };
+/** `total` counts every booking the filters match, regardless of `cursor` and `limit`. */
+export type BookingPage = { bookings: Booking[]; next_cursor?: string; total: number };
 
 /** One route on one date, as the availability range returns it. */
 export type RouteDay = DayState & { route_id: string; service_date: string };
@@ -415,8 +428,8 @@ export class OperationsStore {
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, passengers, ...rest } = input;
-    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []) };
+    const { trips, header, passengers, add_ons, ...rest } = input;
+    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []) };
     this.bookings.set(id, booking);
     return this.view(booking);
   }
@@ -427,17 +440,20 @@ export class OperationsStore {
     const direction = query.order === 'desc' ? -1 : 1;
     const compare = (a: { created_at: string; id: string }, b: { created_at: string; id: string }): number =>
       direction * (a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
-    const matches = [...this.bookings.values()]
+    const lower = (value: unknown): string => (typeof value === 'string' ? value : '').toLowerCase();
+    const filtered = [...this.bookings.values()]
       .filter((b) => !query.agentId || b.agent_id === query.agentId)
+      .filter((b) => !query.statuses || query.statuses.includes(b.status))
+      .filter((b) => query.voucherRef === undefined || lower(b.voucher_ref) === query.voucherRef)
+      .filter((b) => query.q === undefined || [b.id, b.voucher_ref, b.lead_pax].some((field) => lower(field).includes(query.q!)))
       .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
         && (!query.serviceDate || t.service_date === query.serviceDate)
         && (!query.from || t.service_date >= query.from)
-        && (!query.to || t.service_date <= query.to)))
-      .sort(compare)
-      .filter((b) => !cursor || compare(b, cursor) > 0);
+        && (!query.to || t.service_date <= query.to)));
+    const matches = filtered.sort(compare).filter((b) => !cursor || compare(b, cursor) > 0);
     const page = matches.slice(0, query.limit);
     const hasMore = matches.length > query.limit;
-    return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}) };
+    return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}), total: filtered.length };
   }
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 
@@ -454,6 +470,7 @@ export class OperationsStore {
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
     if (changes.passengers) booking.passengers = withSeq(changes.passengers);
+    if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     booking.updated_at = this.now();
     return this.view(booking);
   }

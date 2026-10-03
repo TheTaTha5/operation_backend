@@ -8,6 +8,7 @@ import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
+import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -115,6 +116,16 @@ function tripsInput(input: Record<string, unknown>): BookingTripInput[] {
   }, 0)];
 }
 
+/**
+ * The add-on list under the frontend's `addOns` or the snake_case `add_ons`. On an amendment,
+ * absent leaves the stored list alone and `null` is read as `[]` — cleared, not ignored.
+ */
+const addOnsOf = (input: Record<string, unknown>): unknown => {
+  const value = input.addOns !== undefined ? input.addOns : input.add_ons;
+  return value === null ? [] : value;
+};
+const addOnsLabel = (input: Record<string, unknown>): string => (input.addOns !== undefined ? 'addOns' : 'add_ons');
+
 function bookingInput(body: unknown): BookingInput {
   const input = record(body);
   const trips = tripsInput(input);
@@ -130,6 +141,7 @@ function bookingInput(body: unknown): BookingInput {
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
     header: bookingHeader(input),
     passengers: parseBookingPassengers(input.passengers),
+    add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)),
     // booking_data: input,
   };
 }
@@ -154,7 +166,22 @@ function bookingListQuery(query: Record<string, unknown>): BookingListQuery {
   if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) badRequest('limit must be an integer between 1 and 100');
   const cursor = optionalString(query.cursor);
   const order = query.order === undefined ? undefined : query.order === 'asc' || query.order === 'desc' ? query.order : badRequest('order must be asc or desc');
-  return { routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor, ...(order ? { order } : {}) };
+  const statuses = bookingStatusList(query.status);
+  // Lower-cased here, once, so the two stores compare the same text the same way.
+  const q = optionalString(typeof query.q === 'string' ? query.q.trim() : undefined)?.toLowerCase();
+  const voucherRef = optionalString(typeof query.voucher_ref === 'string' ? query.voucher_ref.trim() : undefined)?.toLowerCase();
+  return {
+    routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor,
+    ...(order ? { order } : {}), ...(statuses ? { statuses } : {}), ...(q === undefined ? {} : { q }), ...(voucherRef === undefined ? {} : { voucherRef }),
+  };
+}
+
+/** `?status=a,b`, or the key repeated. Each value must be a known status, so a typo is a 400 rather than an empty list. */
+function bookingStatusList(value: unknown): BookingStatus[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = (Array.isArray(value) ? value : [value]).flatMap((part) => String(part).split(',')).map((part) => part.trim()).filter((part) => part.length > 0);
+  if (parts.length === 0) return undefined;
+  return [...new Set(parts.map((part) => bookingStatus(part)!))];
 }
 
 /** `?active=` on the agent list: active agents by default, `false` for inactive ones, `all` for both. */
@@ -171,6 +198,7 @@ function bookingChanges(body: unknown): BookingChanges {
     ...(status === undefined ? {} : { status }),
     ...(Object.keys(header).length === 0 ? {} : { header }),
     ...(input.passengers === undefined ? {} : { passengers: parseBookingPassengers(input.passengers) }),
+    ...(addOnsOf(input) === undefined ? {} : { add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
