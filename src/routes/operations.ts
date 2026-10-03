@@ -154,7 +154,22 @@ function bookingListQuery(query: Record<string, unknown>): BookingListQuery {
   if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > 100) badRequest('limit must be an integer between 1 and 100');
   const cursor = optionalString(query.cursor);
   const order = query.order === undefined ? undefined : query.order === 'asc' || query.order === 'desc' ? query.order : badRequest('order must be asc or desc');
-  return { routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor, ...(order ? { order } : {}) };
+  const statuses = bookingStatusList(query.status);
+  // Lower-cased here, once, so the two stores compare the same text the same way.
+  const q = optionalString(typeof query.q === 'string' ? query.q.trim() : undefined)?.toLowerCase();
+  const voucherRef = optionalString(typeof query.voucher_ref === 'string' ? query.voucher_ref.trim() : undefined)?.toLowerCase();
+  return {
+    routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor,
+    ...(order ? { order } : {}), ...(statuses ? { statuses } : {}), ...(q === undefined ? {} : { q }), ...(voucherRef === undefined ? {} : { voucherRef }),
+  };
+}
+
+/** `?status=a,b`, or the key repeated. Each value must be a known status, so a typo is a 400 rather than an empty list. */
+function bookingStatusList(value: unknown): BookingStatus[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = (Array.isArray(value) ? value : [value]).flatMap((part) => String(part).split(',')).map((part) => part.trim()).filter((part) => part.length > 0);
+  if (parts.length === 0) return undefined;
+  return [...new Set(parts.map((part) => bookingStatus(part)!))];
 }
 
 /** `?active=` on the agent list: active agents by default, `false` for inactive ones, `all` for both. */

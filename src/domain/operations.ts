@@ -144,9 +144,16 @@ export type BookingListQuery = {
   cursor?: string;
   /** By `created_at`, then id. `desc` is newest first, which an agent's recent bookings want. Defaults to `asc`. */
   order?: 'asc' | 'desc';
+  /** Any of these statuses. Absent means every status. */
+  statuses?: BookingStatus[];
+  /** Already lower-cased: a substring of the id, `voucher_ref` or `lead_pax`, compared lower-cased. */
+  q?: string;
+  /** Already lower-cased: the whole `voucher_ref`, compared lower-cased. */
+  voucherRef?: string;
 };
 
-export type BookingPage = { bookings: Booking[]; next_cursor?: string };
+/** `total` counts every booking the filters match, regardless of `cursor` and `limit`. */
+export type BookingPage = { bookings: Booking[]; next_cursor?: string; total: number };
 
 /** One route on one date, as the availability range returns it. */
 export type RouteDay = DayState & { route_id: string; service_date: string };
@@ -427,17 +434,20 @@ export class OperationsStore {
     const direction = query.order === 'desc' ? -1 : 1;
     const compare = (a: { created_at: string; id: string }, b: { created_at: string; id: string }): number =>
       direction * (a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
-    const matches = [...this.bookings.values()]
+    const lower = (value: unknown): string => (typeof value === 'string' ? value : '').toLowerCase();
+    const filtered = [...this.bookings.values()]
       .filter((b) => !query.agentId || b.agent_id === query.agentId)
+      .filter((b) => !query.statuses || query.statuses.includes(b.status))
+      .filter((b) => query.voucherRef === undefined || lower(b.voucher_ref) === query.voucherRef)
+      .filter((b) => query.q === undefined || [b.id, b.voucher_ref, b.lead_pax].some((field) => lower(field).includes(query.q!)))
       .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
         && (!query.serviceDate || t.service_date === query.serviceDate)
         && (!query.from || t.service_date >= query.from)
-        && (!query.to || t.service_date <= query.to)))
-      .sort(compare)
-      .filter((b) => !cursor || compare(b, cursor) > 0);
+        && (!query.to || t.service_date <= query.to)));
+    const matches = filtered.sort(compare).filter((b) => !cursor || compare(b, cursor) > 0);
     const page = matches.slice(0, query.limit);
     const hasMore = matches.length > query.limit;
-    return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}) };
+    return { bookings: page.map((booking) => this.view(booking)), ...(hasMore ? { next_cursor: encodeBookingCursor(page[page.length - 1]) } : {}), total: filtered.length };
   }
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 

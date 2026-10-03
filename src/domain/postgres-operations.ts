@@ -375,19 +375,30 @@ export class PostgresOperationsStore {
     const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
     // The direction is one of two fixed strings, never caller text, so it is safe to splice in.
     const [after, order] = query.order === 'desc' ? ['<', 'DESC'] : ['>', 'ASC'];
-    const { rows } = await this.client().query(`${BOOKING_SELECT}
-      WHERE EXISTS (SELECT 1 FROM booking_trips t
+    // One WHERE for the page and the count, so `total` counts exactly what paging walks through.
+    // `q` and `voucherRef` arrive lower-cased; `position` is a plain substring test, so a `%` or `_`
+    // in the search text means itself, as it does to the in-process store's `includes`.
+    const filters = `EXISTS (SELECT 1 FROM booking_trips t
         WHERE t.booking_id = b.id
           AND ($1::text IS NULL OR t.route_id = $1)
           AND ($2::date IS NULL OR t.service_date = $2)
           AND ($3::date IS NULL OR t.service_date >= $3)
           AND ($4::date IS NULL OR t.service_date <= $4))
-        AND ($8::text IS NULL OR b.agent_id = $8)
-        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($5::timestamptz, $6::text))
+        AND ($5::text IS NULL OR b.agent_id = $5)
+        AND ($6::text[] IS NULL OR b.status = ANY($6))
+        AND ($7::text IS NULL OR lower(b.voucher_ref) = $7)
+        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)`;
+    const params = [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, query.agentId ?? null, query.statuses ?? null, query.voucherRef ?? null, query.q ?? null];
+    const [{ rows }, { rows: [{ total }] }] = await Promise.all([
+      this.client().query(`${BOOKING_SELECT}
+      WHERE ${filters}
+        AND ($9::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($9::timestamptz, $10::text))
       ORDER BY b.created_at ${order}, b.id ${order}
-      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1, query.agentId ?? null]);
+      LIMIT $11`, [...params, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]),
+      this.client().query(`SELECT count(*)::int AS total FROM bookings b WHERE ${filters}`, params),
+    ]);
     const page = rows.slice(0, query.limit);
-    return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}) };
+    return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}), total: Number(total) };
   }
   async booking(id: string): Promise<Booking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && booking(row); }
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }

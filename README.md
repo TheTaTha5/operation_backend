@@ -400,6 +400,21 @@ Two consequences worth knowing:
   Bookings tab wants. A cursor carries on in the direction it was issued in, so send the same
   `order` with it. Imported bookings were created at legacy's `bookedAt`, so creation order is
   booking-date order.
+
+  Three more filters, all combinable with the above:
+  - `status=pending_approval` — any of a comma-separated list (`status=cancelled,cancelled_weather`),
+    or the key repeated. An unknown status is a `400`, not an empty list.
+  - `voucher_ref=` — the whole voucher reference, ignoring case and surrounding spaces. This is the
+    duplicate-voucher check.
+  - `q=` — a case-insensitive substring of the booking id, `voucher_ref` or `lead_pax`. `%` and `_`
+    are ordinary characters, not wildcards.
+
+  Every page carries `total`: how many bookings the filters match, ignoring `cursor` and `limit`, so
+  it is the same on every page. A badge count is `?status=pending_approval&limit=1`, read `total`.
+
+  ```json
+  { "bookings": [ … ], "next_cursor": "…", "total": 7 }
+  ```
 - `GET /v1/bookings/{id}`
 - `POST /v1/bookings` — `{ trips: [...] }`, or the flat `{ route_id, service_date, pax }` for a
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
