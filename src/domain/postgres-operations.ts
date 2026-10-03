@@ -15,6 +15,7 @@ import {
   type BookingHeader,
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
+import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -54,7 +55,11 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
-    FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers
+    FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('seq', a.seq, 'type', a.type, 'label', a.label, 'amount', a.amount, 'qty', a.qty, 'note', a.note,
+      'join_adults', a.join_adults, 'join_children', a.join_children) ORDER BY a.seq)
+    FROM booking_addons a WHERE a.booking_id = b.id), '[]'::jsonb) AS add_ons
   FROM bookings b`;
 
 const NUMERIC_HEADER = new Set<string>(BOOKING_HEADER_NUMERIC_COLUMNS);
@@ -96,6 +101,17 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     nationality: passenger.nationality ?? undefined, type: passenger.type ?? undefined,
     foc: passenger.foc ?? undefined,
   })) as BookingPassenger[],
+  // A NULL column is left off rather than sent as null, matching the in-process store, which never
+  // set it. `amount` is NUMERIC; Number() keeps it a JSON number whichever way `pg` hands it over.
+  add_ons: (row.add_ons as Record<string, unknown>[]).map((addOn): BookingAddOn => ({
+    seq: Number(addOn.seq), type: String(addOn.type),
+    ...(addOn.label == null ? {} : { label: String(addOn.label) }),
+    ...(addOn.amount == null ? {} : { amount: Number(addOn.amount) }),
+    ...(addOn.qty == null ? {} : { qty: Number(addOn.qty) }),
+    ...(addOn.note == null ? {} : { note: String(addOn.note) }),
+    ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
+    ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
+  })),
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
@@ -332,6 +348,16 @@ export class PostgresOperationsStore {
     }
   }
 
+  /** Replaces the whole list, the same delete-and-insert `writePassengers` does. */
+  private async writeAddOns(bookingId: string, addOns: readonly BookingAddOnInput[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_addons WHERE booking_id = $1', [bookingId]);
+    for (const [seq, addOn] of addOns.entries()) {
+      await this.client().query(
+        'INSERT INTO booking_addons (booking_id, seq, type, label, amount, qty, note, join_adults, join_children) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [bookingId, seq, addOn.type, addOn.label ?? null, addOn.amount ?? null, addOn.qty ?? null, addOn.note ?? null, addOn.join_adults ?? null, addOn.join_children ?? null]);
+    }
+  }
+
   /** Answers 400 before `booking_trips_route_fk` or the lock draw's foreign key can answer 500. */
   private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
     const ids = [...new Set(trips.map((trip) => trip.route_id))];
@@ -368,6 +394,7 @@ export class PostgresOperationsStore {
     await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
     await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
+    await this.writeAddOns(id, input.add_ons ?? []);
     return (await this.booking(id))!;
   }
 
@@ -426,6 +453,7 @@ export class PostgresOperationsStore {
     // `booking_data` is deliberately left as it was written at create time. The blob is on its way
     // out, and re-serialising an amendment into it would grow the thing being deleted.
     if (changes.passengers) await this.writePassengers(id, changes.passengers);
+    if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     return this.booking(id);
   }
 

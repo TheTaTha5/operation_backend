@@ -34,5 +34,5 @@ export function parseBookingPassengers(input: unknown, label = 'passengers'): Bo
   });
 }
 
-/** Assigns each passenger its position, the way `booking_trips.seq` orders trips. */
-export const withSeq = (rows: readonly BookingPassengerInput[]): BookingPassenger[] => rows.map((row, seq) => ({ ...row, seq }));
+/** Assigns each row its position, the way `booking_trips.seq` orders trips. Passengers and add-ons both use it. */
+export const withSeq = <T extends object>(rows: readonly T[]): (T & { seq: number })[] => rows.map((row, seq) => ({ ...row, seq }));

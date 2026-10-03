@@ -8,6 +8,7 @@ import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
+import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -115,6 +116,16 @@ function tripsInput(input: Record<string, unknown>): BookingTripInput[] {
   }, 0)];
 }
 
+/**
+ * The add-on list under the frontend's `addOns` or the snake_case `add_ons`. On an amendment,
+ * absent leaves the stored list alone and `null` is read as `[]` — cleared, not ignored.
+ */
+const addOnsOf = (input: Record<string, unknown>): unknown => {
+  const value = input.addOns !== undefined ? input.addOns : input.add_ons;
+  return value === null ? [] : value;
+};
+const addOnsLabel = (input: Record<string, unknown>): string => (input.addOns !== undefined ? 'addOns' : 'add_ons');
+
 function bookingInput(body: unknown): BookingInput {
   const input = record(body);
   const trips = tripsInput(input);
@@ -130,6 +141,7 @@ function bookingInput(body: unknown): BookingInput {
     rate_type_ref: optionalString(input.rate_type_ref ?? input.rateTypeRef),
     header: bookingHeader(input),
     passengers: parseBookingPassengers(input.passengers),
+    add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)),
     // booking_data: input,
   };
 }
@@ -186,6 +198,7 @@ function bookingChanges(body: unknown): BookingChanges {
     ...(status === undefined ? {} : { status }),
     ...(Object.keys(header).length === 0 ? {} : { header }),
     ...(input.passengers === undefined ? {} : { passengers: parseBookingPassengers(input.passengers) }),
+    ...(addOnsOf(input) === undefined ? {} : { add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
