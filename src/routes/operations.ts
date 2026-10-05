@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { assertItinerary, OperationsStore, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
+import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
 import { eachDate, isIsoDate, isIsoTime, routeCalendar } from '../domain/calendar.js';
@@ -219,6 +220,14 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   const store = process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
   const authenticator = new OidcAuthenticator();
   if (store instanceof PostgresOperationsStore) app.addHook('onClose', async () => store.close());
+  // Route schemas in this plugin are documentation only (see `openapi.ts`): the hand-written parsers
+  // validate, and responses are sent exactly as the store returns them. An error reaches the
+  // serializer with non-enumerable fields, which `JSON.stringify` would drop, so it gets the same four
+  // fields Fastify's own error path writes.
+  app.setValidatorCompiler(() => () => true);
+  app.setSerializerCompiler(({ httpStatus }) => String(httpStatus).startsWith('2')
+    ? (data) => JSON.stringify(data)
+    : (data) => { const e = data as { statusCode?: number; code?: string; error?: string; message?: string }; return JSON.stringify({ statusCode: e.statusCode, code: e.code, error: e.error, message: e.message }); });
   app.addHook('preHandler', async (request) => {
     const path = request.url.split('?')[0];
     if (path === '/v1/login') return;
@@ -246,7 +255,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
    * booking row. With them, every date carries the open/closed decision and the rule that made it,
    * so a closed day can explain itself rather than just refusing.
    */
-  app.get('/v1/routes', async (request) => {
+  app.get('/v1/routes', { schema: docs.routes }, async (request) => {
     const query = request.query as Record<string, unknown>;
     const from = optionalString(query.from), to = optionalString(query.to);
     if ((from === undefined) !== (to === undefined)) badRequest('from and to must be supplied together');
@@ -288,7 +297,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
    * apart. `deployments[].capacity` is the boat's sellable seats that day, after any override and
    * the licence clamp, so the entries sum to `deployed_capacity`.
    */
-  app.get('/v1/availability', async (request) => {
+  app.get('/v1/availability', { schema: docs.availability }, async (request) => {
     const query = request.query as Record<string, unknown>;
     const from = optionalString(query.from); const to = optionalString(query.to);
     const date = optionalString(query.service_date ?? query.date);
@@ -319,29 +328,29 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     };
   });
 
-  app.get('/v1/bookings', async (request) => {
+  app.get('/v1/bookings', { schema: docs.listBookings }, async (request) => {
     const query = request.query as Record<string, unknown>;
     return await store.listBookings(bookingListQuery(query));
   });
-  app.get('/v1/bookings/:id', async (request) => (await store.booking((request.params as { id: string }).id)) ?? notFound('Booking not found'));
+  app.get('/v1/bookings/:id', { schema: docs.getBooking }, async (request) => (await store.booking((request.params as { id: string }).id)) ?? notFound('Booking not found'));
   /**
    * Every write is signed by the token's user (`actorOf`): `updated_by` comes from the token and a
    * body's `updated_by` is ignored, and each write appends one line to the booking's history in the
    * same transaction. See `booking-actions.ts`.
    */
-  app.post('/v1/bookings', async (request, reply) => {
+  app.post('/v1/bookings', { schema: docs.createBooking }, async (request, reply) => {
     const actor = actorOf(request.user);
     const input = bookingInput(request.body);
     const result = await store.transaction(() => store.createBooking({ ...input, header: stampActor(input.header, actor, true) }, actor));
     return reply.code(201).send(result);
   });
-  app.patch('/v1/bookings/:id', async (request) => {
+  app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
     const actor = actorOf(request.user);
     const changes = bookingChanges(request.body);
     const signed = { ...changes, header: stampActor(changes.header, actor, false) };
     return store.transaction(async () => (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found'));
   });
-  app.post('/v1/bookings/:id/cancel', async (request) => {
+  app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request) => {
     const cancel = parseCancelRequest(record(request.body ?? {}));
     return store.transaction(async () => (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found'));
   });
@@ -397,17 +406,17 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     return { activity: (await store.agentActivity((request.params as { id: string }).id, limit)) ?? notFound('Agent not found') };
   });
 
-  app.get('/v1/seat-locks', async (request) => {
+  app.get('/v1/seat-locks', { schema: docs.listLocks }, async (request) => {
     const query = request.query as Record<string, unknown>;
     return { seat_locks: await store.listLocks(optionalString(query.route_id), optionalString(query.service_date ?? query.date)) };
   });
-  app.post('/v1/seat-locks', async (request, reply) => reply.code(201).send(await store.transaction(() => store.createLock(lockInput(request.body)))));
+  app.post('/v1/seat-locks', { schema: docs.createLock }, async (request, reply) => reply.code(201).send(await store.transaction(() => store.createLock(lockInput(request.body)))));
   app.patch('/v1/seat-locks/:id', async (request) => {
     const body = record(request.body);
     if (body.pax !== undefined) pax(body.pax);
     if (body.agent_id !== undefined) string(body.agent_id, 'agent_id');
     return store.transaction(async () => (await store.amendLock((request.params as { id: string }).id, body as Partial<SeatLock>)) ?? notFound('Seat lock not found'));
   });
-  app.post('/v1/seat-locks/:id/release', async (request) => store.transaction(async () => (await store.releaseLock((request.params as { id: string }).id)) ?? notFound('Seat lock not found')));
+  app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => store.transaction(async () => (await store.releaseLock((request.params as { id: string }).id)) ?? notFound('Seat lock not found')));
   done();
 }

@@ -9,6 +9,12 @@ When the service is running, the interactive Swagger UI is available at `/docs` 
 integrators can view the current API and try requests without maintaining a separate OpenAPI file.
 The raw generated OpenAPI document is available at `/docs/json`.
 
+The routes an external sales channel needs (routes, availability, bookings, cancel, seat locks)
+carry request and response descriptions from `src/routes/openapi.ts`. Those schemas are
+**documentation only**: the route parsers validate, and responses are sent unfiltered. Keep them in
+step with this README by hand. For a sales channel's walkthrough, see
+`docs/love-kingdom-integration.md`.
+
 ## Requirements
 
 - Node.js 20 or newer

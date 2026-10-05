@@ -1,0 +1,172 @@
+# Love Kingdom → Operation Backend: booking integration
+
+For the Love Kingdom team (B2C website and CS sales back-office). This explains how to book boat
+seats directly into Operation Backend, the operations system of record, instead of the ops side
+importing `b2c_LOV-…` rows after the fact.
+
+- **Live contract:** `https://<operation-backend-host>/docs` (Swagger UI) and `/docs/json` (OpenAPI 3).
+  Generate a client from the JSON if you like.
+- **Full field reference:** this repo's `README.md`, section "API". Where this guide and the README
+  disagree, the README wins. Tell us when they disagree.
+
+## 1. What changes for you
+
+| Today | With this API |
+|---|---|
+| Availability is read from the ops DB view (`v_seat_availability`) | `GET /v1/availability`, which is the same answer ops sells against |
+| `assertSeatsAvailable` checks, then you insert. Two buyers at once can both pass, and the check fails open | `POST /v1/bookings` checks and takes the seats in one transaction. `201` means the seats are yours, and `409` means they were not, with nothing written |
+| The ops side drops `addonsSelected` on import | Add-ons are stored on the booking (`addOns`) |
+| No hold while a B2C customer pays | Seat locks: hold, pay, then book from the hold, or release it |
+
+Your own booking (customer, payments, hotels, third-party items, vouchers) **stays in Love Kingdom**.
+We hold only the boat part: who is on which departure, and the sale details operations needs on
+the day.
+
+## 2. Authentication
+
+Every call sends `Authorization: Bearer <token>`. Your server needs a token with **`booking:read`**
+and **`booking:write`**.
+
+- **Production:** a machine-to-machine client in our Authentik (OAuth2 *client credentials*). Your
+  Express server gets a token from Authentik and calls us server-to-server. *Not set up yet. Ask us
+  for a client id and secret.*
+- **Testing now:** `POST /v1/login` with a test username and password that we issue. It returns a
+  12-hour token. It is temporary and will be removed.
+
+Never call us from the browser or ship the credentials to the public `book/` page. Our server does
+not allow your browser origin (CORS), and a token in the page would let anyone book.
+
+## 3. The calls you need
+
+| Purpose | Call |
+|---|---|
+| Route ids (map your `programId` / `opsRouteId` to these) | `GET /v1/routes` |
+| Agent ids (map your channel → agent) | `GET /v1/agents` |
+| Seats left, one day | `GET /v1/availability?route_id=r10&date=2030-01-04` → sell against `available_seats` only |
+| Seats left, a month grid | `GET /v1/availability?from=2030-01-01&to=2030-01-31` (optionally `&route_id=`) |
+| Create | `POST /v1/bookings` → `201` |
+| Read | `GET /v1/bookings/{id}` and `GET /v1/bookings?agent_id=a_b2c&from=…&to=…` |
+| Amend | `PATCH /v1/bookings/{id}` |
+| Cancel | `POST /v1/bookings/{id}/cancel` (releases the seats) |
+| Hold, then release | `POST /v1/seat-locks`, `POST /v1/seat-locks/{id}/release` |
+
+**Keep the `id` we return.** It is the booking's id here. Store it on your booking, for example
+next to `opsAgentCode`, and use it for every later call.
+
+## 4. A booking, mapped from yours
+
+Send one booking per Love Kingdom booking that has boat items. Each `day_trip` / `private_own` /
+`private_partner` item becomes one entry in `trips`. Leave out `hotel`, `third_party` and
+`transfer` items, because they are not boat seats.
+
+```json
+POST /v1/bookings
+{
+  "external_id": "LOV-4190737",
+  "agent_id": "a_b2c",
+  "status": "confirmed",
+  "leadPax": "Jane Doe",
+  "leadPhone": "+66 81 234 5678",
+  "leadEmail": "jane@example.com",
+  "leadNationality": "GB",
+  "pickupZone": "PK",
+  "hotelName": "Blu Monkey Hub Hotel Phuket",
+  "total": 4198,
+  "trips": [
+    { "routeId": "r10", "date": "2030-01-04", "pax": { "ad_fr": 2, "chd_fr": 1 }, "zone": "PK" }
+  ],
+  "passengers": [
+    { "name": "Jane Doe", "nationality": "GB" },
+    { "name": "John Doe", "nationality": "GB" },
+    { "name": "Amy Doe", "nationality": "GB" }
+  ],
+  "addOns": [
+    { "type": "longtail-join", "label": "Longtail Join (2A + 0C)", "amount": 800, "qty": 1, "jAd": 2, "jChd": 0 }
+  ]
+}
+```
+
+| Love Kingdom | Send as | Notes |
+|---|---|---|
+| `id` (`LOV-…`) | `external_id` | Must be unique. See §7, "Retries". |
+| channel → `opsAgentCode` | `agent_id` | We key agents by **id** (`a_b2c`), not code, and agent codes are not unique. Map each channel to an agent id from `GET /v1/agents`. |
+| `customer.name/phone/email/nationality` | `leadPax`, `leadPhone`, `leadEmail`, `leadNationality` | |
+| item `programId` / `opsRouteId` | `trips[].routeId` | Must exist in `GET /v1/routes`, else `400 Unknown route`. |
+| item `travelDate` | `trips[].date` | `YYYY-MM-DD`. Send the string, never a JS `Date`. |
+| `paxAdult/Child/Infant/Foc` + `paxThai/paxForeign` | `trips[].pax` | Grid of `ad`/`chd`/`inf`/`foc` × `_fr` (foreign) / `_th` (Thai). Infants and FOC take seats. An unknown key is a `400`. See §6. |
+| `pickupZone`, `pickupHotel` | `trips[].zone`, `hotelName` (`pickupZone` on the header too) | |
+| `addonsSelected[{addonId,qty}]` | `addOns[{type,amount,qty}]` | `type` is the ops code (`longtail-join`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). `amount` is the **line total**, not a unit price. |
+| `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
+| `total` | `total` | THB, as a number. |
+| private charter item | `trips[].bookingMode: "charter"` + `charterBoatId` | The boat must be deployed that day. |
+
+Fields not in the README's "Booking header fields" table are **dropped, not stored**. If you need
+one kept, ask for it to be modelled.
+
+## 5. Flows
+
+### CS (staff booking for a customer)
+
+1. `GET /v1/availability` for the date. Show `available_seats`.
+2. Staff saves → `POST /v1/bookings`. On `201`, store our `id`. On `409`, show "sold out" and
+   nothing is written.
+3. An edit to date or pax → `PATCH /v1/bookings/{id}` with the full `trips`. It is capacity-checked
+   again, `409` if it no longer fits.
+4. A cancel in Love Kingdom → `POST /v1/bookings/{id}/cancel` with
+   `{ "category": "customer_cancel", "charge_type": "none" }`.
+
+### B2C website (customer pays online)
+
+The order is: hold the seats, take payment, then book from the hold.
+
+1. **Customer clicks "Pay"** → `POST /v1/seat-locks`
+   `{ "route_id": "r10", "service_date": "2030-01-04", "pax": 3, "agent_id": "a_b2c" }`.
+   - `201` gives a lock `id`. Keep it with the PayPal order.
+   - `409` means sold out. Don't send them to PayPal.
+2. **Payment captured** → `POST /v1/bookings`, with the trip drawing on the lock:
+   `"trips": [{ "routeId": "r10", "date": "2030-01-04", "pax": { "ad_fr": 2, "chd_fr": 1 }, "lockDraws": { "<lock id>": 3 } }]`.
+   Then `POST /v1/seat-locks/{lockId}/release` to free anything left over. That is a no-op when
+   every seat was drawn.
+3. **Payment failed, cancelled or abandoned** → `POST /v1/seat-locks/{lockId}/release`.
+
+**Locks do not expire.** A lock you never release holds its seats forever, and ops will see a
+sold-out day that isn't. You need a sweeper that releases locks whose payment never completed,
+for example after 30 minutes.
+
+## 6. Errors
+
+Every error is JSON: `{ "statusCode", "error", "message", "code"? }`. `message` names the field,
+for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a passenger category`.
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `400` | Bad input: missing field, unknown route or lock, bad pax key | Bug in the mapping. Log the `message`, and don't retry. |
+| `401` / `403` | No token, or a token without `booking:write` | Fetch a new token. Check the client's scopes. |
+| `404` | Booking or lock id not found | |
+| `409` | Over capacity, lock short, boat already chartered, already cancelled | Sold out, or the state changed. Show it to the user, and don't retry blindly. |
+| `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |
+
+## 7. Known gaps, read before going live
+
+- **Retrying a create is not safe yet.** If `POST /v1/bookings` times out and you resend the same
+  `external_id`, production answers `500`, not "already exists". There is no lookup by
+  `external_id` either. Until we fix it, after a timeout search
+  `GET /v1/bookings?agent_id=…&date=…` for your booking before you resend.
+- **Thai/foreign split.** You store `paxThai` / `paxForeign` as totals, while we need them per
+  category (`ad_th` vs `chd_th`). If you can't split them, send the untiered keys (`ad`, `chd`,
+  `inf`, `foc`) and agree the rule with ops.
+- **Add-on price and code.** `addonsSelected` carries your `addonId` and no price. You need to
+  send our `type` code and the line `amount`. Agree the code list with ops.
+- **CS agent.** Your channels (Facebook, Line, Walk-in, …) are contact channels, not agents. Decide
+  with sales which `agent_id` each one books under.
+- **No payments here.** Deposits, slips and refunds stay in Love Kingdom. Cancellation charges are
+  recorded on our side for ops only.
+
+## 8. Test checklist
+
+1. Get a test token: `POST /v1/login`.
+2. `GET /v1/routes` and `GET /v1/agents`, then build your two mapping tables.
+3. Create a booking and check `GET /v1/availability` dropped by its pax.
+4. Fill a day, create one more, and expect `409`.
+5. Lock → book with `lockDraws` → release, and check `locked_pax` returns to 0.
+6. Cancel, and check the seats come back.
