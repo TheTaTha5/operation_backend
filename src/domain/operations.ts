@@ -1,10 +1,15 @@
 import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
-import { formatPaxGrid, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
+import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
+import {
+  assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord, refuse, restoredLine, totalAfterRefund,
+  type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelRequest, type HistoryEntry, type HistoryLine,
+  type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
+} from './booking-actions.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type SalesPerson, type StoredActivity, type StoredAgent,
@@ -92,6 +97,12 @@ export type Booking = BookingHeader & {
   booking_data?: Record<string, unknown>;
   passengers: BookingPassenger[];
   add_ons: BookingAddOn[];
+  /** The current cancellation's category and charge. Absent unless the booking was cancelled with one. */
+  cancellation?: BookingCancellation;
+  /** Every reschedule, partial cancel and fee item, oldest first. See `booking-actions.ts`. */
+  reschedules: BookingReschedule[];
+  partial_cancels: BookingPartialCancel[];
+  fee_items: BookingFeeItem[];
   trips: BookingTrip[];
   /**
    * The first trip's route and date, the total pax across every trip, and the seats that total is
@@ -275,6 +286,7 @@ export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusio
 export class OperationsStore {
   private deployments: Deployment[] = [];
   private bookings = new Map<string, StoredBooking>();
+  private histories = new Map<string, HistoryEntry[]>();
   private locks = new Map<string, SeatLock>();
   private tail: Promise<void> = Promise.resolve();
   /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
@@ -417,7 +429,7 @@ export class OperationsStore {
     assertKnownLocks(new Set(this.locks.keys()), trips);
   }
 
-  createBooking(input: BookingInput): Booking {
+  createBooking(input: BookingInput, actor?: string): Booking {
     const status = input.status ?? 'confirmed';
     const planned = planTrips([], input.trips, () => this.id('trip'));
     this.assertRoutes(input.trips);
@@ -429,9 +441,30 @@ export class OperationsStore {
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
     const { trips, header, passengers, add_ons, ...rest } = input;
-    const booking: StoredBooking = { ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []) };
+    const booking: StoredBooking = {
+      ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []),
+      reschedules: [], partial_cancels: [], fee_items: [],
+    };
     this.bookings.set(id, booking);
+    this.log(id, createdLine(actor));
     return this.view(booking);
+  }
+
+  /** Appends one history line. Called after the write it describes, so a refused write leaves none. */
+  private log(bookingId: string, entry: HistoryLine): void {
+    const lines = this.histories.get(bookingId) ?? [];
+    lines.push({ at: this.now(), ...entry });
+    this.histories.set(bookingId, lines);
+  }
+  /** Oldest first. Undefined for an unknown booking, so the route can answer 404 rather than `[]`. */
+  bookingHistory(id: string): HistoryEntry[] | undefined {
+    if (!this.bookings.has(id)) return undefined;
+    return (this.histories.get(id) ?? []).map((entry) => ({ ...entry }));
+  }
+  /** The actor signs every action's write, the way the route stamps it on create and amend. */
+  private touch(booking: StoredBooking, actor: string | undefined): void {
+    booking.updated_at = this.now();
+    if (actor !== undefined) booking.updated_by = actor;
   }
 
   listBookings(query: BookingListQuery): BookingPage {
@@ -457,14 +490,16 @@ export class OperationsStore {
   }
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 
-  amendBooking(id: string, changes: BookingChanges): Booking | undefined {
+  /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
+  amendBooking(id: string, changes: BookingChanges, actor?: string, entry?: HistoryLine): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     const replacement = nextTrips(booking.trips, changes);
     const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
     const status = changes.status ?? booking.status;
     this.assertRoutes(replacement);
-    if (claimsSeats(booking.status, status, tripsChanged(booking.trips, replacement))) this.assertTrips(replacement, { bookingId: id });
+    if (claimsSeats(booking.status, status, claimsMoreSeats(booking.trips, planned))) this.assertTrips(replacement, { bookingId: id });
+    const line = entry ?? editedLine(actor, changes, booking.status);
     booking.trips = planned;
     booking.status = status;
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
@@ -472,21 +507,80 @@ export class OperationsStore {
     if (changes.passengers) booking.passengers = withSeq(changes.passengers);
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     booking.updated_at = this.now();
+    this.log(id, line);
     return this.view(booking);
   }
 
-  cancelBooking(id: string, reason?: string): Booking | undefined {
+  cancelBooking(id: string, request: CancelRequest, actor?: string): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    if (booking.status !== 'cancelled') Object.assign(booking, { status: 'cancelled', cancellation_reason: reason, updated_at: this.now() });
+    const plan = planCancel(booking, request, actor);
+    booking.status = 'cancelled';
+    booking.cancellation_reason = plan.cancellation_reason ?? undefined;
+    if (plan.record) booking.cancellation = { ...plan.record, at: this.now() };
+    else delete booking.cancellation;
+    this.touch(booking, actor);
+    this.log(id, plan.history);
     return this.view(booking);
   }
 
-  partialCancel(id: string, paxToCancel: number): Booking | undefined {
+  /** Back to `confirmed`, lock seats redrawn as far as the locks allow. See `restoreTrips`. */
+  restoreBooking(id: string, actor?: string): { booking: Booking; warnings: LockShortWarning[] } | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    booking.trips = planTrips(booking.trips, partialCancelTrips(booking.trips, booking.status, paxToCancel), () => this.id('trip'));
-    booking.updated_at = this.now();
+    assertRestorable(booking.status);
+    const days = new Map(booking.trips.map((trip) => [dayKey(trip.route_id, trip.service_date), this.day(trip.route_id, trip.service_date, { bookingId: id })]));
+    const { trips, warnings } = restoreTrips(booking.trips, days);
+    this.assertTrips(trips, { bookingId: id });
+    booking.trips = planTrips(booking.trips, trips, () => this.id('trip'));
+    booking.status = 'confirmed';
+    delete booking.cancellation;
+    delete booking.cancellation_reason;
+    this.touch(booking, actor);
+    this.log(id, restoredLine(actor, warnings));
+    return { booking: this.view(booking), warnings };
+  }
+
+  partialCancel(id: string, request: PartialCancelRequest, actor?: string): Booking | undefined {
+    const booking = this.bookings.get(id);
+    if (!booking) return undefined;
+    if (request.kind === 'count') {
+      booking.trips = planTrips(booking.trips, partialCancelTrips(booking.trips, booking.status, request.count), () => this.id('trip'));
+      this.touch(booking, actor);
+      this.log(id, partialCountLine(actor, request.count));
+      return this.view(booking);
+    }
+    assertOpen(booking.status, 'partial cancel');
+    // Seats only go down here, so there is no capacity check — see `claimsMoreSeats`.
+    const { trips, trip, count } = partialCancelByKey(booking.trips, request);
+    const record = { ...partialCancelRecord(trip, request, count, actor), at: this.now() };
+    booking.trips = planTrips(booking.trips, trips, () => this.id('trip'));
+    booking.total = totalAfterRefund(booking.total, request.waived);
+    booking.partial_cancels.push(record);
+    this.touch(booking, actor);
+    this.log(id, partialCancelLine(actor, record));
+    return this.view(booking);
+  }
+
+  rescheduleBooking(id: string, request: RescheduleRequest, actor?: string): Booking | undefined {
+    const booking = this.bookings.get(id);
+    if (!booking) return undefined;
+    if (request.kind === 'move') {
+      const from = booking.trips[0]?.service_date ?? '';
+      return this.amendBooking(id, { route_id: request.route_id, service_date: request.service_date, ...(request.pax === undefined ? {} : { pax: request.pax }) }, actor, movedLine(actor, from, request.service_date));
+    }
+    assertOpen(booking.status, 'reschedule');
+    const { trips, locksReturned } = rescheduleTrips(booking.trips, request.from_date, request.to_date);
+    const planned = planTrips(booking.trips, trips, () => this.id('trip'));
+    this.assertRoutes(trips);
+    if (claimsMoreSeats(booking.trips, planned)) this.assertTrips(trips, { bookingId: id });
+    const plan = planRescheduleRecord(booking, request, actor, locksReturned);
+    const now = this.now();
+    booking.trips = planned;
+    booking.reschedules.push({ ...plan.record, at: now });
+    if (plan.fee_item) booking.fee_items.push({ ...plan.fee_item, at: now });
+    this.touch(booking, actor);
+    this.log(id, plan.history);
     return this.view(booking);
   }
 
@@ -661,13 +755,128 @@ function onlyTrip(trips: readonly StoredTrip[], status: BookingStatus, message: 
   return trips[0];
 }
 
-const drawsKey = (draws: readonly LockDraw[] = []): string => sortedDraws(draws).map((draw) => `${draw.lock_id}:${draw.qty}`).join(',');
+const drawnTotal = (draws: readonly LockDraw[]): number => draws.reduce((sum, draw) => sum + draw.qty, 0);
 
-/** Whether an amendment moves seats at all; an unchanged itinerary must not be re-checked against the pool. */
-export const tripsChanged = (current: readonly StoredTrip[], next: readonly BookingTripInput[]): boolean =>
-  current.length !== next.length || current.some((trip, index) => trip.route_id !== next[index].route_id || trip.service_date !== next[index].service_date
-    || paxTotal(trip.pax) !== paxTotal(next[index].pax) || trip.booking_mode !== (next[index].booking_mode === 'charter' ? 'charter' : 'seat')
-    || (trip.charter_boat_id ?? '') !== (next[index].charter_boat_id ?? '') || drawsKey(trip.lock_draws) !== drawsKey(next[index].lock_draws));
+/**
+ * Whether an amendment asks the pool for anything it is not already holding.
+ *
+ * Trips are matched by id (after `planTrips`), so a reorder is not a change. Only growth counts: a
+ * new trip, a trip moved to another route, day, mode or charter boat, more passengers, more general
+ * seats, or more seats from any one lock. General seats are checked on their own because a trip that
+ * keeps its pax but gives up lock seats takes the same number from the general pool instead.
+ *
+ * Shrinking never needs room. The import brings oversold days over as they are, and checking an
+ * amendment that only frees seats would refuse taking a passenger off a day that is already over.
+ */
+export function claimsMoreSeats(current: readonly StoredTrip[], planned: readonly StoredTrip[]): boolean {
+  const before = new Map(current.map((trip) => [trip.id, trip]));
+  return planned.some((trip) => {
+    const old = before.get(trip.id);
+    if (!old) return true;
+    if (old.route_id !== trip.route_id || old.service_date !== trip.service_date || old.booking_mode !== trip.booking_mode
+      || (old.charter_boat_id ?? '') !== (trip.charter_boat_id ?? '')) return true;
+    const pax = paxTotal(trip.pax), oldPax = paxTotal(old.pax);
+    if (pax > oldPax || pax - drawnTotal(trip.lock_draws) > oldPax - drawnTotal(old.lock_draws)) return true;
+    const oldDraws = new Map(old.lock_draws.map((draw) => [draw.lock_id, draw.qty]));
+    return trip.lock_draws.some((draw) => draw.qty > (oldDraws.get(draw.lock_id) ?? 0));
+  });
+}
+
+/**
+ * Draws cut by `count`, lock seats first, lowest lock id first — the opposite of `clampDraws`.
+ *
+ * A partial cancel names who is leaving, and legacy gives their reserved seats back to the agent's
+ * lock (`booking.js:13904-13919`): the customer dropped out, so the agent may resell the seat. Only
+ * what is left over comes off the general seats.
+ */
+export function returnDrawsFirst(draws: readonly LockDraw[], count: number): LockDraw[] {
+  let left = count;
+  const kept: LockDraw[] = [];
+  for (const draw of sortedDraws(draws)) {
+    const back = Math.min(draw.qty, left);
+    left -= back;
+    if (draw.qty - back > 0) kept.push({ lock_id: draw.lock_id, qty: draw.qty - back });
+  }
+  return kept;
+}
+
+/**
+ * The full partial cancel: named passengers off one trip, their lock seats back first.
+ *
+ * A trip is never emptied this way (decided 2026-10-05). Removing a whole departure is a different
+ * act — cancel the booking, or edit its trips — and one that legacy let happen here by accident.
+ */
+export function partialCancelByKey(trips: readonly StoredTrip[], request: Extract<PartialCancelRequest, { kind: 'record' }>): { trips: BookingTripInput[]; trip: StoredTrip; count: number } {
+  const index = trips.findIndex((trip) => trip.id === request.trip_id);
+  if (index < 0) refuse(`Trip ${request.trip_id} is not on this booking`, 404);
+  const trip = trips[index];
+  const label = `trips[${index}]`;
+  const remaining = trip.pax.map((row) => ({ ...row }));
+  for (const cut of request.pax) {
+    const key = paxKey(cut.category, cut.residency);
+    const cell = remaining.find((row) => row.category === cut.category && row.residency === cut.residency) ?? refuse(`${label} has no ${key} passengers`, 400);
+    if (cut.count > cell.count) refuse(`${label} has ${cell.count} ${key}; cannot remove ${cut.count}`, 400);
+    cell.count -= cut.count;
+  }
+  const left = remaining.filter((row) => row.count > 0);
+  if (left.length === 0) refuse(`${label} would have no passengers; cancel the booking instead`, 400);
+  const count = paxTotal(request.pax);
+  return {
+    trip, count,
+    trips: trips.map((stored) => stored === trip ? { ...asInput(stored, trips), pax: left, lock_draws: returnDrawsFirst(stored.lock_draws, count) } : asInput(stored, trips)),
+  };
+}
+
+/**
+ * Every trip on `from` moved to `to`, on the same route (legacy `bkV2RescheduleBooking`). Their lock
+ * draws are returned: a lock belongs to one departure, so the moved trip takes general seats on the
+ * new day, as the single-trip move in `nextTrips` already does. A charter keeps its boat and must get
+ * it whole on the new day, which the ordinary capacity check decides.
+ */
+export function rescheduleTrips(trips: readonly StoredTrip[], from: string, to: string): { trips: BookingTripInput[]; locksReturned: number } {
+  if (!trips.some((trip) => trip.service_date === from)) refuse(`No trip on ${from} to reschedule`, 400);
+  let locksReturned = 0;
+  const next = trips.map((trip) => {
+    const input = asInput(trip, trips);
+    if (trip.service_date !== from) return input;
+    locksReturned += drawnTotal(trip.lock_draws);
+    return { ...input, service_date: to, lock_draws: [] };
+  });
+  // An overnight outbound cannot move past its return leg, and a route keeps one trip per day.
+  assertItinerary(next);
+  return { trips: next, locksReturned };
+}
+
+export const dayKey = (routeId: string, serviceDate: string): string => `${routeId} ${serviceDate}`;
+
+/**
+ * The trips a restored booking asks for, from each day's state read with the booking excluded.
+ *
+ * Lock seats are redrawn best-effort, as legacy does (`booking.js:12376-12385`): a lock that has
+ * since been used by others gives back what it still has, and the rest of the trip falls to general
+ * seats — the caller's capacity check then decides whether those exist. A charter wants its boat
+ * whole again; if another charter took it meanwhile, the restore is refused rather than leaving two
+ * charters on one boat, which legacy allowed and asked staff to sort out by hand.
+ */
+export function restoreTrips(trips: readonly StoredTrip[], days: ReadonlyMap<string, DayState>): { trips: BookingTripInput[]; warnings: LockShortWarning[] } {
+  const warnings: LockShortWarning[] = [];
+  const left = new Map<string, number>();
+  const next = trips.map((trip) => {
+    const day = days.get(dayKey(trip.route_id, trip.service_date));
+    if (trip.booking_mode === 'charter' && trip.charter_boat_id && day?.boats.find((boat) => boat.boat_id === trip.charter_boat_id)?.chartered) {
+      refuse(`Boat ${trip.charter_boat_id} is chartered by another booking on ${trip.service_date}`, 409, 'charter_boat_taken');
+    }
+    const draws = trip.lock_draws.map((draw) => {
+      const remaining = left.get(draw.lock_id) ?? day?.locks.find((lock) => lock.id === draw.lock_id)?.remaining ?? 0;
+      const got = Math.min(draw.qty, remaining);
+      left.set(draw.lock_id, remaining - got);
+      if (got < draw.qty) warnings.push({ code: 'lock_short', trip_id: trip.id, lock_id: draw.lock_id, wanted: draw.qty, got });
+      return { lock_id: draw.lock_id, qty: got };
+    }).filter((draw) => draw.qty > 0);
+    return { ...asInput(trip, trips), lock_draws: draws };
+  });
+  return { trips: next, warnings };
+}
 
 /**
  * Trip routes that are not in the catalogue.

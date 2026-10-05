@@ -70,14 +70,15 @@ GET    /v1/bookings                                  ✅
 GET    /v1/bookings/{id}                             ✅
 POST   /v1/bookings                                  ✅
 PATCH  /v1/bookings/{id}                             ✅
-POST   /v1/bookings/{id}/cancel                      ✅
-POST   /v1/bookings/{id}/partial-cancel              ✅
-POST   /v1/bookings/{id}/reschedule                  ✅
+POST   /v1/bookings/{id}/cancel                      ✅  category, charge, record (hand-off: booking action records)
+POST   /v1/bookings/{id}/restore                     ✅
+POST   /v1/bookings/{id}/partial-cancel              ✅  by trip and pax key, refund split
+POST   /v1/bookings/{id}/reschedule                  ✅  from_date → to_date, reason, fee item
 POST   /v1/bookings/{id}/approve      over-capacity / FOC approval
 POST   /v1/bookings/{id}/reject
-GET    /v1/bookings/{id}/history      audit trail
+GET    /v1/bookings/{id}/history                     ✅  every write appends; imported from sb_bookings__history
 addOns on POST/PATCH /v1/bookings, add_ons on reads ✅  (replaces PUT /add-ons, see addons-model.md)
-PUT    /v1/bookings/{id}/adjustments  price adjustments, fee items, upgrades
+PUT    /v1/bookings/{id}/adjustments  price adjustments, upgrades (fee items are read-only on the booking, written by reschedule)
 GET    /v1/bookings/{id}/attachments  (replaces /api/attach*)
 POST   /v1/bookings/{id}/attachments
 GET    /v1/attachments/{id}           download one file

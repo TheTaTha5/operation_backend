@@ -10,6 +10,7 @@ import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
+import { actorOf, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, stampActor } from '../domain/booking-actions.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -23,6 +24,7 @@ const string = (value: unknown, name: string): string => typeof value === 'strin
 const optionalString = (value: unknown): string | undefined => typeof value === 'string' && value.length > 0 ? value : undefined;
 const pax = (value: unknown, name = 'pax'): number => typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : badRequest(`${name} must be a positive integer`);
 /** Seats held by the reservation currently being edited, so an availability read does not count them against it. */
+const bookingId = (request: { params: unknown }): string => (request.params as { id: string }).id;
 const exclusion = (query: Record<string, unknown>): Exclusion => ({ bookingId: optionalString(query.exclude_booking_id), lockId: optionalString(query.exclude_lock_id) });
 
 function deployment(body: unknown): Deployment {
@@ -322,29 +324,41 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     return await store.listBookings(bookingListQuery(query));
   });
   app.get('/v1/bookings/:id', async (request) => (await store.booking((request.params as { id: string }).id)) ?? notFound('Booking not found'));
+  /**
+   * Every write is signed by the token's user (`actorOf`): `updated_by` comes from the token and a
+   * body's `updated_by` is ignored, and each write appends one line to the booking's history in the
+   * same transaction. See `booking-actions.ts`.
+   */
   app.post('/v1/bookings', async (request, reply) => {
-    const result = await store.transaction(() => store.createBooking(bookingInput(request.body)));
+    const actor = actorOf(request.user);
+    const input = bookingInput(request.body);
+    const result = await store.transaction(() => store.createBooking({ ...input, header: stampActor(input.header, actor, true) }, actor));
     return reply.code(201).send(result);
   });
   app.patch('/v1/bookings/:id', async (request) => {
+    const actor = actorOf(request.user);
     const changes = bookingChanges(request.body);
-    return store.transaction(async () => (await store.amendBooking((request.params as { id: string }).id, changes)) ?? notFound('Booking not found'));
+    const signed = { ...changes, header: stampActor(changes.header, actor, false) };
+    return store.transaction(async () => (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found'));
   });
   app.post('/v1/bookings/:id/cancel', async (request) => {
-    const body = record(request.body ?? {});
-    return store.transaction(async () => (await store.cancelBooking((request.params as { id: string }).id, optionalString(body.reason))) ?? notFound('Booking not found'));
+    const cancel = parseCancelRequest(record(request.body ?? {}));
+    return store.transaction(async () => (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found'));
+  });
+  app.post('/v1/bookings/:id/restore', async (request) => {
+    const restored = await store.transaction(async () => (await store.restoreBooking(bookingId(request), actorOf(request.user))) ?? notFound('Booking not found'));
+    return { ...restored.booking, warnings: restored.warnings };
   });
   app.post('/v1/bookings/:id/partial-cancel', async (request) => {
-    const body = record(request.body);
-    const quantity = pax(body.pax_to_cancel ?? body.pax, 'pax_to_cancel');
-    return store.transaction(async () => (await store.partialCancel((request.params as { id: string }).id, quantity)) ?? notFound('Booking not found'));
+    const partial = parsePartialCancelRequest(record(request.body));
+    return store.transaction(async () => (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found'));
   });
   app.post('/v1/bookings/:id/reschedule', async (request) => {
-    const body = record(request.body);
-    const route_id = string(body.route_id, 'route_id');
-    const service_date = string(body.service_date ?? body.date, 'service_date');
-    return store.transaction(async () => (await store.amendBooking((request.params as { id: string }).id, { route_id, service_date, ...(body.pax === undefined ? {} : { pax: pax(body.pax) }) })) ?? notFound('Booking not found'));
+    const reschedule = parseRescheduleRequest(record(request.body));
+    return store.transaction(async () => (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found'));
   });
+  /** Oldest first. Not part of the booking read, because it only grows. */
+  app.get('/v1/bookings/:id/history', async (request) => ({ history: (await store.bookingHistory(bookingId(request))) ?? notFound('Booking not found') }));
 
   app.get('/v1/manifest', async (request) => {
     const query = request.query as Record<string, unknown>;

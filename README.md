@@ -275,9 +275,11 @@ carries a `trips` array and one booking may span several days.
 - Moving a single-departure booking to another route or day (`PATCH` with `route_id`/
   `service_date`, or `reschedule`) **drops its lock draws**, because a lock belongs to one departure,
   and the moved trip takes general seats. To draw on a lock on the new day, send `trips`. Reducing
-  the head count (`PATCH` with `pax`, or `partial-cancel`) keeps the lock seats and gives back
-  general seats first. Which passengers left isn't recorded, and this way an agent is never handed
-  back lock seats they had already sold.
+  the head count by a bare number (`PATCH` with `pax`, or `partial-cancel` with `pax_to_cancel`)
+  keeps the lock seats and gives back general seats first. Which passengers left isn't recorded, and
+  this way an agent is never handed back lock seats they had already sold. A partial cancel that
+  **names** who left does the opposite and returns lock seats first — see
+  [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule).
 
 `pax` is a grid of category × pricing tier: categories are `ad`, `chd`, `inf`, `foc`, and a bare key
 is untiered while `_fr` and `_th` are the foreign and Thai tiers (`ad`, `ad_fr`, `ad_th`, …). Every
@@ -427,20 +429,167 @@ Two consequences worth knowing:
   behind it.
 - `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright (echo each kept trip's
   `id`, see [Trip ids](#trip-ids)), or `route_id`,
-  `service_date` and/or `pax` to move a single-departure booking. Capacity is checked only when
-  something actually moves, and days being vacated are released in the same transaction. Any
+  `service_date` and/or `pax` to move a single-departure booking. Days being vacated are
+  released in the same transaction. Any
   [header field](#booking-header-fields) may be sent in the same call, and **the header merges**:
   a field you do not mention keeps the value it had. Sending `passengers` **replaces the whole
   list**, the same way `trips` replaces the itinerary — see [Passengers](#passengers). `addOns`
   works the same way — see [Add-ons](#add-ons). An amendment refused for capacity changes nothing,
   header, passengers and add-ons included.
-- `POST /v1/bookings/{id}/cancel` — accepts optional `{ reason }`; idempotently returns all seats.
-- `POST /v1/bookings/{id}/partial-cancel` — `{ pax_to_cancel }` (also accepts `pax`). Requires a
-  single departure whose passengers are untiered: on a booking split across categories a bare number
-  does not say who left, and any rule for choosing would cancel the wrong people. Send `trips` with
-  the intended grid instead.
-- `POST /v1/bookings/{id}/reschedule` — `{ route_id, service_date, pax? }`; checks target capacity
-  before moving allocation. Single-departure only, on the same grounds.
+  Capacity is checked only when the amendment **asks for more**: a new or moved trip, more
+  passengers, more general seats, or more seats from a lock. Taking passengers off never needs room,
+  so it succeeds on a day that is already oversold (the legacy import brings such days over as they
+  are).
+- `POST /v1/bookings/{id}/cancel`, `/restore`, `/partial-cancel`, `/reschedule` — see
+  [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule).
+- `GET /v1/bookings/{id}/history` — see [History and who made a change](#history-and-who-made-a-change).
+
+#### Booking actions: cancel, restore, partial cancel, reschedule
+
+Each action changes the seats **and records why, who, and what it cost**, the way legacy did.
+Every booking read (`GET /v1/bookings/{id}`, the list, and every write's response) carries the
+records:
+
+| Key | Present | Shape |
+|---|---|---|
+| `cancellation` | only while the booking is cancelled with a category | `{ category, group, note, charge_type, charge_amount, at, by }` |
+| `reschedules` | always, `[]` when none | `[{ from_date, to_date, reason, charge_type, charge_amount, collect, at, by }]`, oldest first |
+| `partial_cancels` | always | `[{ trip_id, service_date, pax_removed, count, category, group, note, charged: {count, amount}, waived: {count, amount}, at, by }]`, oldest first |
+| `fee_items` | always | `[{ type, label, amount, at }]`, oldest first |
+
+`note`, `reason`, `label`, `by` and `trip_id` are `null` when there is none. `at` is an ISO instant.
+**What the agent owes is `total` plus the sum of `fee_items[].amount`**; a fee never changes
+`total`.
+
+**Cancellation categories.** `category` is one of these codes; `group` is derived from it and never
+sent. Weather is not on the list: a weather cancel is its own status, `cancelled_weather`.
+
+| code | label | group |
+|---|---|---|
+| `customer_cancel` | Customer cancelled / changed plan (ลูกค้ายกเลิกเอง / เปลี่ยนแผน) | customer |
+| `no_show` | No-show (ไม่มาตามนัด) | customer |
+| `sick` | Sick / health (ป่วย / เหตุสุขภาพ) | customer |
+| `flight_visa` | Flight / visa / documents (ไฟลท์ / วีซ่า / เอกสาร) | customer |
+| `agent_error` | Agent error / double booking (เอเย่นต์จองผิด / จองซ้ำ) | customer |
+| `operator` | Operator (boat down / trip off) (ฝั่งเรา (เรือเสีย / ทริปไม่ออก)) | operator |
+| `force_majeure` | Force majeure (เหตุสุดวิสัย (ภัยพิบัติ/โรคระบาด)) | operator |
+| `other` | Other (อื่นๆ (ระบุใน note)) — `note` is required | other |
+
+**Charges.** `charge_type` is `none` (default), `full` or `partial`. `partial` needs
+`charge_amount > 0`. `full` is computed: `total` plus the existing fee items. `none` ignores any
+amount. The charge is recorded, not billed: invoices belong to accounting.
+
+**A closed booking is refused.** Cancel, partial cancel and reschedule answer `409` on a booking
+that is `cancelled`, `cancelled_weather`, `rejected` or `completed`.
+
+##### `POST /v1/bookings/{id}/cancel`
+
+```json
+{ "category": "customer_cancel", "note": "changed plan", "charge_type": "partial", "charge_amount": 1500 }
+```
+
+Sets `status: "cancelled"`, writes the `cancellation` record, and sets `cancellation_reason` to the
+category's label plus the note (`Customer cancelled / changed plan (ลูกค้ายกเลิกเอง / เปลี่ยนแผน) ·
+changed plan`), so every reader of that column keeps working. Lock seats go back to their locks and a
+charter's boat is freed, because a cancelled booking holds nothing. A body with no `category` —
+`{ "reason": "..." }` or nothing at all — is the older form: it sets `cancellation_reason` to the
+text and writes no record.
+
+##### `POST /v1/bookings/{id}/restore`
+
+No body. Puts a `cancelled`, `cancelled_weather` or `rejected` booking back to `confirmed`, deletes
+its `cancellation` and clears `cancellation_reason`. Any other status is `409` with
+`code: "not_cancelled"`.
+
+- **Lock seats are redrawn as far as the locks allow.** If someone has used a lock meanwhile, the
+  trip keeps what the lock still has and takes the rest from general seats. Each shortfall is
+  reported, and the restore is refused (`409`) only if general seats cannot take the rest either.
+- **A charter wants its boat back whole.** If another charter took the boat on that day, it is
+  `409` with `code: "charter_boat_taken"`.
+
+The response is the booking plus `warnings` (`[]` when everything fitted):
+
+```json
+{ "...": "the booking", "warnings": [{ "code": "lock_short", "trip_id": "trip_…", "lock_id": "lock_…", "wanted": 3, "got": 1 }] }
+```
+
+##### `POST /v1/bookings/{id}/partial-cancel`
+
+```json
+{ "trip_id": "trip_…", "pax": { "ad_fr": 1, "chd_fr": 1 }, "category": "sick", "note": "",
+  "charged": { "count": 0, "amount": 0 }, "waived": { "count": 2, "amount": 4000 } }
+```
+
+Takes the named passengers off one trip. Works on multi-trip and tiered bookings.
+
+- `pax` keys must be on that trip, each count at most what the trip holds (`400`). An unknown
+  `trip_id` is `404`.
+- **A trip is never emptied this way** (`400`, "trips[0] would have no passengers; cancel the booking
+  instead"). Remove a whole departure by cancelling or by `PATCH` with `trips`.
+- `category` and `note` follow the cancel rules. `charged.count + waived.count` must equal the
+  passengers removed.
+- **`waived.amount` is the refund and lowers `total`** (never below 0). `charged.amount` is a
+  cancellation fee the agent still pays and leaves `total` alone.
+- **Lock seats go back first**, lowest lock id first: the customer dropped out, so the agent may
+  resell the seat. Only the rest come off general seats.
+- No capacity check: seats only go down.
+
+The older body `{ "pax_to_cancel": 2 }` still works as before. It needs a single-trip, untiered
+booking, keeps lock seats, and writes no record.
+
+##### `POST /v1/bookings/{id}/reschedule`
+
+```json
+{ "from_date": "2026-10-10", "to_date": "2026-10-14", "reason": "customer request",
+  "charge_type": "partial", "charge_amount": 500, "collect": "invoice" }
+```
+
+Moves **every trip on `from_date`** to `to_date`, on the same route. Other days are untouched, so
+this works on multi-trip bookings.
+
+- `from_date` and `to_date` are `YYYY-MM-DD` and must differ. `reason` is required. No trip on
+  `from_date` is `400`.
+- The moved trips **return their lock draws** and take general seats on the new day. Their
+  day-of-operations data (van, pickup time) is cleared, as it was arranged for the old day. A charter
+  keeps its boat and must get it whole on the new day.
+- The new day is capacity-checked as usual (`409` when full). Overnight trips and the
+  one-trip-per-route-per-day rule are checked too (`400`).
+- **The price stands; a charge is extra.** `collect` is `invoice` (default) or `separate`. With
+  `invoice` and a charge above 0, a fee item `{ type: "reschedule", label: "Reschedule fee · <from> →
+  <to> · <reason>", amount }` is added. With `separate`, the charge is kept on the reschedule record
+  only. The recorded `collect` is `none` whenever the charge is 0.
+
+The older body `{ route_id, service_date, pax? }` still works. It moves a single-trip booking
+anywhere and writes no reschedule record (it does write a history line).
+
+#### History and who made a change
+
+**Every write is signed by the token's user**: `preferred_username`, else the token subject.
+`updated_by` is set from the token on every write, and **an `updated_by` in the body is ignored**.
+`created_by` defaults to the token user on create, unless the body names one. With authentication
+switched off (local development) there is no user: `updated_by` is left alone and `by` is `null`.
+
+Each write appends one line to the booking's history, in the same transaction:
+
+| Write | `kind` | `tag` | `text` |
+|---|---|---|---|
+| `POST /v1/bookings` | `create` | `Created` | `Created` |
+| `PATCH` | `edit` | `Edited` (`Confirmed` when the status becomes `confirmed`) | `Edited · trips, total` (the keys sent) |
+| cancel | `cancel` | `Cancel` | `Cancelled · <charge> · <category label> · <note>` |
+| restore | `edit` | `Confirmed` | `Restored`, plus `· seat lock <id>: <got>/<wanted> seats back` per short lock |
+| partial cancel | `cancel` | `Cancel` | `Partial cancel · −2 pax · <category label> · charge 0 (฿0) · waive 2 (฿4,000)` |
+| reschedule | `reschedule` | `Reschedule` | `Rescheduled <from> → <to> · <charge> · <collect> · <reason>` |
+
+`<charge>` is `No charge`, `Full charge ฿<n>` or `Charge ฿<n>`.
+
+`GET /v1/bookings/{id}/history` answers `{ "history": [{ at, by, kind, tag, text }] }`, oldest
+first, and `404` for an unknown booking. It is kept out of the booking read because it only grows.
+Imported bookings carry legacy's own lines, whose `kind` values are wider than the table above
+(`notify`, `invoice`, `payment`, …).
+
+**Errors** keep the shape `{ statusCode, error, message }`. `message` names the field or the rule
+and is fit to show to a person. Where a client needs to branch, a machine-readable `code` is added:
+`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`.
 
 #### Booking header fields
 
