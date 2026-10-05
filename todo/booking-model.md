@@ -6,7 +6,9 @@ constrained, joined, or migrated, so every consumer re-parses it and every rule 
 application code or not at all.
 
 This is the normalized target. It is derived from what the frontend *constructs on save*
-(`allotment_v2.html:78328`), not from the legacy schema — their `sb_bookings` is ~130 columns of
+(originally read at `allotment_v2.html:78328`; the code has since been split out, and the save is
+now `const newBk = {` in `allotment_v2/js/08-app.js` of the production checkout,
+`D:\projects\wt-lk-inbox` — search for the symbol, line numbers drift), not from the legacy schema — their `sb_bookings` is ~130 columns of
 wide-column and positional-shred damage and is not a model worth porting.
 
 ## The shape being normalized
@@ -106,12 +108,11 @@ booking_id → bookings, seq, name, nationality, type, foc BOOLEAN
 
 ### `booking_addons`
 
-```
-id, booking_id → bookings, booking_trip_id → booking_trips NULL, type, label, amount, qty, note
-```
-
-Nullable `booking_trip_id` because the document carries add-ons at both levels
-(`newBk.addOns` and `trip.addOns`). One table, one shape, the level expressed by the FK.
+**Built — migration 018, see `addons-model.md`.** The sketch that stood here was wrong in one
+place: it gave add-ons a nullable `booking_trip_id` because "the document carries add-ons at both
+levels (`newBk.addOns` and `trip.addOns`)". No writer produces `trip.addOns` — every other `addOns`
+in the frontend is `rt.addOns`, a rate type's price list. Add-ons are booking-level only, keyed
+`(booking_id, seq)`, with `join_adults`/`join_children` added for the longtail-join counts.
 
 ### `booking_adjustments`
 
@@ -278,9 +279,13 @@ what was open when and what closed it is the useful part.*
 
 ## Open
 
-- `docCheck` — the document says "verification state (set in Document Check view)" but the only
-  `docCheck` object in the source is view state (`date/filter/openId`). Needs a real example
-  before modelling.
+- `docCheck` — **corrected 2026-10-03: the shape is known.** The line here said the only `docCheck`
+  in the source is view state (`date/filter/openId`); that object is `_docCheck`, the Document
+  Check page's own state, and is never saved. The saved field is `bk.docCheck`, written by
+  `docCheckToggleItem`, `docCheckSetStatus`, `docCheckSetNote` and `docCheckRunPre` in
+  `allotment_v2/js/08-app.js` (wt-lk-inbox@ce9769a) and sent by the schemaVer 2 `const newBk = {`:
+  `{status, by, at, note, items{route,date,lead,pax,voucher,payment}, pre}`. Ready to model; it is
+  being dropped on every save today.
 - `trip.ops.van_splits` — shape unknown.
 - Both stores must implement all of this identically. The in-process store has no joins, so the
   trip-total and status-holds-seats rules go in `src/domain/` pure functions first.

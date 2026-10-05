@@ -25,6 +25,7 @@ import { parsePaxGrid, type PaxRow } from '../domain/pax.js';
 import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/operations.js';
 import { isIsoTime } from '../domain/calendar.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
+import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -145,6 +146,9 @@ async function main() {
     const legacyTrips = await read('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx');
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
     const legacyAddOns = await read('SELECT sb_bookings_id, type FROM sb_bookings__addons');
+    const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
+    const legacyFeeItems = await read('SELECT * FROM sb_bookings__feeitems ORDER BY sb_bookings_id, idx');
+    const legacyHistory = await read('SELECT * FROM sb_bookings__history ORDER BY sb_bookings_id, idx');
     const legacyVans = await read('SELECT * FROM sb_vehicles');
     const vanDayRoutes = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__dayroute');
     const vanDayStatus = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__daystatus');
@@ -295,6 +299,12 @@ async function main() {
     for (const t of legacyTrips) { const k = str(t.sb_bookings_id); (tripsOf.get(k) ?? tripsOf.set(k, []).get(k)!).push(t); }
     const passengersOf = new Map<string, Row[]>();
     for (const p of legacyPassengers) { const k = str(p.sb_bookings_id); (passengersOf.get(k) ?? passengersOf.set(k, []).get(k)!).push(p); }
+    const childrenOf = (rows: Row[]): Map<string, Row[]> => {
+      const byBooking = new Map<string, Row[]>();
+      for (const r of rows) { const k = str(r.sb_bookings_id); (byBooking.get(k) ?? byBooking.set(k, []).get(k)!).push(r); }
+      return byBooking;
+    };
+    const partialCancelsOf = childrenOf(legacyPartialCancels), feeItemsOf = childrenOf(legacyFeeItems), historyOf = childrenOf(legacyHistory);
     const addOnsOf = new Map<string, string[]>();
     for (const a of legacyAddOns) { const k = str(a.sb_bookings_id); (addOnsOf.get(k) ?? addOnsOf.set(k, []).get(k)!).push(str(a.type)); }
 
@@ -341,6 +351,9 @@ async function main() {
     };
 
     const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [];
+    // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
+    const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
+    const report = { skip, note };
     for (const b of legacyBookings) {
       const legacyId = str(b.id);
       const status = str(b.status);
@@ -428,6 +441,16 @@ async function main() {
         created_at: created, updated_at: instant(b.updatedat) ?? created, booking_data: {},
       });
       trips.push(...myTrips); pax.push(...myPax); draws.push(...myDraws);
+
+      // A record with no time of its own is given the booking's last change, the latest it can be.
+      const lastChange = String(bookings[bookings.length - 1].updated_at);
+      const cancellation = cancellationRow(b, id, status, lastChange, report);
+      if (cancellation) cancellations.push(cancellation);
+      const reschedule = rescheduleRow(b, id, lastChange, report);
+      if (reschedule) reschedules.push(reschedule);
+      partialCancels.push(...partialCancelRows(partialCancelsOf.get(legacyId) ?? [], id, myTrips.map((t) => String(t.id)), myTrips.map((t) => String(t.service_date)), lastChange, report));
+      feeItems.push(...feeItemRows(feeItemsOf.get(legacyId) ?? [], id, lastChange, report));
+      historyLines.push(...historyRows(historyOf.get(legacyId) ?? [], id, lastChange, report));
 
       // Van data: day 1 of the booking lives on the booking's own `ops_*`, every later day on that
       // trip's (legacy `bkOpsRead`, booking.js:1917). A booking that releases its seats takes no part
@@ -667,6 +690,13 @@ async function main() {
     await insert('booking_trip_pax', pax);
     await insert('booking_trip_lock_draws', draws);
     await insert('booking_passengers', passengers);
+    await insert('booking_cancellations', cancellations);
+    await insert('booking_reschedules', reschedules);
+    await insert('booking_partial_cancels', partialCancels);
+    await insert('booking_fee_items', feeItems);
+    // In legacy's order, so the serial id keeps two lines written at the same instant in sequence.
+    await target.query(`INSERT INTO booking_history (booking_id, at, by, kind, tag, text)
+      SELECT r.booking_id, r.at, r.by, r.kind, r.tag, r.text FROM jsonb_populate_recordset(NULL::booking_history, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(historyLines)]);
     await insert('van_groups', vanGroups);
     await insert('booking_trip_operations', tripOps);
     await insert('booking_trip_van_allocations', allocations);
@@ -686,6 +716,7 @@ async function main() {
     console.log(`read from legacy: ${legacyBookings.length} bookings, ${legacyTrips.length} trips, ${legacyPassengers.length} passengers, ${boatDays.length} boat-days, ${legacyLocks.length} locks, ${capOverrides.length} overrides`);
     console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks`);
     console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
+    console.log(`action records: ${cancellations.length} cancellations, ${reschedules.length} reschedules, ${partialCancels.length} partial cancels, ${feeItems.length} fee items, ${historyLines.length} history lines`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);

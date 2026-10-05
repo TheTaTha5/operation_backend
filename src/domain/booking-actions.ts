@@ -1,0 +1,353 @@
+/**
+ * What the booking actions — cancel, restore, partial cancel, reschedule — record beyond the seat
+ * change: who made it, why, and what it cost. Legacy stamps all of this on the booking document
+ * (`bkV2CancelBooking`, `bkV2RestoreBooking`, `bkV2PartialCancel`, `bkV2RescheduleBooking` in
+ * `allotment_v2/js/booking.js`), and staff and reports read it.
+ *
+ * Everything here is pure. The two stores differ only in where they put the results; the categories,
+ * the labels, the charge arithmetic and the history wording are written once, so they cannot drift.
+ * How the trips change for each action is `operations.ts`'s, next to `nextTrips`.
+ */
+import { holdsSeats, type BookingStatus } from './booking-status.js';
+import { formatPaxGrid, parsePaxGrid, paxTotal, type PaxGrid, type PaxRow } from './pax.js';
+import type { BookingChanges } from './operations.js';
+import type { BookingHeaderPatch } from './booking-header.js';
+
+/** A refusal in the existing `{ statusCode, error, message }` shape. Fastify adds `code` when one is set. */
+export const refuse = (message: string, statusCode: number, code?: string): never => {
+  const error = new Error(message) as Error & { statusCode: number; code?: string };
+  error.statusCode = statusCode;
+  if (code) error.code = code;
+  throw error;
+};
+const badRequest = (message: string): never => refuse(message, 400);
+
+// ── Who ──────────────────────────────────────────────────────────────────────────────────────────
+
+/** The token's user as legacy's `laBy()` names them: the username, else the subject. */
+export const actorOf = (user: { username?: string; subject: string } | undefined): string | undefined => user?.username ?? user?.subject;
+
+/**
+ * The header with the authenticated user stamped on it. `updated_by` always comes from the token,
+ * never from the body: a client could otherwise sign a change with someone else's name. `created_by`
+ * is filled from the token only on create and only when the caller sent none, because an integrator
+ * entering a booking on someone's behalf may name them.
+ *
+ * With authentication off (local development) there is no user, and `updated_by` is left alone.
+ */
+export function stampActor<T extends BookingHeaderPatch>(header: T | undefined, actor: string | undefined, creating: boolean): T {
+  const stamped = { ...(header ?? {}) } as T;
+  delete stamped.updated_by;
+  if (actor === undefined) return stamped;
+  stamped.updated_by = actor;
+  if (creating && (stamped.created_by === undefined || stamped.created_by === null)) stamped.created_by = actor;
+  return stamped;
+}
+
+// ── History ──────────────────────────────────────────────────────────────────────────────────────
+
+/** One line of a booking's history, as `GET /v1/bookings/:id/history` returns it. */
+export type HistoryEntry = { at: string; by: string | null; kind: string; tag: string | null; text: string };
+/** A line about to be written; the store supplies `at`. */
+export type HistoryLine = Omit<HistoryEntry, 'at'>;
+
+const line = (by: string | undefined, kind: string, tag: string, text: string): HistoryLine => ({ by: by ?? null, kind, tag, text });
+
+export const createdLine = (by: string | undefined): HistoryLine => line(by, 'create', 'Created', 'Created');
+
+/**
+ * `Edited · trips, total`. The keys are the ones the amendment carried, in the order the caller can
+ * recognise: itinerary, status, header columns, then the lists. A status moving to `confirmed` is
+ * tagged `Confirmed` so the timeline shows the confirmation, as legacy does.
+ */
+export function editedLine(by: string | undefined, changes: BookingChanges, from: BookingStatus): HistoryLine {
+  const keys: string[] = [];
+  if (changes.trips) keys.push('trips');
+  for (const key of ['route_id', 'service_date', 'pax', 'status'] as const) if (changes[key] !== undefined) keys.push(key);
+  for (const key of Object.keys(changes.header ?? {})) if (key !== 'updated_by') keys.push(key);
+  if (changes.passengers) keys.push('passengers');
+  if (changes.add_ons) keys.push('add_ons');
+  const confirmed = changes.status === 'confirmed' && from !== 'confirmed';
+  return line(by, 'edit', confirmed ? 'Confirmed' : 'Edited', keys.length ? `Edited · ${keys.join(', ')}` : 'Edited');
+}
+
+// ── Cancellation categories ──────────────────────────────────────────────────────────────────────
+
+export type CancelGroup = 'customer' | 'operator' | 'other';
+
+/**
+ * Legacy's `BKV2_CANCEL_REASONS` (`08-app.js:8763`). The code is stable and reported on; `group` is
+ * whose fault it was, derived here and never sent. `weather` is not on the list: a weather cancel is
+ * its own flow (`cancelled_weather`).
+ */
+export const CANCEL_CATEGORIES = [
+  { code: 'customer_cancel', en: 'Customer cancelled / changed plan', th: 'ลูกค้ายกเลิกเอง / เปลี่ยนแผน', group: 'customer' },
+  { code: 'no_show', en: 'No-show', th: 'ไม่มาตามนัด', group: 'customer' },
+  { code: 'sick', en: 'Sick / health', th: 'ป่วย / เหตุสุขภาพ', group: 'customer' },
+  { code: 'flight_visa', en: 'Flight / visa / documents', th: 'ไฟลท์ / วีซ่า / เอกสาร', group: 'customer' },
+  { code: 'agent_error', en: 'Agent error / double booking', th: 'เอเย่นต์จองผิด / จองซ้ำ', group: 'customer' },
+  { code: 'operator', en: 'Operator (boat down / trip off)', th: 'ฝั่งเรา (เรือเสีย / ทริปไม่ออก)', group: 'operator' },
+  { code: 'force_majeure', en: 'Force majeure', th: 'เหตุสุดวิสัย (ภัยพิบัติ/โรคระบาด)', group: 'operator' },
+  { code: 'other', en: 'Other', th: 'อื่นๆ (ระบุใน note)', group: 'other' },
+] as const satisfies readonly { code: string; en: string; th: string; group: CancelGroup }[];
+export type CancelCategory = (typeof CANCEL_CATEGORIES)[number]['code'];
+
+const CATEGORY = new Map<string, (typeof CANCEL_CATEGORIES)[number]>(CANCEL_CATEGORIES.map((c) => [c.code, c]));
+export const isCancelCategory = (value: unknown): value is CancelCategory => typeof value === 'string' && CATEGORY.has(value);
+export const cancelGroup = (code: CancelCategory): CancelGroup => CATEGORY.get(code)!.group;
+/** `Sick / health (ป่วย / เหตุสุขภาพ)` — legacy's `bkV2CancelLabel`. */
+export const cancelLabel = (code: CancelCategory): string => { const c = CATEGORY.get(code)!; return `${c.en} (${c.th})`; };
+
+/**
+ * A reason category and its note, as sent. The note is required for `other`, where the category
+ * alone says nothing (`booking.js:13592`).
+ */
+function categoryAndNote(input: Record<string, unknown>): { category: CancelCategory; note?: string } {
+  const category = input.category;
+  if (!isCancelCategory(category)) badRequest(`category must be one of ${CANCEL_CATEGORIES.map((c) => c.code).join(', ')}`);
+  const note = optionalText(input.note, 'note');
+  if (category === 'other' && note === undefined) badRequest('note is required when category is other');
+  return { category: category as CancelCategory, ...(note === undefined ? {} : { note }) };
+}
+
+// ── Money ────────────────────────────────────────────────────────────────────────────────────────
+
+export type ChargeType = 'none' | 'full' | 'partial';
+const CHARGE_TYPES: readonly ChargeType[] = ['none', 'full', 'partial'];
+
+/** `฿4,000` the way legacy prints it: whole baht, thousands separated. */
+export const baht = (amount: number): string => `฿${Math.round(amount).toLocaleString('en-US')}`;
+
+/** `No charge`, `Full charge ฿4,000` or `Charge ฿500` (`booking.js:12321`). */
+export const chargeLabel = (type: ChargeType, amount: number): string =>
+  type === 'full' ? `Full charge ${baht(amount)}` : type === 'partial' ? `Charge ${baht(amount)}` : 'No charge';
+
+/** A fee charged on top of the booking's own price. */
+export type BookingFeeItem = { type: string; label: string | null; amount: number; at: string };
+
+/**
+ * What the agent owes: the booking's price plus its fee items. Legacy's `acctBookingTotal`
+ * (`accounting.js:18`). `total` already includes add-ons, so they are not added again.
+ */
+export const amountOwed = (booking: { total?: number; fee_items: readonly { amount: number }[] }): number =>
+  (booking.total ?? 0) + booking.fee_items.reduce((sum, item) => sum + item.amount, 0);
+
+/** A charge request resolved to a number: `full` is everything owed, `none` is 0. */
+export const chargeAmount = (charge: { charge_type: ChargeType; charge_amount?: number }, owed: number): number =>
+  charge.charge_type === 'full' ? owed : charge.charge_type === 'partial' ? charge.charge_amount! : 0;
+
+function charge(input: Record<string, unknown>): { charge_type: ChargeType; charge_amount?: number } {
+  const type = input.charge_type ?? 'none';
+  if (!CHARGE_TYPES.includes(type as ChargeType)) badRequest('charge_type must be one of none, full, partial');
+  if (type !== 'partial') return { charge_type: type as ChargeType };
+  const amount = input.charge_amount;
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) badRequest('charge_amount must be greater than 0 for a partial charge');
+  return { charge_type: 'partial', charge_amount: amount as number };
+}
+
+// ── Status rules ─────────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A booking that has given its seats back, or has already sailed, is not cancelled, reduced or
+ * rescheduled again (legacy `bkV2DetailCancel`, `bkV2DetailPartial`, `bkV2DetailReschedule`).
+ */
+export function assertOpen(status: BookingStatus, action: 'cancel' | 'partial cancel' | 'reschedule'): void {
+  if (status === 'cancelled' || status === 'cancelled_weather') refuse(`Booking is already ${status === 'cancelled' ? 'cancelled' : 'cancelled for weather'}`, 409, 'already_cancelled');
+  if (!holdsSeats(status) || status === 'completed') refuse(`Cannot ${action} a ${status} booking`, 409, 'booking_closed');
+}
+
+/** Only a booking that gave its seats back can be restored (`booking.js:12363`). */
+export function assertRestorable(status: BookingStatus): void {
+  if (holdsSeats(status)) refuse('Booking is not cancelled', 409, 'not_cancelled');
+}
+
+// ── Cancel ───────────────────────────────────────────────────────────────────────────────────────
+
+export type BookingCancellation = {
+  category: string; group: CancelGroup; note: string | null;
+  charge_type: ChargeType; charge_amount: number; at: string; by: string | null;
+};
+
+/**
+ * `{ reason }` — or no body — is what the route took before categories existed: it still sets the
+ * free text and writes no cancellation record. Anything with a `category` is the full form.
+ */
+export type CancelRequest =
+  | { kind: 'reason'; reason?: string }
+  | { kind: 'record'; category: CancelCategory; note?: string; charge_type: ChargeType; charge_amount?: number };
+
+export function parseCancelRequest(body: Record<string, unknown>): CancelRequest {
+  if (body.category === undefined) return { kind: 'reason', reason: optionalText(body.reason, 'reason') };
+  return { kind: 'record', ...categoryAndNote(body), ...charge(body) };
+}
+
+/** What a cancel writes: the status, the display text in `cancellation_reason`, the record and the history line. */
+export type CancelPlan = { cancellation_reason: string | null; record?: Omit<BookingCancellation, 'at'>; history: HistoryLine };
+
+export function planCancel(booking: { status: BookingStatus; total?: number; fee_items: readonly { amount: number }[] }, request: CancelRequest, by: string | undefined): CancelPlan {
+  assertOpen(booking.status, 'cancel');
+  if (request.kind === 'reason') {
+    return { cancellation_reason: request.reason ?? null, history: line(by, 'cancel', 'Cancel', request.reason ? `Cancelled · ${request.reason}` : 'Cancelled') };
+  }
+  // The same display text legacy writes into its `cancelReason`, so every reader of the column keeps working.
+  const reason = cancelLabel(request.category) + (request.note ? ` · ${request.note}` : '');
+  const amount = chargeAmount(request, amountOwed(booking));
+  return {
+    cancellation_reason: reason,
+    record: { category: request.category, group: cancelGroup(request.category), note: request.note ?? null, charge_type: request.charge_type, charge_amount: amount, by: by ?? null },
+    history: line(by, 'cancel', 'Cancel', `Cancelled · ${chargeLabel(request.charge_type, amount)} · ${reason}`),
+  };
+}
+
+// ── Restore ──────────────────────────────────────────────────────────────────────────────────────
+
+/** A lock that could not give back every seat the booking had drawn from it before it was cancelled. */
+export type LockShortWarning = { code: 'lock_short'; trip_id: string; lock_id: string; wanted: number; got: number };
+
+export function restoredLine(by: string | undefined, warnings: readonly LockShortWarning[]): HistoryLine {
+  const shorts = warnings.map((w) => ` · seat lock ${w.lock_id}: ${w.got}/${w.wanted} seats back`).join('');
+  return line(by, 'edit', 'Confirmed', `Restored${shorts}`);
+}
+
+// ── Partial cancel ───────────────────────────────────────────────────────────────────────────────
+
+export type Split = { count: number; amount: number };
+export type BookingPartialCancel = {
+  trip_id: string | null; service_date: string | null; pax_removed: PaxGrid; count: number;
+  category: string | null; group: CancelGroup | null; note: string | null;
+  charged: Split; waived: Split; at: string; by: string | null;
+};
+
+/**
+ * `{ pax_to_cancel }` is the route's older body: a bare count off a single-trip, untiered booking,
+ * lock seats kept. The full form names the trip, the passengers by key, why, and the money.
+ */
+export type PartialCancelRequest =
+  | { kind: 'count'; count: number }
+  | { kind: 'record'; trip_id: string; pax: PaxRow[]; category: CancelCategory; note?: string; charged: Split; waived: Split };
+
+export function parsePartialCancelRequest(body: Record<string, unknown>): PartialCancelRequest {
+  if (body.trip_id === undefined && (body.pax_to_cancel !== undefined || typeof body.pax === 'number')) {
+    const count = body.pax_to_cancel ?? body.pax;
+    if (typeof count !== 'number' || !Number.isInteger(count) || count <= 0) badRequest('pax_to_cancel must be a positive integer');
+    return { kind: 'count', count: count as number };
+  }
+  const trip_id = typeof body.trip_id === 'string' && body.trip_id.length > 0 ? body.trip_id : badRequest('trip_id is required');
+  const pax = body.pax === undefined ? badRequest('pax is required: the passengers to remove, by key') : parsePaxGrid(body.pax, 'pax');
+  const removed = paxTotal(pax);
+  if (removed === 0) badRequest('pax must remove at least one passenger');
+  const charged = split(body.charged, 'charged');
+  const waived = split(body.waived, 'waived');
+  if (charged.count + waived.count !== removed) badRequest(`charged.count + waived.count must equal the ${removed} passengers removed`);
+  return { kind: 'record', trip_id, pax, ...categoryAndNote(body), charged, waived };
+}
+
+function split(value: unknown, name: string): Split {
+  if (value === undefined || value === null) return { count: 0, amount: 0 };
+  if (typeof value !== 'object' || Array.isArray(value)) badRequest(`${name} must be an object of count and amount`);
+  const { count = 0, amount = 0 } = value as Record<string, unknown>;
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0) badRequest(`${name}.count must be a non-negative integer`);
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) badRequest(`${name}.amount must be a non-negative number`);
+  return { count: count as number, amount: amount as number };
+}
+
+/**
+ * The booking's price after a partial cancel: the waived amount is refunded, the charged amount is
+ * a fee the agent still pays and leaves `total` alone (`booking.js:13840`). A booking with no price
+ * keeps none.
+ */
+export const totalAfterRefund = (total: number | undefined, waived: Split): number | undefined =>
+  total === undefined ? undefined : Math.max(0, total - waived.amount);
+
+/** The record a full partial cancel writes, from the trip it came off and the request. */
+export function partialCancelRecord(
+  trip: { id: string; service_date: string }, request: Extract<PartialCancelRequest, { kind: 'record' }>, count: number, by: string | undefined,
+): Omit<BookingPartialCancel, 'at'> {
+  return {
+    trip_id: trip.id, service_date: trip.service_date, pax_removed: formatPaxGrid(request.pax), count,
+    category: request.category, group: cancelGroup(request.category), note: request.note ?? null,
+    charged: { ...request.charged }, waived: { ...request.waived }, by: by ?? null,
+  };
+}
+
+/** `Partial cancel · −2 pax · Sick / health (…) · charge 0 (฿0) · waive 2 (฿4,000)` (`booking.js:13894`). */
+export function partialCancelLine(by: string | undefined, record: { count: number; category: string | null; note: string | null; charged: Split; waived: Split }): HistoryLine {
+  const category = record.category && isCancelCategory(record.category) ? ` · ${cancelLabel(record.category)}` : '';
+  const money = `charge ${record.charged.count} (${baht(record.charged.amount)}) · waive ${record.waived.count} (${baht(record.waived.amount)})`;
+  return line(by, 'cancel', 'Cancel', `Partial cancel · −${record.count} pax${category} · ${money}${record.note ? ` · ${record.note}` : ''}`);
+}
+
+/** The older count-only body records no reason or money, but the change still gets its line. */
+export const partialCountLine = (by: string | undefined, count: number): HistoryLine => line(by, 'cancel', 'Cancel', `Partial cancel · −${count} pax`);
+
+// ── Reschedule ───────────────────────────────────────────────────────────────────────────────────
+
+export type Collect = 'none' | 'invoice' | 'separate';
+export type BookingReschedule = {
+  from_date: string; to_date: string; reason: string | null;
+  charge_type: ChargeType; charge_amount: number; collect: Collect; at: string; by: string | null;
+};
+
+/**
+ * `{ route_id, service_date }` is the route's older body: move a single-trip booking anywhere.
+ * The full form moves every trip on one day to another day and records why and what it cost.
+ */
+export type RescheduleRequest =
+  | { kind: 'move'; route_id: string; service_date: string; pax?: number }
+  | { kind: 'record'; from_date: string; to_date: string; reason: string; charge_type: ChargeType; charge_amount?: number; collect: 'invoice' | 'separate' };
+
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+const isoDay = (value: unknown, name: string): string =>
+  typeof value === 'string' && ISO_DAY.test(value) && !Number.isNaN(Date.parse(value)) ? value : badRequest(`${name} must be a YYYY-MM-DD date`);
+
+export function parseRescheduleRequest(body: Record<string, unknown>): RescheduleRequest {
+  if (body.from_date === undefined && (body.route_id !== undefined || body.service_date !== undefined || body.date !== undefined)) {
+    const route_id = typeof body.route_id === 'string' && body.route_id ? body.route_id : badRequest('route_id is required');
+    const service_date = body.service_date ?? body.date;
+    if (typeof service_date !== 'string' || !service_date) badRequest('service_date is required');
+    if (body.pax !== undefined && !(typeof body.pax === 'number' && Number.isInteger(body.pax) && body.pax > 0)) badRequest('pax must be a positive integer');
+    return { kind: 'move', route_id, service_date: service_date as string, ...(body.pax === undefined ? {} : { pax: body.pax as number }) };
+  }
+  const from_date = isoDay(body.from_date, 'from_date');
+  const to_date = isoDay(body.to_date, 'to_date');
+  if (from_date === to_date) badRequest('to_date must differ from from_date');
+  const reason = optionalText(body.reason, 'reason') ?? badRequest('reason is required');
+  const collect = body.collect ?? 'invoice';
+  if (collect !== 'invoice' && collect !== 'separate') badRequest('collect must be invoice or separate');
+  return { kind: 'record', from_date, to_date, reason, ...charge(body), collect: collect as 'invoice' | 'separate' };
+}
+
+/**
+ * The reschedule record, the fee item it adds, and its history line. The trip's price stands; a
+ * charge is extra (`booking.js:13643`). Collected on the invoice it becomes a fee item; collected
+ * separately it is kept on the record only. With no charge there is nothing to collect.
+ */
+export function planRescheduleRecord(
+  booking: { total?: number; fee_items: readonly { amount: number }[] },
+  request: Extract<RescheduleRequest, { kind: 'record' }>, by: string | undefined, locksReturned: number,
+): { record: Omit<BookingReschedule, 'at'>; fee_item?: Omit<BookingFeeItem, 'at'>; history: HistoryLine } {
+  const amount = chargeAmount(request, amountOwed(booking));
+  const collect: Collect = amount > 0 ? request.collect : 'none';
+  const route = `${request.from_date} → ${request.to_date}`;
+  const collected = collect === 'invoice' ? ' · on booking invoice' : collect === 'separate' ? ' · paid separately' : '';
+  const locks = locksReturned > 0 ? ` · ${locksReturned} lock seat${locksReturned === 1 ? '' : 's'} returned` : '';
+  return {
+    record: { from_date: request.from_date, to_date: request.to_date, reason: request.reason, charge_type: request.charge_type, charge_amount: amount, collect, by: by ?? null },
+    ...(collect === 'invoice' ? { fee_item: { type: 'reschedule', label: `Reschedule fee · ${route} · ${request.reason}`, amount } } : {}),
+    history: line(by, 'reschedule', 'Reschedule', `Rescheduled ${route} · ${chargeLabel(request.charge_type, amount)}${collected}${locks} · ${request.reason}`),
+  };
+}
+
+/** The older body moves a trip without a reason; the history still says where it went. */
+export const movedLine = (by: string | undefined, from: string, to: string): HistoryLine =>
+  line(by, 'reschedule', 'Reschedule', `Rescheduled ${from} → ${to}`);
+
+// ── Shared parsing ───────────────────────────────────────────────────────────────────────────────
+
+/** Trimmed text, or undefined when absent or blank. Present and not a string is refused. */
+function optionalText(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') badRequest(`${name} must be a string`);
+  const trimmed = (value as string).trim();
+  return trimmed === '' ? undefined : trimmed;
+}

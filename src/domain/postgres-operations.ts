@@ -2,11 +2,18 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsSeats, demandByDay, drawnLockIds, movedTripIds, nextTrips, partialCancelTrips, planTrips, tripsChanged,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, claimsSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
+  partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
-import { type PaxCategory, type PaxResidency } from './pax.js';
+import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
+import {
+  assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
+  restoredLine, totalAfterRefund,
+  type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
+  type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
+} from './booking-actions.js';
 import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
 import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
@@ -15,6 +22,7 @@ import {
   type BookingHeader,
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
+import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -23,7 +31,7 @@ import {
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
-const TRANSACTION_ATTEMPTS = 5;
+const TRANSACTION_ATTEMPTS = 8;
 const isRetryable = (error: unknown): boolean => error instanceof Error && ['40001', '40P01'].includes((error as Error & { code?: string }).code ?? '');
 const asIso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
 const dateOnly = (value: unknown): string => value instanceof Date ? `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}` : String(value);
@@ -54,8 +62,33 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
-    FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers
+    FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('seq', a.seq, 'type', a.type, 'label', a.label, 'amount', a.amount, 'qty', a.qty, 'note', a.note,
+      'join_adults', a.join_adults, 'join_children', a.join_children) ORDER BY a.seq)
+    FROM booking_addons a WHERE a.booking_id = b.id), '[]'::jsonb) AS add_ons,
+  (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
+    FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('from_date', r.from_date::text, 'to_date', r.to_date::text, 'reason', r.reason, 'charge_type', r.charge_type,
+      'charge_amount', r.charge_amount, 'collect', r.collect, 'at', r.at, 'by', r.by) ORDER BY r.at, r.id)
+    FROM booking_reschedules r WHERE r.booking_id = b.id), '[]'::jsonb) AS reschedules,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('trip_id', pc.booking_trip_id, 'service_date', pc.service_date::text, 'pax_removed', pc.pax_removed, 'count', pc.count,
+      'category', pc.category, 'group', pc.grp, 'note', pc.note, 'charged_count', pc.charged_count, 'charged_amount', pc.charged_amount,
+      'waived_count', pc.waived_count, 'waived_amount', pc.waived_amount, 'at', pc.at, 'by', pc.by) ORDER BY pc.at, pc.id)
+    FROM booking_partial_cancels pc WHERE pc.booking_id = b.id), '[]'::jsonb) AS partial_cancels,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('type', f.type, 'label', f.label, 'amount', f.amount, 'at', f.at) ORDER BY f.at, f.id)
+    FROM booking_fee_items f WHERE f.booking_id = b.id), '[]'::jsonb) AS fee_items
   FROM bookings b`;
+
+/**
+ * A `timestamptz` inside JSON arrives as text in the session's zone (`2026-10-05 09:11:09.1+07`),
+ * not the `Z` instant the in-process store writes, so it is re-rendered the same way.
+ */
+const jsonInstant = (value: unknown): string => new Date(String(value)).toISOString();
+const textOrNull = (value: unknown): string | null => (value === null || value === undefined ? null : String(value));
 
 const NUMERIC_HEADER = new Set<string>(BOOKING_HEADER_NUMERIC_COLUMNS);
 const TIMESTAMP_HEADER = new Set<string>(BOOKING_HEADER_TIMESTAMP_COLUMNS);
@@ -96,6 +129,35 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     nationality: passenger.nationality ?? undefined, type: passenger.type ?? undefined,
     foc: passenger.foc ?? undefined,
   })) as BookingPassenger[],
+  // A NULL column is left off rather than sent as null, matching the in-process store, which never
+  // set it. `amount` is NUMERIC; Number() keeps it a JSON number whichever way `pg` hands it over.
+  add_ons: (row.add_ons as Record<string, unknown>[]).map((addOn): BookingAddOn => ({
+    seq: Number(addOn.seq), type: String(addOn.type),
+    ...(addOn.label == null ? {} : { label: String(addOn.label) }),
+    ...(addOn.amount == null ? {} : { amount: Number(addOn.amount) }),
+    ...(addOn.qty == null ? {} : { qty: Number(addOn.qty) }),
+    ...(addOn.note == null ? {} : { note: String(addOn.note) }),
+    ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
+    ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
+  })),
+  ...(row.cancellation ? { cancellation: cancellation(row.cancellation as Record<string, unknown>) } : {}),
+  reschedules: (row.reschedules as Record<string, unknown>[]).map((r): BookingReschedule => ({
+    from_date: String(r.from_date), to_date: String(r.to_date), reason: textOrNull(r.reason), charge_type: r.charge_type as ChargeType,
+    charge_amount: Number(r.charge_amount), collect: r.collect as Collect, at: jsonInstant(r.at), by: textOrNull(r.by),
+  })),
+  partial_cancels: (row.partial_cancels as Record<string, unknown>[]).map((p): BookingPartialCancel => ({
+    trip_id: textOrNull(p.trip_id), service_date: textOrNull(p.service_date), pax_removed: p.pax_removed as PaxGrid, count: Number(p.count),
+    category: textOrNull(p.category), group: textOrNull(p.group) as CancelGroup | null, note: textOrNull(p.note),
+    charged: { count: Number(p.charged_count), amount: Number(p.charged_amount) }, waived: { count: Number(p.waived_count), amount: Number(p.waived_amount) },
+    at: jsonInstant(p.at), by: textOrNull(p.by),
+  })),
+  fee_items: (row.fee_items as Record<string, unknown>[]).map((f): BookingFeeItem => ({
+    type: String(f.type), label: textOrNull(f.label), amount: Number(f.amount), at: jsonInstant(f.at),
+  })),
+});
+const cancellation = (c: Record<string, unknown>): BookingCancellation => ({
+  category: String(c.category), group: c.group as CancelGroup, note: textOrNull(c.note), charge_type: c.charge_type as ChargeType,
+  charge_amount: Number(c.charge_amount), at: jsonInstant(c.at), by: textOrNull(c.by),
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
@@ -178,9 +240,11 @@ export class PostgresOperationsStore {
         await client.query('ROLLBACK').catch(() => undefined);
         if (attempt >= TRANSACTION_ATTEMPTS || !isRetryable(error)) throw error;
       } finally { client.release(); }
-      // Contended pools are already serialized by the advisory lock, so a short jittered pause is
-      // enough to let the winner commit rather than have both sides collide again immediately.
-      await new Promise((resolve) => setTimeout(resolve, attempt * 10 + Math.random() * 10));
+      // Contended pools are already serialized by the advisory lock, so a jittered pause is enough to
+      // let the winner commit rather than have both sides collide again immediately. It doubles each
+      // time: a write now also touches its history and action records, which every booking read
+      // scans, so several writers can keep colliding for longer than a fixed step outlasts.
+      await new Promise((resolve) => setTimeout(resolve, 2 ** attempt * 5 * (1 + Math.random())));
     }
   }
   private async lockPool(routeId: string, date: string): Promise<void> { await this.client().query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${routeId}:${date}`]); }
@@ -332,6 +396,16 @@ export class PostgresOperationsStore {
     }
   }
 
+  /** Replaces the whole list, the same delete-and-insert `writePassengers` does. */
+  private async writeAddOns(bookingId: string, addOns: readonly BookingAddOnInput[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_addons WHERE booking_id = $1', [bookingId]);
+    for (const [seq, addOn] of addOns.entries()) {
+      await this.client().query(
+        'INSERT INTO booking_addons (booking_id, seq, type, label, amount, qty, note, join_adults, join_children) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [bookingId, seq, addOn.type, addOn.label ?? null, addOn.amount ?? null, addOn.qty ?? null, addOn.note ?? null, addOn.join_adults ?? null, addOn.join_children ?? null]);
+    }
+  }
+
   /** Answers 400 before `booking_trips_route_fk` or the lock draw's foreign key can answer 500. */
   private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
     const ids = [...new Set(trips.map((trip) => trip.route_id))];
@@ -341,7 +415,23 @@ export class PostgresOperationsStore {
     assertKnownLocks(new Set(locks.map((row) => String(row.id))), trips);
   }
 
-  async createBooking(input: BookingInput): Promise<Booking> {
+  /** Appends one history line inside the transaction of the write it describes. */
+  private async log(bookingId: string, entry: HistoryLine): Promise<void> {
+    await this.client().query('INSERT INTO booking_history (booking_id, by, kind, tag, text) VALUES ($1,$2,$3,$4,$5)', [bookingId, entry.by, entry.kind, entry.tag, entry.text]);
+  }
+  /** Oldest first; the serial id orders lines written in one transaction, which share `now()`. */
+  async bookingHistory(id: string): Promise<HistoryEntry[] | undefined> {
+    const { rows: [known] } = await this.client().query('SELECT 1 FROM bookings WHERE id = $1', [id]);
+    if (!known) return undefined;
+    const { rows } = await this.client().query('SELECT at, by, kind, tag, text FROM booking_history WHERE booking_id = $1 ORDER BY at, id', [id]);
+    return rows.map((row) => ({ at: asIso(row.at), by: textOrNull(row.by), kind: String(row.kind), tag: textOrNull(row.tag), text: String(row.text) }));
+  }
+  /** Every action's write is signed by the token's user; without one (auth off) the column is left alone. */
+  private async touch(id: string, actor: string | undefined, extra = '', values: unknown[] = []): Promise<void> {
+    await this.client().query(`UPDATE bookings SET updated_at = now(), updated_by = COALESCE($2, updated_by)${extra} WHERE id = $1`, [id, actor ?? null, ...values]);
+  }
+
+  async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
     const status = input.status ?? 'confirmed';
     const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
@@ -368,6 +458,8 @@ export class PostgresOperationsStore {
     await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
     await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
+    await this.writeAddOns(id, input.add_ons ?? []);
+    await this.log(id, createdLine(actor));
     return (await this.booking(id))!;
   }
 
@@ -375,30 +467,43 @@ export class PostgresOperationsStore {
     const cursor = query.cursor ? decodeBookingCursor(query.cursor) : undefined;
     // The direction is one of two fixed strings, never caller text, so it is safe to splice in.
     const [after, order] = query.order === 'desc' ? ['<', 'DESC'] : ['>', 'ASC'];
-    const { rows } = await this.client().query(`${BOOKING_SELECT}
-      WHERE EXISTS (SELECT 1 FROM booking_trips t
+    // One WHERE for the page and the count, so `total` counts exactly what paging walks through.
+    // `q` and `voucherRef` arrive lower-cased; `position` is a plain substring test, so a `%` or `_`
+    // in the search text means itself, as it does to the in-process store's `includes`.
+    const filters = `EXISTS (SELECT 1 FROM booking_trips t
         WHERE t.booking_id = b.id
           AND ($1::text IS NULL OR t.route_id = $1)
           AND ($2::date IS NULL OR t.service_date = $2)
           AND ($3::date IS NULL OR t.service_date >= $3)
           AND ($4::date IS NULL OR t.service_date <= $4))
-        AND ($8::text IS NULL OR b.agent_id = $8)
-        AND ($5::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($5::timestamptz, $6::text))
+        AND ($5::text IS NULL OR b.agent_id = $5)
+        AND ($6::text[] IS NULL OR b.status = ANY($6))
+        AND ($7::text IS NULL OR lower(b.voucher_ref) = $7)
+        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)`;
+    const params = [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, query.agentId ?? null, query.statuses ?? null, query.voucherRef ?? null, query.q ?? null];
+    const [{ rows }, { rows: [{ total }] }] = await Promise.all([
+      this.client().query(`${BOOKING_SELECT}
+      WHERE ${filters}
+        AND ($9::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($9::timestamptz, $10::text))
       ORDER BY b.created_at ${order}, b.id ${order}
-      LIMIT $7`, [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1, query.agentId ?? null]);
+      LIMIT $11`, [...params, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]),
+      this.client().query(`SELECT count(*)::int AS total FROM bookings b WHERE ${filters}`, params),
+    ]);
     const page = rows.slice(0, query.limit);
-    return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}) };
+    return { bookings: page.map(booking), ...(rows.length > query.limit ? { next_cursor: encodeBookingCursor({ created_at: asIso(page[page.length - 1].created_at), id: String(page[page.length - 1].id) }) } : {}), total: Number(total) };
   }
   async booking(id: string): Promise<Booking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && booking(row); }
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }
 
-  async amendBooking(id: string, changes: BookingChanges): Promise<Booking | undefined> {
+  /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
+  async amendBooking(id: string, changes: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     const replacement = nextTrips(current.trips, changes);
     const planned = planTrips(current.trips, replacement, newTripId);
     const status = changes.status ?? current.status;
     await this.assertRoutes(replacement);
-    if (claimsSeats(current.status, status, tripsChanged(current.trips, replacement))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
+    if (claimsSeats(current.status, status, claimsMoreSeats(current.trips, planned))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
+    await this.log(id, entry ?? editedLine(actor, changes, current.status));
     await this.writeTrips(id, current.trips, planned);
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
     // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
@@ -415,19 +520,91 @@ export class PostgresOperationsStore {
     // `booking_data` is deliberately left as it was written at create time. The blob is on its way
     // out, and re-serialising an amendment into it would grow the thing being deleted.
     if (changes.passengers) await this.writePassengers(id, changes.passengers);
+    if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     return this.booking(id);
   }
 
-  async cancelBooking(id: string, reason?: string): Promise<Booking | undefined> {
-    const { rowCount } = await this.client().query("UPDATE bookings SET status='cancelled', cancellation_reason=$2, updated_at=now() WHERE id=$1 AND status <> 'cancelled'", [id, reason ?? null]);
-    if (rowCount === 0 && !(await this.booking(id))) return undefined;
-    return this.booking(id);
-  }
-
-  async partialCancel(id: string, count: number): Promise<Booking | undefined> {
+  async cancelBooking(id: string, request: CancelRequest, actor?: string): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
-    await this.writeTrips(id, current.trips, planTrips(current.trips, partialCancelTrips(current.trips, current.status, count), newTripId));
-    await this.client().query('UPDATE bookings SET updated_at=now() WHERE id=$1', [id]);
+    const plan = planCancel(current, request, actor);
+    await this.touch(id, actor, ", status = 'cancelled', cancellation_reason = $3", [plan.cancellation_reason]);
+    if (plan.record) {
+      const r = plan.record;
+      await this.client().query(`INSERT INTO booking_cancellations (booking_id, category, grp, note, charge_type, charge_amount, by) VALUES ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (booking_id) DO UPDATE SET category = EXCLUDED.category, grp = EXCLUDED.grp, note = EXCLUDED.note, charge_type = EXCLUDED.charge_type,
+          charge_amount = EXCLUDED.charge_amount, at = now(), by = EXCLUDED.by`, [id, r.category, r.group, r.note, r.charge_type, r.charge_amount, r.by]);
+    } else {
+      await this.client().query('DELETE FROM booking_cancellations WHERE booking_id = $1', [id]);
+    }
+    await this.log(id, plan.history);
+    return this.booking(id);
+  }
+
+  /**
+   * Back to `confirmed`, lock seats redrawn as far as the locks allow (`restoreTrips`). The pools are
+   * locked before the days are read, so the lock remainders it decides on cannot move underneath it.
+   */
+  async restoreBooking(id: string, actor?: string): Promise<{ booking: Booking; warnings: LockShortWarning[] } | undefined> {
+    const current = await this.storedBooking(id); if (!current) return undefined;
+    assertRestorable(current.status);
+    const days = new Map<string, DayState>();
+    const pools = [...new Map(current.trips.map((trip) => [dayKey(trip.route_id, trip.service_date), trip])).entries()].sort(([a], [b]) => a.localeCompare(b));
+    for (const [key, trip] of pools) {
+      await this.lockPool(trip.route_id, trip.service_date);
+      days.set(key, await this.day(trip.route_id, trip.service_date, { bookingId: id }));
+    }
+    const { trips, warnings } = restoreTrips(current.trips, days);
+    await this.assertTrips(trips, { bookingId: id });
+    await this.writeTrips(id, current.trips, planTrips(current.trips, trips, newTripId));
+    await this.touch(id, actor, ", status = 'confirmed', cancellation_reason = NULL");
+    await this.client().query('DELETE FROM booking_cancellations WHERE booking_id = $1', [id]);
+    await this.log(id, restoredLine(actor, warnings));
+    return { booking: (await this.booking(id))!, warnings };
+  }
+
+  async partialCancel(id: string, request: PartialCancelRequest, actor?: string): Promise<Booking | undefined> {
+    const current = await this.storedBooking(id); if (!current) return undefined;
+    if (request.kind === 'count') {
+      await this.writeTrips(id, current.trips, planTrips(current.trips, partialCancelTrips(current.trips, current.status, request.count), newTripId));
+      await this.touch(id, actor);
+      await this.log(id, partialCountLine(actor, request.count));
+      return this.booking(id);
+    }
+    assertOpen(current.status, 'partial cancel');
+    // Seats only go down here, so there is no capacity check — see `claimsMoreSeats`.
+    const { trips, trip, count } = partialCancelByKey(current.trips, request);
+    const record = partialCancelRecord(trip, request, count, actor);
+    await this.writeTrips(id, current.trips, planTrips(current.trips, trips, newTripId));
+    await this.touch(id, actor, ', total = $3', [totalAfterRefund(current.total, request.waived) ?? null]);
+    await this.client().query(`INSERT INTO booking_partial_cancels (booking_id, booking_trip_id, service_date, pax_removed, count, category, grp, note,
+        charged_count, charged_amount, waived_count, waived_amount, by) VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [id, record.trip_id, record.service_date, JSON.stringify(record.pax_removed), record.count, record.category, record.group, record.note,
+        record.charged.count, record.charged.amount, record.waived.count, record.waived.amount, record.by]);
+    await this.log(id, partialCancelLine(actor, record));
+    return this.booking(id);
+  }
+
+  async rescheduleBooking(id: string, request: RescheduleRequest, actor?: string): Promise<Booking | undefined> {
+    const current = await this.storedBooking(id); if (!current) return undefined;
+    if (request.kind === 'move') {
+      const from = current.trips[0]?.service_date ?? '';
+      return this.amendBooking(id, { route_id: request.route_id, service_date: request.service_date, ...(request.pax === undefined ? {} : { pax: request.pax }) }, actor, movedLine(actor, from, request.service_date));
+    }
+    assertOpen(current.status, 'reschedule');
+    const { trips, locksReturned } = rescheduleTrips(current.trips, request.from_date, request.to_date);
+    const planned = planTrips(current.trips, trips, newTripId);
+    await this.assertRoutes(trips);
+    if (claimsMoreSeats(current.trips, planned)) await this.assertTrips(trips, { bookingId: id }, current.trips);
+    await this.writeTrips(id, current.trips, planned);
+    const plan = planRescheduleRecord(current, request, actor, locksReturned);
+    const r = plan.record;
+    await this.client().query(`INSERT INTO booking_reschedules (booking_id, from_date, to_date, reason, charge_type, charge_amount, collect, by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [id, r.from_date, r.to_date, r.reason, r.charge_type, r.charge_amount, r.collect, r.by]);
+    if (plan.fee_item) {
+      await this.client().query('INSERT INTO booking_fee_items (booking_id, type, label, amount) VALUES ($1,$2,$3,$4)', [id, plan.fee_item.type, plan.fee_item.label, plan.fee_item.amount]);
+    }
+    await this.touch(id, actor);
+    await this.log(id, plan.history);
     return this.booking(id);
   }
 
