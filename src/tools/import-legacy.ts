@@ -9,7 +9,11 @@
  * Imported rows are owned by the `lg_` id prefix, and a run first deletes every `lg_` booking, lock
  * and van group, so running it twice leaves one copy. Deployments, capacity overrides and vans are
  * upserted on their natural keys, and an imported van's dated rows (month matrix, status, drivers)
- * are replaced. Agents, markets and salespeople keep legacy's ids and are upserted too; an agent's
+ * are replaced. They are also mirrored: one whose key no longer exists in legacy at all is deleted,
+ * because legacy is master while this import runs (until cutover) and a boat taken off a day there
+ * must stop selling seats here. A row legacy still has but this import skipped is kept and listed.
+ * A van still referenced by something this import did not create cannot be deleted, and the whole
+ * run rolls back. Agents, markets and salespeople keep legacy's ids and are upserted too; an agent's
  * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
  * bookings named in `--remove`.
  *
@@ -661,9 +665,19 @@ async function main() {
     // Deleting the bookings already cascaded their trips' allocations and trip operations.
     const replacedGroups = (await target.query(`DELETE FROM van_groups WHERE id LIKE '${PREFIX}%'`)).rowCount;
     const importedVans = vans.map((v) => String(v.id));
+    // Mirroring: keyed on every legacy row, not only the ones that mapped, so a row skipped this run is
+    // reported rather than deleted. An empty source is refused rather than read as "delete everything".
+    if (boatDays.length === 0) throw new Error('Legacy returned no deployments (trips__boat): refusing to mirror an empty source');
+    const legacyVanIds = legacyVans.map((v) => str(v.id)).filter(Boolean);
+    const staleVans = (await target.query('SELECT id FROM vans WHERE id <> ALL($1::text[]) ORDER BY id', [legacyVanIds])).rows.map((r) => String(r.id));
     for (const table of ['van_day_routes', 'van_status_ranges', 'van_days']) {
-      await target.query(`DELETE FROM ${table} WHERE van_id = ANY($1::text[])`, [importedVans]);
+      await target.query(`DELETE FROM ${table} WHERE van_id = ANY($1::text[])`, [[...importedVans, ...staleVans]]);
     }
+    await target.query('DELETE FROM vans WHERE id = ANY($1::text[])', [staleVans]);
+    const removedDeployments = (await target.query(`DELETE FROM deployments WHERE service_date::text || '::' || boat_id <> ALL($1::text[])
+      RETURNING service_date::text AS day, boat_id, route_id`, [boatDays.map((bd) => `${str(bd.trips_id)}::${str(bd.key)}`)])).rows;
+    const removedOverrides = (await target.query(`DELETE FROM boat_capacity_overrides WHERE service_date::text || '::' || boat_id <> ALL($1::text[])
+      RETURNING service_date::text AS day, boat_id`, [capOverrides.map((o) => str(o.key))])).rows;
     const upsert = (rows: Row[], extra = '') => `ON CONFLICT (id) DO UPDATE SET ${Object.keys(rows[0] ?? { id: 0 }).filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).concat(extra ? [extra] : []).join(', ')}`;
     await insert('vans', vans, upsert(vans));
     // Agents before their children; programmes, activity and sub-markets are replaced, not merged.
@@ -721,6 +735,13 @@ async function main() {
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
     console.log('target now holds:', after);
+    // Grouped by boat and route, so 30 days of one boat taken off one programme reads as one line.
+    const byBoatRoute = new Map<string, string[]>();
+    for (const d of removedDeployments) (byBoatRoute.get(`${d.boat_id} ${d.route_id}`) ?? byBoatRoute.set(`${d.boat_id} ${d.route_id}`, []).get(`${d.boat_id} ${d.route_id}`)!).push(String(d.day));
+    console.log(`\nremoved, no longer in legacy: ${removedDeployments.length} deployments, ${removedOverrides.length} capacity overrides, ${staleVans.length} vans`);
+    for (const [boatRoute, days] of byBoatRoute) console.log(`  deployment ${boatRoute}: ${days.length} day(s), ${days.sort()[0]} … ${days[days.length - 1]}`);
+    for (const o of removedOverrides) console.log(`  capacity override ${o.boat_id} ${o.day}`);
+    for (const id of staleVans) console.log(`  van ${id}`);
     console.log(`\nplaceholders created (${placeholders.length}):`);
     for (const p of placeholders) console.log(`  ${p}`);
     console.log(`\nagent data to check (${agentData.length}):`);
