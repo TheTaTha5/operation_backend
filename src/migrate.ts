@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
 import { readFile, readdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { Client } from 'pg';
+import { checksumMatches, migrationChecksum } from './migration-checksum.js';
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error('DATABASE_URL is required');
@@ -59,11 +59,11 @@ try {
 
   for (const file of files) {
     const sql = await readFile(join(migrationsDir, file), 'utf8');
-    const checksum = createHash('sha256').update(sql).digest('hex');
+    const checksum = migrationChecksum(sql);
     const recorded = ledger.get(file);
     if (recorded !== undefined) {
       // Editing an applied migration leaves this database permanently different from a freshly migrated one.
-      if (recorded !== checksum) console.warn(`  ! ${file} has changed since it was applied — this database no longer matches a fresh migration`);
+      if (!checksumMatches(recorded, sql)) console.warn(`  ! ${file} has changed since it was applied — this database no longer matches a fresh migration`);
       continue;
     }
     // The statements and the ledger row commit together, so a failure can never record a half-applied migration.
