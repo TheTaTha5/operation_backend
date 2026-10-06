@@ -151,9 +151,9 @@ const idParam = { type: 'object', required: ['id'], properties: { id: { type: 's
 export const docs = {
   routes: {
     tags: ['Catalogue'], summary: 'List routes (programmes)', security: BEARER,
-    description: 'The route ids a booking trip must use. With `from` and `to`, each route carries its operating calendar per day.',
-    querystring: { type: 'object', properties: { from: isoDate, to: isoDate } },
-    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } } } } } } }, 400: err('Bad date range'), ...UNAUTHORIZED },
+    description: 'The route ids a booking trip must use. With `from` and `to`, each route carries its operating calendar per day. `kind=marine` lists boat programmes only; `kind=land` lists transfers, tours and tickets.',
+    querystring: { type: 'object', properties: { from: isoDate, to: isoDate, kind: { type: 'string', enum: ['marine', 'land'] } } },
+    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, kind: { type: 'string', enum: ['marine', 'land'] }, ext_id: { type: 'string', description: 'Love Kingdom product code, e.g. PTP-005:VT-002' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } } } } } } }, 400: err('Bad date range or kind'), ...UNAUTHORIZED },
   },
   availability: {
     tags: ['Availability'], summary: 'Seats left on a route and day, or over a range', security: BEARER,

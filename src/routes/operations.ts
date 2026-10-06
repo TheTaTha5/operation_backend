@@ -3,7 +3,7 @@ import { assertItinerary, OperationsStore, type OvnMode, type BookingChanges, ty
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
-import { eachDate, isIsoDate, isIsoTime, routeCalendar } from '../domain/calendar.js';
+import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
@@ -259,7 +259,9 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const query = request.query as Record<string, unknown>;
     const from = optionalString(query.from), to = optionalString(query.to);
     if ((from === undefined) !== (to === undefined)) badRequest('from and to must be supplied together');
-    const routes = await store.listRoutes();
+    const kind = optionalString(query.kind);
+    if (kind !== undefined && !isRouteKind(kind)) badRequest('kind must be marine or land');
+    const routes = (await store.listRoutes()).filter((route) => kind === undefined || route.kind === kind);
     if (from === undefined || to === undefined) return { routes };
 
     if (!isIsoDate(from) || !isIsoDate(to)) badRequest('from and to must be YYYY-MM-DD dates');

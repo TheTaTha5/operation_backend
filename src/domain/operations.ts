@@ -324,7 +324,8 @@ export class OperationsStore {
 
   /** Loads reference data that a PostgreSQL deployment gets from migrations instead. */
   seedCatalogue(catalogue: Partial<{ routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] }>): void {
-    if (catalogue.routes) this.catalogue.routes = catalogue.routes.map((route) => ({ ...route }));
+    // `kind` defaults the way the column does, so both stores list the same route the same way.
+    if (catalogue.routes) this.catalogue.routes = catalogue.routes.map((route) => ({ ...route, kind: route.kind ?? 'marine' }));
     if (catalogue.seasons) this.catalogue.seasons = catalogue.seasons.map((season) => ({ ...season }));
     if (catalogue.overrides) this.catalogue.overrides = catalogue.overrides.map((override) => ({ ...override }));
     if (catalogue.boats) this.catalogue.boats = catalogue.boats.map((boat) => ({ ...boat }));
