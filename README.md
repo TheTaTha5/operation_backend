@@ -40,6 +40,7 @@ npm run dev
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes, times, seasons, day overrides) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:boats [-- --commit]` | Copy the boat catalogue from the legacy database, the same way: dry run unless `--commit`, legacy wins, never deletes. Legacy's `totalcap` is never read, and a boat selling more seats than its licence is skipped and listed, not clamped. Run the import afterwards so deployments pick up new or changed boats. |
 
 Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed, with line endings normalized to LF so a Windows checkout (`core.autocrlf`) and a Railway build agree: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
 
@@ -120,8 +121,10 @@ yet**: `POST /v1/bookings` checks boat seats, a land route has no deployments, a
 `409 Insufficient available seats`. Selling land products needs its own capacity rule, which is
 undecided.
 
-The route catalogue is still edited in legacy. `npm run sync:routes` copies it here, and is meant to
-be run again whenever legacy has changed (see Commands).
+The route and boat catalogues are still edited in legacy. `npm run sync:routes` and
+`npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
+Commands). A boat missing here is not just a missing row: the import skips every deployment on it,
+so its seats are absent from `GET /v1/availability`. Run `sync:boats` before the import.
 
 `GET /v1/boats` is deliberately **not** date-aware. `boat_capacity_overrides` changes one boat's
 seats for one day, but `GET /v1/availability` already resolves that against the day's deployment,
