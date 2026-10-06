@@ -649,10 +649,10 @@ export class PostgresOperationsStore {
 
   /** Reference data. Dates are cast in SQL so the driver never hands back a Date to re-render. */
   async listRoutes(): Promise<Route[]> {
-    const { rows } = await this.client().query(`SELECT r.id, r.name, r.pier, r.family_id, r.color, r.islands, r.sort,
+    const { rows } = await this.client().query(`SELECT r.id, r.name, r.kind, r.ext_id, r.pier, r.family_id, r.color, r.islands, r.sort,
       COALESCE((SELECT array_agg(t.departs_at ORDER BY t.idx) FROM route_times t WHERE t.route_id = r.id), '{}') AS times
       FROM routes r ORDER BY r.sort NULLS LAST, r.id`);
-    return rows.map((row) => ({ id: String(row.id), name: String(row.name), pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [] }));
+    return rows.map((row) => ({ id: String(row.id), name: String(row.name), kind: row.kind, ext_id: row.ext_id ?? undefined, pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [] }));
   }
   /**
    * The boat catalogue. `license_pax` stays undefined for a boat with no licence on file rather

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { buildApp } from '../src/app.js';
+import { OperationsStore } from '../src/domain/operations.js';
 import type { InjectOptions } from 'fastify';
 
 const app = buildApp();
@@ -158,6 +159,26 @@ test('the route calendar endpoint validates its range', async () => {
     assert.ok(typeof route.days['2026-08-26'].open === 'boolean');
     assert.ok(route.days['2026-08-26'].source, 'a day always says which rule decided it');
   }
+});
+
+test('the in-process catalogue gives an unmarked route the column default, marine', () => {
+  const store = new OperationsStore();
+  store.seedCatalogue({ routes: [{ id: 'r3', name: 'Similan' }, { id: 'r-show', name: 'Fantasea', kind: 'land', ext_id: 'PTP-002' }] });
+  assert.deepEqual(store.listRoutes().map((r) => [r.id, r.kind, r.ext_id]), [['r3', 'marine', undefined], ['r-show', 'land', 'PTP-002']]);
+});
+
+test('GET /v1/routes filters by kind', async () => {
+  assert.equal((await request('GET', '/v1/routes?kind=boat')).statusCode, 400, 'only marine or land');
+
+  const all = (await request('GET', '/v1/routes')).json().routes as Array<{ id: string; kind: string }>;
+  for (const route of all) assert.ok(route.kind === 'marine' || route.kind === 'land', `${route.id} states its kind`);
+  for (const kind of ['marine', 'land']) {
+    const response = await request('GET', `/v1/routes?kind=${kind}`);
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json().routes.map((r: { id: string }) => r.id), all.filter((r) => r.kind === kind).map((r) => r.id), `kind=${kind} is the catalogue minus the other kind, in the same order`);
+  }
+  const ranged = await request('GET', '/v1/routes?kind=marine&from=2026-08-01&to=2026-08-02');
+  assert.ok(ranged.json().routes.every((r: { kind: string }) => r.kind === 'marine'), 'the filter applies with a calendar range too');
 });
 
 test('a reservation being edited does not compete with its own seats', async () => {

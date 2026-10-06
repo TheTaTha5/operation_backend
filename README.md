@@ -39,6 +39,7 @@ npm run dev
 | `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes, times, seasons, day overrides) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. |
 
 Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
 
@@ -105,8 +106,22 @@ Reference data every other endpoint refers to by id.
 - `GET /v1/routes` — the route catalogue. With `from=&to=` each route also carries its operating
   calendar resolved per date, as `days[date] = { open, source }`, where `source` names the rule that
   decided it. The range is capped at 400 days, and `from`/`to` must be supplied together.
+  Each route is `{ id, name, kind, ext_id?, pier?, family_id?, color?, islands?, sort?, times }`.
+  `kind=marine` or `kind=land` lists only that kind (`400` for anything else).
 - `GET /v1/boats` — the boat catalogue: `{ id, name, type?, pier?, capacity, license_pax,
   charter_ceiling, crew? }`.
+
+**Not every route is a boat trip.** `kind` is `marine` for a boat programme (it has a pier,
+deployments and seats) and `land` for a transfer, city tour or show/park ticket, which has none of
+these. `ext_id` is a land product's Love Kingdom code, e.g. `PTP-005:VT-002` (product, then variant);
+treat it as opaque. A calendar or seat view wants `kind=marine`. A land route is in the catalogue
+so that legacy bookings on it have a route to point at, but **it cannot be booked through this API
+yet**: `POST /v1/bookings` checks boat seats, a land route has no deployments, and the answer is
+`409 Insufficient available seats`. Selling land products needs its own capacity rule, which is
+undecided.
+
+The route catalogue is still edited in legacy. `npm run sync:routes` copies it here, and is meant to
+be run again whenever legacy has changed (see Commands).
 
 `GET /v1/boats` is deliberately **not** date-aware. `boat_capacity_overrides` changes one boat's
 seats for one day, but `GET /v1/availability` already resolves that against the day's deployment,
