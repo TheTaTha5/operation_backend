@@ -18,7 +18,10 @@ export function buildApp(): FastifyInstance {
   });
 
   const corsOrigins = process.env.CORS_ORIGIN?.split(',').map((origin) => origin.trim()).filter(Boolean);
-  app.register(fastifyCors, { origin: corsOrigins?.length ? corsOrigins : false });
+  // `methods` is spelled out because @fastify/cors defaults to GET,HEAD,POST, which blocks a browser's
+  // preflight for PATCH /v1/bookings/{id} and DELETE /operations/deployments/… . PUT is for the
+  // catalogue write endpoints in todo/legacy-replacement.md.
+  app.register(fastifyCors, { origin: corsOrigins?.length ? corsOrigins : false, methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] });
 
   // Live API documentation: Swagger UI is generated from the registered Fastify routes at startup.
   // Register it before operations routes so the documentation page itself is not behind API auth.

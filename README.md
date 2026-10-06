@@ -93,7 +93,7 @@ ordinary Bearer token: `Authorization: Bearer <access_token>` on any request. Ro
 `AUTH_JWT_SECRET` (which invalidates every outstanding token) and remove these two variables once
 testing is done.
 
-The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated). The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
+The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
 
 ## API
 
@@ -755,4 +755,6 @@ lock itself holds `pax − drawn_pax`, and that is what a new draw may take.
 
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 
-`GET /api/health` remains available for service health checks.
+`GET /api/health` remains available for service health checks. It returns `{ status: "ok", commit }`,
+where `commit` is the git SHA Railway built the running deploy from (`null` outside Railway). If it
+is not the head of the branch you pushed, the deploy you are talking to is stale.
