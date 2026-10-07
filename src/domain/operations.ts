@@ -1,13 +1,13 @@
 import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
-import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
+import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
+  confirmationStamp, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelRequest, type HistoryEntry, type HistoryLine,
   type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
@@ -20,6 +20,10 @@ import {
   removeRouteRows, routeRows, selectRateTypes,
   type CatalogueRoute, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows, type RateTypeSummary, type RouteBlock,
 } from './rate-types.js';
+import {
+  bookingHoldsSeats, decidedRecord, decideStatus, discountOf, focCountOf, pendingApproval, reweigh, sortApprovalDays,
+  type ApprovalDay, type ApprovalKind, type ApprovalWarning, type BookingApproval, type Intent, type NewApproval,
+} from './booking-approvals.js';
 
 export type Deployment = {
   boat_id: string;
@@ -65,8 +69,11 @@ export type BookingTrip = TripDetails & { id: string; seq: number; route_id: str
 
 export type BookingInput = {
   trips: BookingTripInput[];
-  /** Defaults to `confirmed`. A status that releases seats is created without reserving any. */
-  status?: BookingStatus;
+  /**
+   * Which save button: "Save as quote" or "Confirm" (default). The server decides the status from it
+   * and the facts (`decideStatus`); a client no longer sends a status.
+   */
+  intent?: Intent;
   external_id?: string;
   agent_id?: string;
   voucher_ref?: string;
@@ -103,6 +110,8 @@ export type Booking = BookingHeader & {
   booking_data?: Record<string, unknown>;
   passengers: BookingPassenger[];
   add_ons: BookingAddOn[];
+  /** Every approval the booking waited for, oldest first. The last `pending` one of a kind is the one waiting. */
+  approvals: BookingApproval[];
   /** The current cancellation's category and charge. Absent unless the booking was cancelled with one. */
   cancellation?: BookingCancellation;
   /** Every reschedule, partial cancel and fee item, oldest first. See `booking-actions.ts`. */
@@ -211,7 +220,9 @@ export function bookingView(stored: StoredBooking): Booking {
   const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
   const first = stored.trips[0];
   const seats = stored.trips.filter((trip) => trip.booking_mode !== 'charter').reduce((sum, trip) => sum + paxTotal(trip.pax), 0);
-  return { ...stored, trips, route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax, allocated_pax: holdsSeats(stored.status) ? seats : 0 };
+  // Approvals are copied: the store decides them in place, and a view already handed out must not change.
+  const approvals = (stored.approvals ?? []).map((approval) => ({ ...approval, days: approval.days.map((day) => ({ ...day })) }));
+  return { ...stored, approvals, trips, route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax, allocated_pax: bookingHoldsSeats(stored) ? seats : 0 };
 }
 
 const fail = (message: string, statusCode: number): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
@@ -282,7 +293,7 @@ export function demandByDay(trips: readonly BookingTripInput[]): DayDemand[] {
 export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusion = {}): Map<string, number> {
   const drawn = new Map<string, number>();
   for (const booking of bookings) {
-    if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
+    if (booking.id === exclude.bookingId || !bookingHoldsSeats(booking)) continue;
     for (const trip of booking.trips) for (const draw of trip.lock_draws) drawn.set(draw.lock_id, (drawn.get(draw.lock_id) ?? 0) + draw.qty);
   }
   return drawn;
@@ -437,7 +448,7 @@ export class OperationsStore {
       .map((d) => ({ boat_id: d.boat_id, capacity: d.capacity, license_pax: d.license_pax, override_capacity: this.boatOverride(d.boat_id, serviceDate) }));
     const trips: HeldTrip[] = [];
     for (const booking of this.bookings.values()) {
-      if (booking.id === exclude.bookingId || !holdsSeats(booking.status)) continue;
+      if (booking.id === exclude.bookingId || !bookingHoldsSeats(booking)) continue;
       for (const trip of booking.trips) {
         if (trip.route_id !== routeId || trip.service_date !== serviceDate) continue;
         trips.push({ booking_mode: trip.booking_mode, pax: paxTotal(trip.pax), charter_boat_id: trip.charter_boat_id });
@@ -506,27 +517,55 @@ export class OperationsStore {
   }
 
   createBooking(input: BookingInput, actor?: string): Booking {
-    const status = input.status ?? 'confirmed';
     const planned = planTrips([], input.trips, () => this.id('trip'));
     this.assertRoutes(input.trips);
-    // A booking created in a status that releases seats — a rejection being recorded, a cancelled
-    // import — reserves nothing, so a full day must not stop it being written down.
-    if (holdsSeats(status)) this.assertTrips(input.trips);
+    // Weighed first, then decided: the days over the allotment are a fact the status depends on.
+    const decision = decideStatus(input.intent ?? 'confirm', {
+      focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
+      overDays: this.weighTrips(input.trips),
+    }, actor);
+    const status = decision.status;
     const now = this.now();
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, passengers, add_ons, ...rest } = input;
+    const { trips, header, passengers, add_ons, intent: _intent, ...rest } = input;
     // `booking_data` is what PostgreSQL's create writes: the input's blob if it carries one, otherwise
     // the column's `{}`. Nothing sends one since the blob stopped being written (2026-09-22), so both
     // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
-      ...rest, ...header, booking_data: rest.booking_data ?? {}, id, status, created_at: now, updated_at: now, trips: planned,
-      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), reschedules: [], partial_cancels: [], fee_items: [],
+      ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}),
+      booking_data: rest.booking_data ?? {}, id, status, created_at: now, updated_at: now, trips: planned,
+      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
     };
     this.bookings.set(id, booking);
+    this.requestApprovals(booking, decision.approvals);
     this.log(id, createdLine(actor));
+    for (const line of decision.history) this.log(id, line);
     return this.view(booking);
+  }
+
+  /** The days the trips put over the allotment (`weighDay`), after refusing what legacy refuses. */
+  private weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}): ApprovalDay[] {
+    const over: ApprovalDay[] = [];
+    for (const demand of demandByDay(trips)) {
+      const weight = weighDay(this.day(demand.route_id, demand.service_date, exclude), demand);
+      if (weight) over.push({ route_id: demand.route_id, service_date: demand.service_date, ...weight });
+    }
+    return over;
+  }
+
+  /** One approval waits per kind: a new request replaces a pending one of its kind. */
+  private requestApprovals(booking: StoredBooking, requests: readonly NewApproval[]): void {
+    for (const request of requests) {
+      this.replacePending(booking, request.kind);
+      booking.approvals.push({
+        ...request, days: sortApprovalDays(request.days), status: 'pending', requested_at: this.now(), decided_by: null, decided_at: null, note: null,
+      });
+    }
+  }
+  private replacePending(booking: StoredBooking, kind: ApprovalKind): void {
+    for (const approval of booking.approvals) if (approval.kind === kind && approval.status === 'pending') approval.status = 'replaced';
   }
 
   /** Appends one history line. Called after the write it describes, so a refused write leaves none. */
@@ -577,18 +616,24 @@ export class OperationsStore {
     const changes = stripServerOwned(requested, booking as unknown as Record<string, unknown> & { status: BookingStatus });
     const replacement = nextTrips(booking.trips, changes);
     const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
-    const status = changes.status ?? booking.status;
     this.assertRoutes(replacement);
-    if (claimsSeats(booking.status, status, claimsMoreSeats(booking.trips, planned))) this.assertTrips(replacement, { bookingId: id });
+    const reweighed = reweighs(booking, changes, claimsMoreSeats(booking.trips, planned))
+      ? reweigh(booking, this.weighTrips(replacement, { bookingId: id }), actor) : undefined;
     const line = entry ?? editedLine(actor, changes, booking.status);
     booking.trips = planned;
-    booking.status = status;
+    if (reweighed) {
+      if (reweighed.request) this.requestApprovals(booking, [reweighed.request]);
+      else this.replacePending(booking, 'approval');
+      if (reweighed.status === 'confirmed' && !booking.confirmed_at) Object.assign(booking, confirmationStamp(actor, this.now()));
+      booking.status = reweighed.status;
+    }
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
     if (changes.passengers) booking.passengers = withSeq(changes.passengers);
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     booking.updated_at = this.now();
     this.log(id, line);
+    for (const extra of reweighed?.history ?? []) this.log(id, extra);
     return this.view(booking);
   }
 
@@ -606,23 +651,33 @@ export class OperationsStore {
   }
 
   /**
-   * `/confirm`, `/approve`, `/reject`, `/cancel-weather`: the rules are `planStatusCommand`'s. None of
-   * them asks for more seats — each moves between statuses that hold the same seats, or gives them
-   * back — so there is no capacity check.
+   * `/confirm`, `/approve`, `/reject`, `/cancel-weather`: the rules are `planStatusCommand`'s. Only
+   * approving a booking that waited over the allotment gives it seats (`plan.claims`), and legacy
+   * grants those even past the boats' registered seats, with a warning to add a boat: so does this.
    */
-  changeBookingStatus(id: string, command: StatusCommand, request: StatusCommandRequest, actor?: string): Booking | undefined {
+  changeBookingStatus(
+    id: string, command: StatusCommand, request: StatusCommandRequest, actor?: string,
+  ): { booking: Booking; warnings: ApprovalWarning[] } | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     const plan = planStatusCommand(command, booking, request, actor);
+    const warnings = plan.claims ? licenceWarnings(booking.trips, (routeId, date) => this.day(routeId, date, { bookingId: id })) : [];
+    const now = this.now();
+    if (plan.decide) {
+      const pending = pendingApproval(booking.approvals, plan.decide.kind);
+      if (pending) Object.assign(pending, { status: plan.decide.status, decided_by: actor ?? null, decided_at: now, note: plan.decide.note });
+      else booking.approvals.push(decidedRecord(plan.decide.kind, plan.decide.status, plan.status, focCountOf(booking.trips), actor, now, plan.decide.note));
+    }
+    this.requestApprovals(booking, plan.request);
     booking.status = plan.status;
     if (plan.confirms) {
-      booking.confirmed_at = this.now();
+      booking.confirmed_at = now;
       if (actor === undefined) delete booking.confirmed_by; else booking.confirmed_by = actor;
     }
     if (plan.cancellation_reason !== undefined) booking.cancellation_reason = plan.cancellation_reason;
     this.touch(booking, actor);
-    this.log(id, plan.history);
-    return this.view(booking);
+    for (const line of plan.history) this.log(id, line);
+    return { booking: this.view(booking), warnings };
   }
 
   /** Back to `confirmed`, lock seats redrawn as far as the locks allow. See `restoreTrips`. */
@@ -869,6 +924,28 @@ const drawnTotal = (draws: readonly LockDraw[]): number => draws.reduce((sum, dr
  * Shrinking never needs room. The import brings oversold days over as they are, and checking an
  * amendment that only frees seats would refuse taking a passenger off a day that is already over.
  */
+/**
+ * Whether an amendment is weighed against the allotment again: a booking holding its seats that asks
+ * for more, or one waiting over the allotment (holding nothing) whose itinerary changes at all.
+ */
+export function reweighs(
+  booking: { status: BookingStatus; approvals?: readonly BookingApproval[] }, changes: BookingChanges, moreSeats: boolean,
+): boolean {
+  if (bookingHoldsSeats(booking)) return moreSeats;
+  const itinerary = changes.trips !== undefined || changes.route_id !== undefined || changes.service_date !== undefined || changes.pax !== undefined;
+  return booking.status === 'pending_approval' && itinerary;
+}
+
+/** The days an approval puts past the boats' registered seats. `dayOf` reads the day without this booking. */
+export function licenceWarnings(trips: readonly StoredTrip[], dayOf: (routeId: string, date: string) => DayState): ApprovalWarning[] {
+  const warnings: ApprovalWarning[] = [];
+  for (const demand of demandByDay(trips.map((trip) => asInput(trip, trips)))) {
+    const over = licenceShortfall(dayOf(demand.route_id, demand.service_date), demand);
+    if (over > 0) warnings.push({ code: 'over_licence', route_id: demand.route_id, service_date: demand.service_date, over_by: over });
+  }
+  return warnings;
+}
+
 export function claimsMoreSeats(current: readonly StoredTrip[], planned: readonly StoredTrip[]): boolean {
   const before = new Map(current.map((trip) => [trip.id, trip]));
   return planned.some((trip) => {
@@ -1003,13 +1080,3 @@ export function assertKnownLocks(known: ReadonlySet<string>, trips: readonly Boo
   if (missing.length > 0) fail(`Unknown seat lock: ${missing.join(', ')}`, 400);
 }
 
-/**
- * Whether an amendment asks the pool for seats it is not already holding.
- *
- * Two ways that happens: the itinerary moved while the booking was holding, or the status crossed
- * from releasing to holding — a quote being confirmed asks for its seats for the first time, and a
- * day that filled up in the meantime must be allowed to refuse it. An amendment that only shrinks
- * the booking, or leaves a released booking released, is never checked.
- */
-export const claimsSeats = (from: BookingStatus, to: BookingStatus, tripsMoved: boolean): boolean =>
-  holdsSeats(to) && (tripsMoved || !holdsSeats(from));

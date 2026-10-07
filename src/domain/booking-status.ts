@@ -30,13 +30,4 @@ export const SEAT_RELEASING_STATUSES = ['cancelled', 'rejected', 'cancelled_weat
 const RELEASES = new Set<string>(SEAT_RELEASING_STATUSES);
 export const holdsSeats = (status: string): boolean => !RELEASES.has(status);
 
-/**
- * A booking saved *because* it exceeded capacity has not been granted those seats yet, so counting
- * them would let it consume the very capacity it is waiting on. Legacy expresses this as
- * `bkPendHoldsSeat`, keyed on the approval record's `over`/`totOver`.
- *
- * The approval record arrives with `booking_approvals` in stage 3. Until then this is the identity
- * for every row: all seven `pending_approval` bookings in production carry an empty approval, which
- * legacy already reads as holding seats.
- */
-export const pendingApprovalHoldsSeats = (approval?: { over_total?: number }): boolean => (approval?.over_total ?? 0) <= 0;
+/** A `pending_approval` booking over the allotment holds nothing while it waits: see `bookingHoldsSeats`. */

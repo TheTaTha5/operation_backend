@@ -12,6 +12,9 @@ import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { formatPaxGrid, parsePaxGrid, paxTotal, type PaxGrid, type PaxRow } from './pax.js';
 import type { BookingChanges } from './operations.js';
 import type { BookingHeader, BookingHeaderPatch } from './booking-header.js';
+import {
+  decideStatus, discountOf, focCountOf, pendingApproval, type ApprovalKind, type BookingApproval, type NewApproval,
+} from './booking-approvals.js';
 
 /** A refusal in the existing `{ statusCode, error, message }` shape. Fastify adds `code` when one is set. */
 export const refuse = (message: string, statusCode: number, code?: string): never => {
@@ -392,24 +395,24 @@ export function stripServerOwned(changes: BookingChanges, stored: Record<string,
 }
 
 /**
- * The header a create stores: the caller's fields, plus who created it and when, and — when it is
- * created confirmed — who confirmed it and when. A body naming any of those is refused: `created_by`
- * may only repeat the logged-in user. With authentication off (local development) there is no user,
- * and the user columns stay empty.
+ * The header a create stores: the caller's fields, plus who created it and when. A body naming any
+ * server-set field is refused: `created_by` may only repeat the logged-in user. Who confirmed it is
+ * stamped by the store once it has decided the status (`confirmationStamp`). With authentication
+ * off (local development) there is no user, and the user columns stay empty.
  */
-export function createHeader(header: BookingHeader, actor: string | undefined, status: BookingStatus, now: string): BookingHeader {
+export function createHeader(header: BookingHeader, actor: string | undefined, now: string): BookingHeader {
   if (header.created_by !== undefined && header.created_by !== actor) ownedRefusal('created_by', 'set');
   for (const field of ['booked_at', 'confirmed_by', 'confirmed_at'] as const) if (header[field] !== undefined) ownedRefusal(field, 'set');
   const out: BookingHeader = { ...header, booked_at: now };
   delete out.updated_by;
   delete out.created_by;
   if (actor !== undefined) { out.created_by = actor; out.updated_by = actor; }
-  if (status === 'confirmed') {
-    out.confirmed_at = now;
-    if (actor !== undefined) out.confirmed_by = actor;
-  }
   return out;
 }
+
+/** The header columns a booking gets when it becomes `confirmed` for the first time. */
+export const confirmationStamp = (actor: string | undefined, now: string): Pick<BookingHeader, 'confirmed_at' | 'confirmed_by'> =>
+  (actor === undefined ? { confirmed_at: now } : { confirmed_at: now, confirmed_by: actor });
 
 /** Statuses a booking can no longer be edited in (legacy `bkV2EditBooking`: "Cannot edit a … booking"). */
 const CLOSED: readonly BookingStatus[] = ['cancelled', 'completed', 'rejected', 'cancelled_weather'];
@@ -435,8 +438,18 @@ export function parseStatusCommandRequest(body: Record<string, unknown>): Status
   return note === undefined ? {} : { note };
 }
 
-/** What a command writes: the new status, whether it confirms, any cancellation text, and the history line. */
-export type StatusPlan = { status: BookingStatus; confirms: boolean; cancellation_reason?: string; history: HistoryLine };
+/**
+ * What a command writes: the new status, whether it confirms, any cancellation text, and the history
+ * lines. `decide` closes the pending approval of that kind (or records a decided one, for a booking
+ * that never had a record — legacy's imported `pending_approval` bookings). `request` asks for new
+ * approvals. `claims` says the booking starts holding seats it was not holding: an approval of an
+ * over-allotment booking.
+ */
+export type StatusPlan = {
+  status: BookingStatus; confirms: boolean; cancellation_reason?: string; history: HistoryLine[];
+  decide?: { kind: ApprovalKind; status: 'approved' | 'rejected'; note: string | null };
+  request: NewApproval[]; claims: boolean;
+};
 
 const FROM: Record<StatusCommand, readonly BookingStatus[] | 'open'> = {
   confirm: ['draft', 'quote', 'pending'],
@@ -446,7 +459,11 @@ const FROM: Record<StatusCommand, readonly BookingStatus[] | 'open'> = {
 };
 
 export function planStatusCommand(
-  command: StatusCommand, booking: { status: BookingStatus; confirmed_at?: string; trips: readonly { pax: readonly PaxRow[] }[] },
+  command: StatusCommand,
+  booking: {
+    status: BookingStatus; confirmed_at?: string; foc_reason?: string; price_discount?: number;
+    approvals?: readonly BookingApproval[]; trips: readonly { pax: readonly PaxRow[] }[];
+  },
   request: StatusCommandRequest, by: string | undefined,
 ): StatusPlan {
   const from = FROM[command];
@@ -455,25 +472,39 @@ export function planStatusCommand(
     refuse(`Cannot ${command} a ${booking.status} booking: ${command} applies to ${from.join(', ')}`, 409, 'wrong_status');
   }
   const note = request.note ? ` · ${request.note}` : '';
-  const foc = booking.trips.reduce((sum, trip) => sum + trip.pax.filter((row) => row.category === 'foc').reduce((n, row) => n + row.count, 0), 0);
+  const foc = focCountOf(booking.trips);
   // Who confirmed is stamped the first time a booking becomes confirmed, never overwritten (legacy).
   const confirming = (to: BookingStatus) => to === 'confirmed' && !booking.confirmed_at;
 
   if (command === 'confirm') {
-    // Free passengers wait for an FOC approval first, as legacy's save does (`bkV2SubmitBooking`).
-    const to: BookingStatus = foc > 0 ? 'pending_foc' : 'confirmed';
-    return { status: to, confirms: confirming(to), history: line(by, 'edit', to === 'confirmed' ? 'Confirmed' : 'FOC', to === 'confirmed' ? `Confirmed${note}` : `Sent for FOC approval · ${foc} FOC pax${note}`) };
+    // The same decision as a create with intent `confirm`: FOC passengers wait for an FOC approval,
+    // a discount for its approval. A draft, quote or pending booking already holds its seats, so the
+    // allotment is not weighed again.
+    const decision = decideStatus('confirm', { focCount: foc, focReason: booking.foc_reason, discount: discountOf(booking), overDays: [] }, by);
+    const to = decision.status;
+    const own = to === 'confirmed' ? [line(by, 'edit', 'Confirmed', `Confirmed${note}`)] : decision.history.map((h) => ({ ...h, text: `${h.text}${note}` }));
+    return { status: to, confirms: confirming(to), history: own, request: decision.approvals, claims: false };
   }
+  const kind: ApprovalKind = booking.status === 'pending_foc' ? 'foc' : 'approval';
+  const tag = kind === 'foc' ? 'FOC' : 'Approval';
   if (command === 'approve') {
-    const tag = booking.status === 'pending_foc' ? 'FOC' : 'Approval';
-    const text = booking.status === 'pending_foc' ? `FOC approved · ${foc} pax · booking confirmed` : 'Approved · booking confirmed';
-    return { status: 'confirmed', confirms: confirming('confirmed'), history: line(by, 'confirm', tag, `${text}${note}`) };
+    // An approval remembers where the booking was going; with no record (legacy's imported
+    // `pending_approval` bookings), confirmed, as legacy's `bkV2EnsureApproval` defaults it.
+    const pending = pendingApproval(booking.approvals, kind);
+    const to: BookingStatus = kind === 'foc' ? 'confirmed' : pending?.target_status ?? 'confirmed';
+    const text = kind === 'foc' ? `FOC approved · ${foc} pax · booking ${to}` : to === 'confirmed' ? 'Approved · booking confirmed' : `Approved · now ${to}`;
+    return {
+      status: to, confirms: confirming(to), history: [line(by, 'confirm', tag, `${text}${note}`)],
+      decide: { kind, status: 'approved', note: request.note ?? null }, request: [], claims: kind === 'approval' && Boolean(pending?.over_capacity),
+    };
   }
   if (command === 'reject') {
-    const tag = booking.status === 'pending_foc' ? 'FOC' : 'Approval';
-    return { status: 'rejected', confirms: false, history: line(by, 'cancel', tag, `${tag === 'FOC' ? 'FOC rejected' : 'Rejected'}${note}`) };
+    return {
+      status: 'rejected', confirms: false, history: [line(by, 'cancel', tag, `${kind === 'foc' ? 'FOC rejected' : 'Rejected'}${note}`)],
+      decide: { kind, status: 'rejected', note: request.note ?? null }, request: [], claims: false,
+    };
   }
-  return { status: 'cancelled_weather', confirms: false, cancellation_reason: 'weather', history: line(by, 'weather', 'Weather', `Cancelled for weather${note}`) };
+  return { status: 'cancelled_weather', confirms: false, cancellation_reason: 'weather', history: [line(by, 'weather', 'Weather', `Cancelled for weather${note}`)], request: [], claims: false };
 }
 
 // ── Shared parsing ───────────────────────────────────────────────────────────────────────────────

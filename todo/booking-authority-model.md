@@ -206,3 +206,52 @@ Changed from the design: `PATCH` also refuses `booked_at`, and a create refuses 
 Legacy client changes still owed (`ops/40-ops-bookings.js`): `toServer` must stop sending
 `createdBy`, `bookedAt`, `confirmedBy`, `confirmedAt` on `POST`; `statusPatch` → `/approve` /
 `/reject`; weather → `/cancel-weather`; a save that changes the status → `PATCH` then `/confirm`.
+
+## Phase 2 — shipped 2026-10-07
+
+Decided: question 1, **approve over the licence like legacy**, with `warnings` (`over_licence`,
+per day) instead of a refusal. Question 2, **the alias, documented and logged**: nothing is live
+(`CLAUDE.md`), so the alias is a convenience for the two clients, not a production safeguard.
+
+Built as designed, in:
+
+- `booking-approvals.ts` (pure, both stores): `decideStatus` (the save), `reweigh` (an edit),
+  `bookingHoldsSeats` (an over-allotment wait holds nothing), `parseIntent` (the alias),
+  `decidedRecord`, `licenceWarnings` (in `operations.ts`).
+- `capacity.ts`: `weighDay` (the four tiers), `licenceShortfall`, `licensed_free` on `DayState`.
+- `booking-actions.ts`: `createHeader` no longer stamps the confirmation (the store does, once it
+  has decided); `planStatusCommand` returns the approval to decide or ask for.
+- Both stores: create, amend and the status commands; PostgreSQL counts seats with the same rule in
+  SQL (`WAITING_FOR_SEATS`) and reads `approvals` in `BOOKING_SELECT`.
+- Migration 023, Swagger, README "How the status is decided", `docs/love-kingdom-integration.md`.
+- Tests: `test/booking-approvals.test.ts` (8), the older tests moved off creating in a status.
+  187 / 187 on PostgreSQL; 181 + 6 PostgreSQL-only skipped in-process.
+
+Changed from the design:
+
+- `booking_approvals.status` gains **`replaced`**: an edit that asks again closes the pending
+  request rather than deleting it, so the audit keeps every request.
+- **The discount is weighed on create and `/confirm` only**, not on every edit. Legacy re-asks on
+  every "Confirm" save of a discounted booking; here an edit carries the waiting discount over.
+- **`/confirm` does not re-weigh the allotment**: a `draft`/`quote`/`pending` booking already holds
+  its seats.
+- **No booking is created in a released status** (`cancelled`, `rejected`, …) any more: it is
+  created, then cancelled. The importer writes legacy's statuses directly and is unaffected.
+- `claimsSeats` and `pendingApprovalHoldsSeats` are gone: status no longer changes through `PATCH`,
+  and the seat rule is `bookingHoldsSeats`.
+- `/restore` and `/reschedule` with `from_date`/`to_date` still refuse over the allotment
+  (`assertTrips`), as before: legacy's tiered guard is the save's, and neither is a save. (The older
+  reschedule body goes through `PATCH`, so it is weighed like an edit.)
+
+Legacy client changes owed (`wt-operation-backend-integration`, `allotment_v2/js/ops/40-ops-bookings.js`),
+on top of phase 1's:
+
+- **Create** sends `status: bk.status || 'confirmed'` (`toServer`). Legacy computes `pending_approval`
+  and `pending_foc` itself, and those are now `400`. Send `intent` instead (`quote`/`draft` →
+  `quote`, else `confirm`), and take `status` and `approvals` from the response.
+- **Send `focReason`.** Legacy requires one before confirming FOC passengers (`08-app.js`), but the
+  integration does not send it: a confirm with FOC passengers is now `400`.
+- **Stop deciding the status in the browser** after a save: show the server's answer, including a
+  `pending_approval` that holds no seats.
+- The approval note and `approval`/`focApproval` it keeps locally (`keep`) can come from
+  `approvals` instead.

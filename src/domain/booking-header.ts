@@ -35,6 +35,8 @@ export type BookingHeader = {
   booking_date?: string; booked_at?: string; created_by?: string; updated_by?: string;
   confirmed_at?: string; confirmed_by?: string;
   notes?: string; note?: string;
+  /** Why the booking carries FOC (free) passengers; required before they can be confirmed. */
+  foc_reason?: string;
 };
 
 /**
@@ -70,7 +72,7 @@ export const BOOKING_HEADER_COLUMNS = [
   'payment_method', 'payment_net_days', 'payment_source', 'payment_contract_version',
   'market', 'market_sub', 'market_agent_id', 'market_at',
   'booking_date', 'booked_at', 'created_by', 'updated_by', 'confirmed_at', 'confirmed_by',
-  'notes', 'note',
+  'notes', 'note', 'foc_reason',
 ] as const satisfies readonly (keyof BookingHeader)[];
 
 /**
@@ -230,6 +232,7 @@ function fields(document: Record<string, unknown>): readonly Field[] {
 
     ['notes', text, own('notes')],
     ['note', text, own('note')],
+    ['foc_reason', text, own('focReason', 'foc_reason')],
   ];
 }
 

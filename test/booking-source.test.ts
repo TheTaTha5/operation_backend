@@ -12,7 +12,7 @@ test('a source booking payload is normalized into columns, and the request is no
     method: 'POST', url: '/v1/bookings', payload: {
       id: 'BK-source-1', agentId: 'a_b2c', voucherRef: '007592',
       trips: [{ routeId: 'r4', date, bookingMode: 'charter', charterBoatId: 'boat-source', pax: { ad_fr: 10, inf_fr: 1, foc_fr: 2 } }],
-      passengers: [{ name: 'Example passenger' }],
+      passengers: [{ name: 'Example passenger' }], focReason: 'tour leaders',
     },
   });
   assert.equal(response.statusCode, 201);
@@ -145,10 +145,14 @@ test('a charter may fill the boat to its licence but never past it', async () =>
   assert.equal((await charter(48)).statusCode, 409, 'and the old crew-inclusive number is refused too');
   assert.equal((await charter(45)).statusCode, 201, 'a charter buys the boat, so it may exceed the 38-seat selling cap');
 
-  // A seat booking still answers to the smaller commercial cap, not the licence.
+  // A seat booking still answers to the smaller commercial cap: past it, within the licence, it waits
+  // for approval holding nothing (legacy's save); past the licence it is refused.
   const other = '2030-05-06';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-oceanus', route_id: 'r7', service_date: other, capacity: 38, license_pax: 45 } });
-  assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 39 } })).statusCode, 409);
+  assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 46 } })).statusCode, 409);
+  const over = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 39 } })).json();
+  assert.equal(over.status, 'pending_approval');
+  assert.equal(over.allocated_pax, 0);
   assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r7', service_date: other, pax: 38 } })).statusCode, 201);
 });
 
@@ -156,21 +160,20 @@ test('a quote holds its seats; a released status reserves none', async () => {
   const date = '2030-06-01';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-quote', route_id: 'r8', service_date: date, capacity: 10 } });
 
-  const quote = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 6, status: 'quote' } });
+  const quote = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 6, intent: 'quote' } });
   assert.equal(quote.statusCode, 201);
   assert.equal(quote.json().status, 'quote');
   assert.equal(quote.json().allocated_pax, 6, 'a quote is not a sale but it does reserve');
   assert.equal((await app.inject({ method: 'GET', url: `/v1/availability?route_id=r8&date=${date}` })).json().available_seats, 4);
 
-  // Four seats left, so a six-pax sale is refused — the quote is in the way.
+  // Four seats left, so a six-pax sale is refused — the quote is in the way. (No licence is
+  // registered here, so there is no room over the allotment to wait for either.)
   assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 6 } })).statusCode, 409);
 
-  // A booking recorded in a released status reserves nothing, so a full day must not refuse it.
-  const recorded = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 40, status: 'cancelled' } });
-  assert.equal(recorded.statusCode, 201, 'a cancellation being written down is not a capacity request');
-  assert.equal(recorded.json().allocated_pax, 0);
-  assert.equal((await app.inject({ method: 'GET', url: `/v1/availability?route_id=r8&date=${date}` })).json().available_seats, 4, 'and it changed nothing');
-
+  // A booking is not created in a released status: it is cancelled after. The status is the server's.
+  const recorded = await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 1, status: 'cancelled' } });
+  assert.equal(recorded.statusCode, 400);
+  assert.match(recorded.json().message, /^status cancelled cannot be asked for on create: send intent quote or confirm/);
   assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 1, status: 'shipped' } })).statusCode, 400);
 });
 
@@ -178,7 +181,8 @@ test('reopening a cancelled booking is capacity-checked, even with an unchanged 
   const date = '2030-06-02';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-transition', route_id: 'r9', service_date: date, capacity: 10 } });
 
-  const shelved = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r9', service_date: date, pax: 8, status: 'cancelled' } })).json() as { id: string };
+  const shelved = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r9', service_date: date, pax: 8 } })).json() as { id: string };
+  await app.inject({ method: 'POST', url: `/v1/bookings/${shelved.id}/cancel` });
   const sold = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r9', service_date: date, pax: 6 } })).json() as { id: string };
   assert.equal((await app.inject({ method: 'GET', url: `/v1/availability?route_id=r9&date=${date}` })).json().available_seats, 4);
 

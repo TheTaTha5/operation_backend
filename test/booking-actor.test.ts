@@ -50,13 +50,13 @@ test('who confirmed and who approved come from the login, never a typed name', a
   assert.equal(confirmedOnCreate.confirmed_by, 'ops1', 'created as confirmed: stamped at once');
   assert.ok(confirmedOnCreate.confirmed_at);
 
-  const quote = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, status: 'quote' })).json();
+  const quote = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, intent: 'quote' })).json();
   assert.equal(quote.confirmed_by, undefined, 'a quote is not confirmed yet');
   const confirmed = (await send('POST', `/v1/bookings/${quote.id}/confirm`)).json();
   assert.equal(confirmed.status, 'confirmed');
   assert.equal(confirmed.confirmed_by, 'ops1');
 
-  const waiting = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, status: 'pending_approval' })).json();
+  const waiting = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, price_discount: -500 })).json();
   const approved = (await send('POST', `/v1/bookings/${waiting.id}/approve`, { note: 'boss said yes', approved_by: 'mallory' })).json();
   assert.equal(approved.confirmed_by, 'ops1', 'a body cannot name the approver');
   const history = (await send('GET', `/v1/bookings/${waiting.id}/history`)).json().history as { by: string; text: string }[];

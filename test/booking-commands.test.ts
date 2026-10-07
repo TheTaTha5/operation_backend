@@ -41,25 +41,24 @@ test('a PATCH may echo a server-owned value, never change it', () => {
 
 test('a create stamps who and when, and refuses a body that claims them', () => {
   const now = '2026-10-07T03:00:00.000Z';
-  assert.deepEqual(createHeader({ lead_pax: 'A' }, 'ops1', 'confirmed', now),
-    { lead_pax: 'A', booked_at: now, created_by: 'ops1', updated_by: 'ops1', confirmed_at: now, confirmed_by: 'ops1' });
-  assert.deepEqual(createHeader({}, 'ops1', 'quote', now), { booked_at: now, created_by: 'ops1', updated_by: 'ops1' }, 'a quote is not confirmed');
-  assert.deepEqual(createHeader({}, undefined, 'confirmed', now), { booked_at: now, confirmed_at: now }, 'authentication off: no user to stamp');
-  assert.equal(createHeader({ created_by: 'ops1' }, 'ops1', 'quote', now).created_by, 'ops1', 'repeating the logged-in user is fine');
-  refused(() => createHeader({ created_by: 'agent-desk' }, 'ops1', 'quote', now), 400, /^created_by cannot be set: it is the logged-in user/);
-  refused(() => createHeader({ booked_at: now }, 'ops1', 'quote', now), 400, /^booked_at cannot be set/);
-  refused(() => createHeader({ confirmed_by: 'boss' }, 'ops1', 'confirmed', now), 400, /^confirmed_by cannot be set/);
+  // Who confirmed is stamped by the store, once it has decided the status (`confirmationStamp`).
+  assert.deepEqual(createHeader({ lead_pax: 'A' }, 'ops1', now), { lead_pax: 'A', booked_at: now, created_by: 'ops1', updated_by: 'ops1' });
+  assert.deepEqual(createHeader({}, undefined, now), { booked_at: now }, 'authentication off: no user to stamp');
+  assert.equal(createHeader({ created_by: 'ops1' }, 'ops1', now).created_by, 'ops1', 'repeating the logged-in user is fine');
+  refused(() => createHeader({ created_by: 'agent-desk' }, 'ops1', now), 400, /^created_by cannot be set: it is the logged-in user/);
+  refused(() => createHeader({ booked_at: now }, 'ops1', now), 400, /^booked_at cannot be set/);
+  refused(() => createHeader({ confirmed_by: 'boss' }, 'ops1', now), 400, /^confirmed_by cannot be set/);
 });
 
 test('each command is allowed only from the statuses legacy allows it from', () => {
   const trips = [{ pax: [{ category: 'ad' as const, residency: 'unknown' as const, count: 2 }] }];
   const withFoc = [{ pax: [...trips[0].pax, { category: 'foc' as const, residency: 'foreign' as const, count: 1 }] }];
   assert.equal(planStatusCommand('confirm', { status: 'quote', trips }, {}, 'ops1').status, 'confirmed');
-  assert.equal(planStatusCommand('confirm', { status: 'draft', trips: withFoc }, {}, 'ops1').status, 'pending_foc', 'free passengers wait for an FOC approval');
-  assert.equal(planStatusCommand('approve', { status: 'pending_foc', trips: withFoc }, {}, 'ops1').history.text, 'FOC approved · 1 pax · booking confirmed');
+  assert.equal(planStatusCommand('confirm', { status: 'draft', trips: withFoc, foc_reason: 'guide' }, {}, 'ops1').status, 'pending_foc', 'free passengers wait for an FOC approval');
+  assert.equal(planStatusCommand('approve', { status: 'pending_foc', trips: withFoc }, {}, 'ops1').history[0].text, 'FOC approved · 1 pax · booking confirmed');
   assert.equal(planStatusCommand('approve', { status: 'pending_approval', trips, confirmed_at: '2026-01-01T00:00:00Z' }, {}, 'ops1').confirms, false,
     'a booking confirmed before keeps its first confirmation');
-  assert.equal(planStatusCommand('reject', { status: 'pending_approval', trips }, { note: 'no boat' }, 'ops1').history.text, 'Rejected · no boat');
+  assert.equal(planStatusCommand('reject', { status: 'pending_approval', trips }, { note: 'no boat' }, 'ops1').history[0].text, 'Rejected · no boat');
   refused(() => planStatusCommand('confirm', { status: 'confirmed', trips }, {}, 'ops1'), 409, /^Cannot confirm a confirmed booking: confirm applies to draft, quote, pending$/);
   refused(() => planStatusCommand('approve', { status: 'quote', trips }, {}, 'ops1'), 409, /^Cannot approve a quote booking/);
   refused(() => planStatusCommand('reject', { status: 'confirmed', trips }, {}, 'ops1'), 409, /^Cannot reject a confirmed booking/);
@@ -109,7 +108,7 @@ test('a closed booking cannot be edited', async () => {
 });
 
 test('confirm moves a quote to confirmed, or to pending_foc when it carries free passengers', async () => {
-  const quote = await booked('2038-01-09', { status: 'quote' });
+  const quote = await booked('2038-01-09', { intent: 'quote' });
   const confirmed = await request('POST', `/v1/bookings/${quote.id}/confirm`);
   assert.equal(confirmed.statusCode, 200, confirmed.body);
   assert.equal(confirmed.json().status, 'confirmed');
@@ -119,24 +118,29 @@ test('confirm moves a quote to confirmed, or to pending_foc when it carries free
   assert.equal(again.json().code, 'wrong_status');
 
   await request('POST', '/operations/deployments', { boat_id: 'boat-cmd-foc', route_id: 'r2', service_date: '2038-01-10', capacity: 20 });
-  const foc = (await request('POST', '/v1/bookings', { status: 'quote', trips: [{ routeId: 'r2', date: '2038-01-10', pax: { ad: 2, foc: 1 } }] })).json();
+  const foc = (await request('POST', '/v1/bookings', { intent: 'quote', trips: [{ routeId: 'r2', date: '2038-01-10', pax: { ad: 2, foc: 1 } }] })).json();
+  const unexplained = await request('POST', `/v1/bookings/${foc.id}/confirm`);
+  assert.equal(unexplained.statusCode, 400, 'confirming free passengers needs a reason (legacy requires one)');
+  assert.match(unexplained.json().message, /^foc_reason is required/);
+  assert.equal((await request('PATCH', `/v1/bookings/${foc.id}`, { focReason: 'tour guide' })).statusCode, 200);
   const waiting = (await request('POST', `/v1/bookings/${foc.id}/confirm`)).json();
   assert.equal(waiting.status, 'pending_foc');
   assert.equal(waiting.confirmed_at, undefined, 'not confirmed yet');
   const approved = (await request('POST', `/v1/bookings/${foc.id}/approve`, { note: 'guide' })).json();
   assert.equal(approved.status, 'confirmed');
   const history = (await request('GET', `/v1/bookings/${foc.id}/history`)).json().history as { tag: string; text: string }[];
-  assert.deepEqual(history.slice(-2).map((h) => [h.tag, h.text]), [['FOC', 'Sent for FOC approval · 1 FOC pax'], ['FOC', 'FOC approved · 1 pax · booking confirmed · guide']]);
+  assert.deepEqual(history.slice(-2).map((h) => [h.tag, h.text]), [['FOC', 'Waiting for FOC approval · 1 FOC pax'], ['FOC', 'FOC approved · 1 pax · booking confirmed · guide']]);
 });
 
 test('reject gives the seats back; approve does not apply to a confirmed booking', async () => {
   const date = '2038-01-11';
-  const waiting = await booked(date, { status: 'pending_approval' });
-  assert.equal(await seatsLeft(date), 18, 'a pending approval holds its seats');
+  const waiting = await booked(date, { price_discount: -500 });
+  assert.equal(waiting.status, 'pending_approval', 'a discount waits for approval');
+  assert.equal(await seatsLeft(date), 18, 'waiting only for a discount, it holds its seats');
   assert.equal((await request('POST', `/v1/bookings/${waiting.id}/approve`)).statusCode, 200);
   assert.equal((await request('POST', `/v1/bookings/${waiting.id}/approve`)).statusCode, 409, 'already confirmed');
 
-  const other = await booked('2038-01-12', { status: 'pending_approval' });
+  const other = await booked('2038-01-12', { price_discount: -500 });
   const rejected = await request('POST', `/v1/bookings/${other.id}/reject`, { note: 'over the boat' });
   assert.equal(rejected.json().status, 'rejected');
   assert.equal(await seatsLeft('2038-01-12'), 20, 'the seats are back');
@@ -160,6 +164,6 @@ test('cancel-weather releases the seats, records the reason, and /restore undoes
 
 test('a command on an unknown booking is 404, and a bad note is 400', async () => {
   assert.equal((await request('POST', '/v1/bookings/no-such-booking/confirm')).statusCode, 404);
-  const booking = await booked('2038-01-14', { status: 'quote' });
+  const booking = await booked('2038-01-14', { intent: 'quote' });
   assert.equal((await request('POST', `/v1/bookings/${booking.id}/confirm`, { note: 42 })).statusCode, 400);
 });

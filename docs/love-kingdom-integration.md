@@ -64,7 +64,7 @@ POST /v1/bookings
 {
   "external_id": "LOV-4190737",
   "agent_id": "a_b2c",
-  "status": "confirmed",
+  "intent": "confirm",
   "leadPax": "Jane Doe",
   "leadPhone": "+66 81 234 5678",
   "leadEmail": "jane@example.com",
@@ -89,11 +89,13 @@ POST /v1/bookings
 | Love Kingdom | Send as | Notes |
 |---|---|---|
 | `id` (`LOV-…`) | `external_id` | Must be unique. See §7, "Retries". |
+| "Confirm" or "Save as quote" | `intent`: `confirm` (default) or `quote` | **Don't send `status`.** We decide it and return it; read `status` from the response. The old `status` field still works for now but is deprecated and logged. See below. |
 | channel → `opsAgentCode` | `agent_id` | We key agents by **id** (`a_b2c`), not code, and agent codes are not unique. Map each channel to an agent id from `GET /v1/agents`. |
 | `customer.name/phone/email/nationality` | `leadPax`, `leadPhone`, `leadEmail`, `leadNationality` | |
 | item `programId` / `opsRouteId` | `trips[].routeId` | Must exist in `GET /v1/routes`, else `400 Unknown route`. |
 | item `travelDate` | `trips[].date` | `YYYY-MM-DD`. Send the string, never a JS `Date`. |
 | `paxAdult/Child/Infant/Foc` + `paxThai/paxForeign` | `trips[].pax` | Grid of `ad`/`chd`/`inf`/`foc` × `_fr` (foreign) / `_th` (Thai). Infants and FOC take seats. An unknown key is a `400`. See §6. |
+| why FOC passengers are free | `focReason` | **Required** when you confirm a booking with `foc` passengers, else `400`. |
 | `pickupZone`, `pickupHotel` | `trips[].zone`, `hotelName` (`pickupZone` on the header too) | |
 | `addonsSelected[{addonId,qty}]` | `addOns[{type,amount,qty}]` | `type` is the ops code (`longtail-join`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). `amount` is the **line total**, not a unit price. |
 | `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
@@ -103,15 +105,29 @@ POST /v1/bookings
 Fields not in the README's "Booking header fields" table are **dropped, not stored**. If you need
 one kept, ask for it to be modelled.
 
+**The status in the response is ours, and it may not be `confirmed`.** With `intent: confirm` you get:
+
+| `status` | Why | Seats |
+|---|---|---|
+| `confirmed` | it fitted | held |
+| `pending_foc` | it has FOC passengers; ops approve them | held |
+| `pending_approval` | it carries a discount; the salesperson approves it | held |
+| `pending_approval` | the day's seats on sale are gone, but the boat has registered seats left; ops decide | **not held** (`allocated_pax: 0`) until approved |
+
+`approvals` on the booking says what it waits for. Show the customer "waiting for confirmation"
+for any `pending_*` status, and read the booking again later (`GET /v1/bookings/{id}`) to see
+the decision: `confirmed`, or `rejected`.
+
 ## 5. Flows
 
 ### CS (staff booking for a customer)
 
 1. `GET /v1/availability` for the date. Show `available_seats`.
-2. Staff saves → `POST /v1/bookings`. On `201`, store our `id`. On `409`, show "sold out" and
-   nothing is written.
-3. An edit to date or pax → `PATCH /v1/bookings/{id}` with the full `trips`. It is capacity-checked
-   again, `409` if it no longer fits.
+2. Staff saves → `POST /v1/bookings` with `intent`. On `201`, store our `id` and show our
+   `status` (§4). On `409`, show "sold out" and nothing is written.
+3. An edit to date or pax → `PATCH /v1/bookings/{id}` with the full `trips`. It is weighed
+   again: `409` if it no longer fits at all, or `200` with `status: pending_approval` if it now
+   needs ops to approve it.
 4. A cancel in Love Kingdom → `POST /v1/bookings/{id}/cancel` with
    `{ "category": "customer_cancel", "charge_type": "none" }`.
 
@@ -140,10 +156,10 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 
 | Status | Meaning | What to do |
 |---|---|---|
-| `400` | Bad input: missing field, unknown route or lock, bad pax key | Bug in the mapping. Log the `message`, and don't retry. |
+| `400` | Bad input: missing field, unknown route or lock, bad pax key, a `status` other than `quote`/`confirmed`, FOC without `focReason` | Bug in the mapping. Log the `message`, and don't retry. |
 | `401` / `403` | No token, or a token without `booking:write` | Fetch a new token. Check the client's scopes. |
 | `404` | Booking or lock id not found | |
-| `409` | Over capacity, lock short, boat already chartered, already cancelled | Sold out, or the state changed. Show it to the user, and don't retry blindly. |
+| `409` | Seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, or the state changed. Show it to the user, and don't retry blindly. |
 | `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |
 
 ## 7. Known gaps, read before going live
@@ -167,6 +183,8 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 1. Get a test token: `POST /v1/login`.
 2. `GET /v1/routes` and `GET /v1/agents`, then build your two mapping tables.
 3. Create a booking and check `GET /v1/availability` dropped by its pax.
-4. Fill a day, create one more, and expect `409`.
-5. Lock → book with `lockDraws` → release, and check `locked_pax` returns to 0.
-6. Cancel, and check the seats come back.
+4. Fill a day's seats on sale, create one more, and expect `201` with `status: pending_approval` and
+   `allocated_pax: 0` (or `409` when the boat has no registered seats beyond those on sale).
+5. Create with a `foc` passenger and no `focReason`, and expect `400`.
+6. Lock → book with `lockDraws` → release, and check `locked_pax` returns to 0.
+7. Cancel, and check the seats come back.

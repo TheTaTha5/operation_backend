@@ -142,8 +142,10 @@ test('cancel records the category and charge, and refuses a booking that is alre
   assert.equal(again.statusCode, 409);
   assert.equal(again.json().message, 'Booking is already cancelled');
 
-  for (const status of ['cancelled_weather', 'rejected', 'completed']) {
-    const closed = await create({ route_id: 'r1', service_date: day, pax: 1, status });
+  // Reached through the commands that close a booking. (`completed` only comes from legacy's import.)
+  for (const [status, discount, command] of [['cancelled_weather', 0, 'cancel-weather'], ['rejected', -500, 'reject']] as const) {
+    const closed = await create({ route_id: 'r1', service_date: day, pax: 1, ...(discount ? { price_discount: discount } : {}) });
+    assert.equal((await request('POST', `/v1/bookings/${closed.id}/${command}`)).json().status, status);
     assert.equal((await request('POST', `/v1/bookings/${closed.id}/cancel`, { category: 'no_show' })).statusCode, 409, status);
   }
 
@@ -182,7 +184,10 @@ test('restore confirms a cancelled booking and clears its cancellation', async (
   assert.deepEqual(restored.json().warnings, []);
   assert.equal(await seatsLeft('r1', day), 28, 'it holds its seats again');
 
-  const rejected = await create({ route_id: 'r1', service_date: day, pax: 1, status: 'rejected' });
+  // A discount on a confirm waits for approval; rejecting that is the way to a rejected booking.
+  const waiting = await create({ route_id: 'r1', service_date: day, pax: 1, price_discount: -500 });
+  const rejected = (await request('POST', `/v1/bookings/${waiting.id}/reject`)).json();
+  assert.equal(rejected.status, 'rejected');
   assert.equal((await request('POST', `/v1/bookings/${rejected.id}/restore`)).json().status, 'confirmed', 'rejected is restorable too, to confirmed');
 });
 
@@ -361,9 +366,11 @@ test('a reschedule clears the moved trip\'s day-of-operations data', { skip: !ur
 });
 
 test('a reschedule or partial cancel is refused on a closed booking', async () => {
+  // `completed` is closed too, but only legacy's import writes it: no command reaches it.
   const day = '2037-03-28';
   await deploy('r1', day, 20);
-  const completed = await create({ route_id: 'r1', service_date: day, pax: 2, status: 'completed' });
-  assert.equal((await request('POST', `/v1/bookings/${completed.id}/reschedule`, { from_date: day, to_date: '2037-03-29', reason: 'x' })).statusCode, 409);
-  assert.equal((await request('POST', `/v1/bookings/${completed.id}/partial-cancel`, { trip_id: completed.trips[0].id, pax: { ad: 1 }, category: 'sick', waived: { count: 1, amount: 0 } })).statusCode, 409);
+  const closed = await create({ route_id: 'r1', service_date: day, pax: 2 });
+  await request('POST', `/v1/bookings/${closed.id}/cancel`, { category: 'sick' });
+  assert.equal((await request('POST', `/v1/bookings/${closed.id}/reschedule`, { from_date: day, to_date: '2037-03-29', reason: 'x' })).statusCode, 409);
+  assert.equal((await request('POST', `/v1/bookings/${closed.id}/partial-cancel`, { trip_id: closed.trips[0].id, pax: { ad: 1 }, category: 'sick', waived: { count: 1, amount: 0 } })).statusCode, 409);
 });

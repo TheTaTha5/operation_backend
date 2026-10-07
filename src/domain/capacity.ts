@@ -65,8 +65,12 @@ export type HeldLock = { id: string; pax: number; drawn: number };
 
 export type BoatDay = { boat_id: string; sellable: number; licensed: number; license_pax?: number; chartered: boolean };
 export type LockDay = HeldLock & { remaining: number };
-/** A day's numbers plus the per-boat and per-lock detail a sale is checked against. */
-export type DayState = Capacity & { boats: BoatDay[]; locks: LockDay[] };
+/**
+ * A day's numbers plus the per-boat and per-lock detail a sale is checked against.
+ * `licensed_free` is the registered passenger seats still unsold on the day's open boats, locks not
+ * subtracted: the ceiling legacy's over-allotment approval may reach, and no further.
+ */
+export type DayState = Capacity & { boats: BoatDay[]; locks: LockDay[]; licensed_free: number };
 
 /**
  * One route's seat pool on one day.
@@ -98,12 +102,14 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
   const lockDays = locks.map((l) => ({ ...l, remaining: Math.max(l.pax - l.drawn, 0) }));
   const locked_pax = lockDays.reduce((sum, l) => sum + l.remaining, 0);
   const open = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.sellable, 0);
+  const openLicensed = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.licensed, 0);
   return {
     deployed_capacity: boats.reduce((sum, boat) => sum + boat.sellable, 0),
     licensed_capacity: boats.reduce((sum, boat) => sum + boat.licensed, 0),
     booked_pax, charter_pax, locked_pax,
     available_seats: open - unplaced - booked_pax - locked_pax,
     boats, locks: lockDays,
+    licensed_free: openLicensed - unplaced - booked_pax,
   };
 }
 
@@ -154,6 +160,62 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
     need += boat.sellable;
   }
   if (need > 0 && day.available_seats < need) refuse('Insufficient available seats', 409);
+}
+
+/**
+ * Weighs a demand the way legacy's save does ("Anti-overbook guard (tiered)", `bkV2CommitBooking`),
+ * and answers how far over the allotment it is, if at all. `day` must be read with the booking
+ * being amended excluded.
+ *
+ * Lock draws and charters are checked exactly as `assertDayFits` checks them. A seat trip's general
+ * need (its pax less its lock draw) then falls in one of four tiers:
+ *
+ * - it fits the seats available → `undefined`;
+ * - it would fit only by taking seats other agents' locks hold → refused (`409`);
+ * - it is over the allotment but within the boats' licensed seats → answered as an over-allotment,
+ *   for an approval to decide;
+ * - it is over the licensed seats too → refused (`409`): there is no registered seat left.
+ */
+export function weighDay(day: DayState, demand: DayDemand): { need: number; over_by: number } | undefined {
+  const where = `on ${demand.route_id} ${demand.service_date}`;
+  let drawn = 0;
+  for (const [lockId, qty] of demand.draws) {
+    const lock = day.locks.find((l) => l.id === lockId) ?? refuse(`Seat lock ${lockId} is not active ${where}`, 400);
+    if (qty > lock.remaining) refuse(`Seat lock ${lockId} has ${lock.remaining} seats left`, 409);
+    drawn += qty;
+  }
+  // Charters take whole boats, out of the sellable seats and out of the licensed ones alike.
+  let charterSeats = 0, charterLicensed = 0;
+  const taking = new Set<string>();
+  for (const charter of demand.charters) {
+    if (!charter.boat_id) { charterSeats += charter.pax; charterLicensed += charter.pax; continue; }
+    const boat = day.boats.find((b) => b.boat_id === charter.boat_id) ?? refuse(`Boat ${charter.boat_id} is not deployed ${where}`, 400);
+    if (boat.chartered || taking.has(boat.boat_id)) refuse(`Boat ${boat.boat_id} is already chartered ${where}`, 409);
+    if (charter.pax > boat.licensed) refuse(`A charter of ${charter.pax} exceeds boat ${boat.boat_id}'s licensed ${boat.licensed} passengers`, 409);
+    taking.add(boat.boat_id);
+    charterSeats += boat.sellable;
+    charterLicensed += boat.licensed;
+  }
+  if (charterSeats > 0 && day.available_seats < charterSeats) refuse('Insufficient available seats', 409);
+
+  const available = day.available_seats - charterSeats;
+  const need = Math.max(demand.seat - drawn, 0);
+  if (need === 0 || need <= available) return undefined;
+  const physical = available + day.locked_pax;
+  if (need <= physical) refuse(`Insufficient available seats ${where}: the rest are held by seat locks`, 409);
+  const licensed = day.licensed_free - charterLicensed;
+  if (need > licensed) refuse(`Insufficient available seats ${where}: the boats' registered seats are full (${Math.max(licensed, 0)} left)`, 409);
+  return { need, over_by: need - physical };
+}
+
+/**
+ * How many of a demand's general seats have no registered seat left on the day: the warning an
+ * approval over the licence carries. Legacy lets a manager approve it anyway ("add a boat before the
+ * travel date", `bkV2ApproveBooking`), so this never refuses.
+ */
+export function licenceShortfall(day: DayState, demand: DayDemand): number {
+  const drawn = [...demand.draws.values()].reduce((sum, qty) => sum + qty, 0);
+  return Math.max(0, Math.max(demand.seat - drawn, 0) - Math.max(day.licensed_free, 0));
 }
 
 /**
