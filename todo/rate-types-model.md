@@ -20,7 +20,28 @@ Changed from the design below:
 - **`created_on` is not accepted by the API.** It is legacy's `createdDate`, and only the importer
   will fill it; `created_at` is this service's own.
 
-Still open: the importer (next change), then the agents FK, then the items under "Open".
+### The importer — shipped 2026-10-07
+
+`src/tools/import-legacy.ts` reads the 15 legacy tables (the per-route transfer tables found by
+name) and maps them with the pure `src/tools/legacy-rate-types.ts` (`test/legacy-rate-types.test.ts`).
+Rate types keep legacy's ids and are upserted. Under each, only `LEGACY_HOLDS` is replaced (zones
+PK/KL/NoTransfer, speedboat/catamaran charters, the longtail add-on, transfers on the legacy table
+routes); RN prices, longtail charters, other routes' transfers and `applies_to` survive a re-run. A
+code already owned by another rate type here is skipped and listed rather than aborting the run.
+
+**Rehearsed 2026-10-07** against production legacy (read-only) into a throwaway local target that
+`sync:routes` and `sync:boats` had filled first:
+
+- 84 of 84 rate types, 519 routes, 10,438 seat prices, 251 charter rows, 155 longtail rows,
+  1,530 transfer prices. One issue listed: `rtmuticommw2ho7` r11 `travel_to "20207-05-15"`.
+- `rt003` read through `GET /v1/rate-types/rt003` matched legacy's own rows cell for cell (PK, KL,
+  NoTransfer, foreign and Thai, adult and child; the speedboat charter).
+- A second run changed no count. Then, after an RN price, a longtail charter, a transfer on r7 and a
+  bundle `applies_to` were entered through the API, a re-run kept all four, and put a hand-changed
+  PK price (2500 → 99) back to legacy's 2500.
+
+Still open: running the import in production; then the `agents.rate_type_id` FK migration, which
+cannot ship before it; then the items under "Open".
 
 A rate type is a price list: what an agent pays per seat on each route and pickup zone, per charter
 boat, and per add-on. Nothing in this service can price a booking until rate types live here
@@ -372,6 +393,5 @@ In order, what pricing a booking still needs after this:
 
 ## Follow-ups
 
-- **Next change: extend `src/tools/import-legacy.ts`** (decided above). Until it runs, every legacy
-  rate type is missing here and `agents.rate_type_id` points at ids this service does not know.
-  The agents FK migration follows the first import.
+- ~~Extend `src/tools/import-legacy.ts`~~: shipped, see "The importer" at the top.
+- **Run it in production**, then the `agents.rate_type_id` FK migration.

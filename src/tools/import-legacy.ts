@@ -17,6 +17,14 @@
  * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
  * bookings named in `--remove`.
  *
+ * Rate types keep legacy's ids and are upserted (mapping: `legacy-rate-types.ts`). Under each one,
+ * only what legacy's tables can hold is replaced: seat prices in zones PK, KL and NoTransfer,
+ * speedboat and catamaran charters, the longtail add-on, and transfers on the routes legacy has a
+ * table for. Everything else was entered here by hand, because legacy drops it on save — RN prices,
+ * longtail charters, other routes' transfers, a bundle's `applies_to` — and is kept across runs. A
+ * route taken off a rate in legacy is taken off here, with its prices. A rate type legacy no longer
+ * has is kept and listed, as agents are, since bookings may name it.
+ *
  * Rows go in as SQL, not through the API, so the capacity check is skipped on purpose: legacy days
  * that were oversold arrive oversold rather than half-imported. The mapping itself reuses the domain
  * parsers (`bookingHeader`, `parsePaxGrid`, `isBookingStatus`) so an imported row obeys the same rules
@@ -30,6 +38,7 @@ import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/
 import { isIsoTime } from '../domain/calendar.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
+import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -167,7 +176,25 @@ async function main() {
     const legacyAgentPeriods = await read('SELECT * FROM sb_agents__programperiods ORDER BY sb_agents_id, idx');
     const legacyAgentActivity = await read('SELECT * FROM sb_agents__activity ORDER BY sb_agents_id, idx');
     const rateBindings = await read('SELECT id, ratetypeid FROM sb_agents_rate_bindings');
+    // Rate types. Legacy keeps a private-transfer table per route it has ever priced; they are found
+    // by name, so a route legacy adds a table for is read without a change here.
+    const transferTables = (await read(`SELECT table_name FROM information_schema.tables
+      WHERE table_schema = current_schema() AND table_name ~ '^sb_rate_types__addons__r[0-9]+$' ORDER BY table_name`)).map((t) => str(t.table_name));
+    const legacyRateTypes = {
+      rates: await read('SELECT * FROM sb_rate_types'),
+      routes: await read('SELECT * FROM sb_rate_types__routes'),
+      seat: await read('SELECT * FROM sb_rate_types__seatrates'),
+      charter: await read('SELECT * FROM sb_rate_types__charterrates'),
+      validity: await read('SELECT * FROM sb_rate_types__routevalidity'),
+      bundles: await read('SELECT * FROM sb_rate_types__routebundles'),
+      addons: await read('SELECT * FROM sb_rate_types__addons'),
+      byRoute: await read('SELECT * FROM sb_rate_types__addons__byroute'),
+      applies: await read('SELECT * FROM sb_rate_types__addons__applies'),
+      transfers: [] as { routeId: string; rows: Row[] }[],
+    };
+    for (const table of transferTables) legacyRateTypes.transfers.push({ routeId: table.slice('sb_rate_types__addons__'.length), rows: await read(`SELECT * FROM "${table}"`) });
     const routes = new Set((await target.query('SELECT id FROM routes')).rows.map((r) => String(r.id)));
+    const routePiers = new Map((await target.query('SELECT id, pier FROM routes')).rows.map((r) => [String(r.id), { pier: r.pier ?? undefined }]));
     const boats = new Map((await target.query('SELECT id, capacity, license_pax FROM boats')).rows.map((b) => [String(b.id), b]));
     const totalcap = new Map(legacyBoats.map((b) => [str(b.id), int(b.totalcap)]));
 
@@ -649,6 +676,22 @@ async function main() {
       subs.push({ market_id: marketId, idx: int(s.idx), name });
     }
 
+    // ── Rate types: after salespeople, because a rate's owner must be one (placeholders included) ──
+    const rateTypes = mapLegacyRateTypes(legacyRateTypes, routePiers, salesIds);
+    // A code is what this import matches rate types on. If one already belongs to a different rate
+    // type here (one created through the API), the unique index would abort the whole run: that rate
+    // type is left out and listed instead, for someone to rename one of the two.
+    const codeOwner = new Map((await target.query('SELECT id, code FROM rate_types')).rows.map((r) => [String(r.code), String(r.id)]));
+    const clashes = new Set(rateTypes.rateTypes.filter((r) => codeOwner.has(String(r.code)) && codeOwner.get(String(r.code)) !== r.id).map((r) => String(r.id)));
+    for (const id of clashes) {
+      const code = String(rateTypes.rateTypes.find((r) => r.id === id)!.code);
+      rateTypes.issues.push(`${id.padEnd(18)} skipped: code ${code} already belongs to rate type ${codeOwner.get(code)} here`);
+    }
+    const keepRate = (row: Row) => !clashes.has(String(row.rate_type_id ?? row.id));
+    for (const key of ['rateTypes', 'routes', 'seat', 'charter', 'longtail', 'transfer'] as const) rateTypes[key] = rateTypes[key].filter(keepRate);
+    const rateIds = rateTypes.rateTypes.map((r) => String(r.id));
+    const rateTypesOnlyHere = (await target.query('SELECT id FROM rate_types WHERE id <> ALL($1::text[]) ORDER BY id', [legacyRateTypes.rates.map((r) => str(r.id))])).rows.map((r) => String(r.id));
+
     // ── Write, in one transaction ──
     await target.query('BEGIN');
     const insert = async (table: string, rows: Row[], conflict = '') => {
@@ -689,6 +732,27 @@ async function main() {
     await target.query('DELETE FROM agent_programs WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
     await target.query('DELETE FROM agent_activity WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
     await insert('agent_programs', agentPrograms);
+
+    // Rate types: the header is upserted; under it, only what legacy can hold is replaced.
+    await insert('rate_types', rateTypes.rateTypes, upsert(rateTypes.rateTypes, 'updated_at = now()'));
+    await target.query(`DELETE FROM rate_type_routes WHERE rate_type_id = ANY($1::text[]) AND NOT (rate_type_id || '|' || route_id = ANY($2::text[]))`,
+      [rateIds, rateTypes.routes.map((r) => `${r.rate_type_id}|${r.route_id}`)]);
+    // `UNIQUE (rate_type_id, seq)` is checked row by row, so the kept routes move clear of every
+    // position before they take legacy's order, or swapping two would collide halfway.
+    await target.query('UPDATE rate_type_routes SET seq = seq + 100000 WHERE rate_type_id = ANY($1::text[])', [rateIds]);
+    await insert('rate_type_routes', rateTypes.routes, `ON CONFLICT (rate_type_id, route_id) DO UPDATE SET seq = EXCLUDED.seq,
+      travel_from = EXCLUDED.travel_from, travel_to = EXCLUDED.travel_to, longtail_bundle = EXCLUDED.longtail_bundle,
+      longtail_bundle_adult = EXCLUDED.longtail_bundle_adult, longtail_bundle_child = EXCLUDED.longtail_bundle_child,
+      longtail_bundle_applies_to = CASE WHEN EXCLUDED.longtail_bundle IS NULL THEN NULL ELSE rate_type_routes.longtail_bundle_applies_to END`);
+    await target.query('DELETE FROM rate_type_seat_prices WHERE rate_type_id = ANY($1::text[]) AND zone = ANY($2::text[])', [rateIds, [...LEGACY_HOLDS.zones]]);
+    await insert('rate_type_seat_prices', rateTypes.seat);
+    await target.query('DELETE FROM rate_type_charter_prices WHERE rate_type_id = ANY($1::text[]) AND boat_type = ANY($2::text[])', [rateIds, [...LEGACY_HOLDS.boatTypes]]);
+    await insert('rate_type_charter_prices', rateTypes.charter);
+    await target.query('DELETE FROM rate_type_longtail_prices WHERE rate_type_id = ANY($1::text[])', [rateIds]);
+    await insert('rate_type_longtail_prices', rateTypes.longtail);
+    await target.query('DELETE FROM rate_type_transfer_prices WHERE rate_type_id = ANY($1::text[]) AND route_id = ANY($2::text[])',
+      [rateIds, legacyRateTypes.transfers.map((t) => t.routeId)]);
+    await insert('rate_type_transfer_prices', rateTypes.transfer);
     // In legacy's order, oldest first, so the serial id breaks ties between entries at the same instant.
     await target.query(`INSERT INTO agent_activity (agent_id, at, by, kind, text)
       SELECT r.agent_id, r.at, r.by, r.kind, r.text FROM jsonb_populate_recordset(NULL::agent_activity, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(agentActivity)]);
@@ -724,7 +788,10 @@ async function main() {
       (SELECT count(*) FROM van_groups)::int van_groups, (SELECT count(*) FROM booking_trip_van_allocations)::int van_allocations,
       (SELECT count(*) FROM booking_trip_operations)::int trip_operations,
       (SELECT count(*) FROM agents)::int agents, (SELECT count(*) FROM agent_programs)::int agent_programs, (SELECT count(*) FROM agent_activity)::int agent_activity,
-      (SELECT count(*) FROM markets)::int markets, (SELECT count(*) FROM sales_people)::int sales_people`);
+      (SELECT count(*) FROM markets)::int markets, (SELECT count(*) FROM sales_people)::int sales_people,
+      (SELECT count(*) FROM rate_types)::int rate_types, (SELECT count(*) FROM rate_type_routes)::int rate_type_routes,
+      (SELECT count(*) FROM rate_type_seat_prices)::int rate_seat_prices, (SELECT count(*) FROM rate_type_charter_prices)::int rate_charter_prices,
+      (SELECT count(*) FROM rate_type_longtail_prices)::int rate_longtail_prices, (SELECT count(*) FROM rate_type_transfer_prices)::int rate_transfer_prices`);
 
     console.log(`\n${commit ? 'COMMIT' : 'DRY RUN (rolled back)'}`);
     console.log(`read from legacy: ${legacyBookings.length} bookings, ${legacyTrips.length} trips, ${legacyPassengers.length} passengers, ${boatDays.length} boat-days, ${legacyLocks.length} locks, ${capOverrides.length} overrides`);
@@ -734,6 +801,9 @@ async function main() {
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
+    console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
+      + `${rateTypes.charter.length} charter rows, ${rateTypes.longtail.length} longtail rows, ${rateTypes.transfer.length} transfer prices `
+      + `(transfer tables: ${legacyRateTypes.transfers.map((t) => t.routeId).join(', ')})`);
     console.log('target now holds:', after);
     // Grouped by boat and route, so 30 days of one boat taken off one programme reads as one line.
     const byBoatRoute = new Map<string, string[]>();
@@ -746,6 +816,11 @@ async function main() {
     for (const p of placeholders) console.log(`  ${p}`);
     console.log(`\nagent data to check (${agentData.length}):`);
     for (const d of agentData) console.log(`  ${d}`);
+    console.log(`\nrate type data to check (${rateTypes.issues.length}):`);
+    for (const i of rateTypes.issues) console.log(`  ${i}`);
+    for (const [what, n] of rateTypes.notes) note(what, n);
+    console.log(`\nrate types here but not in legacy, kept (${rateTypesOnlyHere.length}):`);
+    for (const id of rateTypesOnlyHere) console.log(`  ${id}`);
     console.log(`\nvan group conflicts (${conflicts.length}):`);
     for (const c of conflicts) console.log(`  ${c}`);
     console.log('\nnotes:');

@@ -191,8 +191,8 @@ Field notes:
   has no endpoint yet.
 - **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
 - **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). It
-  is not validated yet: legacy's rate types are not imported, so the ids agents hold have nothing to
-  point at here. The foreign key comes after the first import.
+  is not validated yet. The foreign key is a migration that can only ship after the import has run
+  in production: before it, agents hold rate type ids that `rate_types` does not have yet.
 - **Not here yet:** credit used and available (needs invoices and payments, which this service
   doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
   contract history (the Contracts port).
@@ -203,7 +203,14 @@ A rate type is a price list: what an agent pays per seat on each route and picku
 boat, and per add-on. All of these are under `booking:read` / `booking:write`, like agents. Nothing
 prices a booking from them yet; that is the quote, a later slice (`todo/rate-types-model.md`).
 
-Legacy's rate types are not imported yet, so the list starts empty.
+Rate types arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids
+(`rt003`, `rt_staff`, …), which are the ids `agents.rate_type_id` and `bookings.rate_type_ref`
+already hold. Until cutover legacy is the master, and each import run replaces only what legacy's
+tables can hold: seat prices in zones PK, KL and NoTransfer, speedboat and catamaran charters, the
+longtail add-on, and transfers on r4, r5, r6, r10, r11 and r12. Legacy dropped everything else on
+save, so it can only be entered here, and the import keeps it: RN prices, longtail charters,
+transfers on other routes, a bundle's `applies_to`. A legacy price changed here is put back by the
+next import run, so change those in legacy until cutover.
 
 - `GET /v1/rate-types?active=&q=`: summary rows, A–Z by name (case-insensitive), then id.
   - `active` is `true` (the default), `false`, or `all`.
