@@ -442,9 +442,12 @@ export class OperationsStore {
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
     const { trips, header, passengers, add_ons, ...rest } = input;
+    // `booking_data` is what PostgreSQL's create writes: the input's blob if it carries one, otherwise
+    // the column's `{}`. Nothing sends one since the blob stopped being written (2026-09-22), so both
+    // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
-      ...rest, ...header, id, status, created_at: now, updated_at: now, trips: planned, passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []),
-      reschedules: [], partial_cancels: [], fee_items: [],
+      ...rest, ...header, booking_data: rest.booking_data ?? {}, id, status, created_at: now, updated_at: now, trips: planned,
+      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), reschedules: [], partial_cancels: [], fee_items: [],
     };
     this.bookings.set(id, booking);
     this.log(id, createdLine(actor));

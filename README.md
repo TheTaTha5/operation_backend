@@ -668,11 +668,12 @@ on `POST` it simply means the field was never filled in, since there is nothing 
 partially: `{"guides": {"english": true}}` sets `guide_english` and leaves the other three guide
 columns alone.
 
-> **`booking_data` is deprecated and will be removed.** It still appears on responses and still
-> holds the payload exactly as it was sent at create time. It is deliberately *not* rewritten by
-> `PATCH` — the columns are the ones that move — so on any amended booking the blob is a record of
-> what was first sent, not of what the booking now says. Read the columns. A future release stops
-> returning it, and a later one drops it.
+> **`booking_data` is deprecated and will be removed.** It still appears on responses, but nothing
+> writes it any more: a booking created since 2026-09-22 has `{}`, and so does every imported one.
+> Only a booking created through this API before that date carries the payload as it was sent at
+> create time, and `PATCH` never rewrote it, so even there it records what was first sent, not what
+> the booking now says. Read the columns. A future release stops returning it, and a later one
+> drops it.
 
 #### Passengers
 
