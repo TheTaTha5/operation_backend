@@ -22,6 +22,19 @@ Replace the legacy system with a modern backend that **decides**, not one that o
 - `todo/legacy-replacement.md` lists the data still to give a home; the rules to move are in
   `allotment_v2/js` and need the same kind of list.
 
+## Nothing live depends on this yet
+
+**operation-backend is a development project.** No production traffic uses it, and `main` is a
+development branch too. So:
+
+- Changes, migrations and contract changes go through directly. No rollout plan, no deprecation
+  period, no keeping an old field alive "so live clients don't break" — there are none.
+- Breaking a client (legacy's integration branch, Love Kingdom) is fine; say what they must change.
+- The design-note stop before new rules or schema still applies: it is about getting the rule right,
+  not about protecting production.
+
+This changes when the first area cuts over and real traffic arrives. Update this section then.
+
 ## Authority: who decides each value
 
 Every field a feature adds is one of three kinds. The design note says which, for every field.
