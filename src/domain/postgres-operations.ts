@@ -27,6 +27,11 @@ import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
 } from './agents.js';
+import {
+  assertOwner, assertRateTypeUnused, assertRouteBlock, generateRateTypeCode, newRateTypeRow, nextRouteSeq, patchedRateTypeRow, rateTypeExists, rateTypeView, routeRows, selectRateTypes,
+  type BundleAppliesTo, type BundleMode, type NationalityScope, type RateTier, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows,
+  type RateTypeSummary, type RouteBlock, type RouteRows, type SeatPriceRow,
+} from './rate-types.js';
 
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
@@ -701,6 +706,166 @@ export class PostgresOperationsStore {
     if (!known) return undefined;
     const { rows } = await this.client().query('SELECT id, at, by, kind, text FROM agent_activity WHERE agent_id = $1', [id]);
     return latestActivity(rows.map((row) => ({ at: asIso(row.at), by: text(row.by), kind: String(row.kind), text: String(row.text), seq: Number(row.id) })), limit);
+  }
+
+  // ── Rate types ─────────────────────────────────────────────────────────────────────────────────
+  // The rows are read and written here; everything the API says about them is `rate-types.ts`'s.
+
+  /** Every row of the given rate types (all of them when `ids` is undefined), grouped by rate type. */
+  private async readRateTypes(ids?: readonly string[]): Promise<RateTypeRows[]> {
+    const params = [ids === undefined ? null : [...ids]];
+    const where = (column: string) => `WHERE ($1::text[] IS NULL OR ${column} = ANY($1))`;
+    const n = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
+    // One after another, not Promise.all: inside a transaction these share one connection, and `pg`
+    // deprecates queuing a query on a client that is still running one (removed in pg@9).
+    const select = async (sql: string) => (await this.client().query(sql, params)).rows;
+    const rates = await select(`SELECT id, code, name, note, color, owner_sales_id, valid_from::text, valid_to::text, active, nationality_scope, transfer_unit,
+      created_on::text, created_at, updated_at FROM rate_types ${where('id')}`);
+    const routes = await select(`SELECT rate_type_id, route_id, seq, travel_from::text, travel_to::text, longtail_bundle, longtail_bundle_adult, longtail_bundle_child,
+      longtail_bundle_applies_to FROM rate_type_routes ${where('rate_type_id')}`);
+    const seat = await select(`SELECT rate_type_id, route_id, zone, category, residency, tier, price FROM rate_type_seat_prices ${where('rate_type_id')}`);
+    const charter = await select(`SELECT rate_type_id, route_id, boat_type, starter_price, starter_includes, extra_per_pax FROM rate_type_charter_prices ${where('rate_type_id')}`);
+    const longtail = await select(`SELECT rate_type_id, route_id, join_adult, join_child, charter_price, charter_capacity FROM rate_type_longtail_prices ${where('rate_type_id')}`);
+    const transfer = await select(`SELECT rate_type_id, route_id, zone, vehicle, price FROM rate_type_transfer_prices ${where('rate_type_id')}`);
+    const all = new Map<string, RateTypeRows>();
+    for (const r of rates) {
+      all.set(String(r.id), {
+        rate: {
+          id: String(r.id), code: String(r.code), name: String(r.name), note: text(r.note), color: text(r.color), owner_sales_id: text(r.owner_sales_id),
+          valid_from: text(r.valid_from), valid_to: text(r.valid_to), active: r.active === true, nationality_scope: text(r.nationality_scope) as NationalityScope | null,
+          transfer_unit: text(r.transfer_unit), created_on: text(r.created_on), created_at: asIso(r.created_at), updated_at: asIso(r.updated_at),
+        },
+        routes: [], seat: [], charter: [], longtail: [], transfer: [],
+      });
+    }
+    const of = (row: QueryResultRow) => all.get(String(row.rate_type_id));
+    for (const r of routes) of(r)?.routes.push({
+      rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), seq: Number(r.seq), travel_from: text(r.travel_from), travel_to: text(r.travel_to),
+      longtail_bundle: text(r.longtail_bundle) as BundleMode | null, longtail_bundle_adult: n(r.longtail_bundle_adult), longtail_bundle_child: n(r.longtail_bundle_child),
+      longtail_bundle_applies_to: text(r.longtail_bundle_applies_to) as BundleAppliesTo | null,
+    });
+    for (const r of seat) of(r)?.seat.push({
+      rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), zone: String(r.zone), category: r.category as SeatPriceRow['category'],
+      residency: r.residency as SeatPriceRow['residency'], tier: r.tier as RateTier, price: Number(r.price),
+    });
+    for (const r of charter) of(r)?.charter.push({
+      rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), boat_type: String(r.boat_type),
+      starter_price: n(r.starter_price), starter_includes: n(r.starter_includes), extra_per_pax: n(r.extra_per_pax),
+    });
+    for (const r of longtail) of(r)?.longtail.push({
+      rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), join_adult: n(r.join_adult), join_child: n(r.join_child),
+      charter_price: n(r.charter_price), charter_capacity: n(r.charter_capacity),
+    });
+    for (const r of transfer) of(r)?.transfer.push({ rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), zone: String(r.zone), vehicle: String(r.vehicle), price: Number(r.price) });
+    return [...all.values()];
+  }
+
+  async listRateTypes(query: RateTypeListQuery): Promise<RateTypeSummary[]> { return selectRateTypes(await this.readRateTypes(), query); }
+  async rateType(id: string): Promise<RateType | undefined> { const [rows] = await this.readRateTypes([id]); return rows && rateTypeView(rows); }
+
+  /** Answers 400 before a foreign key could answer 500: unknown routes, wrong zones, an owner who is not a salesperson. */
+  private async assertRateTypeRefs(blocks: readonly { route_id: string; block: RouteBlock; label: string }[], owner: string | null | undefined): Promise<void> {
+    if (blocks.length > 0) {
+      const { rows } = await this.client().query('SELECT id, pier FROM routes WHERE id = ANY($1::text[])', [blocks.map((b) => b.route_id)]);
+      const catalogue = new Map(rows.map((row) => [String(row.id), { id: String(row.id), pier: row.pier ?? undefined }]));
+      for (const { route_id, block, label } of blocks) assertRouteBlock(block, route_id, catalogue, label);
+    }
+    if (owner !== null && owner !== undefined) {
+      const { rows } = await this.client().query('SELECT id FROM sales_people WHERE id = $1', [owner]);
+      assertOwner(owner, new Set(rows.map((row) => String(row.id))));
+    }
+  }
+
+  /** One route's rows: the route, then each price table in one statement however many cells it has. */
+  private async insertRouteRows(rows: RouteRows): Promise<void> {
+    const r = rows.route;
+    await this.client().query(`INSERT INTO rate_type_routes (rate_type_id, route_id, seq, travel_from, travel_to, longtail_bundle, longtail_bundle_adult,
+      longtail_bundle_child, longtail_bundle_applies_to) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [r.rate_type_id, r.route_id, r.seq, r.travel_from, r.travel_to, r.longtail_bundle, r.longtail_bundle_adult, r.longtail_bundle_child, r.longtail_bundle_applies_to]);
+    const key = [r.rate_type_id, r.route_id];
+    if (rows.seat.length > 0) {
+      await this.client().query(`INSERT INTO rate_type_seat_prices (rate_type_id, route_id, zone, category, residency, tier, price)
+        SELECT $1, $2, * FROM unnest($3::text[], $4::text[], $5::text[], $6::text[], $7::numeric[])`,
+      [...key, rows.seat.map((s) => s.zone), rows.seat.map((s) => s.category), rows.seat.map((s) => s.residency), rows.seat.map((s) => s.tier), rows.seat.map((s) => s.price)]);
+    }
+    if (rows.charter.length > 0) {
+      await this.client().query(`INSERT INTO rate_type_charter_prices (rate_type_id, route_id, boat_type, starter_price, starter_includes, extra_per_pax)
+        SELECT $1, $2, * FROM unnest($3::text[], $4::numeric[], $5::int[], $6::numeric[])`,
+      [...key, rows.charter.map((c) => c.boat_type), rows.charter.map((c) => c.starter_price), rows.charter.map((c) => c.starter_includes), rows.charter.map((c) => c.extra_per_pax)]);
+    }
+    for (const l of rows.longtail) {
+      await this.client().query('INSERT INTO rate_type_longtail_prices (rate_type_id, route_id, join_adult, join_child, charter_price, charter_capacity) VALUES ($1,$2,$3,$4,$5,$6)',
+        [...key, l.join_adult, l.join_child, l.charter_price, l.charter_capacity]);
+    }
+    if (rows.transfer.length > 0) {
+      await this.client().query(`INSERT INTO rate_type_transfer_prices (rate_type_id, route_id, zone, vehicle, price)
+        SELECT $1, $2, * FROM unnest($3::text[], $4::text[], $5::numeric[])`,
+      [...key, rows.transfer.map((t) => t.zone), rows.transfer.map((t) => t.vehicle), rows.transfer.map((t) => t.price)]);
+    }
+  }
+
+  async createRateType(input: RateTypeCreate): Promise<RateType> {
+    await this.assertRateTypeRefs(input.routes.map(({ route_id, block }, index) => ({ route_id, block, label: `routes[${index}]` })), input.header.owner);
+    if (input.header.id !== undefined && (await this.client().query('SELECT 1 FROM rate_types WHERE id = $1', [input.header.id])).rowCount) rateTypeExists('id', input.header.id);
+    const codes = new Set((await this.client().query('SELECT code FROM rate_types')).rows.map((row) => String(row.code)));
+    if (input.header.code !== undefined && codes.has(input.header.code)) rateTypeExists('code', input.header.code);
+    const id = input.header.id ?? `rt_${randomUUID()}`;
+    const row = newRateTypeRow(input.header, id, input.header.code ?? generateRateTypeCode(input.header.name, codes), new Date().toISOString());
+    try {
+      await this.client().query(`INSERT INTO rate_types (id, code, name, note, color, owner_sales_id, valid_from, valid_to, active, nationality_scope, transfer_unit, created_on)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [row.id, row.code, row.name, row.note, row.color, row.owner_sales_id, row.valid_from, row.valid_to, row.active, row.nationality_scope, row.transfer_unit, row.created_on]);
+    } catch (error) {
+      // Two creates racing for the same id or code: the checks above both passed, the index caught it.
+      const e = error as Error & { code?: string; constraint?: string };
+      if (e.code === '23505') rateTypeExists(e.constraint === 'rate_types_pkey' ? 'id' : 'code', e.constraint === 'rate_types_pkey' ? row.id : row.code);
+      throw error;
+    }
+    for (const [seq, { route_id, block }] of input.routes.entries()) await this.insertRouteRows(routeRows(id, route_id, seq, block));
+    return (await this.rateType(id))!;
+  }
+
+  async patchRateType(id: string, patch: RateTypePatch): Promise<RateType | undefined> {
+    const [current] = await this.readRateTypes([id]);
+    if (!current) return undefined;
+    await this.assertRateTypeRefs([], patch.owner);
+    const next = patchedRateTypeRow(current.rate, patch, new Date().toISOString());
+    await this.client().query(`UPDATE rate_types SET name = $2, note = $3, color = $4, owner_sales_id = $5, valid_from = $6, valid_to = $7, active = $8,
+      nationality_scope = $9, transfer_unit = $10, updated_at = now() WHERE id = $1`,
+    [id, next.name, next.note, next.color, next.owner_sales_id, next.valid_from, next.valid_to, next.active, next.nationality_scope, next.transfer_unit]);
+    return this.rateType(id);
+  }
+
+  /** Replaces one route's block; a route new to the rate goes after the ones it has. */
+  async putRateTypeRoute(id: string, routeId: string, block: RouteBlock): Promise<RateType | undefined> {
+    if (!(await this.client().query('SELECT 1 FROM rate_types WHERE id = $1', [id])).rowCount) return undefined;
+    await this.assertRateTypeRefs([{ route_id: routeId, block, label: '' }], undefined);
+    const { rows } = await this.client().query('SELECT route_id, seq FROM rate_type_routes WHERE rate_type_id = $1', [id]);
+    const existing = rows.find((row) => String(row.route_id) === routeId);
+    const seq = existing ? Number(existing.seq) : nextRouteSeq(rows.map((row) => ({ seq: Number(row.seq) })));
+    // The prices cascade from the route row, so deleting it and writing the block again replaces the lot.
+    await this.client().query('DELETE FROM rate_type_routes WHERE rate_type_id = $1 AND route_id = $2', [id, routeId]);
+    await this.insertRouteRows(routeRows(id, routeId, seq, block));
+    await this.client().query('UPDATE rate_types SET updated_at = now() WHERE id = $1', [id]);
+    return this.rateType(id);
+  }
+
+  /** Undefined for an unknown rate type, false for a route the rate does not cover. */
+  async deleteRateTypeRoute(id: string, routeId: string): Promise<boolean | undefined> {
+    if (!(await this.client().query('SELECT 1 FROM rate_types WHERE id = $1', [id])).rowCount) return undefined;
+    const { rowCount } = await this.client().query('DELETE FROM rate_type_routes WHERE rate_type_id = $1 AND route_id = $2', [id, routeId]);
+    if (!rowCount) return false;
+    await this.client().query('UPDATE rate_types SET updated_at = now() WHERE id = $1', [id]);
+    return true;
+  }
+
+  async deleteRateType(id: string): Promise<boolean> {
+    if (!(await this.client().query('SELECT 1 FROM rate_types WHERE id = $1', [id])).rowCount) return false;
+    const { rows: [used] } = await this.client().query(`SELECT (SELECT count(*) FROM agents WHERE rate_type_id = $1)::int AS agents,
+      (SELECT count(*) FROM bookings WHERE rate_type_ref = $1)::int AS bookings`, [id]);
+    assertRateTypeUnused(id, { agents: Number(used.agents), bookings: Number(used.bookings) });
+    await this.client().query('DELETE FROM rate_types WHERE id = $1', [id]);
+    return true;
   }
 
   async listDayOverrides(from?: string, to?: string): Promise<RouteDayOverride[]> {

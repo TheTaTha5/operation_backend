@@ -13,7 +13,7 @@ frontend porting spec "Agent List (`data-view="agents"`)", §3 "Missing endpoint
 - **Writes** (spec phase 2) are not started: `POST /v1/agents`, `PATCH /v1/agents/:id`,
   `PUT /v1/agents/:id/programs`, deactivate/activate. With them come activity rows stamped from
   `request.user`, and a decision on a `sales:write` scope.
-- **Later:** `GET /v1/rate-types` (Rate Types port), rate seasons, add-on prices, credit used.
+- **Later:** ~~`GET /v1/rate-types`~~ (shipped 2026-10-07, `todo/rate-types-model.md`), rate seasons, add-on prices, credit used.
 
 ## Decisions made, and why
 

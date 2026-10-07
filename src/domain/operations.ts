@@ -14,6 +14,11 @@ import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type SalesPerson, type StoredActivity, type StoredAgent,
 } from './agents.js';
+import {
+  addRouteRows, assertOwner, assertRateTypeUnused, assertRouteBlock, generateRateTypeCode, newRateTypeRow, nextRouteSeq, patchedRateTypeRow, rateTypeExists, rateTypeView,
+  removeRouteRows, routeRows, selectRateTypes,
+  type CatalogueRoute, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows, type RateTypeSummary, type RouteBlock,
+} from './rate-types.js';
 
 export type Deployment = {
   boat_id: string;
@@ -320,6 +325,75 @@ export class OperationsStore {
   agentActivity(id: string, limit: number): AgentActivity[] | undefined {
     if (!this.directory.agents.some((agent) => agent.id === id)) return undefined;
     return latestActivity(this.directory.activity.get(id) ?? [], limit);
+  }
+
+  /**
+   * Rate types, held as the same rows PostgreSQL holds (`RateTypeRows`) so both stores hand
+   * `rate-types.ts` identical input. Route and owner checks need the catalogue and the salespeople;
+   * unseeded, there is nothing to check against and they are skipped, as bookings' routes are.
+   */
+  private rateTypes = new Map<string, RateTypeRows>();
+  private routeCatalogue(): Map<string, CatalogueRoute> | undefined {
+    return this.catalogue.routes.length === 0 ? undefined : new Map(this.catalogue.routes.map((route) => [route.id, { id: route.id, pier: route.pier }]));
+  }
+  private salesIds(): Set<string> | undefined {
+    return this.directory.sales.length === 0 ? undefined : new Set(this.directory.sales.map((person) => person.id));
+  }
+  listRateTypes(query: RateTypeListQuery): RateTypeSummary[] { return selectRateTypes([...this.rateTypes.values()], query); }
+  rateType(id: string): RateType | undefined { const rows = this.rateTypes.get(id); return rows && rateTypeView(rows); }
+
+  createRateType(input: RateTypeCreate): RateType {
+    const catalogue = this.routeCatalogue();
+    input.routes.forEach(({ route_id, block }, index) => assertRouteBlock(block, route_id, catalogue, `routes[${index}]`));
+    assertOwner(input.header.owner, this.salesIds());
+    const codes = new Set([...this.rateTypes.values()].map(({ rate }) => rate.code));
+    if (input.header.id !== undefined && this.rateTypes.has(input.header.id)) rateTypeExists('id', input.header.id);
+    if (input.header.code !== undefined && codes.has(input.header.code)) rateTypeExists('code', input.header.code);
+    const id = input.header.id ?? this.id('rt');
+    const rows: RateTypeRows = { rate: newRateTypeRow(input.header, id, input.header.code ?? generateRateTypeCode(input.header.name, codes), this.now()), routes: [], seat: [], charter: [], longtail: [], transfer: [] };
+    input.routes.forEach(({ route_id, block }, seq) => addRouteRows(rows, routeRows(id, route_id, seq, block)));
+    this.rateTypes.set(id, rows);
+    return rateTypeView(rows);
+  }
+
+  patchRateType(id: string, patch: RateTypePatch): RateType | undefined {
+    const rows = this.rateTypes.get(id);
+    if (!rows) return undefined;
+    assertOwner(patch.owner, this.salesIds());
+    rows.rate = patchedRateTypeRow(rows.rate, patch, this.now());
+    return rateTypeView(rows);
+  }
+
+  /** Replaces one route's block; a route new to the rate goes after the ones it has. */
+  putRateTypeRoute(id: string, routeId: string, block: RouteBlock): RateType | undefined {
+    const rows = this.rateTypes.get(id);
+    if (!rows) return undefined;
+    assertRouteBlock(block, routeId, this.routeCatalogue(), '');
+    const seq = rows.routes.find((route) => route.route_id === routeId)?.seq ?? nextRouteSeq(rows.routes);
+    removeRouteRows(rows, routeId);
+    addRouteRows(rows, routeRows(id, routeId, seq, block));
+    rows.rate = { ...rows.rate, updated_at: this.now() };
+    return rateTypeView(rows);
+  }
+
+  /** Undefined for an unknown rate type, false for a route the rate does not cover. */
+  deleteRateTypeRoute(id: string, routeId: string): boolean | undefined {
+    const rows = this.rateTypes.get(id);
+    if (!rows) return undefined;
+    if (!rows.routes.some((route) => route.route_id === routeId)) return false;
+    removeRouteRows(rows, routeId);
+    rows.rate = { ...rows.rate, updated_at: this.now() };
+    return true;
+  }
+
+  deleteRateType(id: string): boolean {
+    if (!this.rateTypes.has(id)) return false;
+    assertRateTypeUnused(id, {
+      agents: this.directory.agents.filter((agent) => agent.rate_type_id === id).length,
+      bookings: [...this.bookings.values()].filter((booking) => booking.rate_type_ref === id).length,
+    });
+    this.rateTypes.delete(id);
+    return true;
   }
 
   /** Loads reference data that a PostgreSQL deployment gets from migrations instead. */

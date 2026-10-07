@@ -106,8 +106,10 @@ PATCH  /v1/agents/{id}
 PUT    /v1/agents/{id}/programs
 POST   /v1/agents/{id}/deactivate, /v1/agents/{id}/activate
 GET    /v1/markets, /v1/sales                        ✅
-GET    /v1/rate-types, /v1/rate-types/{id}
-POST   /v1/rate-types, PATCH /v1/rate-types/{id}
+GET    /v1/rate-types, /v1/rate-types/{id}                                  ✅
+POST   /v1/rate-types, PATCH /v1/rate-types/{id}                         ✅
+PUT    /v1/rate-types/{id}/routes/{route_id}, DELETE …/routes/{route_id} ✅
+DELETE /v1/rate-types/{id}                                               ✅  (409 while in use)
 PUT    /v1/agents/{id}/rate-bindings
 GET    /v1/contracts, POST /v1/contracts, PATCH /v1/contracts/{id}
 GET    /v1/contract-templates, PUT /v1/contract-templates/{id}
