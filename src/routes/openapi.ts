@@ -80,11 +80,12 @@ const addOn = {
   },
 };
 
+const STATUSES = ['draft', 'quote', 'pending', 'pending_approval', 'pending_foc', 'confirmed', 'rejected', 'cancelled', 'cancelled_weather', 'completed'];
+
 const bookingHeaderIn = {
   external_id: { type: 'string', description: 'Your own booking id (e.g. `LOV-4190737`). Unique across all bookings.' },
   agent_id: { type: 'string', description: 'The selling agent, from `GET /v1/agents`' },
   voucher_ref: { type: 'string' },
-  status: { type: 'string', enum: ['draft', 'quote', 'pending', 'pending_approval', 'pending_foc', 'confirmed', 'rejected', 'cancelled', 'cancelled_weather', 'completed'], default: 'confirmed' },
   leadPax: { type: 'string', description: 'Lead passenger name (`lead_pax`)' },
   leadPhone: { type: 'string' },
   leadEmail: { type: 'string' },
@@ -96,9 +97,36 @@ const bookingHeaderIn = {
   notes: { type: 'string' },
 };
 
+/** Set by the server, never by a request: refused on create, and on `PATCH` unless it repeats the stored value. */
+const SERVER_SET = 'Set by the server.';
+const serverOwned = {
+  created_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who created the booking.` },
+  booked_at: { type: 'string', format: 'date-time', readOnly: true, description: `${SERVER_SET} When the booking was created.` },
+  confirmed_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who first confirmed it (\`/confirm\`, \`/approve\`, or a create as \`confirmed\`).` },
+  confirmed_at: { type: 'string', format: 'date-time', readOnly: true, description: `${SERVER_SET} When it was first confirmed.` },
+  updated_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who last changed it; a request's value is ignored.` },
+};
+
 const bookingIn = {
   type: 'object',
-  description: 'Header scalars accept camelCase or snake_case. A field not listed in the README "Booking header fields" table is dropped, not stored.',
+  description: 'Header scalars accept camelCase or snake_case. A field not listed in the README "Booking header fields" table is dropped, not stored. '
+    + '`created_by`, `booked_at`, `confirmed_by` and `confirmed_at` are set by the server and refused here (`created_by` may only repeat the logged-in user).',
+  properties: {
+    status: {
+      type: 'string', enum: STATUSES, default: 'confirmed',
+      description: 'The starting status. Only on create: afterwards the status changes through `/confirm`, `/approve`, `/reject`, `/cancel`, `/cancel-weather` and `/restore`.',
+    },
+    ...bookingHeaderIn,
+    trips: { type: 'array', minItems: 1, items: tripIn },
+    passengers: { type: 'array', items: passenger, description: 'Replaces the whole list' },
+    addOns: { type: 'array', items: addOn, description: 'Replaces the whole list. `[]` or `null` clears it.' },
+  },
+};
+
+const bookingPatchIn = {
+  type: 'object',
+  description: 'Only the fields you send change. `status` and the server-set fields (`created_by`, `booked_at`, `confirmed_by`, `confirmed_at`) '
+    + 'are accepted only when they repeat the stored value, so a client that sends the whole booking back keeps working; a different value is `400`.',
   properties: {
     ...bookingHeaderIn,
     trips: { type: 'array', minItems: 1, items: tripIn },
@@ -130,9 +158,32 @@ const booking = {
     },
     passengers: { type: 'array', items: passenger },
     add_ons: { type: 'array', items: addOn },
-    cancellation_reason: { type: 'string' },
+    cancellation_reason: { type: 'string', readOnly: true, description: `${SERVER_SET} Written by \`/cancel\` and \`/cancel-weather\`.` },
+    ...serverOwned,
     created_at: { type: 'string', format: 'date-time' },
     updated_at: { type: 'string', format: 'date-time' },
+  },
+};
+
+/** What each status command does, for its documentation. */
+const COMMAND_DOCS: Record<string, { summary: string; description: string }> = {
+  confirm: {
+    summary: 'Confirm a draft, quote or pending booking',
+    description: 'From `draft`, `quote` or `pending`. Becomes `confirmed`, or `pending_foc` when a trip carries FOC (free) passengers, who need `/approve` first. '
+      + 'Stamps `confirmed_by` (the logged-in user) and `confirmed_at` the first time it is confirmed.',
+  },
+  approve: {
+    summary: 'Approve a booking waiting for approval',
+    description: 'From `pending_approval` or `pending_foc`. Becomes `confirmed`; the approver is the logged-in user. Optional `note` goes into the history.',
+  },
+  reject: {
+    summary: 'Reject a booking waiting for approval',
+    description: 'From `pending_approval` or `pending_foc`. Becomes `rejected` and gives its seats back. Optional `note` goes into the history.',
+  },
+  'cancel-weather': {
+    summary: 'Cancel a booking because the trip was called off for weather',
+    description: 'From any status that holds seats. Becomes `cancelled_weather`, `cancellation_reason` `weather`, and gives its seats back. '
+      + 'Undo with `/restore`. Refunds and credits are not handled here yet.',
   },
 };
 
@@ -192,10 +243,22 @@ export const docs = {
   },
   amendBooking: {
     tags: ['Bookings'], summary: 'Amend a booking', security: BEARER, params: idParam,
-    description: 'Header fields merge (absent keeps, `null`/`""` clears). `trips`, `passengers` and `addOns` replace outright when sent. Changing trips is capacity-checked.',
-    body: bookingIn,
-    response: { 200: booking, 400: err('Invalid input'), 404: err('Booking not found'), 409: err('Over capacity'), ...UNAUTHORIZED },
+    description: 'Header fields merge (absent keeps, `null`/`""` clears). `trips`, `passengers` and `addOns` replace outright when sent. Changing trips is capacity-checked. '
+      + 'The status is not changed here: use the commands. A cancelled, rejected, weather-cancelled or completed booking cannot be edited (`409 booking_closed`).',
+    body: bookingPatchIn,
+    response: {
+      200: booking, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
+      404: err('Booking not found'), 409: err('Over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
+    },
   },
+  statusCommand: (command: string) => ({
+    tags: ['Bookings'], summary: COMMAND_DOCS[command].summary, description: COMMAND_DOCS[command].description, security: BEARER, params: idParam,
+    body: { type: 'object', properties: { note: { type: 'string', description: 'Written into the booking history' } } },
+    response: {
+      200: booking, 400: err('Invalid body'), 404: err('Booking not found'),
+      409: err('Not allowed from the booking\'s current status (`wrong_status`, `already_cancelled` or `booking_closed`)'), ...UNAUTHORIZED,
+    },
+  }),
   cancelBooking: {
     tags: ['Bookings'], summary: 'Cancel a booking and release its seats', security: BEARER, params: idParam,
     body: {

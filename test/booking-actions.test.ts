@@ -34,11 +34,9 @@ test('a full charge is the total plus fee items, and the reason text is legacy\'
   assert.equal(chargeLabel('none', 0), 'No charge');
 });
 
-test('updated_by comes from the token, never the body; created_by defaults to it', () => {
-  assert.deepEqual(stampActor({ updated_by: 'mallory', lead_pax: 'A' }, 'ops1', false), { updated_by: 'ops1', lead_pax: 'A' });
-  assert.deepEqual(stampActor({ updated_by: 'mallory' }, undefined, false), {}, 'with auth off the column is left alone');
-  assert.deepEqual(stampActor({}, 'ops1', true), { updated_by: 'ops1', created_by: 'ops1' });
-  assert.deepEqual(stampActor({ created_by: 'agent-desk' }, 'ops1', true), { created_by: 'agent-desk', updated_by: 'ops1' }, 'an integrator may name the creator');
+test('updated_by comes from the token, never the body', () => {
+  assert.deepEqual(stampActor({ updated_by: 'mallory', lead_pax: 'A' }, 'ops1'), { updated_by: 'ops1', lead_pax: 'A' });
+  assert.deepEqual(stampActor({ updated_by: 'mallory' }, undefined), {}, 'with auth off the column is left alone');
   assert.equal(editedLine('ops1', { trips: [], header: { total: 1, updated_by: 'ops1' } }, 'confirmed').text, 'Edited · trips, total');
   assert.equal(editedLine('ops1', { status: 'confirmed' }, 'quote').tag, 'Confirmed');
 });

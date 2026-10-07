@@ -9,8 +9,8 @@ import {
 } from './operations.js';
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
 import {
-  assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  restoredLine, totalAfterRefund,
+  assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
+  planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
@@ -501,8 +501,10 @@ export class PostgresOperationsStore {
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }
 
   /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
-  async amendBooking(id: string, changes: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
+  async amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
+    assertEditable(current.status);
+    const changes = stripServerOwned(requested, current as unknown as Record<string, unknown> & { status: Booking['status'] });
     const replacement = nextTrips(current.trips, changes);
     const planned = planTrips(current.trips, replacement, newTripId);
     const status = changes.status ?? current.status;
@@ -541,6 +543,20 @@ export class PostgresOperationsStore {
     } else {
       await this.client().query('DELETE FROM booking_cancellations WHERE booking_id = $1', [id]);
     }
+    await this.log(id, plan.history);
+    return this.booking(id);
+  }
+
+  /** `/confirm`, `/approve`, `/reject`, `/cancel-weather`. The rules are `planStatusCommand`'s; no seats are claimed. */
+  async changeBookingStatus(id: string, command: StatusCommand, request: StatusCommandRequest, actor?: string): Promise<Booking | undefined> {
+    const current = await this.storedBooking(id); if (!current) return undefined;
+    const plan = planStatusCommand(command, current, request, actor);
+    // `touch` binds $1 (id) and $2 (actor); these extra assignments follow from $3.
+    const values: unknown[] = [plan.status];
+    const sets = [', status = $3'];
+    if (plan.confirms) { values.push(actor ?? null); sets.push(`, confirmed_at = now(), confirmed_by = $${values.length + 2}`); }
+    if (plan.cancellation_reason !== undefined) { values.push(plan.cancellation_reason); sets.push(`, cancellation_reason = $${values.length + 2}`); }
+    await this.touch(id, actor, sets.join(''), values);
     await this.log(id, plan.history);
     return this.booking(id);
   }

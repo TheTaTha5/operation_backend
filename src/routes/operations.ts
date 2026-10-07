@@ -11,7 +11,9 @@ import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
-import { actorOf, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, stampActor } from '../domain/booking-actions.js';
+import {
+  actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
+} from '../domain/booking-actions.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -345,20 +347,29 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   /**
    * Every write is signed by the token's user (`actorOf`): `updated_by` comes from the token and a
    * body's `updated_by` is ignored, and each write appends one line to the booking's history in the
-   * same transaction. See `booking-actions.ts`.
+   * same transaction. Who created a booking and when, and who confirmed it and when, are the
+   * server's (`createHeader`, `stripServerOwned`); the status moves only through the commands
+   * below. See `booking-actions.ts`.
    */
   app.post('/v1/bookings', { schema: docs.createBooking }, async (request, reply) => {
     const actor = actorOf(request.user);
     const input = bookingInput(request.body);
-    const result = await store.transaction(() => store.createBooking({ ...input, header: stampActor(input.header, actor, true) }, actor));
+    const header = createHeader(input.header ?? {}, actor, input.status ?? 'confirmed', new Date().toISOString());
+    const result = await store.transaction(() => store.createBooking({ ...input, header }, actor));
     return reply.code(201).send(result);
   });
   app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
     const actor = actorOf(request.user);
     const changes = bookingChanges(request.body);
-    const signed = { ...changes, header: stampActor(changes.header, actor, false) };
+    const signed = { ...changes, header: stampActor(changes.header, actor) };
     return store.transaction(async () => (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found'));
   });
+  for (const command of STATUS_COMMANDS) {
+    app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
+      const body = parseStatusCommandRequest(record(request.body ?? {}));
+      return store.transaction(async () => (await store.changeBookingStatus(bookingId(request), command, body, actorOf(request.user))) ?? notFound('Booking not found'));
+    });
+  }
   app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request) => {
     const cancel = parseCancelRequest(record(request.body ?? {}));
     return store.transaction(async () => (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found'));

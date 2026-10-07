@@ -6,7 +6,8 @@ import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from 
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
-  assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord, refuse, restoredLine, totalAfterRefund,
+  assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
+  planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelRequest, type HistoryEntry, type HistoryLine,
   type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
@@ -569,9 +570,11 @@ export class OperationsStore {
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 
   /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
-  amendBooking(id: string, changes: BookingChanges, actor?: string, entry?: HistoryLine): Booking | undefined {
+  amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine): Booking | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
+    assertEditable(booking.status);
+    const changes = stripServerOwned(requested, booking as unknown as Record<string, unknown> & { status: BookingStatus });
     const replacement = nextTrips(booking.trips, changes);
     const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
     const status = changes.status ?? booking.status;
@@ -597,6 +600,26 @@ export class OperationsStore {
     booking.cancellation_reason = plan.cancellation_reason ?? undefined;
     if (plan.record) booking.cancellation = { ...plan.record, at: this.now() };
     else delete booking.cancellation;
+    this.touch(booking, actor);
+    this.log(id, plan.history);
+    return this.view(booking);
+  }
+
+  /**
+   * `/confirm`, `/approve`, `/reject`, `/cancel-weather`: the rules are `planStatusCommand`'s. None of
+   * them asks for more seats — each moves between statuses that hold the same seats, or gives them
+   * back — so there is no capacity check.
+   */
+  changeBookingStatus(id: string, command: StatusCommand, request: StatusCommandRequest, actor?: string): Booking | undefined {
+    const booking = this.bookings.get(id);
+    if (!booking) return undefined;
+    const plan = planStatusCommand(command, booking, request, actor);
+    booking.status = plan.status;
+    if (plan.confirms) {
+      booking.confirmed_at = this.now();
+      if (actor === undefined) delete booking.confirmed_by; else booking.confirmed_by = actor;
+    }
+    if (plan.cancellation_reason !== undefined) booking.cancellation_reason = plan.cancellation_reason;
     this.touch(booking, actor);
     this.log(id, plan.history);
     return this.view(booking);

@@ -93,10 +93,26 @@ history line; a closed booking refuses `PATCH`; both stores.
   approved or rejected, when, note). `pendingApprovalHoldsSeats` then reads the real over-count.
 - Love Kingdom's create contract changes on both sides.
 
-## Questions
+## Decisions — 2026-10-07
 
-1. **Legacy bug? The approver's name is typed by hand** (any text), and FOC approve hard-codes
-   `'RM'`. Recommended: take it from the login token, like `updated_by`.
-2. **`created_by`:** today the body may name someone else ("entered on someone's behalf"), which
-   legacy also allows (`d.createdBy` from the form). Keep that, or always the token?
-3. **Phase split:** phase 1 now, phase 2 as its own design after?
+1. **The approver is the logged-in user.** Legacy's typed name (and FOC's hard-coded `'RM'`) is a
+   bug, not copied.
+2. **`created_by` is the logged-in user, always,** on create too: a body naming anyone else is `400`.
+3. **Both phases, together.** Phase 1 is built; phase 2's schema needs its own approval first
+   (`CLAUDE.md`), below.
+
+## Phase 1 — shipped 2026-10-07
+
+As designed above, with: `createHeader` (create stamps `created_by`, `booked_at`, and
+`confirmed_by`/`confirmed_at` when created confirmed; refuses them in the body), `stripServerOwned`
+(the `PATCH` transition rule), `assertEditable`, `planStatusCommand` in `booking-actions.ts`;
+`changeBookingStatus` in both stores; the four routes; Swagger (`docs.statusCommand`,
+`bookingPatchIn`, the read-only fields); README. Tests: `test/booking-commands.test.ts`, plus the
+four older tests that pinned the old behaviour. 179 / 179 on PostgreSQL.
+
+Changed from the design: `PATCH` also refuses `booked_at`, and a create refuses `booked_at`,
+`confirmed_by` and `confirmed_at` (the server sets them).
+
+Legacy client changes still owed (`ops/40-ops-bookings.js`): `toServer` must stop sending
+`createdBy`, `bookedAt`, `confirmedBy`, `confirmedAt` on `POST`; `statusPatch` → `/approve` /
+`/reject`; weather → `/cancel-weather`; a save that changes the status → `PATCH` then `/confirm`.

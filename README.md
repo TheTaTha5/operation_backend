@@ -498,8 +498,32 @@ trip's data goes when that trip is removed. Both paths end the same way.
 
 `status` is one of `draft`, `quote`, `pending`, `pending_approval`, `pending_foc`, `confirmed`,
 `completed`, `rejected`, `cancelled`, `cancelled_weather`. It defaults to `confirmed` on create,
-may be set on create or changed with `PATCH`, and an unrecognised value is a `400` listing the
-valid ones.
+and an unrecognised value is a `400` listing the valid ones.
+
+**After a booking is created, its status changes only through a command**, never `PATCH`. The
+server checks the move is allowed from where the booking is and records who made it:
+
+| Command | From | To |
+|---|---|---|
+| `POST /v1/bookings/{id}/confirm` | `draft`, `quote`, `pending` | `confirmed`, or `pending_foc` when a trip carries FOC (free) passengers |
+| `POST /v1/bookings/{id}/approve` | `pending_approval`, `pending_foc` | `confirmed` |
+| `POST /v1/bookings/{id}/reject` | `pending_approval`, `pending_foc` | `rejected` (seats given back) |
+| `POST /v1/bookings/{id}/cancel-weather` | any status that holds seats | `cancelled_weather`, `cancellation_reason` `weather` (seats given back) |
+| `POST /v1/bookings/{id}/cancel` | any status that holds seats | `cancelled` — see [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule) |
+| `POST /v1/bookings/{id}/restore` | `cancelled`, `rejected`, `cancelled_weather` | `confirmed` |
+
+- `confirm`, `approve`, `reject` and `cancel-weather` take an optional `{ "note": "…" }`, written
+  into the history. Each answers the booking, `404` for an unknown one, and `409` with
+  `code: "wrong_status"` (or `already_cancelled` / `booking_closed`) when the move is not allowed
+  from the current status.
+- **Who confirmed is the logged-in user.** `confirm`, `approve` and a create as `confirmed` stamp
+  `confirmed_by` and `confirmed_at` the first time a booking is confirmed; a later approval keeps the
+  first confirmation. The approver is never a name from the request.
+- `cancel-weather` handles the booking only. Refunds and credits stay in legacy until money moves
+  here. Undo it with `/restore`.
+- These are legacy's rules (`bkV2ApproveBooking`, `bkV2RejectBooking`, `bkV2FocApprove`,
+  `bkV2FocReject`, `bkV2WeatherResolveOne`). Nothing in legacy ever sets `completed`, so no command
+  does either.
 
 **Seats are released by `cancelled`, `rejected` and `cancelled_weather`. Every other status holds
 them** — including `quote` and `draft`. That is a denylist rather than an allowlist on purpose, and
@@ -512,9 +536,9 @@ Two consequences worth knowing:
 
 - A booking created in a released status **reserves nothing and is never capacity-checked**, so a
   cancellation can be recorded against a day that is already full.
-- Changing status from a released one to a holding one **is** capacity-checked, even when the
-  itinerary has not moved — confirming a quote asks for those seats for the first time, and a day
-  that filled up in the meantime will refuse it with a `409`.
+- Bringing a released booking back with `/restore` **is** capacity-checked, even when the itinerary
+  has not moved — it asks for those seats again, and a day that filled up in the meantime refuses
+  it with a `409`.
 
 - `GET /v1/bookings` — optionally filter by `route_id` and an exact `service_date` (or `date`),
   or by an inclusive trip-date range using `from` and `to`; a booking matches if any of its trips
@@ -563,6 +587,16 @@ Two consequences worth knowing:
   passengers, more general seats, or more seats from a lock. Taking passengers off never needs room,
   so it succeeds on a day that is already oversold (the legacy import brings such days over as they
   are).
+
+  **`PATCH` changes what the client knows, not what the server decides.** `status`, `created_by`,
+  `booked_at`, `confirmed_by` and `confirmed_at` are accepted only when they **repeat the stored
+  value** — so a client that sends the whole booking back on every save keeps working — and a
+  different value is a `400` naming what to do instead, e.g.
+  `status cannot be changed with PATCH: use POST /v1/bookings/{id}/confirm, /approve, /reject, /cancel, /cancel-weather or /restore`.
+  A `cancelled`, `rejected`, `cancelled_weather` or `completed` booking cannot be edited at all:
+  `409` with `code: "booking_closed"`, as legacy refuses it.
+- `POST /v1/bookings/{id}/confirm`, `/approve`, `/reject`, `/cancel-weather` — see
+  [Status](#status-and-which-statuses-hold-seats).
 - `POST /v1/bookings/{id}/cancel`, `/restore`, `/partial-cancel`, `/reschedule` — see
   [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule).
 - `GET /v1/bookings/{id}/history` — see [History and who made a change](#history-and-who-made-a-change).
@@ -689,15 +723,20 @@ anywhere and writes no reschedule record (it does write a history line).
 
 **Every write is signed by the token's user**: `preferred_username`, else the token subject.
 `updated_by` is set from the token on every write, and **an `updated_by` in the body is ignored**.
-`created_by` defaults to the token user on create, unless the body names one. With authentication
-switched off (local development) there is no user: `updated_by` is left alone and `by` is `null`.
+**`created_by` is the logged-in user, always**: a create that names anyone else is a `400`, and
+`booked_at` is the time of the create. Neither may be sent. With authentication switched off (local
+development) there is no user: the user columns stay empty and `by` is `null`.
 
 Each write appends one line to the booking's history, in the same transaction:
 
 | Write | `kind` | `tag` | `text` |
 |---|---|---|---|
 | `POST /v1/bookings` | `create` | `Created` | `Created` |
-| `PATCH` | `edit` | `Edited` (`Confirmed` when the status becomes `confirmed`) | `Edited · trips, total` (the keys sent) |
+| `PATCH` | `edit` | `Edited` | `Edited · trips, total` (the keys sent) |
+| confirm | `edit` | `Confirmed` (`FOC` when it goes to `pending_foc`) | `Confirmed`, or `Sent for FOC approval · <n> FOC pax`; `· <note>` |
+| approve | `confirm` | `Approval` (`FOC` from `pending_foc`) | `Approved · booking confirmed`, or `FOC approved · <n> pax · booking confirmed`; `· <note>` |
+| reject | `cancel` | `Approval` (`FOC` from `pending_foc`) | `Rejected`, or `FOC rejected`; `· <note>` |
+| cancel-weather | `weather` | `Weather` | `Cancelled for weather · <note>` |
 | cancel | `cancel` | `Cancel` | `Cancelled · <charge> · <category label> · <note>` |
 | restore | `edit` | `Confirmed` | `Restored`, plus `· seat lock <id>: <got>/<wanted> seats back` per short lock |
 | partial cancel | `cancel` | `Cancel` | `Partial cancel · −2 pax · <category label> · charge 0 (฿0) · waive 2 (฿4,000)` |
@@ -712,7 +751,7 @@ Imported bookings carry legacy's own lines, whose `kind` values are wider than t
 
 **Errors** keep the shape `{ statusCode, error, message }`. `message` names the field or the rule
 and is fit to show to a person. Where a client needs to branch, a machine-readable `code` is added:
-`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`.
+`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`, `wrong_status`.
 
 #### Booking header fields
 
@@ -736,8 +775,9 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | price | `price_mode`, `manual_total`, `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`, `price_extra` |
 | payment | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version` |
 | market | `market`, `market_sub`, `market_agent_id`, `market_at` |
-| lifecycle | `status`, `booking_date`, `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
+| lifecycle | `booking_date` |
 | free text | `notes`, `note` |
+| **set by the server** (read-only) | `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason`; `status` after create |
 
 A field you do not send is **absent from the response**, not `null` — absence means never given,
 which is not the same claim as an explicit blank. `booking_date` and `market_at` are plain
