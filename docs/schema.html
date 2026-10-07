@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Database Schema</title>
+<!--
+  Generated file: the tables, columns, types and keys come from the PostgreSQL catalog of a database
+  built by migrations/*.sql, and the notes from docs/schema.md. The migrations are the authority; if
+  this page disagrees with them, this page is wrong. Self-contained: it loads nothing from the network.
+-->
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f6f3; --surface: #ffffff; --ink: #1c1c1f; --muted: #66666e; --faint: #a1a1a9;
+  --border: #dcdce1; --rule: #efeff2; --line: #a3a3ad; --hot: #2563eb; --match: #fde68a;
+  --pk: #92400e; --pk-bg: #fef3c7; --fk: #1e40af; --fk-bg: #dbeafe; --uk: #6b21a8; --uk-bg: #f3e8ff;
+  --a-sales: #7c3aed; --a-rates: #0e7490; --a-actions: #c2410c; --a-bookings: #2563eb; --a-catalogue: #047857; --a-ops: #be185d;
+  --shadow: 0 1px 2px rgb(0 0 0 / .05), 0 3px 10px rgb(0 0 0 / .04);
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111113; --surface: #1b1b1f; --ink: #ececf0; --muted: #a1a1aa; --faint: #6b6b74;
+    --border: #2f2f37; --rule: #26262c; --line: #62626d; --hot: #60a5fa; --match: #713f12;
+    --pk: #fcd34d; --pk-bg: #3a2e0a; --fk: #93c5fd; --fk-bg: #172554; --uk: #d8b4fe; --uk-bg: #3b0764;
+    --a-sales: #a78bfa; --a-rates: #22d3ee; --a-actions: #fb923c; --a-bookings: #60a5fa; --a-catalogue: #34d399; --a-ops: #f472b6;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: flex; flex-direction: column; background: var(--bg); color: var(--ink); font: 14px/1.45 var(--sans); }
+code { font-family: var(--mono); font-size: .92em; }
+button { font: inherit; color: inherit; }
+
+/* ── Top bar ── */
+.top { flex: none; padding: 14px 20px 10px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.top-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+h1 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
+.meta { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: auto; }
+.search { width: 220px; max-width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; font-size: 13px; }
+.zoom { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.zoom button { padding: 5px 10px; border: 0; border-left: 1px solid var(--border); background: var(--bg); cursor: pointer; font-size: 13px; }
+.zoom button:first-child { border-left: 0; }
+.zoom button:hover { background: var(--rule); }
+.zoom-level { min-width: 46px; padding: 5px 6px; color: var(--muted); font-size: 12px; text-align: center; border-left: 1px solid var(--border); background: var(--surface); }
+.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+.legend-box > summary { margin-top: 8px; color: var(--muted); font-size: 12.5px; cursor: pointer; }
+@media (min-width: 641px) { .legend-box > summary { display: none; } }
+.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend svg { overflow: visible; }
+
+/* ── Canvas ── */
+.stage { flex: 1; min-height: 0; overflow: auto; position: relative; }
+.sizer { position: relative; }
+.inner { position: absolute; top: 0; left: 0; transform-origin: 0 0; display: flex; align-items: flex-start; gap: 84px; padding: 28px; width: max-content; }
+#lines { position: absolute; top: 0; left: 0; z-index: 1; pointer-events: none; overflow: visible; }
+.lane { display: flex; flex-direction: column; gap: 14px; padding: 14px 16px 18px; border-radius: 16px;
+  background: color-mix(in srgb, var(--area) 6%, transparent); border: 1px solid color-mix(in srgb, var(--area) 18%, transparent); }
+.lane-head h2 { margin: 0; font-size: 15px; color: var(--area); }
+.lane-head p { width: 0; min-width: 100%; margin: 2px 0 0; color: var(--muted); font-size: 12.5px; }
+.tracks { display: flex; align-items: flex-start; gap: 56px; }
+.track { display: flex; flex-direction: column; gap: 22px; }
+
+.card { position: relative; z-index: 2; width: 264px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); overflow: hidden; cursor: pointer; transition: opacity .15s; }
+.card:focus-visible { outline: 2px solid var(--hot); outline-offset: 2px; }
+.card.selected { outline: 2px solid var(--hot); outline-offset: 1px; }
+.card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; padding: 7px 10px 6px;
+  border-top: 3px solid var(--area); background: color-mix(in srgb, var(--area) 9%, var(--surface)); }
+.card-name { font: 650 12.5px var(--mono); }
+.card-count { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.row { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 6px; min-height: 22px; padding: 2px 10px; border-top: 1px solid var(--rule); font-size: 12px; }
+.col { font: 11px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row.has-note .col { text-decoration: underline dotted var(--faint); text-underline-offset: 3px; }
+.type { color: var(--muted); font-size: 11px; }
+.keys { display: flex; gap: 3px; }
+.k { padding: 1px 3px; border-radius: 4px; font: 700 9px var(--sans); letter-spacing: .03em; line-height: 1.3; }
+.k.pk { color: var(--pk); background: var(--pk-bg); }
+.k.fk { color: var(--fk); background: var(--fk-bg); }
+.k.uk { color: var(--uk); background: var(--uk-bg); }
+.k.ref { color: var(--muted); border: 1px dashed var(--faint); padding: 0 2px; }
+.row.hot-row { background: color-mix(in srgb, var(--hot) 13%, transparent); }
+.row.match { background: var(--match); }
+.group { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px 10px; border: 0; border-top: 1px solid var(--rule);
+  background: transparent; color: var(--muted); font-size: 11.5px; text-align: left; cursor: pointer; }
+.group:hover { background: var(--rule); }
+.chev { display: inline-block; width: 10px; transition: transform .12s; }
+.group[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.group-n { margin-left: auto; color: var(--faint); }
+
+/* Lines */
+.wire { fill: none; stroke: var(--line); stroke-width: 1.3; }
+.loose .wire { stroke-dasharray: 5 4; }
+.mark { stroke: var(--line); stroke-width: 1.3; fill: none; }
+.ring { stroke: var(--line); stroke-width: 1.3; fill: var(--bg); }
+.rel.hot .wire, .rel.hot .mark, .rel.hot .ring { stroke: var(--hot); stroke-width: 2.2; }
+.focusing .card:not(.near) { opacity: .28; }
+.focusing .rel:not(.hot) { opacity: .08; }
+.hover-only .rel:not(.hot) { display: none; }
+
+/* ── Details panel ── */
+/* The panel opens below the top bar, so search and zoom stay usable beside it. */
+.panel { position: fixed; top: var(--top-h, 0px); right: 0; bottom: 0; z-index: 10; width: min(420px, 100vw); overflow: auto; padding: 18px 20px 28px;
+  background: var(--surface); border-left: 1px solid var(--border); box-shadow: -8px 0 24px rgb(0 0 0 / .08);
+  transform: translateX(105%); transition: transform .18s ease; }
+.panel.open { transform: none; }
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.panel h2 { margin: 0; font: 650 16px var(--mono); overflow-wrap: anywhere; }
+.close { flex: none; padding: 2px 9px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.area-tag { display: inline-block; margin-top: 6px; padding: 1px 8px; border-radius: 999px; color: var(--area);
+  background: color-mix(in srgb, var(--area) 12%, transparent); font-size: 12px; font-weight: 600; }
+.panel h3 { margin: 20px 0 8px; font-size: 12px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.panel p { margin: 10px 0 0; }
+.link-list { margin: 0; padding: 0; list-style: none; }
+.link-list li { padding: 8px 0; border-top: 1px solid var(--rule); }
+.link-list .how { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.pill { padding: 0 7px; border-radius: 999px; font-size: 11.5px; border: 1px solid var(--border); color: var(--muted); }
+.pill.fk { color: var(--fk); background: var(--fk-bg); border-color: transparent; }
+.pill.loose { border-style: dashed; }
+.reason { margin-top: 4px; color: var(--muted); font-size: 12.5px; }
+.goto { padding: 0; border: 0; background: none; color: var(--hot); font: 600 13px var(--mono); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.cols { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.cols td { padding: 5px 4px; border-top: 1px solid var(--rule); vertical-align: top; }
+.cols .note { color: var(--muted); }
+.cols .grp td { padding-top: 12px; color: var(--muted); font-weight: 600; border-top: 0; }
+.cols code { font-size: 12px; }
+.none { color: var(--faint); }
+
+@media (max-width: 640px) {
+  .top { padding: 12px 16px 8px; }
+  .tools { margin-left: 0; width: 100%; }
+  .search { flex: 1; }
+  .panel { top: 0; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-row">
+    <div>
+      <h1>Database schema</h1>
+      <p class="meta" id="meta"></p>
+    </div>
+    <div class="tools">
+      <input class="search" id="search" type="search" placeholder="Find a table or column" aria-label="Find a table or column">
+      <div class="zoom" role="group" aria-label="Zoom">
+        <button type="button" id="zoom-out" aria-label="Zoom out">−</button>
+        <button type="button" id="zoom-fit">Fit</button>
+        <button type="button" id="zoom-100">100%</button>
+        <button type="button" id="zoom-in" aria-label="Zoom in">+</button>
+        <span class="zoom-level" id="zoom-level"></span>
+      </div>
+      <label class="toggle"><input type="checkbox" id="all-lines" checked> All lines</label>
+    </div>
+  </div>
+  <details class="legend-box" id="legend" open>
+  <summary>Legend</summary>
+  <div class="legend">
+    <span><svg width="34" height="10"><path d="M0,5 H34" stroke="currentColor" stroke-width="1.5"/></svg>foreign key: the database refuses an id that points at nothing</span>
+    <span><svg width="34" height="10"><path d="M0,5 H34" stroke="currentColor" stroke-width="1.5" stroke-dasharray="5 4"/></svg>no foreign key: only the code keeps the id valid</span>
+    <span><svg width="30" height="14"><path d="M4,1 V13 M9,1 V13 M9,7 H30" stroke="currentColor" stroke-width="1.3" fill="none"/></svg>exactly one</span>
+    <span><svg width="30" height="14"><path d="M4,1 V13 M4,7 H30" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="14" cy="7" r="3.6" stroke="currentColor" stroke-width="1.3" fill="var(--surface)"/></svg>zero or one</span>
+    <span><svg width="30" height="14"><path d="M0,1 L11,7 M0,13 L11,7 M0,7 H30" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="18" cy="7" r="3.6" stroke="currentColor" stroke-width="1.3" fill="var(--surface)"/></svg>zero or many</span>
+    <span><b class="k pk">PK</b> primary key <b class="k fk">FK</b> foreign key <b class="k uk">UK</b> unique <b class="k ref">ref</b> id with no key</span>
+    <span>Hover a table to trace its links. Click it for details.</span>
+  </div>
+  </details>
+</header>
+<main class="stage" id="stage">
+  <div class="sizer" id="sizer">
+    <div class="inner" id="inner"><svg id="lines" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg></div>
+  </div>
+</main>
+<aside class="panel" id="panel" aria-live="polite"></aside>
+
+<script id="schema-data" type="application/json">{"source":"generated from migrations 001–023 (schema read 2026-10-07)","areas":[{"id":"sales","name":"Agents and sales","blurb":"Resellers, the markets they sell into, and the salespeople who own them. Read-only in the API; the rows come from the legacy import.","tracks":[["markets","market_subs","sales_people"],["agents","agent_programs","agent_activity"]]},{"id":"rates","name":"Rate types","blurb":"The price lists agents are sold at, route by route: seats, charters, the longtail add-on and transfers. Nothing prices a booking from them yet.","tracks":[["rate_types","rate_type_routes"],["rate_type_seat_prices","rate_type_charter_prices","rate_type_longtail_prices","rate_type_transfer_prices"]]},{"id":"actions","name":"Booking action records","blurb":"What cancels, reschedules and partial cancels recorded: who did it, why, and what it cost.","tracks":[["booking_history","booking_cancellations","booking_fee_items","booking_reschedules","booking_partial_cancels"]]},{"id":"bookings","name":"Bookings","blurb":"A booking is a sale; a trip is a departure. Seats are counted per trip, so one booking can span several days.","tracks":[["bookings","booking_passengers","booking_addons","booking_approvals","booking_approval_days"],["booking_trips","booking_trip_pax","booking_trip_lock_draws"]]},{"id":"catalogue","name":"Catalogue and seat pool","blurb":"Routes and boats, when each route runs, and the deployments and seat locks that make up a day’s seats.","tracks":[["routes","route_times","route_seasons","route_day_overrides","seat_locks"],["boats","deployments","boat_capacity_overrides"]]},{"id":"ops","name":"Day-of-operations and vans","blurb":"Who drives, which van, who rides with whom. Filled by the legacy import; no API reads or writes it yet.","tracks":[["booking_trip_operations","booking_trip_van_allocations"],["van_groups","vans","van_days","van_day_routes","van_status_ranges"]]}],"tables":{"agent_activity":{"area":"sales","purpose":"The agent’s audit log.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"agent_id","type":"text","required":true,"fk":true},{"name":"at","type":"timestamptz","required":true},{"name":"by","type":"text","required":false},{"name":"kind","type":"text","required":true},{"name":"text","type":"text","required":true}]},"agent_programs":{"area":"sales","purpose":"The routes an agent may sell, with the booking window sales entered.","groups":[],"columns":[{"name":"agent_id","type":"text","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"idx","type":"integer","required":true},{"name":"book_from","type":"date","required":false},{"name":"book_to","type":"date","required":false},{"name":"note","type":"text","required":false}]},"agents":{"area":"sales","purpose":"A reseller, or a house channel such as walk-in, with its contract and payment terms. Never hard-deleted.","groups":["Contact","Contract","Company","Signatory","Booking channel","Audit"],"columns":[{"name":"id","type":"text","required":true,"pk":true,"note":"Legacy id, e.g. a01"},{"name":"code","type":"text","required":false},{"name":"name","type":"text","required":true},{"name":"market_id","type":"text","required":false,"fk":true},{"name":"sub_market","type":"text","required":false},{"name":"sales_id","type":"text","required":false,"fk":true},{"name":"color","type":"text","required":false,"group":"Contact"},{"name":"pay_type","type":"text","required":false,"note":"Invoice, proforma, bt, cot"},{"name":"vat_mode","type":"text","required":true,"note":"None, include, exclude"},{"name":"credit_days","type":"integer","required":false},{"name":"credit_limit","type":"numeric","required":false},{"name":"contact","type":"text","required":false,"group":"Contact"},{"name":"email","type":"text","required":false,"group":"Contact"},{"name":"phone","type":"text","required":false,"group":"Contact"},{"name":"note","type":"text","required":false,"group":"Contact"},{"name":"rate_type_id","type":"text","required":false,"ref":true,"note":"The key waits for the import"},{"name":"contract_template_id","type":"text","required":false,"group":"Contract"},{"name":"contract_status","type":"text","required":false,"group":"Contract"},{"name":"contract_version","type":"text","required":false,"group":"Contract"},{"name":"contract_start","type":"date","required":false,"group":"Contract"},{"name":"contract_end","type":"date","required":false,"group":"Contract"},{"name":"legal_name","type":"text","required":false,"group":"Company"},{"name":"tax_id","type":"text","required":false,"group":"Company"},{"name":"tat_license","type":"text","required":false,"group":"Company"},{"name":"address","type":"text","required":false,"group":"Company"},{"name":"company_tel","type":"text","required":false,"group":"Company"},{"name":"hotline","type":"text","required":false,"group":"Company"},{"name":"fax","type":"text","required":false,"group":"Company"},{"name":"website","type":"text","required":false,"group":"Company"},{"name":"signatory_name","type":"text","required":false,"group":"Signatory"},{"name":"signatory_designation","type":"text","required":false,"group":"Signatory"},{"name":"signatory_tel","type":"text","required":false,"group":"Signatory"},{"name":"signatory_signed_date","type":"date","required":false,"group":"Signatory"},{"name":"booking_method","type":"text","required":false,"group":"Booking channel"},{"name":"booking_cutoff","type":"text","required":false,"group":"Booking channel"},{"name":"booking_cancel_policy","type":"text","required":false,"group":"Booking channel"},{"name":"booking_email","type":"text","required":false,"group":"Booking channel"},{"name":"booking_phone","type":"text","required":false,"group":"Booking channel"},{"name":"house","type":"boolean","required":true,"note":"Own channel, not a reseller"},{"name":"active","type":"boolean","required":true},{"name":"created_at","type":"timestamptz","required":true,"group":"Audit"},{"name":"updated_at","type":"timestamptz","required":true,"group":"Audit"}]},"boat_capacity_overrides":{"area":"catalogue","purpose":"Ops lowering one boat’s seats for one day. Still capped by the licence.","groups":[],"columns":[{"name":"boat_id","type":"text","required":true,"pk":true,"fk":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"capacity","type":"integer","required":true,"note":"This day only"},{"name":"reason","type":"text","required":false}]},"boats":{"area":"catalogue","purpose":"The fleet. capacity is what the company sells; license_pax is the legal passenger maximum and caps it.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"name","type":"text","required":true},{"name":"type","type":"text","required":false},{"name":"pier","type":"text","required":false},{"name":"capacity","type":"integer","required":true,"note":"Seats the company sells"},{"name":"license_pax","type":"integer","required":false,"note":"Legal passenger maximum"},{"name":"crew","type":"integer","required":false}]},"booking_addons":{"area":"bookings","purpose":"Extras sold with the booking: longtail join, private transfer, B2C extras. Replaced as a whole list on amendment.","groups":[],"columns":[{"name":"booking_id","type":"text","required":true,"pk":true,"fk":true},{"name":"seq","type":"integer","required":true,"pk":true},{"name":"type","type":"text","required":true,"note":"Open set, no catalogue"},{"name":"label","type":"text","required":false,"note":"Name as sold"},{"name":"amount","type":"numeric","required":false,"note":"Line total"},{"name":"qty","type":"integer","required":false},{"name":"note","type":"text","required":false},{"name":"join_adults","type":"integer","required":false},{"name":"join_children","type":"integer","required":false}]},"booking_approval_days":{"area":"bookings","purpose":"The route-days an over-allotment approval is about, as they were when it was asked.","groups":[],"columns":[{"name":"approval_id","type":"bigint","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"ref":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"need","type":"integer","required":true,"note":"Seats asked for"},{"name":"over_by","type":"integer","required":true,"note":"Seats the allotment lacks"}]},"booking_approvals":{"area":"bookings","purpose":"An approval a booking waited for: over the allotment, a discount, or FOC passengers. One row per request, kept after it is decided.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"fk":true},{"name":"kind","type":"text","required":true,"note":"Approval or foc"},{"name":"status","type":"text","required":true,"note":"Pending, approved, rejected, replaced"},{"name":"over_capacity","type":"boolean","required":true,"note":"Holds no seats while pending"},{"name":"over_total","type":"integer","required":false},{"name":"discount","type":"numeric","required":false},{"name":"foc_count","type":"integer","required":false},{"name":"target_status","type":"text","required":true,"note":"Where approve moves the booking"},{"name":"requested_by","type":"text","required":false},{"name":"requested_at","type":"timestamptz","required":true},{"name":"decided_by","type":"text","required":false},{"name":"decided_at","type":"timestamptz","required":false},{"name":"note","type":"text","required":false}]},"booking_cancellations":{"area":"actions","purpose":"The current cancellation: category, note and charge. At most one per booking; a restore deletes it.","groups":[],"columns":[{"name":"booking_id","type":"text","required":true,"pk":true,"fk":true},{"name":"category","type":"text","required":true},{"name":"grp","type":"text","required":true,"note":"Customer, operator, other"},{"name":"note","type":"text","required":false},{"name":"charge_type","type":"text","required":true,"note":"None, full, partial"},{"name":"charge_amount","type":"numeric","required":true},{"name":"at","type":"timestamptz","required":true},{"name":"by","type":"text","required":false}]},"booking_fee_items":{"area":"actions","purpose":"Charges on top of the booking’s total, such as a reschedule fee. Owed = total + these.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"fk":true},{"name":"type","type":"text","required":true},{"name":"label","type":"text","required":false},{"name":"amount","type":"numeric","required":true},{"name":"at","type":"timestamptz","required":true}]},"booking_history":{"area":"actions","purpose":"The booking’s timeline: one line per change, written in the same transaction as the change.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"fk":true},{"name":"at","type":"timestamptz","required":true},{"name":"by","type":"text","required":false,"note":"Username from the token"},{"name":"kind","type":"text","required":true},{"name":"tag","type":"text","required":false},{"name":"text","type":"text","required":true}]},"booking_partial_cancels":{"area":"actions","purpose":"Every reduction in passengers, with what was charged and what was waived. Append-only.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"fk":true},{"name":"booking_trip_id","type":"text","required":false,"ref":true},{"name":"service_date","type":"date","required":false},{"name":"pax_removed","type":"jsonb","required":true,"note":"E.g. ad_fr 1"},{"name":"count","type":"integer","required":true},{"name":"category","type":"text","required":false},{"name":"grp","type":"text","required":false},{"name":"note","type":"text","required":false},{"name":"charged_count","type":"integer","required":true},{"name":"charged_amount","type":"numeric","required":true},{"name":"waived_count","type":"integer","required":true},{"name":"waived_amount","type":"numeric","required":true,"note":"Refunded off total"},{"name":"at","type":"timestamptz","required":true},{"name":"by","type":"text","required":false}]},"booking_passengers":{"area":"bookings","purpose":"The named passengers on a booking, in order. Replaced as a whole list on amendment.","groups":[],"columns":[{"name":"booking_id","type":"text","required":true,"pk":true,"fk":true},{"name":"seq","type":"integer","required":true,"pk":true},{"name":"name","type":"text","required":true},{"name":"nationality","type":"text","required":false},{"name":"type","type":"text","required":false},{"name":"foc","type":"boolean","required":false}]},"booking_reschedules":{"area":"actions","purpose":"Every move of a booking to another date, with reason and charge. Append-only.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"fk":true},{"name":"from_date","type":"date","required":true},{"name":"to_date","type":"date","required":true},{"name":"reason","type":"text","required":false},{"name":"charge_type","type":"text","required":true},{"name":"charge_amount","type":"numeric","required":true},{"name":"collect","type":"text","required":true,"note":"None, invoice, separate"},{"name":"at","type":"timestamptz","required":true},{"name":"by","type":"text","required":false}]},"booking_trip_lock_draws":{"area":"bookings","purpose":"How many of a trip’s seats came out of which seat lock, so they are not counted twice.","groups":[],"columns":[{"name":"booking_trip_id","type":"text","required":true,"pk":true,"fk":true},{"name":"seat_lock_id","type":"text","required":true,"pk":true,"fk":true},{"name":"qty","type":"integer","required":true}]},"booking_trip_operations":{"area":"ops","purpose":"Ops-board data for one trip: boat, final pickup time, pier check-in, reconfirmation.","groups":[],"columns":[{"name":"booking_trip_id","type":"text","required":true,"pk":true,"fk":true},{"name":"boat_id","type":"text","required":false,"ref":true},{"name":"pickup_time_final","type":"text","required":false,"note":"HH:MM"},{"name":"return_same_van","type":"boolean","required":true},{"name":"upgrade","type":"text","required":false},{"name":"pier_checkin","type":"text","required":false},{"name":"reconfirm_status","type":"text","required":false},{"name":"reconfirm_at","type":"timestamptz","required":false},{"name":"reconfirm_by","type":"text","required":false}]},"booking_trip_pax":{"area":"bookings","purpose":"How many passengers of each age category and residency are on a trip. Seats held are summed from here.","groups":[],"columns":[{"name":"booking_trip_id","type":"text","required":true,"pk":true,"fk":true},{"name":"category","type":"text","required":true,"pk":true,"note":"Ad, chd, inf, foc"},{"name":"residency","type":"text","required":true,"pk":true,"note":"Unknown, foreign, thai"},{"name":"count","type":"integer","required":true}]},"booking_trip_van_allocations":{"area":"ops","purpose":"Which van group each part of a trip’s passengers rides in. Part 0 is the main part; more parts are splits.","groups":[],"columns":[{"name":"booking_trip_id","type":"text","required":true,"pk":true,"fk":true},{"name":"idx","type":"integer","required":true,"pk":true,"note":"0 is the main part"},{"name":"ad","type":"integer","required":true},{"name":"chd","type":"integer","required":true},{"name":"inf","type":"integer","required":true},{"name":"foc","type":"integer","required":true},{"name":"van_group_id","type":"text","required":false,"fk":true},{"name":"sequence","type":"integer","required":false,"note":"Manual pickup order"},{"name":"return_van_id","type":"text","required":false,"fk":true},{"name":"source","type":"text","required":true,"note":"Main, manual, alt_pickup"},{"name":"pick_area_id","type":"text","required":false},{"name":"pick_hotel","type":"text","required":false},{"name":"pick_zone","type":"text","required":false},{"name":"drop_area_id","type":"text","required":false},{"name":"drop_hotel","type":"text","required":false},{"name":"drop_zone","type":"text","required":false}]},"booking_trips":{"area":"bookings","purpose":"One departure of a booking: route, date, seat or charter, pickup and overnight details.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"booking_id","type":"text","required":true,"uk":true,"fk":true},{"name":"seq","type":"integer","required":true,"uk":true,"note":"Order in the itinerary"},{"name":"route_id","type":"text","required":true,"fk":true},{"name":"service_date","type":"date","required":true},{"name":"booking_mode","type":"text","required":true,"note":"Seat or charter"},{"name":"charter_boat_id","type":"text","required":false,"ref":true,"note":"Charters only"},{"name":"zone","type":"text","required":false,"note":"Pickup zone, e.g. PK"},{"name":"pickup_time","type":"text","required":false,"note":"HH:MM"},{"name":"ovn","type":"text","required":false,"note":"Overnight: return or self"},{"name":"ovn_return_date","type":"date","required":false},{"name":"ovn_leg","type":"boolean","required":true,"note":"This trip is a return leg"},{"name":"ovn_of","type":"text","required":false,"fk":true,"note":"The leg's outbound trip"}]},"bookings":{"area":"bookings","purpose":"The sale: status, agent, price and the details the booking form writes. Seats are not stored here but counted from its trips.","groups":["Sale","Lead passenger","Pickup and drop-off","Guides","Passenger needs","Cash on tour","Price breakdown","Payment snapshot","Market snapshot","Notes","FOC"],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"status","type":"text","required":true,"note":"One of 10. cancelled, rejected and cancelled_weather give their seats back; every other status holds them, except a pending_approval booking waiting for an over-allotment approval."},{"name":"cancellation_reason","type":"text","required":false},{"name":"created_at","type":"timestamptz","required":true},{"name":"updated_at","type":"timestamptz","required":true},{"name":"external_id","type":"text","required":false,"uk":true,"note":"Caller's own reference"},{"name":"agent_id","type":"text","required":false,"ref":true},{"name":"voucher_ref","type":"text","required":false},{"name":"rate_type_ref","type":"text","required":false,"ref":true,"note":"A snapshot of the rate used"},{"name":"booking_mode","type":"text","required":false,"note":"Copy of the first trip's"},{"name":"booking_data","type":"jsonb","required":true,"note":"Legacy blob, being removed"},{"name":"schema_ver","type":"integer","required":false,"group":"Sale"},{"name":"sold_by","type":"text","required":false,"group":"Sale"},{"name":"purpose","type":"text","required":false,"group":"Sale"},{"name":"staff_id","type":"text","required":false,"group":"Sale"},{"name":"staff_purpose","type":"text","required":false,"group":"Sale"},{"name":"lead_pax","type":"text","required":false,"group":"Lead passenger"},{"name":"lead_nationality","type":"text","required":false,"group":"Lead passenger"},{"name":"lead_type","type":"text","required":false,"group":"Lead passenger"},{"name":"lead_foc","type":"boolean","required":false,"group":"Lead passenger"},{"name":"lead_phone","type":"text","required":false,"group":"Lead passenger"},{"name":"lead_email","type":"text","required":false,"group":"Lead passenger"},{"name":"pickup_area_id","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"pickup_self","type":"boolean","required":false,"group":"Pickup and drop-off"},{"name":"pickup_area","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"pickup_zone","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"hotel_name","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"room_number","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"dropoff_same","type":"boolean","required":false,"group":"Pickup and drop-off"},{"name":"dropoff_area_id","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"dropoff_area","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"dropoff_hotel_name","type":"text","required":false,"group":"Pickup and drop-off"},{"name":"guide_english","type":"boolean","required":false,"group":"Guides"},{"name":"guide_russian","type":"boolean","required":false,"group":"Guides"},{"name":"guide_chinese","type":"boolean","required":false,"group":"Guides"},{"name":"guide_other_lang","type":"text","required":false,"group":"Guides"},{"name":"pax_type","type":"text","required":false,"group":"Passenger needs"},{"name":"special_meals_veg","type":"integer","required":false,"group":"Passenger needs"},{"name":"special_meals_vegan","type":"integer","required":false,"group":"Passenger needs"},{"name":"special_meals_halal","type":"integer","required":false,"group":"Passenger needs"},{"name":"special_meals_allergies","type":"text","required":false,"group":"Passenger needs"},{"name":"large_luggage","type":"integer","required":false,"group":"Passenger needs"},{"name":"cash_on_tour_amount","type":"numeric","required":false,"group":"Cash on tour"},{"name":"cash_on_tour_currency","type":"text","required":false,"group":"Cash on tour"},{"name":"cash_on_tour_handling","type":"text","required":false,"group":"Cash on tour"},{"name":"cash_on_tour_note","type":"text","required":false,"group":"Cash on tour"},{"name":"price_mode","type":"text","required":false},{"name":"manual_total","type":"numeric","required":false},{"name":"total","type":"numeric","required":false,"note":"Stored as sent"},{"name":"price_seat","type":"numeric","required":false,"group":"Price breakdown"},{"name":"price_addon","type":"numeric","required":false,"group":"Price breakdown"},{"name":"price_foc_discount","type":"numeric","required":false,"group":"Price breakdown"},{"name":"price_discount","type":"numeric","required":false,"group":"Price breakdown"},{"name":"price_extra","type":"numeric","required":false,"group":"Price breakdown"},{"name":"payment_method","type":"text","required":false,"group":"Payment snapshot"},{"name":"payment_net_days","type":"integer","required":false,"group":"Payment snapshot"},{"name":"payment_source","type":"text","required":false,"group":"Payment snapshot"},{"name":"payment_contract_version","type":"text","required":false,"group":"Payment snapshot"},{"name":"market","type":"text","required":false,"group":"Market snapshot"},{"name":"market_sub","type":"text","required":false,"group":"Market snapshot"},{"name":"market_agent_id","type":"text","required":false,"group":"Market snapshot"},{"name":"market_at","type":"date","required":false,"group":"Market snapshot"},{"name":"booking_date","type":"date","required":false,"group":"Sale"},{"name":"booked_at","type":"timestamptz","required":false,"group":"Sale"},{"name":"created_by","type":"text","required":false,"group":"Sale"},{"name":"updated_by","type":"text","required":false,"group":"Sale"},{"name":"confirmed_at","type":"timestamptz","required":false,"group":"Sale"},{"name":"confirmed_by","type":"text","required":false,"group":"Sale"},{"name":"notes","type":"text","required":false,"group":"Notes"},{"name":"note","type":"text","required":false,"group":"Notes"},{"name":"foc_reason","type":"text","required":false,"group":"FOC"}]},"deployments":{"area":"catalogue","purpose":"Boat X sails route Y on date D. This is what creates seats. A boat sails one route per day.","groups":[],"columns":[{"name":"boat_id","type":"text","required":true,"pk":true,"ref":true},{"name":"route_id","type":"text","required":true,"ref":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"capacity","type":"integer","required":true},{"name":"license_pax","type":"integer","required":false,"note":"Copied from boats on write"},{"name":"registered_persons","type":"integer","required":true,"note":"Passengers plus crew, never sold"}]},"market_subs":{"area":"sales","purpose":"A market’s sub-markets, in order.","groups":[],"columns":[{"name":"market_id","type":"text","required":true,"pk":true,"fk":true},{"name":"idx","type":"integer","required":true},{"name":"name","type":"text","required":true,"pk":true}]},"markets":{"area":"sales","purpose":"The markets agents sell into.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"name","type":"text","required":true},{"name":"color","type":"text","required":false},{"name":"sort","type":"integer","required":false}]},"rate_type_charter_prices":{"area":"rates","purpose":"A whole-boat price per boat type: starter_price covers starter_includes passengers, each one more costs extra_per_pax.","groups":[],"columns":[{"name":"rate_type_id","type":"text","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"boat_type","type":"text","required":true,"pk":true,"note":"Lowercase boat type"},{"name":"starter_price","type":"numeric","required":false},{"name":"starter_includes","type":"integer","required":false,"note":"Passengers the starter covers"},{"name":"extra_per_pax","type":"numeric","required":false}]},"rate_type_longtail_prices":{"area":"rates","purpose":"The longtail add-on on one route: joining a shared longtail per person, or chartering one.","groups":[],"columns":[{"name":"rate_type_id","type":"text","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"join_adult","type":"numeric","required":false},{"name":"join_child","type":"numeric","required":false},{"name":"charter_price","type":"numeric","required":false},{"name":"charter_capacity","type":"integer","required":false}]},"rate_type_routes":{"area":"rates","purpose":"The routes a rate covers, in order, with the travel window and the longtail bundle. Every price hangs off one of these rows.","groups":[],"columns":[{"name":"rate_type_id","type":"text","required":true,"pk":true,"uk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"seq","type":"integer","required":true,"uk":true,"note":"Order in the rate"},{"name":"travel_from","type":"date","required":false},{"name":"travel_to","type":"date","required":false},{"name":"longtail_bundle","type":"text","required":false,"note":"Free or paid, empty means none"},{"name":"longtail_bundle_adult","type":"numeric","required":false},{"name":"longtail_bundle_child","type":"numeric","required":false},{"name":"longtail_bundle_applies_to","type":"text","required":false,"note":"Seat, charter, both"}]},"rate_type_seat_prices":{"area":"rates","purpose":"One seat price per zone, age category, residency and tier. Only tier net is billed; sell and min_sell are printed on contracts.","groups":[],"columns":[{"name":"rate_type_id","type":"text","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"zone","type":"text","required":true,"pk":true,"note":"PK, KL, NoTransfer, RN"},{"name":"category","type":"text","required":true,"pk":true,"note":"Ad, chd, inf"},{"name":"residency","type":"text","required":true,"pk":true,"note":"Foreign or thai"},{"name":"tier","type":"text","required":true,"pk":true,"note":"Net, sell, min_sell"},{"name":"price","type":"numeric","required":true}]},"rate_type_transfer_prices":{"area":"rates","purpose":"A private transfer to the route from one pickup zone, per vehicle.","groups":[],"columns":[{"name":"rate_type_id","type":"text","required":true,"pk":true,"fk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"zone","type":"text","required":true,"pk":true},{"name":"vehicle","type":"text","required":true,"pk":true},{"name":"price","type":"numeric","required":true}]},"rate_types":{"area":"rates","purpose":"A price list agents are sold at. The prices hang off its routes. Nothing prices a booking from it yet.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true,"note":"E.g. rt003"},{"name":"code","type":"text","required":true,"uk":true,"note":"Never edited, the import matches on it"},{"name":"name","type":"text","required":true},{"name":"note","type":"text","required":false},{"name":"color","type":"text","required":false},{"name":"owner_sales_id","type":"text","required":false,"fk":true,"note":"Empty means shared"},{"name":"valid_from","type":"date","required":false},{"name":"valid_to","type":"date","required":false},{"name":"active","type":"boolean","required":true},{"name":"nationality_scope","type":"text","required":false,"note":"Both, thai, foreign"},{"name":"transfer_unit","type":"text","required":false,"note":"Label, e.g. per trip"},{"name":"created_on","type":"date","required":false,"note":"Legacy's createdDate"},{"name":"created_at","type":"timestamptz","required":true},{"name":"updated_at","type":"timestamptz","required":true}]},"route_day_overrides":{"area":"catalogue","purpose":"A single-day open or closed exception. It beats any season covering that date.","groups":[],"columns":[{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"kind","type":"text","required":true,"note":"Open or closed, beats any season"}]},"route_seasons":{"area":"catalogue","purpose":"Date windows when a route normally runs (open) or does not (closed).","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"route_id","type":"text","required":true,"fk":true},{"name":"kind","type":"text","required":true,"note":"Open or closed"},{"name":"from_date","type":"date","required":true},{"name":"to_date","type":"date","required":true}]},"route_times":{"area":"catalogue","purpose":"A route’s departure times, in order.","groups":[],"columns":[{"name":"route_id","type":"text","required":true,"pk":true,"fk":true},{"name":"idx","type":"integer","required":true,"pk":true},{"name":"departs_at","type":"text","required":true,"note":"HH:MM"}]},"routes":{"area":"catalogue","purpose":"A programme customers can book: a boat trip (marine) or a land product such as a transfer, tour or show ticket (land).","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"name","type":"text","required":true},{"name":"pier","type":"text","required":false},{"name":"family_id","type":"text","required":false},{"name":"color","type":"text","required":false},{"name":"islands","type":"text","required":false},{"name":"sort","type":"bigint","required":false},{"name":"kind","type":"text","required":true,"note":"Marine or land"},{"name":"ext_id","type":"text","required":false,"note":"Love Kingdom product code"}]},"sales_people":{"area":"sales","purpose":"The salespeople who own agents. Never deleted: one who leaves becomes inactive.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"code","type":"text","required":false},{"name":"name","type":"text","required":true},{"name":"full_name","type":"text","required":false},{"name":"designation","type":"text","required":false},{"name":"email","type":"text","required":false},{"name":"tel","type":"text","required":false},{"name":"color","type":"text","required":false},{"name":"active","type":"boolean","required":true}]},"seat_locks":{"area":"catalogue","purpose":"Seats held on one route-day for an agent. Bookings draw from it; it holds pax minus what has been drawn.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"route_id","type":"text","required":true,"ref":true},{"name":"service_date","type":"date","required":true},{"name":"pax","type":"integer","required":true},{"name":"agent_id","type":"text","required":false,"ref":true},{"name":"status","type":"text","required":true,"note":"Active or released"},{"name":"created_at","type":"timestamptz","required":true},{"name":"updated_at","type":"timestamptz","required":true},{"name":"released_at","type":"timestamptz","required":false}]},"van_day_routes":{"area":"ops","purpose":"The month matrix: which routes a van serves on which dates.","groups":[],"columns":[{"name":"van_id","type":"text","required":true,"pk":true,"fk":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"route_id","type":"text","required":true,"pk":true,"fk":true}]},"van_days":{"area":"ops","purpose":"One van on one day: a status override and that day’s driver.","groups":[],"columns":[{"name":"van_id","type":"text","required":true,"pk":true,"fk":true},{"name":"service_date","type":"date","required":true,"pk":true},{"name":"status","type":"text","required":false,"note":"Available, off, maintenance"},{"name":"driver","type":"text","required":false},{"name":"driver_phone","type":"text","required":false},{"name":"plate","type":"text","required":false},{"name":"sent_at","type":"timestamptz","required":false,"note":"Job order sent"}]},"van_groups":{"area":"ops","purpose":"One outbound van run on a route-day. The group holds the van, so its passengers cannot disagree about it.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"service_date","type":"date","required":true,"uk":true},{"name":"route_id","type":"text","required":true,"uk":true,"fk":true},{"name":"zone","type":"text","required":true,"note":"The pickup zone the group collects from, or __CHARTER__ for a charter’s own van."},{"name":"number","type":"integer","required":true,"uk":true,"note":"Display number"},{"name":"van_id","type":"text","required":false,"fk":true,"note":"Outbound van"},{"name":"return_van_id","type":"text","required":false,"fk":true},{"name":"pickup_time","type":"text","required":false,"note":"HH:MM"}]},"van_status_ranges":{"area":"ops","purpose":"A van out of service over a span of dates. An open end means until further notice.","groups":[],"columns":[{"name":"id","type":"bigint","required":true,"pk":true},{"name":"van_id","type":"text","required":true,"fk":true},{"name":"status","type":"text","required":true,"note":"Off or maintenance"},{"name":"from_date","type":"date","required":true},{"name":"to_date","type":"date","required":false,"note":"Empty means open-ended"},{"name":"note","type":"text","required":false}]},"vans":{"area":"ops","purpose":"The van fleet. Never deleted: a retired van is set inactive.","groups":[],"columns":[{"name":"id","type":"text","required":true,"pk":true},{"name":"name","type":"text","required":true},{"name":"plate","type":"text","required":false},{"name":"type","type":"text","required":false},{"name":"capacity","type":"integer","required":true},{"name":"ownership","type":"text","required":true,"note":"Own or partner"},{"name":"partner_name","type":"text","required":false},{"name":"zone_base","type":"text","required":false,"note":"PK or KL"},{"name":"color","type":"text","required":false},{"name":"driver","type":"text","required":false},{"name":"driver_phone","type":"text","required":false},{"name":"active","type":"boolean","required":true}]}},"rels":[{"child":"route_times","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"route_seasons","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"route_day_overrides","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_passengers","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"boat_capacity_overrides","col":"boat_id","parent":"boats","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trips","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"oneOrMore","parentEnd":"one"},{"child":"booking_trip_pax","col":"booking_trip_id","parent":"booking_trips","pcol":"id","enforced":true,"childEnd":"oneOrMore","parentEnd":"one"},{"child":"booking_trips","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trip_operations","col":"booking_trip_id","parent":"booking_trips","pcol":"id","enforced":true,"childEnd":"zeroOrOne","parentEnd":"one"},{"child":"booking_trip_lock_draws","col":"booking_trip_id","parent":"booking_trips","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trip_lock_draws","col":"seat_lock_id","parent":"seat_locks","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trips","col":"ovn_of","parent":"booking_trips","pcol":"id","enforced":true,"childEnd":"zeroOrOne","parentEnd":"zeroOrOne"},{"child":"van_day_routes","col":"van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"van_day_routes","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"van_status_ranges","col":"van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"van_days","col":"van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"van_groups","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"van_groups","col":"van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"van_groups","col":"return_van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"booking_trip_van_allocations","col":"booking_trip_id","parent":"booking_trips","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trip_van_allocations","col":"van_group_id","parent":"van_groups","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"booking_trip_van_allocations","col":"return_van_id","parent":"vans","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"market_subs","col":"market_id","parent":"markets","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"agents","col":"market_id","parent":"markets","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"agents","col":"sales_id","parent":"sales_people","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"agent_programs","col":"agent_id","parent":"agents","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"agent_programs","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"agent_activity","col":"agent_id","parent":"agents","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_addons","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_history","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_cancellations","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrOne","parentEnd":"one"},{"child":"booking_reschedules","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_partial_cancels","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_fee_items","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trips","col":"charter_boat_id","parent":"boats","pcol":"id","enforced":false,"reason":"The real rule, \"deployed on this route that day\", is stronger than a key, and both stores check it before writing (014).","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"deployments","col":"boat_id","parent":"boats","pcol":"id","enforced":false,"reason":"Left out for the same reason. 014 says it and `charter_boat_id` \"should gain a key together\".","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"deployments","col":"route_id","parent":"routes","pcol":"id","enforced":false,"reason":"Created (001) before the route catalogue existed (005). 008 added a key for `booking_trips.route_id` only.","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"seat_locks","col":"route_id","parent":"routes","pcol":"id","enforced":false,"reason":"Same as `deployments.route_id`.","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_trip_operations","col":"boat_id","parent":"boats","pcol":"id","enforced":false,"reason":"Created without one (013). No API writes the column yet.","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"bookings","col":"agent_id","parent":"agents","pcol":"id","enforced":false,"reason":"Created (002) before the agents table (017). No key was added when it arrived.","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"seat_locks","col":"agent_id","parent":"agents","pcol":"id","enforced":false,"reason":"Same as `bookings.agent_id`.","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"booking_partial_cancels","col":"booking_trip_id","parent":"booking_trips","pcol":"id","enforced":false,"reason":"Deliberate: the record must outlive a trip a later edit removes (020).","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"boat_capacity_overrides","col":"boat_id","parent":"deployments","pcol":"boat_id","reason":"An override applies to the deployment of the same boat on the same day. The two are matched on `boat_id` and `service_date`; no key links them.","enforced":false,"join":true,"childEnd":"zeroOrOne","parentEnd":"zeroOrOne"},{"child":"rate_types","col":"owner_sales_id","parent":"sales_people","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"rate_type_routes","col":"rate_type_id","parent":"rate_types","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"rate_type_routes","col":"route_id","parent":"routes","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"rate_type_seat_prices","col":"rate_type_id","parent":"rate_type_routes","pcol":"rate_type_id","enforced":true,"reason":"Composite key: `(rate_type_id, route_id)` → `rate_type_routes (rate_type_id, route_id)`. The line is drawn from the first column.","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"rate_type_charter_prices","col":"rate_type_id","parent":"rate_type_routes","pcol":"rate_type_id","enforced":true,"reason":"Composite key: `(rate_type_id, route_id)` → `rate_type_routes (rate_type_id, route_id)`. The line is drawn from the first column.","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"rate_type_longtail_prices","col":"rate_type_id","parent":"rate_type_routes","pcol":"rate_type_id","enforced":true,"reason":"Composite key: `(rate_type_id, route_id)` → `rate_type_routes (rate_type_id, route_id)`. The line is drawn from the first column.","childEnd":"zeroOrOne","parentEnd":"one"},{"child":"rate_type_transfer_prices","col":"rate_type_id","parent":"rate_type_routes","pcol":"rate_type_id","enforced":true,"reason":"Composite key: `(rate_type_id, route_id)` → `rate_type_routes (rate_type_id, route_id)`. The line is drawn from the first column.","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_approvals","col":"booking_id","parent":"bookings","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_approval_days","col":"approval_id","parent":"booking_approvals","pcol":"id","enforced":true,"childEnd":"zeroOrMany","parentEnd":"one"},{"child":"booking_approval_days","col":"route_id","parent":"routes","pcol":"id","enforced":false,"reason":"Created without one (023).","childEnd":"zeroOrMany","parentEnd":"one"},{"child":"agents","col":"rate_type_id","parent":"rate_types","pcol":"id","enforced":false,"reason":"Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`).","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"},{"child":"bookings","col":"rate_type_ref","parent":"rate_types","pcol":"id","enforced":false,"reason":"Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings (`todo/rate-types-model.md`).","childEnd":"zeroOrMany","parentEnd":"zeroOrOne"}]}</script>
+<script>
+(() => {
+  const data = JSON.parse(document.getElementById('schema-data').textContent);
+  const $ = (id) => document.getElementById(id);
+  const stage = $('stage'), sizer = $('sizer'), inner = $('inner'), svg = $('lines'), panel = $('panel');
+  const search = $('search'), allLines = $('all-lines');
+  const SVG = 'http://www.w3.org/2000/svg';
+
+  const el = (tag, attrs = {}, ...kids) => {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs)) {
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else node.setAttribute(key, value);
+    }
+    for (const kid of kids) if (kid !== null && kid !== undefined) node.append(kid);
+    return node;
+  };
+  const svgEl = (tag, attrs) => { const node = document.createElementNS(SVG, tag); for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v); return node; };
+  /** Text with `code` spans, as the reasons in docs/schema.md are written. Never parsed as HTML. */
+  const inline = (text) => { const out = document.createDocumentFragment(); text.split('`').forEach((part, i) => out.append(i % 2 ? el('code', { text: part }) : part)); return out; };
+
+  const areas = Object.fromEntries(data.areas.map((a) => [a.id, a]));
+  const cards = new Map();
+  const rows = new Map();
+  const relsOf = new Map(Object.keys(data.tables).map((t) => [t, []]));
+  data.rels.forEach((r, i) => { r.i = i; relsOf.get(r.child).push(r); if (r.parent !== r.child) relsOf.get(r.parent).push(r); });
+
+  let scale = 1, autoFit = true, hover = null, selected = null, hits = null;
+
+  $('meta').textContent = `${Object.keys(data.tables).length} tables · ${data.rels.length} links · ${data.source}`;
+
+  // ── Cards ──
+  function columnRow(table, c) {
+    const keys = el('span', { class: 'keys' });
+    if (c.pk) keys.append(el('b', { class: 'k pk', text: 'PK' }));
+    if (c.fk) keys.append(el('b', { class: 'k fk', text: 'FK' }));
+    if (c.ref) keys.append(el('b', { class: 'k ref', text: 'ref' }));
+    if (c.uk) keys.append(el('b', { class: 'k uk', text: 'UK' }));
+    const row = el('div', { class: 'row' + (c.note ? ' has-note' : ''), title: c.note ? `${c.name}: ${c.note}` : c.name },
+      keys, el('span', { class: 'col', text: c.name }), el('span', { class: 'type', text: c.type }));
+    rows.set(`${table}.${c.name}`, row);
+    return row;
+  }
+
+  function card(name) {
+    const t = data.tables[name];
+    const node = el('article', { class: 'card', tabindex: '0', style: `--area: var(--a-${t.area})`, 'aria-label': `Table ${name}` },
+      el('header', { class: 'card-head' }, el('span', { class: 'card-name', text: name }), el('span', { class: 'card-count', text: `${t.columns.length} cols` })));
+    for (const c of t.columns) if (!c.group) node.append(columnRow(name, c));
+    for (const group of t.groups) {
+      const members = t.columns.filter((c) => c.group === group);
+      const body = el('div', { hidden: '' });
+      for (const c of members) body.append(columnRow(name, c));
+      const toggle = el('button', { class: 'group', type: 'button', 'aria-expanded': 'false' },
+        el('span', { class: 'chev', text: '▸' }), el('span', { text: group }), el('span', { class: 'group-n', text: String(members.length) }));
+      toggle.addEventListener('click', (event) => { event.stopPropagation(); openGroup(toggle, body, body.hidden); });
+      node.append(toggle, body);
+    }
+    node.addEventListener('mouseenter', () => { hover = name; applyFocus(); });
+    node.addEventListener('mouseleave', () => { hover = null; applyFocus(); });
+    node.addEventListener('click', (event) => { event.stopPropagation(); select(name); });
+    node.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); select(name); } });
+    cards.set(name, node);
+    return node;
+  }
+
+  /** `auto` marks a group the search opened, so the search may close it again; a click claims it. */
+  function setGroup(toggle, open, auto) {
+    const body = toggle.nextElementSibling;
+    body.hidden = !open;
+    toggle.setAttribute('aria-expanded', String(open));
+    if (open && auto) toggle.dataset.auto = '1'; else delete toggle.dataset.auto;
+  }
+  function openGroup(toggle, body, open) { setGroup(toggle, open, false); relayout(); }
+
+  for (const area of data.areas) {
+    const tracks = el('div', { class: 'tracks' });
+    for (const track of area.tracks) tracks.append(el('div', { class: 'track' }, ...track.map(card)));
+    inner.append(el('section', { class: 'lane', style: `--area: var(--a-${area.id})` },
+      el('header', { class: 'lane-head' }, el('h2', { text: area.name }), el('p', { text: area.blurb })), tracks));
+  }
+
+  // ── Lines ──
+  /** A box in the canvas's own, unscaled coordinates. */
+  function box(node) {
+    const r = node.getBoundingClientRect(), base = inner.getBoundingClientRect();
+    return { l: (r.left - base.left) / scale, r: (r.right - base.left) / scale, t: (r.top - base.top) / scale, b: (r.bottom - base.top) / scale };
+  }
+  /** The column's row, or the card's header when the row is folded away inside a group. */
+  const anchor = (table, column) => { const row = rows.get(`${table}.${column}`); return row && row.offsetParent !== null ? row : cards.get(table).firstChild; };
+
+  /** Line-end symbols in crow's-foot notation, drawn outward from the card edge at (x, y). */
+  function ending(g, x, y, dir, kind) {
+    const at = (dx) => x + dir * dx;
+    const stroke = (d) => g.append(svgEl('path', { d, class: 'mark' }));
+    const bar = (dx) => stroke(`M${at(dx)},${y - 6} V${y + 6}`);
+    const ring = (dx) => g.append(svgEl('circle', { cx: at(dx), cy: y, r: 3.6, class: 'ring' }));
+    const crow = () => stroke(`M${at(0)},${y - 6} L${at(11)},${y} M${at(0)},${y + 6} L${at(11)},${y} M${at(0)},${y} H${at(11)}`);
+    if (kind === 'one') { bar(5); bar(10); }
+    else if (kind === 'zeroOrOne') { bar(5); ring(14); }
+    else if (kind === 'oneOrMore') { crow(); bar(15); }
+    else { crow(); ring(18); }
+  }
+
+  function draw() {
+    const w = inner.offsetWidth, h = inner.offsetHeight;
+    svg.setAttribute('width', w); svg.setAttribute('height', h); svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    svg.replaceChildren();
+    for (const r of data.rels) {
+      const from = box(cards.get(r.child)), to = box(cards.get(r.parent));
+      const a = box(anchor(r.child, r.col)), b = box(anchor(r.parent, r.pcol));
+      const y1 = (a.t + a.b) / 2, y2 = (b.t + b.b) / 2;
+      // Leave each card on the side facing the other; cards stacked in one track loop out to the right.
+      let s1 = 1, s2 = 1;
+      if (r.child !== r.parent && to.l >= from.r - 1) s2 = -1;
+      else if (r.child !== r.parent && to.r <= from.l + 1) s1 = -1;
+      const x1 = s1 > 0 ? from.r : from.l, x2 = s2 > 0 ? to.r : to.l;
+      let d;
+      if (s1 === s2) {
+        const out = Math.max(x1, x2) + 26 + Math.min(80, Math.abs(y2 - y1) * 0.1);
+        d = `M${x1},${y1} C${out},${y1} ${out},${y2} ${x2},${y2}`;
+      } else {
+        const pull = Math.max(36, Math.abs(x2 - x1) * 0.45);
+        d = `M${x1},${y1} C${x1 + s1 * pull},${y1} ${x2 + s2 * pull},${y2} ${x2},${y2}`;
+      }
+      const g = svgEl('g', { class: 'rel' + (r.enforced ? '' : ' loose'), 'data-i': r.i });
+      g.append(svgEl('path', { d, class: 'wire' }));
+      ending(g, x1, y1, s1, r.childEnd);
+      ending(g, x2, y2, s2, r.parentEnd);
+      svg.append(g);
+    }
+    applyFocus();
+  }
+
+  // ── Focus: hover, selection, search ──
+  const neighbours = (t) => { const set = new Set([t]); for (const r of relsOf.get(t)) { set.add(r.child); set.add(r.parent); } return set; };
+  function applyFocus() {
+    const t = hover ?? selected;
+    const near = t ? neighbours(t) : hits;
+    inner.classList.toggle('focusing', Boolean(near));
+    inner.classList.toggle('hover-only', !allLines.checked);
+    for (const [name, node] of cards) {
+      node.classList.toggle('near', Boolean(near?.has(name)));
+      node.classList.toggle('selected', name === selected);
+    }
+    for (const row of rows.values()) row.classList.remove('hot-row');
+    for (const g of svg.children) {
+      const r = data.rels[g.dataset.i], hot = Boolean(t) && (r.child === t || r.parent === t);
+      g.classList.toggle('hot', hot);
+      if (hot) { rows.get(`${r.child}.${r.col}`)?.classList.add('hot-row'); rows.get(`${r.parent}.${r.pcol}`)?.classList.add('hot-row'); }
+    }
+  }
+
+  function select(name, scroll = false) {
+    selected = name;
+    applyFocus();
+    showPanel(name);
+    if (scroll) reveal(name);
+  }
+  function clearSelection() { selected = null; applyFocus(); panel.classList.remove('open'); }
+  stage.addEventListener('click', clearSelection);
+
+  function reveal(name) {
+    const b = box(cards.get(name));
+    stage.scrollTo({ left: Math.max(0, ((b.l + b.r) / 2) * scale - stage.clientWidth / 2), top: Math.max(0, b.t * scale - 60), behavior: 'smooth' });
+  }
+
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    hits = q ? new Set(Object.keys(data.tables).filter((t) => t.includes(q) || data.tables[t].columns.some((c) => c.name.includes(q)))) : null;
+    for (const [key, row] of rows) row.classList.toggle('match', Boolean(q) && key.split('.')[1].includes(q));
+    // A match folded inside a group is opened so it can be seen, and closed again once the search
+    // stops matching it. Groups the reader opened themselves are left alone.
+    let moved = false;
+    for (const node of cards.values()) for (const toggle of node.querySelectorAll('.group')) {
+      const matches = q.length >= 2 && Boolean(toggle.nextElementSibling.querySelector('.match'));
+      if (matches && toggle.nextElementSibling.hidden) { setGroup(toggle, true, true); moved = true; }
+      else if (!matches && toggle.dataset.auto) { setGroup(toggle, false, false); moved = true; }
+    }
+    if (moved) relayout(); else applyFocus();
+  });
+  search.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && hits?.size) { const first = [...cards.keys()].find((t) => hits.has(t)); select(first, true); }
+    if (event.key === 'Escape') { search.value = ''; search.dispatchEvent(new Event('input')); }
+  });
+  allLines.addEventListener('change', applyFocus);
+
+  // ── Details panel ──
+  function goto(name) { const b = el('button', { class: 'goto', type: 'button', text: name }); b.addEventListener('click', () => select(name, true)); return b; }
+  function linkItem(r, outgoing) {
+    const column = data.tables[r.child].columns.find((c) => c.name === r.col);
+    const head = outgoing
+      ? el('div', {}, el('code', { text: r.col }), ' → ', goto(r.parent), el('code', { text: `.${r.pcol}` }))
+      : el('div', {}, goto(r.child), el('code', { text: `.${r.col}` }), ' → ', el('code', { text: r.pcol }));
+    const kind = r.join ? 'matched, no key' : r.enforced ? 'foreign key' : 'no foreign key';
+    const how = el('div', { class: 'how' }, el('span', { class: 'pill' + (r.enforced ? ' fk' : ' loose'), text: kind }));
+    if (!r.join) how.append(el('span', { class: 'pill', text: column.required ? 'always set' : 'may be empty' }));
+    if (r.child === r.parent) how.append(el('span', { class: 'pill', text: 'same table' }));
+    return el('li', {}, head, how, r.reason ? el('div', { class: 'reason' }, inline(r.reason)) : null);
+  }
+
+  function showPanel(name) {
+    const t = data.tables[name], area = areas[t.area];
+    const outgoing = relsOf.get(name).filter((r) => r.child === name);
+    const incoming = relsOf.get(name).filter((r) => r.parent === name);
+    const close = el('button', { class: 'close', type: 'button', 'aria-label': 'Close', text: '✕' });
+    close.addEventListener('click', clearSelection);
+    const list = (items, out) => items.length ? el('ul', { class: 'link-list' }, ...items.map((r) => linkItem(r, out))) : el('p', { class: 'none', text: 'Nothing.' });
+    const table = el('table', { class: 'cols' });
+    const addRows = (cols) => {
+      for (const c of cols) {
+        const keys = [c.pk && 'PK', c.fk && 'FK', c.ref && 'ref', c.uk && 'UK'].filter(Boolean).join(' ');
+        table.append(el('tr', {},
+          el('td', {}, el('code', { text: c.name }), keys ? el('div', { class: 'note', text: keys }) : null),
+          el('td', { class: 'note', text: c.type + (c.required ? '' : ', optional') }),
+          el('td', { class: 'note', text: c.note ?? '' })));
+      }
+    };
+    addRows(t.columns.filter((c) => !c.group));
+    for (const group of t.groups) { table.append(el('tr', { class: 'grp' }, el('td', { colspan: '3', text: group }))); addRows(t.columns.filter((c) => c.group === group)); }
+    panel.replaceChildren(
+      el('div', { class: 'panel-head' }, el('h2', { text: name }), close),
+      el('span', { class: 'area-tag', style: `--area: var(--a-${t.area})`, text: area.name }),
+      el('p', { text: t.purpose }),
+      el('h3', { text: `Points at (${outgoing.length})` }), list(outgoing, true),
+      el('h3', { text: `Pointed at by (${incoming.length})` }), list(incoming, false),
+      el('h3', { text: `Columns (${t.columns.length})` }), table);
+    panel.classList.add('open');
+    panel.scrollTop = 0;
+  }
+
+  // ── Zoom ──
+  function sizeStage() { sizer.style.width = `${inner.offsetWidth * scale}px`; sizer.style.height = `${inner.offsetHeight * scale}px`; }
+  function setScale(next) {
+    scale = Math.min(1.6, Math.max(0.25, next));
+    inner.style.transform = `scale(${scale})`;
+    sizeStage();
+    $('zoom-level').textContent = `${Math.round(scale * 100)}%`;
+  }
+  const fit = () => setScale(Math.min(1, (stage.clientWidth - 4) / inner.offsetWidth));
+  function relayout() { draw(); sizeStage(); }
+  $('zoom-in').addEventListener('click', () => { autoFit = false; setScale(scale * 1.25); });
+  $('zoom-out').addEventListener('click', () => { autoFit = false; setScale(scale / 1.25); });
+  $('zoom-100').addEventListener('click', () => { autoFit = false; setScale(1); });
+  $('zoom-fit').addEventListener('click', () => { autoFit = true; fit(); });
+  const header = document.querySelector('.top');
+  const measureTop = () => document.documentElement.style.setProperty('--top-h', `${header.offsetHeight}px`);
+  new ResizeObserver(measureTop).observe(header);
+  window.addEventListener('resize', () => { if (autoFit) fit(); });
+  document.addEventListener('keydown', (event) => {
+    if (event.target instanceof HTMLInputElement) return;
+    if (event.key === 'Escape') clearSelection();
+    else if (event.key === '+' || event.key === '=') { autoFit = false; setScale(scale * 1.25); }
+    else if (event.key === '-') { autoFit = false; setScale(scale / 1.25); }
+    else if (event.key === '0') { autoFit = true; fit(); }
+  });
+
+  // On a phone the legend would fill the screen, so it starts folded there.
+  if (matchMedia('(max-width: 640px)').matches) $('legend').open = false;
+  measureTop();
+  draw();
+  fit();
+})();
+</script>
+</body>
+</html>
