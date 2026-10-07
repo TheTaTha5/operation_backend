@@ -260,8 +260,8 @@ Field notes:
   order: `market`, `sales`, `pay_type`, `rate_type`, `programs`, `contact`. This is legacy's
   `agIncompleteFields`. Any one of email, phone or contact counts as contact.
 - **`programs`** are the routes the agent may sell. `book_from`/`book_to` is the booking window sales
-  entered, and `null` means open. Travel dates are not stored: they come from the rate type, which
-  has no endpoint yet.
+  entered, and `null` means open. Travel dates are not stored: they come from the rate type (see
+  [Rate types](#rate-types)).
 - **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
 - **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). It
   is not validated yet. The foreign key is a migration that can only ship after the import has run
