@@ -1,5 +1,9 @@
 # Frontend: implement Authentik OIDC authentication
 
+> **Superseded.** Login moves to this service (CLAUDE.md): legacy's users are imported here and
+> `POST /v1/login` becomes the real login. The design is pending in
+> `todo/login-permissions-model.md`. This browser PKCE/Authentik plan is kept for reference only.
+
 Implement Authentik OIDC login in the plain-JavaScript frontend using **Authorization Code Flow with PKCE**.
 
 ## Configuration
