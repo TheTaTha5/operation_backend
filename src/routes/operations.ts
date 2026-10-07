@@ -11,7 +11,10 @@ import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
-import { actorOf, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, stampActor } from '../domain/booking-actions.js';
+import {
+  actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
+} from '../domain/booking-actions.js';
+import { parseIntent } from '../domain/booking-approvals.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -130,15 +133,21 @@ const addOnsOf = (input: Record<string, unknown>): unknown => {
 };
 const addOnsLabel = (input: Record<string, unknown>): string => (input.addOns !== undefined ? 'addOns' : 'add_ons');
 
-function bookingInput(body: unknown): BookingInput {
+/**
+ * The create body. Which save button it was (`intent`) is read here too, with the deprecated
+ * `status` it replaces (`parseIntent`); `viaStatus` lets the route log a client still sending it.
+ */
+function bookingInput(body: unknown): BookingInput & { viaStatus: boolean } {
   const input = record(body);
+  const { intent, viaStatus } = parseIntent(input);
   const trips = tripsInput(input);
   // A supplied top-level `pax` is a claim about the whole itinerary; disagreeing with the trips it
   // describes is a client bug worth reporting rather than silently resolving in favour of one side.
   if (input.trips !== undefined && input.pax !== undefined && pax(input.pax) !== trips.reduce((sum, trip) => sum + paxTotal(trip.pax), 0)) badRequest('pax must equal the sum of trip.pax');
   return {
     trips,
-    status: bookingStatus(input.status),
+    intent,
+    viaStatus,
     external_id: optionalString(input.external_id ?? input.id),
     agent_id: optionalString(input.agent_id ?? input.agentId),
     voucher_ref: optionalString(input.voucher_ref ?? input.voucherRef),
@@ -345,20 +354,34 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   /**
    * Every write is signed by the token's user (`actorOf`): `updated_by` comes from the token and a
    * body's `updated_by` is ignored, and each write appends one line to the booking's history in the
-   * same transaction. See `booking-actions.ts`.
+   * same transaction. Who created a booking and when, and who confirmed it and when, are the
+   * server's (`createHeader`, `stripServerOwned`); the status moves only through the commands
+   * below. See `booking-actions.ts`.
    */
   app.post('/v1/bookings', { schema: docs.createBooking }, async (request, reply) => {
     const actor = actorOf(request.user);
-    const input = bookingInput(request.body);
-    const result = await store.transaction(() => store.createBooking({ ...input, header: stampActor(input.header, actor, true) }, actor));
+    const { viaStatus, ...input } = bookingInput(request.body);
+    // `status` on create is deprecated for `intent` and goes when both clients send `intent`; the
+    // log says who still sends it.
+    if (viaStatus) request.log.warn({ status: (request.body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
+    const header = createHeader(input.header ?? {}, actor, new Date().toISOString());
+    const result = await store.transaction(() => store.createBooking({ ...input, header }, actor));
     return reply.code(201).send(result);
   });
   app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
     const actor = actorOf(request.user);
     const changes = bookingChanges(request.body);
-    const signed = { ...changes, header: stampActor(changes.header, actor, false) };
+    const signed = { ...changes, header: stampActor(changes.header, actor) };
     return store.transaction(async () => (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found'));
   });
+  for (const command of STATUS_COMMANDS) {
+    app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
+      const body = parseStatusCommandRequest(record(request.body ?? {}));
+      const changed = await store.transaction(async () => (await store.changeBookingStatus(bookingId(request), command, body, actorOf(request.user))) ?? notFound('Booking not found'));
+      // `warnings` is the days an approval puts past the boats' registered seats; empty otherwise.
+      return { ...changed.booking, warnings: changed.warnings };
+    });
+  }
   app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request) => {
     const cancel = parseCancelRequest(record(request.body ?? {}));
     return store.transaction(async () => (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found'));

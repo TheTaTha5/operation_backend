@@ -11,7 +11,10 @@
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { formatPaxGrid, parsePaxGrid, paxTotal, type PaxGrid, type PaxRow } from './pax.js';
 import type { BookingChanges } from './operations.js';
-import type { BookingHeaderPatch } from './booking-header.js';
+import type { BookingHeader, BookingHeaderPatch } from './booking-header.js';
+import {
+  decideStatus, discountOf, focCountOf, pendingApproval, type ApprovalKind, type BookingApproval, type NewApproval,
+} from './booking-approvals.js';
 
 /** A refusal in the existing `{ statusCode, error, message }` shape. Fastify adds `code` when one is set. */
 export const refuse = (message: string, statusCode: number, code?: string): never => {
@@ -28,19 +31,17 @@ const badRequest = (message: string): never => refuse(message, 400);
 export const actorOf = (user: { username?: string; subject: string } | undefined): string | undefined => user?.username ?? user?.subject;
 
 /**
- * The header with the authenticated user stamped on it. `updated_by` always comes from the token,
- * never from the body: a client could otherwise sign a change with someone else's name. `created_by`
- * is filled from the token only on create and only when the caller sent none, because an integrator
- * entering a booking on someone's behalf may name them.
+ * An amendment's header with the authenticated user stamped on it. `updated_by` always comes from
+ * the token, never from the body: a client could otherwise sign a change with someone else's name.
+ * A create is stamped by `createHeader`, which also sets who created the booking and when.
  *
  * With authentication off (local development) there is no user, and `updated_by` is left alone.
  */
-export function stampActor<T extends BookingHeaderPatch>(header: T | undefined, actor: string | undefined, creating: boolean): T {
+export function stampActor<T extends BookingHeaderPatch>(header: T | undefined, actor: string | undefined): T {
   const stamped = { ...(header ?? {}) } as T;
   delete stamped.updated_by;
   if (actor === undefined) return stamped;
   stamped.updated_by = actor;
-  if (creating && (stamped.created_by === undefined || stamped.created_by === null)) stamped.created_by = actor;
   return stamped;
 }
 
@@ -341,6 +342,170 @@ export function planRescheduleRecord(
 /** The older body moves a trip without a reason; the history still says where it went. */
 export const movedLine = (by: string | undefined, from: string, to: string): HistoryLine =>
   line(by, 'reschedule', 'Reschedule', `Rescheduled ${from} → ${to}`);
+
+// ── Server-owned fields ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Values the server decides, never the request (CLAUDE.md, "Authority"). Who created a booking and
+ * when, and who confirmed it and when, come from the login and the clock; the status moves only
+ * through a command. `updated_by` is stamped by `stampActor`.
+ */
+export const SERVER_OWNED_HEADER = ['created_by', 'booked_at', 'confirmed_by', 'confirmed_at'] as const;
+type OwnedField = typeof SERVER_OWNED_HEADER[number] | 'status';
+
+/** What to do instead, for each refusal. */
+const INSTEAD: Record<OwnedField, string> = {
+  status: 'use POST /v1/bookings/{id}/confirm, /approve, /reject, /cancel, /cancel-weather or /restore',
+  confirmed_by: 'it is stamped from the login by /confirm or /approve',
+  confirmed_at: 'it is stamped by /confirm or /approve',
+  created_by: 'it is the logged-in user who created the booking',
+  booked_at: 'it is the time the booking was created',
+};
+const ownedRefusal = (field: OwnedField, verb: string): never => badRequest(`${field} cannot be ${verb}: ${INSTEAD[field]}`);
+
+/** Two values of a server-owned field are the same claim: both empty, the same text, or the same instant. */
+function sameValue(field: OwnedField, sent: unknown, stored: unknown): boolean {
+  const empty = (v: unknown) => v === undefined || v === null || v === '';
+  if (empty(sent) || empty(stored)) return empty(sent) && empty(stored);
+  if (field === 'booked_at' || field === 'confirmed_at') {
+    const a = Date.parse(String(sent)), b = Date.parse(String(stored));
+    if (!Number.isNaN(a) && !Number.isNaN(b)) return a === b;
+  }
+  return String(sent).trim() === String(stored).trim();
+}
+
+/**
+ * A `PATCH`'s changes with the server-owned values taken out.
+ *
+ * The transition rule: a client that sends the whole booking back — legacy's integration does, on
+ * every save — echoes these values unchanged, and that is accepted and ignored. A *different* value
+ * is a claim the client may not make, refused with `400` naming what to do instead.
+ */
+export function stripServerOwned(changes: BookingChanges, stored: Record<string, unknown> & { status: BookingStatus }): BookingChanges {
+  const { status, ...rest } = changes;
+  if (status !== undefined && status !== stored.status) ownedRefusal('status', 'changed with PATCH');
+  if (!rest.header) return rest;
+  const header = { ...rest.header } as Record<string, unknown>;
+  for (const field of SERVER_OWNED_HEADER) {
+    if (!(field in header)) continue;
+    if (!sameValue(field, header[field], stored[field])) ownedRefusal(field, 'changed with PATCH');
+    delete header[field];
+  }
+  return { ...rest, header: header as BookingHeaderPatch };
+}
+
+/**
+ * The header a create stores: the caller's fields, plus who created it and when. A body naming any
+ * server-set field is refused: `created_by` may only repeat the logged-in user. Who confirmed it is
+ * stamped by the store once it has decided the status (`confirmationStamp`). With authentication
+ * off (local development) there is no user, and the user columns stay empty.
+ */
+export function createHeader(header: BookingHeader, actor: string | undefined, now: string): BookingHeader {
+  if (header.created_by !== undefined && header.created_by !== actor) ownedRefusal('created_by', 'set');
+  for (const field of ['booked_at', 'confirmed_by', 'confirmed_at'] as const) if (header[field] !== undefined) ownedRefusal(field, 'set');
+  const out: BookingHeader = { ...header, booked_at: now };
+  delete out.updated_by;
+  delete out.created_by;
+  if (actor !== undefined) { out.created_by = actor; out.updated_by = actor; }
+  return out;
+}
+
+/** The header columns a booking gets when it becomes `confirmed` for the first time. */
+export const confirmationStamp = (actor: string | undefined, now: string): Pick<BookingHeader, 'confirmed_at' | 'confirmed_by'> =>
+  (actor === undefined ? { confirmed_at: now } : { confirmed_at: now, confirmed_by: actor });
+
+/** Statuses a booking can no longer be edited in (legacy `bkV2EditBooking`: "Cannot edit a … booking"). */
+const CLOSED: readonly BookingStatus[] = ['cancelled', 'completed', 'rejected', 'cancelled_weather'];
+export function assertEditable(status: BookingStatus): void {
+  if (CLOSED.includes(status)) refuse(`Cannot edit a ${status} booking`, 409, 'booking_closed');
+}
+
+// ── Status commands ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The commands that move a booking's status, besides `/cancel` and `/restore`. Each is a decision a
+ * person makes; the server checks it is allowed from where the booking is, and records who made it.
+ * The rules are legacy's (`bkV2ApproveBooking`, `bkV2RejectBooking`, `bkV2FocApprove`,
+ * `bkV2FocReject`, `bkV2WeatherResolveOne`), except that the approver is the logged-in user, not a
+ * typed name (legacy's FOC approval even hard-coded `RM`).
+ */
+export const STATUS_COMMANDS = ['confirm', 'approve', 'reject', 'cancel-weather'] as const;
+export type StatusCommand = typeof STATUS_COMMANDS[number];
+export type StatusCommandRequest = { note?: string };
+
+export function parseStatusCommandRequest(body: Record<string, unknown>): StatusCommandRequest {
+  const note = optionalText(body.note, 'note');
+  return note === undefined ? {} : { note };
+}
+
+/**
+ * What a command writes: the new status, whether it confirms, any cancellation text, and the history
+ * lines. `decide` closes the pending approval of that kind (or records a decided one, for a booking
+ * that never had a record — legacy's imported `pending_approval` bookings). `request` asks for new
+ * approvals. `claims` says the booking starts holding seats it was not holding: an approval of an
+ * over-allotment booking.
+ */
+export type StatusPlan = {
+  status: BookingStatus; confirms: boolean; cancellation_reason?: string; history: HistoryLine[];
+  decide?: { kind: ApprovalKind; status: 'approved' | 'rejected'; note: string | null };
+  request: NewApproval[]; claims: boolean;
+};
+
+const FROM: Record<StatusCommand, readonly BookingStatus[] | 'open'> = {
+  confirm: ['draft', 'quote', 'pending'],
+  approve: ['pending_approval', 'pending_foc'],
+  reject: ['pending_approval', 'pending_foc'],
+  'cancel-weather': 'open',
+};
+
+export function planStatusCommand(
+  command: StatusCommand,
+  booking: {
+    status: BookingStatus; confirmed_at?: string; foc_reason?: string; price_discount?: number;
+    approvals?: readonly BookingApproval[]; trips: readonly { pax: readonly PaxRow[] }[];
+  },
+  request: StatusCommandRequest, by: string | undefined,
+): StatusPlan {
+  const from = FROM[command];
+  if (from === 'open') assertOpen(booking.status, 'cancel');
+  else if (!from.includes(booking.status)) {
+    refuse(`Cannot ${command} a ${booking.status} booking: ${command} applies to ${from.join(', ')}`, 409, 'wrong_status');
+  }
+  const note = request.note ? ` · ${request.note}` : '';
+  const foc = focCountOf(booking.trips);
+  // Who confirmed is stamped the first time a booking becomes confirmed, never overwritten (legacy).
+  const confirming = (to: BookingStatus) => to === 'confirmed' && !booking.confirmed_at;
+
+  if (command === 'confirm') {
+    // The same decision as a create with intent `confirm`: FOC passengers wait for an FOC approval,
+    // a discount for its approval. A draft, quote or pending booking already holds its seats, so the
+    // allotment is not weighed again.
+    const decision = decideStatus('confirm', { focCount: foc, focReason: booking.foc_reason, discount: discountOf(booking), overDays: [] }, by);
+    const to = decision.status;
+    const own = to === 'confirmed' ? [line(by, 'edit', 'Confirmed', `Confirmed${note}`)] : decision.history.map((h) => ({ ...h, text: `${h.text}${note}` }));
+    return { status: to, confirms: confirming(to), history: own, request: decision.approvals, claims: false };
+  }
+  const kind: ApprovalKind = booking.status === 'pending_foc' ? 'foc' : 'approval';
+  const tag = kind === 'foc' ? 'FOC' : 'Approval';
+  if (command === 'approve') {
+    // An approval remembers where the booking was going; with no record (legacy's imported
+    // `pending_approval` bookings), confirmed, as legacy's `bkV2EnsureApproval` defaults it.
+    const pending = pendingApproval(booking.approvals, kind);
+    const to: BookingStatus = kind === 'foc' ? 'confirmed' : pending?.target_status ?? 'confirmed';
+    const text = kind === 'foc' ? `FOC approved · ${foc} pax · booking ${to}` : to === 'confirmed' ? 'Approved · booking confirmed' : `Approved · now ${to}`;
+    return {
+      status: to, confirms: confirming(to), history: [line(by, 'confirm', tag, `${text}${note}`)],
+      decide: { kind, status: 'approved', note: request.note ?? null }, request: [], claims: kind === 'approval' && Boolean(pending?.over_capacity),
+    };
+  }
+  if (command === 'reject') {
+    return {
+      status: 'rejected', confirms: false, history: [line(by, 'cancel', tag, `${kind === 'foc' ? 'FOC rejected' : 'Rejected'}${note}`)],
+      decide: { kind, status: 'rejected', note: request.note ?? null }, request: [], claims: false,
+    };
+  }
+  return { status: 'cancelled_weather', confirms: false, cancellation_reason: 'weather', history: [line(by, 'weather', 'Weather', `Cancelled for weather${note}`)], request: [], claims: false };
+}
 
 // ── Shared parsing ───────────────────────────────────────────────────────────────────────────────
 

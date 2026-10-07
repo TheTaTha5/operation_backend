@@ -497,24 +497,112 @@ trip's data goes when that trip is removed. Both paths end the same way.
 #### Status, and which statuses hold seats
 
 `status` is one of `draft`, `quote`, `pending`, `pending_approval`, `pending_foc`, `confirmed`,
-`completed`, `rejected`, `cancelled`, `cancelled_weather`. It defaults to `confirmed` on create,
-may be set on create or changed with `PATCH`, and an unrecognised value is a `400` listing the
-valid ones.
+`completed`, `rejected`, `cancelled`, `cancelled_weather`. **The server decides it; a client never
+sends one.**
+
+##### How the status is decided on create: `intent`
+
+A create says which save button was pressed — `"intent": "quote"` ("Save as quote") or
+`"intent": "confirm"` ("Confirm", the default) — and the server decides the status from that and
+the facts, the way legacy's save does (`bkV2SubmitBooking`, `bkV2CommitBooking`):
+
+| The facts | `intent: quote` | `intent: confirm` |
+|---|---|---|
+| fits the seats on sale | `quote` | `confirmed`, stamped `confirmed_by`/`confirmed_at` |
+| carries FOC (free) passengers | `quote` | `pending_foc` — needs `focReason`, else `400 foc_reason is required to confirm FOC (free) passengers` |
+| carries a discount (`price_discount` ≠ 0) | `quote` | `pending_approval`, **holding** its seats |
+| over the allotment, within the boats' registered seats | `pending_approval`, **holding no seats** | `pending_approval`, **holding no seats** |
+| needs seats other agents' locks hold | `409` | `409` |
+| past the boats' registered seats (`license_pax`) | `409` | `409` |
+
+"Over the allotment" means a day's seats on sale (`available_seats`) plus what locks still hold are
+not enough, but the registered seats (`licensed_capacity`) are. Legacy saves that for a manager to
+decide; so does this. While it waits, the booking **holds no seats** — counting them would let it
+take the very room it is waiting for (legacy `bkPendHoldsSeat`) — so `allocated_pax` is `0` and
+`available_seats` does not move. A booking waiting only for a discount approval does hold its seats.
+
+When an approval is asked for, the booking's `approvals` list gets a `pending` entry that remembers
+where the booking was going (`target_status`): `/approve` moves it there. Over the allotment with
+FOC passengers asks for both, and approves in two steps (`pending_approval` → `pending_foc` →
+`confirmed`).
+
+```jsonc
+// POST /v1/bookings  { "intent": "confirm", "trips": [{ "routeId": "r3", "date": "2039-02-01", "pax": { "ad": 22 } }] }
+// on a day with 20 seats on sale and 25 registered → 201
+{
+  "status": "pending_approval", "allocated_pax": 0,
+  "approvals": [{
+    "kind": "approval", "status": "pending", "over_capacity": true, "over_total": 2, "discount": null, "foc_count": null,
+    "target_status": "confirmed", "requested_by": "ops1", "requested_at": "…", "decided_by": null, "decided_at": null, "note": null,
+    "days": [{ "route_id": "r3", "service_date": "2039-02-01", "need": 22, "over_by": 2 }]
+  }]
+}
+```
+
+`approvals` is every approval asked for, oldest first, kept after it is decided: `kind` `approval`
+(over the allotment and/or a discount) or `foc`; `status` `pending`, `approved`, `rejected`, or
+`replaced` (a later edit asked again before it was decided). At most one per kind is `pending`.
+
+**`status` on create is deprecated.** Until both clients send `intent`, a create may still send the
+old `status`, read as the intent it meant: `quote` or `draft` → `quote`; `confirmed` or
+`pending_foc` → `confirm`. The server still decides the final status. Any other status is a `400`
+(`status pending_approval cannot be asked for on create: send intent quote or confirm, and the server
+decides the status`); `intent` and `status` that disagree are a `400`. Each use is logged as a
+warning (`deprecated: POST /v1/bookings with status; send intent`) so we can see who still sends it.
+It will be removed.
+
+##### After create: commands
+
+**After a booking is created, its status changes only through a command**, never `PATCH`. The
+server checks the move is allowed from where the booking is and records who made it:
+
+| Command | From | To |
+|---|---|---|
+| `POST /v1/bookings/{id}/confirm` | `draft`, `quote`, `pending` | as a create with `intent: confirm`: `confirmed`; `pending_foc` with FOC passengers (`foc_reason` required); `pending_approval` with a discount. The seats it holds are not weighed again |
+| `POST /v1/bookings/{id}/approve` | `pending_approval`, `pending_foc` | the approval's `target_status` (`confirmed` unless FOC passengers still wait: `pending_foc`). Over the allotment, it now holds its seats |
+| `POST /v1/bookings/{id}/reject` | `pending_approval`, `pending_foc` | `rejected` (seats given back) |
+| `POST /v1/bookings/{id}/cancel-weather` | any status that holds seats | `cancelled_weather`, `cancellation_reason` `weather` (seats given back) |
+| `POST /v1/bookings/{id}/cancel` | any status that holds seats | `cancelled` — see [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule) |
+| `POST /v1/bookings/{id}/restore` | `cancelled`, `rejected`, `cancelled_weather` | `confirmed` |
+
+- `confirm`, `approve`, `reject` and `cancel-weather` take an optional `{ "note": "…" }`, written
+  into the history (and, for `approve`/`reject`, onto the approval). Each answers the booking plus
+  `warnings`, `404` for an unknown one, and `409` with `code: "wrong_status"` (or
+  `already_cancelled` / `booking_closed`) when the move is not allowed from the current status.
+- **Approving past the registered seats is allowed, with a warning**, as legacy allows it ("add a
+  boat before the travel date"). When an over-allotment booking is approved and its seats no longer
+  fit the boats' licence — another booking took the room meanwhile — the approval goes through and
+  `warnings` lists each day short:
+
+  ```json
+  { "...": "the booking", "status": "confirmed", "warnings": [{ "code": "over_licence", "route_id": "r3", "service_date": "2039-02-03", "over_by": 17 }] }
+  ```
+
+  `warnings` is `[]` otherwise, and always `[]` for `confirm`, `reject` and `cancel-weather`.
+- **Who confirmed is the logged-in user.** `confirm`, `approve` and a create the server confirms
+  stamp `confirmed_by` and `confirmed_at` the first time a booking is confirmed; a later approval
+  keeps the first confirmation. The approver is never a name from the request; `decided_by` on the
+  approval is the logged-in user too.
+- A legacy-imported `pending_approval` or `pending_foc` booking has no approval record. It holds
+  its seats (legacy reads it the same way), `/approve` moves it to `confirmed`, and the decision is
+  recorded as a new, already-decided entry in `approvals`.
+- `cancel-weather` handles the booking only. Refunds and credits stay in legacy until money moves
+  here. Undo it with `/restore`.
+- These are legacy's rules (`bkV2ApproveBooking`, `bkV2RejectBooking`, `bkV2FocApprove`,
+  `bkV2FocReject`, `bkV2WeatherResolveOne`). Nothing in legacy ever sets `completed`, so no command
+  does either.
 
 **Seats are released by `cancelled`, `rejected` and `cancelled_weather`. Every other status holds
-them** — including `quote` and `draft`. That is a denylist rather than an allowlist on purpose, and
+them** — including `quote` and `draft` — **except a `pending_approval` booking waiting for an
+over-allotment approval**, which holds none until it is approved (above). That is a denylist rather than an allowlist on purpose, and
 the direction matters more than the membership: a status nobody has classified yet holds its seats
 instead of releasing them. Over-holding is a day that looks fuller than it is and someone asks;
 under-holding is two parties sold the same seat, at the pier, on the day. It matches the rule the
 legacy frontend applies (`getSeatsConsumed`).
 
-Two consequences worth knowing:
-
-- A booking created in a released status **reserves nothing and is never capacity-checked**, so a
-  cancellation can be recorded against a day that is already full.
-- Changing status from a released one to a holding one **is** capacity-checked, even when the
-  itinerary has not moved — confirming a quote asks for those seats for the first time, and a day
-  that filled up in the meantime will refuse it with a `409`.
+Bringing a released booking back with `/restore` **is** capacity-checked, even when the itinerary
+has not moved — it asks for those seats again, and a day that filled up in the meantime refuses it
+with a `409`. (A booking is never created in a released status: it is cancelled after.)
 
 - `GET /v1/bookings` — optionally filter by `route_id` and an exact `service_date` (or `date`),
   or by an inclusive trip-date range using `from` and `to`; a booking matches if any of its trips
@@ -545,8 +633,12 @@ Two consequences worth knowing:
   single departure. A supplied top-level `pax` must equal the sum across trips. The header fields
   are stored as columns and returned as columns — see [Booking header fields](#booking-header-fields)
   below. An optional `passengers` array is stored as columns too — see
-  [Passengers](#passengers) — and so is an optional `addOns` array, see [Add-ons](#add-ons). **The itinerary is weighed as a whole**: if any day is short of seats
-  the booking is refused entirely and no day is left holding part of it. A booking has **at most one
+  [Passengers](#passengers) — and so is an optional `addOns` array, see [Add-ons](#add-ons).
+  `intent` (`quote` or `confirm`) says which save button it was; the server decides the status —
+  see [How the status is decided](#how-the-status-is-decided-on-create-intent). **The itinerary is
+  weighed as a whole**: if any day is refused (locks in the way, registered seats full) the booking
+  is refused entirely and no day is left holding part of it; if any day is over the allotment the
+  whole booking waits for approval. A booking has **at most one
   trip per route per day** (`400` otherwise); send one trip with the combined pax. A trip must name a route in the catalogue (`GET /v1/routes`); an
   unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
   behind it.
@@ -559,10 +651,24 @@ Two consequences worth knowing:
   list**, the same way `trips` replaces the itinerary — see [Passengers](#passengers). `addOns`
   works the same way — see [Add-ons](#add-ons). An amendment refused for capacity changes nothing,
   header, passengers and add-ons included.
-  Capacity is checked only when the amendment **asks for more**: a new or moved trip, more
+  Capacity is weighed only when the amendment **asks for more**: a new or moved trip, more
   passengers, more general seats, or more seats from a lock. Taking passengers off never needs room,
   so it succeeds on a day that is already oversold (the legacy import brings such days over as they
-  are).
+  are). **An amendment can change the status**, the way a create decides it: asking for more than
+  the allotment has moves the booking to `pending_approval` (holding no seats, remembering where it
+  was), and a booking waiting over the allotment is weighed again whenever its itinerary changes —
+  still over, a new approval replaces the old (`replaced`); fits now, it goes back where it was
+  (`Fits the allotment now · confirmed`). Past the registered seats or into locked seats is `409`.
+
+  **`PATCH` changes what the client knows, not what the server decides.** `status`, `created_by`,
+  `booked_at`, `confirmed_by` and `confirmed_at` are accepted only when they **repeat the stored
+  value** — so a client that sends the whole booking back on every save keeps working — and a
+  different value is a `400` naming what to do instead, e.g.
+  `status cannot be changed with PATCH: use POST /v1/bookings/{id}/confirm, /approve, /reject, /cancel, /cancel-weather or /restore`.
+  A `cancelled`, `rejected`, `cancelled_weather` or `completed` booking cannot be edited at all:
+  `409` with `code: "booking_closed"`, as legacy refuses it.
+- `POST /v1/bookings/{id}/confirm`, `/approve`, `/reject`, `/cancel-weather` — see
+  [Status](#status-and-which-statuses-hold-seats).
 - `POST /v1/bookings/{id}/cancel`, `/restore`, `/partial-cancel`, `/reschedule` — see
   [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule).
 - `GET /v1/bookings/{id}/history` — see [History and who made a change](#history-and-who-made-a-change).
@@ -689,15 +795,23 @@ anywhere and writes no reschedule record (it does write a history line).
 
 **Every write is signed by the token's user**: `preferred_username`, else the token subject.
 `updated_by` is set from the token on every write, and **an `updated_by` in the body is ignored**.
-`created_by` defaults to the token user on create, unless the body names one. With authentication
-switched off (local development) there is no user: `updated_by` is left alone and `by` is `null`.
+**`created_by` is the logged-in user, always**: a create that names anyone else is a `400`, and
+`booked_at` is the time of the create. Neither may be sent. With authentication switched off (local
+development) there is no user: the user columns stay empty and `by` is `null`.
 
 Each write appends one line to the booking's history, in the same transaction:
 
 | Write | `kind` | `tag` | `text` |
 |---|---|---|---|
-| `POST /v1/bookings` | `create` | `Created` | `Created` |
-| `PATCH` | `edit` | `Edited` (`Confirmed` when the status becomes `confirmed`) | `Edited · trips, total` (the keys sent) |
+| `POST /v1/bookings` | `create` | `Created` | `Created`, then any line below for an approval it waits for |
+| waits for approval (create, confirm, `PATCH`) | `approval` | `Approval` | `Waiting for approval · over the allotment by <n> (<route> <date> +<n>, …) · discount ฿<n>` (the parts that apply) |
+| waits for FOC approval (create, confirm) | `foc` | `FOC` | `Waiting for FOC approval · <n> FOC pax` |
+| fits again (`PATCH`) | `approval` | `Approval` | `Fits the allotment now · <status>` |
+| `PATCH` | `edit` | `Edited` | `Edited · trips, total` (the keys sent) |
+| confirm | `edit` | `Confirmed` (`FOC`/`Approval` when it waits) | `Confirmed`, or one of the waiting lines above; `· <note>` |
+| approve | `confirm` | `Approval` (`FOC` from `pending_foc`) | `Approved · booking confirmed`, `Approved · now <status>`, or `FOC approved · <n> pax · booking confirmed`; `· <note>` |
+| reject | `cancel` | `Approval` (`FOC` from `pending_foc`) | `Rejected`, or `FOC rejected`; `· <note>` |
+| cancel-weather | `weather` | `Weather` | `Cancelled for weather · <note>` |
 | cancel | `cancel` | `Cancel` | `Cancelled · <charge> · <category label> · <note>` |
 | restore | `edit` | `Confirmed` | `Restored`, plus `· seat lock <id>: <got>/<wanted> seats back` per short lock |
 | partial cancel | `cancel` | `Cancel` | `Partial cancel · −2 pax · <category label> · charge 0 (฿0) · waive 2 (฿4,000)` |
@@ -712,7 +826,7 @@ Imported bookings carry legacy's own lines, whose `kind` values are wider than t
 
 **Errors** keep the shape `{ statusCode, error, message }`. `message` names the field or the rule
 and is fit to show to a person. Where a client needs to branch, a machine-readable `code` is added:
-`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`.
+`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`, `wrong_status`.
 
 #### Booking header fields
 
@@ -736,8 +850,10 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | price | `price_mode`, `manual_total`, `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`, `price_extra` |
 | payment | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version` |
 | market | `market`, `market_sub`, `market_agent_id`, `market_at` |
-| lifecycle | `status`, `booking_date`, `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
+| lifecycle | `booking_date` |
 | free text | `notes`, `note` |
+| FOC | `foc_reason` (`focReason`) — why passengers travel free; required to confirm FOC passengers |
+| **set by the server** (read-only) | `status`, `approvals`, `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
 
 A field you do not send is **absent from the response**, not `null` — absence means never given,
 which is not the same claim as an explicit blank. `booking_date` and `market_at` are plain

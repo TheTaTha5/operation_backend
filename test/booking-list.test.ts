@@ -18,10 +18,15 @@ test('the booking list filters by status, voucher and free text, and counts what
   await request('POST', '/operations/deployments', { boat_id: 'boat-list-filters', route_id: 'r1', service_date: date, capacity: 30 });
   const run = Date.now().toString(36);
   const agent = `tag_list_${run}`;
+  // Each status is reached the way a client reaches it: a discount waits for approval, the cancels are commands.
   const make = async (status: string, voucher: string | undefined, lead: string) => {
-    const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, agent_id: agent, status, voucher_ref: voucher, lead_pax: lead });
+    const discount = status === 'pending_approval' ? { price_discount: -500 } : {};
+    const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, agent_id: agent, voucher_ref: voucher, lead_pax: lead, ...discount });
     assert.equal(created.statusCode, 201, created.body);
-    return created.json().id as string;
+    const id = created.json().id as string;
+    if (status === 'cancelled' || status === 'cancelled_weather') await request('POST', `/v1/bookings/${id}/${status === 'cancelled' ? 'cancel' : 'cancel-weather'}`);
+    assert.equal((await request('GET', `/v1/bookings/${id}`)).json().status, status);
+    return id;
   };
   const pending = await make('pending_approval', `VCH-${run}-A`, 'Somchai Jaidee');
   const cancelled = await make('cancelled', `vch-${run}-b`, 'Anna 100%_Smith');

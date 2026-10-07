@@ -2,20 +2,20 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, claimsSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
-  partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
+  licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
 import {
-  assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  restoredLine, totalAfterRefund,
+  assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
+  confirmationStamp, planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
-import { holdsSeats, SEAT_RELEASING_STATUSES } from './booking-status.js';
-import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
+import { SEAT_RELEASING_STATUSES } from './booking-status.js';
+import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
 import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import {
   BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
@@ -32,6 +32,19 @@ import {
   type BundleAppliesTo, type BundleMode, type NationalityScope, type RateTier, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows,
   type RateTypeSummary, type RouteBlock, type RouteRows, type SeatPriceRow,
 } from './rate-types.js';
+import {
+  decidedRecord, decideStatus, discountOf, focCountOf, reweigh,
+  type ApprovalDay, type ApprovalKind, type ApprovalStatus, type ApprovalWarning, type BookingApproval, type NewApproval,
+} from './booking-approvals.js';
+
+/**
+ * `bookingHoldsSeats` in SQL, for the seat counts that cannot load every booking: a
+ * `pending_approval` booking waiting for an over-allotment approval holds no seats. The rule is
+ * written once in `booking-approvals.ts`; this is its translation, kept equal by running the suite
+ * on both stores. `b` must be the booking.
+ */
+const WAITING_FOR_SEATS = `(b.status = 'pending_approval' AND EXISTS (
+  SELECT 1 FROM booking_approvals ap WHERE ap.booking_id = b.id AND ap.kind = 'approval' AND ap.status = 'pending' AND ap.over_capacity))`;
 
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
@@ -85,7 +98,15 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     FROM booking_partial_cancels pc WHERE pc.booking_id = b.id), '[]'::jsonb) AS partial_cancels,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('type', f.type, 'label', f.label, 'amount', f.amount, 'at', f.at) ORDER BY f.at, f.id)
-    FROM booking_fee_items f WHERE f.booking_id = b.id), '[]'::jsonb) AS fee_items
+    FROM booking_fee_items f WHERE f.booking_id = b.id), '[]'::jsonb) AS fee_items,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('kind', ap.kind, 'status', ap.status, 'over_capacity', ap.over_capacity, 'over_total', ap.over_total,
+      'discount', ap.discount, 'foc_count', ap.foc_count, 'target_status', ap.target_status, 'requested_by', ap.requested_by, 'requested_at', ap.requested_at,
+      'decided_by', ap.decided_by, 'decided_at', ap.decided_at, 'note', ap.note,
+      'days', COALESCE((SELECT jsonb_agg(jsonb_build_object('route_id', ad.route_id, 'service_date', ad.service_date::text, 'need', ad.need, 'over_by', ad.over_by)
+                                         ORDER BY ad.service_date, ad.route_id COLLATE "C")
+                        FROM booking_approval_days ad WHERE ad.approval_id = ap.id), '[]'::jsonb)) ORDER BY ap.requested_at, ap.id)
+    FROM booking_approvals ap WHERE ap.booking_id = b.id), '[]'::jsonb) AS approvals
   FROM bookings b`;
 
 /**
@@ -159,6 +180,15 @@ const stored = (row: QueryResultRow): StoredBooking => ({
   fee_items: (row.fee_items as Record<string, unknown>[]).map((f): BookingFeeItem => ({
     type: String(f.type), label: textOrNull(f.label), amount: Number(f.amount), at: jsonInstant(f.at),
   })),
+  approvals: (row.approvals as Record<string, unknown>[]).map(approval),
+});
+const numberOrNull = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value));
+const approval = (a: Record<string, unknown>): BookingApproval => ({
+  kind: a.kind as ApprovalKind, status: a.status as ApprovalStatus, over_capacity: a.over_capacity === true,
+  over_total: numberOrNull(a.over_total), discount: numberOrNull(a.discount), foc_count: numberOrNull(a.foc_count),
+  target_status: a.target_status as Booking['status'], requested_by: textOrNull(a.requested_by), requested_at: jsonInstant(a.requested_at),
+  decided_by: textOrNull(a.decided_by), decided_at: a.decided_at == null ? null : jsonInstant(a.decided_at), note: textOrNull(a.note),
+  days: (a.days as Record<string, unknown>[]).map((d): ApprovalDay => ({ route_id: String(d.route_id), service_date: String(d.service_date), need: Number(d.need), over_by: Number(d.over_by) })),
 });
 const cancellation = (c: Record<string, unknown>): BookingCancellation => ({
   category: String(c.category), group: c.group as CancelGroup, note: textOrNull(c.note), charge_type: c.charge_type as ChargeType,
@@ -286,7 +316,7 @@ export class PostgresOperationsStore {
        FROM booking_trips t
        JOIN bookings b ON b.id = t.booking_id
        JOIN booking_trip_pax p ON p.booking_trip_id = t.id
-       WHERE t.route_id = ANY($1::text[]) AND t.service_date BETWEEN $2 AND $3 AND b.status <> ALL($5::text[])
+       WHERE t.route_id = ANY($1::text[]) AND t.service_date BETWEEN $2 AND $3 AND b.status <> ALL($5::text[]) AND NOT ${WAITING_FOR_SEATS}
          AND t.booking_id IS DISTINCT FROM $4
        GROUP BY t.route_id, t.service_date, t.booking_mode, t.charter_boat_id`, [ids, from, to, exclude.bookingId ?? null, releasing]);
     const { rows: locks } = await this.client().query(
@@ -294,7 +324,7 @@ export class PostgresOperationsStore {
               COALESCE((SELECT SUM(d.qty) FROM booking_trip_lock_draws d
                         JOIN booking_trips t ON t.id = d.booking_trip_id
                         JOIN bookings b ON b.id = t.booking_id
-                        WHERE d.seat_lock_id = l.id AND b.status <> ALL($5::text[]) AND t.booking_id IS DISTINCT FROM $4), 0)::int AS drawn
+                        WHERE d.seat_lock_id = l.id AND b.status <> ALL($5::text[]) AND NOT ${WAITING_FOR_SEATS} AND t.booking_id IS DISTINCT FROM $4), 0)::int AS drawn
        FROM seat_locks l
        WHERE l.route_id = ANY($1::text[]) AND l.service_date BETWEEN $2 AND $3 AND l.status = 'active' AND l.id IS DISTINCT FROM $6`,
       [ids, from, to, exclude.bookingId ?? null, releasing, exclude.lockId ?? null]);
@@ -412,6 +442,42 @@ export class PostgresOperationsStore {
   }
 
   /** Answers 400 before `booking_trips_route_fk` or the lock draw's foreign key can answer 500. */
+  /**
+   * `assertTrips`, but over the allotment is an answer rather than a refusal: the days the trips put
+   * over it (`weighDay`). The same pool locks, in the same order, so the answer cannot go stale before
+   * the write.
+   */
+  private async weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = []): Promise<ApprovalDay[]> {
+    const days = demandByDay(trips);
+    const pools = new Map<string, { route_id: string; service_date: string }>();
+    for (const day of [...days, ...vacating]) pools.set(`${day.route_id} ${day.service_date}`, { route_id: day.route_id, service_date: day.service_date });
+    for (const key of [...pools.keys()].sort()) { const pool = pools.get(key)!; await this.lockPool(pool.route_id, pool.service_date); }
+    const over: ApprovalDay[] = [];
+    for (const demand of days) {
+      const weight = weighDay(await this.day(demand.route_id, demand.service_date, exclude), demand);
+      if (weight) over.push({ route_id: demand.route_id, service_date: demand.service_date, ...weight });
+    }
+    return over;
+  }
+
+  /** One approval waits per kind: a new request replaces a pending one of its kind. */
+  private async requestApprovals(bookingId: string, requests: readonly NewApproval[]): Promise<void> {
+    for (const request of requests) {
+      await this.replacePending(bookingId, request.kind);
+      const { rows: [row] } = await this.client().query(
+        `INSERT INTO booking_approvals (booking_id, kind, status, over_capacity, over_total, discount, foc_count, target_status, requested_by)
+         VALUES ($1,$2,'pending',$3,$4,$5,$6,$7,$8) RETURNING id`,
+        [bookingId, request.kind, request.over_capacity, request.over_total, request.discount, request.foc_count, request.target_status, request.requested_by]);
+      for (const day of request.days) {
+        await this.client().query('INSERT INTO booking_approval_days (approval_id, route_id, service_date, need, over_by) VALUES ($1,$2,$3,$4,$5)',
+          [row.id, day.route_id, day.service_date, day.need, day.over_by]);
+      }
+    }
+  }
+  private async replacePending(bookingId: string, kind: ApprovalKind): Promise<void> {
+    await this.client().query("UPDATE booking_approvals SET status = 'replaced' WHERE booking_id = $1 AND kind = $2 AND status = 'pending'", [bookingId, kind]);
+  }
+
   private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
     const ids = [...new Set(trips.map((trip) => trip.route_id))];
     const { rows } = await this.client().query('SELECT id FROM routes WHERE id = ANY($1::text[])', [ids]);
@@ -437,12 +503,15 @@ export class PostgresOperationsStore {
   }
 
   async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
-    const status = input.status ?? 'confirmed';
     const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
-    // A booking created in a status that releases seats — a rejection being recorded, a cancelled
-    // import — reserves nothing, so a full day must not stop it being written down.
-    if (holdsSeats(status)) await this.assertTrips(input.trips);
+    // Weighed first, then decided: the days over the allotment are a fact the status depends on.
+    const decision = decideStatus(input.intent ?? 'confirm', {
+      focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
+      overDays: await this.weighTrips(input.trips),
+    }, actor);
+    const status = decision.status;
+    const head: BookingHeader = { ...input.header, ...(status === 'confirmed' ? confirmationStamp(actor, new Date().toISOString()) : {}) };
     const id = `booking_${randomUUID()}`;
     // Only the header columns the caller actually supplied are written, so a NULL keeps meaning
     // "never given" rather than "explicitly blanked". The column list is generated rather than
@@ -450,7 +519,7 @@ export class PostgresOperationsStore {
     const columns = ['id', 'status', 'external_id', 'agent_id', 'voucher_ref', 'rate_type_ref', 'booking_mode'];
     const values: unknown[] = [id, status, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null];
     for (const column of BOOKING_HEADER_COLUMNS) {
-      const value = input.header?.[column];
+      const value = head[column];
       if (value === undefined) continue;
       columns.push(column);
       values.push(value);
@@ -464,7 +533,9 @@ export class PostgresOperationsStore {
     await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
     await this.writeAddOns(id, input.add_ons ?? []);
+    await this.requestApprovals(id, decision.approvals);
     await this.log(id, createdLine(actor));
+    for (const line of decision.history) await this.log(id, line);
     return (await this.booking(id))!;
   }
 
@@ -501,13 +572,16 @@ export class PostgresOperationsStore {
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }
 
   /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
-  async amendBooking(id: string, changes: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
+  async amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
+    assertEditable(current.status);
+    const changes = stripServerOwned(requested, current as unknown as Record<string, unknown> & { status: Booking['status'] });
     const replacement = nextTrips(current.trips, changes);
     const planned = planTrips(current.trips, replacement, newTripId);
-    const status = changes.status ?? current.status;
     await this.assertRoutes(replacement);
-    if (claimsSeats(current.status, status, claimsMoreSeats(current.trips, planned))) await this.assertTrips(replacement, { bookingId: id }, current.trips);
+    const reweighed = reweighs(current, changes, claimsMoreSeats(current.trips, planned))
+      ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips), actor) : undefined;
+    const status = reweighed?.status ?? current.status;
     await this.log(id, entry ?? editedLine(actor, changes, current.status));
     await this.writeTrips(id, current.trips, planned);
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
@@ -515,6 +589,7 @@ export class PostgresOperationsStore {
     // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
     const assignments = ['booking_mode = $2', 'status = $3', 'updated_at = now()'];
     const values: unknown[] = [id, replacement[0]?.booking_mode ?? null, status];
+    if (status === 'confirmed' && reweighed && !current.confirmed_at) { values.push(actor ?? null); assignments.push(`confirmed_at = now(), confirmed_by = ${values.length}`); }
     for (const column of BOOKING_HEADER_COLUMNS) {
       const value = changes.header?.[column];
       if (value === undefined) continue;
@@ -526,6 +601,9 @@ export class PostgresOperationsStore {
     // out, and re-serialising an amendment into it would grow the thing being deleted.
     if (changes.passengers) await this.writePassengers(id, changes.passengers);
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
+    if (reweighed?.request) await this.requestApprovals(id, [reweighed.request]);
+    else if (reweighed) await this.replacePending(id, 'approval');
+    for (const line of reweighed?.history ?? []) await this.log(id, line);
     return this.booking(id);
   }
 
@@ -543,6 +621,47 @@ export class PostgresOperationsStore {
     }
     await this.log(id, plan.history);
     return this.booking(id);
+  }
+
+  /**
+   * `/confirm`, `/approve`, `/reject`, `/cancel-weather`. The rules are `planStatusCommand`'s. Approving
+   * an over-allotment booking gives it seats even past the licence, with warnings (`licenceWarnings`).
+   */
+  async changeBookingStatus(
+    id: string, command: StatusCommand, request: StatusCommandRequest, actor?: string,
+  ): Promise<{ booking: Booking; warnings: ApprovalWarning[] } | undefined> {
+    const current = await this.storedBooking(id); if (!current) return undefined;
+    const plan = planStatusCommand(command, current, request, actor);
+    let warnings: ApprovalWarning[] = [];
+    if (plan.claims) {
+      const days = new Map<string, DayState>();
+      for (const trip of current.trips) {
+        const key = dayKey(trip.route_id, trip.service_date);
+        if (!days.has(key)) days.set(key, await this.day(trip.route_id, trip.service_date, { bookingId: id }));
+      }
+      warnings = licenceWarnings(current.trips, (routeId, date) => days.get(dayKey(routeId, date))!);
+    }
+    if (plan.decide) {
+      const { rowCount } = await this.client().query(
+        "UPDATE booking_approvals SET status = $3, decided_by = $4, decided_at = now(), note = $5 WHERE booking_id = $1 AND kind = $2 AND status = 'pending'",
+        [id, plan.decide.kind, plan.decide.status, actor ?? null, plan.decide.note]);
+      if (rowCount === 0) {
+        const record = decidedRecord(plan.decide.kind, plan.decide.status, plan.status, focCountOf(current.trips), actor, '', plan.decide.note);
+        await this.client().query(
+          `INSERT INTO booking_approvals (booking_id, kind, status, over_capacity, foc_count, target_status, decided_by, decided_at, note)
+           VALUES ($1,$2,$3,false,$4,$5,$6,now(),$7)`,
+          [id, record.kind, record.status, record.foc_count, record.target_status, record.decided_by, record.note]);
+      }
+    }
+    await this.requestApprovals(id, plan.request);
+    // `touch` binds $1 (id) and $2 (actor); these extra assignments follow from $3.
+    const values: unknown[] = [plan.status];
+    const sets = [', status = $3'];
+    if (plan.confirms) { values.push(actor ?? null); sets.push(`, confirmed_at = now(), confirmed_by = $${values.length + 2}`); }
+    if (plan.cancellation_reason !== undefined) { values.push(plan.cancellation_reason); sets.push(`, cancellation_reason = $${values.length + 2}`); }
+    await this.touch(id, actor, sets.join(''), values);
+    for (const line of plan.history) await this.log(id, line);
+    return { booking: (await this.booking(id))!, warnings };
   }
 
   /**
@@ -619,7 +738,7 @@ export class PostgresOperationsStore {
         COALESCE((SELECT SUM(d.qty) FROM booking_trip_lock_draws d
                   JOIN booking_trips t ON t.id = d.booking_trip_id
                   JOIN bookings b ON b.id = t.booking_id
-                  WHERE d.seat_lock_id = l.id AND b.status <> ALL($4::text[])), 0)::int AS drawn_pax
+                  WHERE d.seat_lock_id = l.id AND b.status <> ALL($4::text[]) AND NOT ${WAITING_FOR_SEATS}), 0)::int AS drawn_pax
       FROM seat_locks l
       WHERE ($1::text IS NULL OR l.id = $1) AND ($2::text IS NULL OR l.route_id = $2) AND ($3::date IS NULL OR l.service_date = $3)
       ORDER BY l.created_at`, [filter.id ?? null, filter.routeId ?? null, filter.date ?? null, [...SEAT_RELEASING_STATUSES]]);

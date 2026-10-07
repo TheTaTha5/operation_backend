@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { BOOKING_STATUSES, holdsSeats, isBookingStatus, pendingApprovalHoldsSeats, SEAT_RELEASING_STATUSES } from '../src/domain/booking-status.js';
-import { claimsSeats } from '../src/domain/operations.js';
+import { BOOKING_STATUSES, holdsSeats, isBookingStatus, SEAT_RELEASING_STATUSES } from '../src/domain/booking-status.js';
+import { bookingHoldsSeats, type BookingApproval } from '../src/domain/booking-approvals.js';
+import { reweighs } from '../src/domain/operations.js';
 
 test('the enum is what the frontend writes, not what happens to exist', () => {
   // Six of these appear in the legacy production data; a status the API refuses is a booking the
@@ -28,18 +29,24 @@ test('an unclassified status holds its seats rather than releasing them', () => 
   assert.equal(holdsSeats('some_status_added_next_year'), true);
 });
 
-test('a pending approval that is over capacity has not been granted its seats', () => {
-  assert.equal(pendingApprovalHoldsSeats(), true, 'no approval record: legacy reads this as holding');
-  assert.equal(pendingApprovalHoldsSeats({}), true);
-  assert.equal(pendingApprovalHoldsSeats({ over_total: 0 }), true);
-  assert.equal(pendingApprovalHoldsSeats({ over_total: 4 }), false, 'saved because it exceeded the pool');
+const waiting = (over_capacity: boolean, status: BookingApproval['status'] = 'pending'): BookingApproval => ({
+  kind: 'approval', status, over_capacity, over_total: over_capacity ? 4 : null, discount: over_capacity ? null : 500, foc_count: null,
+  target_status: 'confirmed', requested_by: null, requested_at: '2026-10-07T00:00:00.000Z', decided_by: null, decided_at: null, note: null, days: [],
 });
 
-test('an amendment is capacity-checked only when it asks for seats it is not holding', () => {
-  assert.equal(claimsSeats('confirmed', 'confirmed', false), false, 'nothing moved');
-  assert.equal(claimsSeats('confirmed', 'confirmed', true), true, 'the itinerary moved');
-  assert.equal(claimsSeats('quote', 'confirmed', false), false, 'both hold seats already');
-  assert.equal(claimsSeats('cancelled', 'confirmed', false), true, 'reinstating asks for its seats back');
-  assert.equal(claimsSeats('confirmed', 'cancelled', true), false, 'releasing never needs room');
-  assert.equal(claimsSeats('cancelled', 'rejected', true), false, 'still released');
+test('a pending approval that is over the allotment has not been granted its seats', () => {
+  assert.equal(bookingHoldsSeats({ status: 'pending_approval' }), true, 'no approval record: legacy reads this as holding');
+  assert.equal(bookingHoldsSeats({ status: 'pending_approval', approvals: [waiting(false)] }), true, 'waiting only for a discount');
+  assert.equal(bookingHoldsSeats({ status: 'pending_approval', approvals: [waiting(true)] }), false, 'saved because it exceeded the allotment');
+  assert.equal(bookingHoldsSeats({ status: 'pending_approval', approvals: [waiting(true, 'replaced')] }), true, 'a replaced request no longer counts');
+  assert.equal(bookingHoldsSeats({ status: 'confirmed', approvals: [waiting(true)] }), true, 'only a pending_approval booking waits');
+  assert.equal(bookingHoldsSeats({ status: 'cancelled' }), false);
+});
+
+test('an amendment is weighed again only when it asks for seats it is not holding', () => {
+  const moved = { trips: [] };
+  assert.equal(reweighs({ status: 'confirmed' }, {}, false), false, 'nothing more asked for');
+  assert.equal(reweighs({ status: 'confirmed' }, moved, true), true, 'more seats, or seats on another day');
+  assert.equal(reweighs({ status: 'pending_approval', approvals: [waiting(true)] }, { header: {} }, false), false, 'a header edit leaves the request alone');
+  assert.equal(reweighs({ status: 'pending_approval', approvals: [waiting(true)] }, { pax: 2 }, false), true, 'fewer seats may fit now');
 });

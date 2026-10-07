@@ -93,7 +93,9 @@ after(async () => { await app.close(); await pool?.end(); });
 test('imported records land in the tables and read back through the API', { skip: !url && 'PostgreSQL only' }, async () => {
   const date = '2037-05-01';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-import', route_id: 'r1', service_date: date, capacity: 20 } });
-  const booking = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r1', service_date: date, pax: 3, status: 'cancelled' } })).json();
+  const booking = (await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r1', service_date: date, pax: 3 } })).json();
+  // The import writes legacy's status as it is; the API only reaches `cancelled` through /cancel.
+  await pool!.query("UPDATE bookings SET status = 'cancelled' WHERE id = $1", [booking.id]);
   const { report } = reporter();
   // `import-legacy.ts`'s statement: only the columns the rows carry, so a serial id takes its default.
   const insert = (table: string, rows: object[]) => {

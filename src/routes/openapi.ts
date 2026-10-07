@@ -80,11 +80,12 @@ const addOn = {
   },
 };
 
+const STATUSES = ['draft', 'quote', 'pending', 'pending_approval', 'pending_foc', 'confirmed', 'rejected', 'cancelled', 'cancelled_weather', 'completed'];
+
 const bookingHeaderIn = {
   external_id: { type: 'string', description: 'Your own booking id (e.g. `LOV-4190737`). Unique across all bookings.' },
   agent_id: { type: 'string', description: 'The selling agent, from `GET /v1/agents`' },
   voucher_ref: { type: 'string' },
-  status: { type: 'string', enum: ['draft', 'quote', 'pending', 'pending_approval', 'pending_foc', 'confirmed', 'rejected', 'cancelled', 'cancelled_weather', 'completed'], default: 'confirmed' },
   leadPax: { type: 'string', description: 'Lead passenger name (`lead_pax`)' },
   leadPhone: { type: 'string' },
   leadEmail: { type: 'string' },
@@ -93,12 +94,48 @@ const bookingHeaderIn = {
   hotelName: { type: 'string' },
   roomNumber: { type: 'string' },
   total: { type: 'number', description: 'Sale total in THB. A number, never a string.' },
+  price_discount: { type: 'number', description: 'Discount in THB, sent negative as legacy stores it. On a confirm, any discount waits for approval (`pending_approval`).' },
+  focReason: { type: 'string', description: 'Why passengers travel free (`foc_reason`). Required to confirm a booking with FOC passengers.' },
   notes: { type: 'string' },
+};
+
+/** Set by the server, never by a request: refused on create, and on `PATCH` unless it repeats the stored value. */
+const SERVER_SET = 'Set by the server.';
+const serverOwned = {
+  created_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who created the booking.` },
+  booked_at: { type: 'string', format: 'date-time', readOnly: true, description: `${SERVER_SET} When the booking was created.` },
+  confirmed_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who first confirmed it (\`/confirm\`, \`/approve\`, or a create the server confirmed).` },
+  confirmed_at: { type: 'string', format: 'date-time', readOnly: true, description: `${SERVER_SET} When it was first confirmed.` },
+  updated_by: { type: 'string', readOnly: true, description: `${SERVER_SET} The logged-in user who last changed it; a request's value is ignored.` },
 };
 
 const bookingIn = {
   type: 'object',
-  description: 'Header scalars accept camelCase or snake_case. A field not listed in the README "Booking header fields" table is dropped, not stored.',
+  description: 'Header scalars accept camelCase or snake_case. A field not listed in the README "Booking header fields" table is dropped, not stored. '
+    + '`created_by`, `booked_at`, `confirmed_by` and `confirmed_at` are set by the server and refused here (`created_by` may only repeat the logged-in user).',
+  properties: {
+    intent: {
+      type: 'string', enum: ['quote', 'confirm'], default: 'confirm',
+      description: 'Which save button: "Save as quote" or "Confirm". The server decides the status from it and the facts: '
+        + '`quote`; `confirmed`; `pending_foc` (FOC passengers, needs `focReason`); or `pending_approval` '
+        + '(over the allotment but within the boats\' registered seats, holding no seats; or a discount on a confirm). See README "Booking status".',
+    },
+    status: {
+      type: 'string', enum: ['quote', 'draft', 'confirmed', 'pending_foc'], deprecated: true,
+      description: 'Deprecated: send `intent`. Read as `intent`: `quote`/`draft` → quote, `confirmed`/`pending_foc` → confirm. '
+        + 'Any other status is `400`; `intent` and `status` that disagree are `400`. Logged as a deprecation warning.',
+    },
+    ...bookingHeaderIn,
+    trips: { type: 'array', minItems: 1, items: tripIn },
+    passengers: { type: 'array', items: passenger, description: 'Replaces the whole list' },
+    addOns: { type: 'array', items: addOn, description: 'Replaces the whole list. `[]` or `null` clears it.' },
+  },
+};
+
+const bookingPatchIn = {
+  type: 'object',
+  description: 'Only the fields you send change. `status` and the server-set fields (`created_by`, `booked_at`, `confirmed_by`, `confirmed_at`) '
+    + 'are accepted only when they repeat the stored value, so a client that sends the whole booking back keeps working; a different value is `400`.',
   properties: {
     ...bookingHeaderIn,
     trips: { type: 'array', minItems: 1, items: tripIn },
@@ -114,7 +151,8 @@ const booking = {
     id: { type: 'string' },
     external_id: { type: 'string' },
     agent_id: { type: 'string' },
-    status: { type: 'string' },
+    status: { type: 'string', enum: STATUSES, readOnly: true, description: `${SERVER_SET} Decided on create from \`intent\`, then moved by the commands and re-weighed by edits.` },
+    foc_reason: { type: 'string' },
     lead_pax: { type: 'string' },
     total: { type: 'number' },
     route_id: { type: 'string', description: 'Derived: first trip' },
@@ -130,9 +168,54 @@ const booking = {
     },
     passengers: { type: 'array', items: passenger },
     add_ons: { type: 'array', items: addOn },
-    cancellation_reason: { type: 'string' },
+    approvals: {
+      type: 'array', readOnly: true, description: `${SERVER_SET} Every approval asked for, oldest first, kept after it is decided. At most one per kind is \`pending\`.`,
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['approval', 'foc'], description: '`approval`: over the allotment and/or a discount. `foc`: free passengers.' },
+          status: { type: 'string', enum: ['pending', 'approved', 'rejected', 'replaced'], description: '`replaced`: a later edit asked again before this was decided.' },
+          over_capacity: { type: 'boolean', description: 'Over the allotment. While pending, the booking holds no seats.' },
+          over_total: { type: 'integer', nullable: true }, discount: { type: 'number', nullable: true }, foc_count: { type: 'integer', nullable: true },
+          target_status: { type: 'string', description: 'Where `/approve` moves the booking' },
+          requested_by: { type: 'string', nullable: true }, requested_at: { type: 'string', format: 'date-time' },
+          decided_by: { type: 'string', nullable: true }, decided_at: { type: 'string', format: 'date-time', nullable: true }, note: { type: 'string', nullable: true },
+          days: {
+            type: 'array', description: 'The days over the allotment, as they were when asked',
+            items: { type: 'object', properties: { route_id: { type: 'string' }, service_date: isoDate, need: { type: 'integer' }, over_by: { type: 'integer' } } },
+          },
+        },
+      },
+    },
+    cancellation_reason: { type: 'string', readOnly: true, description: `${SERVER_SET} Written by \`/cancel\` and \`/cancel-weather\`.` },
+    ...serverOwned,
     created_at: { type: 'string', format: 'date-time' },
     updated_at: { type: 'string', format: 'date-time' },
+  },
+};
+
+/** What each status command does, for its documentation. */
+const COMMAND_DOCS: Record<string, { summary: string; description: string }> = {
+  confirm: {
+    summary: 'Confirm a draft, quote or pending booking',
+    description: 'From `draft`, `quote` or `pending`. Decided as a create with `intent: confirm`: `confirmed`; `pending_foc` when a trip carries FOC (free) passengers '
+      + '(`foc_reason` required, else `400`); `pending_approval` when it carries a discount. The seats it holds are not weighed again. '
+      + 'Stamps `confirmed_by` (the logged-in user) and `confirmed_at` the first time it is confirmed.',
+  },
+  approve: {
+    summary: 'Approve a booking waiting for approval',
+    description: 'From `pending_approval` or `pending_foc`. Moves to the approval\'s `target_status` (usually `confirmed`; `pending_foc` when FOC passengers still wait); '
+      + 'the approver is the logged-in user. Approving a booking that waited over the allotment gives it its seats, even past the boats\' registered seats: '
+      + 'then `warnings` lists each day (`over_licence`, `over_by`) — add a boat. Optional `note` is kept on the approval and in the history.',
+  },
+  reject: {
+    summary: 'Reject a booking waiting for approval',
+    description: 'From `pending_approval` or `pending_foc`. Becomes `rejected` and gives its seats back. Optional `note` is kept on the approval and in the history.',
+  },
+  'cancel-weather': {
+    summary: 'Cancel a booking because the trip was called off for weather',
+    description: 'From any status that holds seats. Becomes `cancelled_weather`, `cancellation_reason` `weather`, and gives its seats back. '
+      + 'Undo with `/restore`. Refunds and credits are not handled here yet.',
   },
 };
 
@@ -186,16 +269,45 @@ export const docs = {
   },
   createBooking: {
     tags: ['Bookings'], summary: 'Create a booking', security: BEARER,
-    description: 'Seats are checked and taken in the same transaction, so a 201 means the seats are yours. `409` means a trip did not fit and nothing was written.',
+    description: 'Seats are weighed and the status decided in one transaction. A trip that fits takes its seats. Over the allotment but within the boats\' '
+      + 'registered seats, the booking is still created (`201`) as `pending_approval`, holding no seats until `/approve`. Seats held by other agents\' locks, '
+      + 'or past the registered seats, are `409` and nothing is written. Read `status` from the response; it is the server\'s.',
     body: bookingIn,
-    response: { 201: booking, 400: err('Invalid input, or unknown route/lock'), 409: err('Over capacity, lock short, or boat already chartered'), ...UNAUTHORIZED },
+    response: {
+      201: booking, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
+      409: err('Seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
+    },
   },
   amendBooking: {
     tags: ['Bookings'], summary: 'Amend a booking', security: BEARER, params: idParam,
-    description: 'Header fields merge (absent keeps, `null`/`""` clears). `trips`, `passengers` and `addOns` replace outright when sent. Changing trips is capacity-checked.',
-    body: bookingIn,
-    response: { 200: booking, 400: err('Invalid input'), 404: err('Booking not found'), 409: err('Over capacity'), ...UNAUTHORIZED },
+    description: 'Header fields merge (absent keeps, `null`/`""` clears). `trips`, `passengers` and `addOns` replace outright when sent. '
+      + 'Asking for more seats is weighed like a create: over the allotment the booking moves to `pending_approval` (holding none); a waiting booking that fits again '
+      + 'goes back to where it was. '
+      + 'The status is not changed here: use the commands. A cancelled, rejected, weather-cancelled or completed booking cannot be edited (`409 booking_closed`).',
+    body: bookingPatchIn,
+    response: {
+      200: booking, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
+      404: err('Booking not found'), 409: err('Over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
+    },
   },
+  statusCommand: (command: string) => ({
+    tags: ['Bookings'], summary: COMMAND_DOCS[command].summary, description: COMMAND_DOCS[command].description, security: BEARER, params: idParam,
+    body: { type: 'object', properties: { note: { type: 'string', description: 'Written into the booking history' } } },
+    response: {
+      200: {
+        ...booking,
+        properties: {
+          ...booking.properties,
+          warnings: {
+            type: 'array', description: 'Empty unless `/approve` granted seats past the registered seats',
+            items: { type: 'object', properties: { code: { type: 'string', enum: ['over_licence'] }, route_id: { type: 'string' }, service_date: isoDate, over_by: { type: 'integer' } } },
+          },
+        },
+      },
+      400: err('Invalid body, or FOC passengers confirmed without `foc_reason`'), 404: err('Booking not found'),
+      409: err('Not allowed from the booking\'s current status (`wrong_status`, `already_cancelled` or `booking_closed`)'), ...UNAUTHORIZED,
+    },
+  }),
   cancelBooking: {
     tags: ['Bookings'], summary: 'Cancel a booking and release its seats', security: BEARER, params: idParam,
     body: {

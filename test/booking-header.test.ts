@@ -82,7 +82,7 @@ test('a booking round-trips its header through storage', async () => {
       priceBreakdown: { seat: 12000, addOn: 800, focDiscount: -500, discount: -200, extra: 0 },
       paymentSnapshot: { method: 'credit', netDays: 30, source: 'contract', contractVersion: 'v3' },
       marketSnapshot: { market: 'EU', sub: 'DE', agentId: 'a_de', at: '2026-09-01' },
-      bookingDate: '2026-09-01', total: 12100, priceMode: 'rate', createdBy: 'RM',
+      bookingDate: '2026-09-01', total: 12100, priceMode: 'rate',
       trips: [{ routeId: 'r6', date, pax: { ad_fr: 4 } }],
     },
   });
@@ -98,7 +98,8 @@ test('a booking round-trips its header through storage', async () => {
   assert.equal(booking.payment_net_days, 30);
   assert.equal(booking.market_at, '2026-09-01', 'a DATE comes back as a plain ISO day, not a stringified Date');
   assert.equal(booking.booking_date, '2026-09-01');
-  assert.equal(booking.created_by, 'RM');
+  assert.equal(booking.created_by, undefined, 'the creator is the logged-in user; with authentication off there is none');
+  assert.ok(!Number.isNaN(Date.parse(booking.booked_at)), 'booked_at is stamped by the server');
 
   // NUMERIC is handed back by `pg` as a string. Unconverted, `total` would be 12100 for the
   // in-process store and "12100.00" for PostgreSQL — exactly the shape of divergence that kept the
@@ -228,7 +229,7 @@ test('an amendment refused for capacity leaves the header as it was', async () =
 
 test('a booking keeps its header through the amendments that do not mention it', async () => {
   const booking = await booked('2030-08-05', 30);
-  await app.inject({ method: 'PATCH', url: `/v1/bookings/${booking.id}`, payload: { status: 'pending_approval' } });
+  assert.equal((await app.inject({ method: 'PATCH', url: `/v1/bookings/${booking.id}`, payload: { notes: 'a header-only edit' } })).statusCode, 200);
   const rescheduled = await app.inject({
     method: 'POST', url: `/v1/bookings/${booking.id}/reschedule`,
     payload: { route_id: 'r6', service_date: '2030-08-05' },
