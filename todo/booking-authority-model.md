@@ -84,14 +84,104 @@ Kingdom send both); `total` and prices stay client-sent until the quote exists.
 same value succeeds; each command's allowed and refused starting statuses; who is stamped; the
 history line; a closed booking refuses `PATCH`; both stores.
 
-## Phase 2 (next): the server decides the status on save
+## Phase 2: the server decides the status on save
 
-- `POST` (and a `PATCH` that changes trips or pax) takes an **intent**, `quote` or `confirm`, instead
-  of a status. The server computes the status as legacy's save does: FOC → `pending_foc`, over
-  allotment within licence → `pending_approval` (no longer `409`), discount → `pending_approval`.
-- New columns and a table: the FOC reason, and the approval record (reason, target status, who
-  approved or rejected, when, note). `pendingApprovalHoldsSeats` then reads the real over-count.
-- Love Kingdom's create contract changes on both sides.
+### What legacy's save does (`bkV2CommitBooking`, "Anti-overbook guard (tiered)")
+
+For each seat trip (charters are checked elsewhere), on create and on an edit that **increases** a
+trip's general-seat need, with `need` = pax less its own lock draw:
+
+| `need` against the day | Legacy |
+|---|---|
+| ≤ seats available | fits |
+| ≤ seats available **+ locked seats** (only locks in the way) | **hard block** (`lockViolation`) — our `409` today |
+| over that, ≤ the boat's **licensed** seats free (or any land route) | **over allotment**: the user confirms, the booking is saved `pending_approval` with an approval record listing each over-full day (`over[]`, `totOver`) |
+| over the licensed seats free | **hard block** (`licenseBlock`): no real seat |
+
+Then, in order:
+
+- a **discount** on a confirm → `pending_approval`, reason `discount` (or `over_capacity+discount`),
+  approved by the agent's salesperson;
+- **FOC passengers** on a confirm → `pending_foc` (an FOC reason is required to save);
+- an approval record wins: the booking is `pending_approval` with `targetStatus` = what it would
+  otherwise be (`confirmed`, `pending_foc` or `quote`). Approve then moves it there.
+- **Seats:** an over-allotment `pending_approval` does **not** hold seats while it waits
+  (`bkPendHoldsSeat`); a discount-only one does. (Legacy's own comment says the opposite; the
+  function is what runs.)
+- A resolved approval is kept for audit and replaced when a later save needs a new one.
+
+### The server's version
+
+**Contract.** `POST /v1/bookings` takes `intent`: `quote` or `confirm` (default `confirm`). The
+server computes the status from it and the rules above. A `PATCH` that increases seats is
+re-weighed the same way. The response says what happened (`status`, and `approval` when one is
+waiting). Transition: `status` on create is accepted as an alias — `quote`/`draft` mean `quote`,
+`confirmed`/`pending_foc` mean `confirm` — and any other value is `400`.
+
+**Capacity.** A new pure function, next to `assertDayFits`, classifies a day's demand as *fits*,
+*locks in the way* (`409`), *over allotment* (approval), or *over licence* (`409`). It reads the
+numbers `dayCapacity` already has: available seats, locked seats, and the licensed seats left.
+
+**Schema (migration 023):**
+
+```sql
+-- The reason legacy requires before FOC (free) passengers can be confirmed. A client fact.
+ALTER TABLE bookings ADD COLUMN foc_reason TEXT;
+
+-- Each approval a booking waited for, and how it was decided. Legacy kept one (`approval`) and a
+-- second for FOC (`focApproval`) on the booking document, overwriting earlier ones; here each is a row.
+CREATE TABLE booking_approvals (
+  id            BIGSERIAL PRIMARY KEY,
+  booking_id    TEXT NOT NULL REFERENCES bookings (id) ON DELETE CASCADE,
+  kind          TEXT NOT NULL CHECK (kind IN ('approval', 'foc')),
+  status        TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected')),
+  over_capacity BOOLEAN NOT NULL,          -- over the allotment: the booking holds no seats while pending
+  over_total    INTEGER CHECK (over_total >= 0),
+  discount      NUMERIC(12,2) CHECK (discount >= 0),
+  foc_count     INTEGER CHECK (foc_count >= 0),
+  target_status TEXT NOT NULL,             -- where approve moves it
+  requested_by  TEXT, requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_by    TEXT, decided_at TIMESTAMPTZ, note TEXT
+);
+CREATE INDEX booking_approvals_booking ON booking_approvals (booking_id, requested_at, id);
+
+-- The days an over-allotment approval is about (legacy `approval.over[]`), as they were when asked.
+CREATE TABLE booking_approval_days (
+  approval_id   BIGINT NOT NULL REFERENCES booking_approvals (id) ON DELETE CASCADE,
+  route_id      TEXT NOT NULL,
+  service_date  DATE NOT NULL,
+  need          INTEGER NOT NULL,
+  over_by       INTEGER NOT NULL CHECK (over_by > 0),
+  PRIMARY KEY (approval_id, route_id, service_date)
+);
+```
+
+Additive, no backfill. The seven legacy `pending_approval` bookings have no approval record, which
+legacy reads as "holds its seats" — so do we.
+
+**Seat holding.** `holdsSeats` gains the approval: a `pending_approval` booking whose current
+approval is `over_capacity` holds nothing. Both stores pass it through the same pure function;
+PostgreSQL's capacity query excludes those bookings with the same predicate, tested on both stores.
+
+**Commands.** `approve` moves to the approval's `target_status` and claims the seats when the
+approval was over allotment (see question 1). `reject` closes the approval. `/confirm` runs the
+same weighing as a create with intent `confirm`.
+
+**Clients, on both sides together:** Love Kingdom sends `intent` (or keeps `status: "confirmed"`,
+the alias); legacy's integration stops computing `pending_*` itself and shows what the server
+answered.
+
+**Not here:** the discount rule reads `price_discount` as sent, until the quote computes it; the
+importer maps legacy's `approval` / `focApproval` records in a later change.
+
+### Questions for phase 2
+
+1. **Approving over the licence.** Legacy lets a manager approve a booking even when the boat has
+   no registered seat left ("approve, but add a boat before the travel date"). That sells a seat
+   that does not physically exist. Copy it, or refuse with `409` until a boat is added?
+   Recommended: refuse — the licence is the legal passenger ceiling (`CLAUDE.md`, "Capacity").
+2. **`status` on create:** accept `quote`/`draft`/`confirmed`/`pending_foc` as aliases for `intent`
+   while clients move, as above? Recording a booking straight into `cancelled` would then be refused.
 
 ## Decisions — 2026-10-07
 
