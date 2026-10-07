@@ -12,6 +12,7 @@ import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import type { AgentListQuery } from '../domain/agents.js';
 import { actorOf, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, stampActor } from '../domain/booking-actions.js';
+import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -191,6 +192,12 @@ function bookingStatusList(value: unknown): BookingStatus[] | undefined {
 function agentListQuery(query: Record<string, unknown>): AgentListQuery {
   const active = query.active === undefined || query.active === 'true' ? true : query.active === 'false' ? false : query.active === 'all' ? undefined : badRequest('active must be true, false or all');
   return { marketId: optionalString(query.market), salesId: optionalString(query.sales), q: optionalString(query.q), active };
+}
+
+/** `?active=` on the rate type list, as on agents: active by default, `false` for inactive ones, `all` for both. */
+function rateTypeListQuery(query: Record<string, unknown>): RateTypeListQuery {
+  const active = query.active === undefined || query.active === 'true' ? true : query.active === 'false' ? false : query.active === 'all' ? undefined : badRequest('active must be true, false or all');
+  return { active, q: optionalString(query.q) };
 }
 
 function bookingChanges(body: unknown): BookingChanges {
@@ -406,6 +413,40 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const limit = query.limit === undefined ? 50 : Number(query.limit);
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) badRequest('limit must be an integer between 1 and 200');
     return { activity: (await store.agentActivity((request.params as { id: string }).id, limit)) ?? notFound('Agent not found') };
+  });
+
+  /**
+   * Rate types: the price lists agents are sold at (`src/domain/rate-types.ts`). Under `booking:*`
+   * like agents. Prices are written one route at a time, because a route's block is one fact: the
+   * zones, tiers, charter boats and transfers it offers replace what it had, never merge into it.
+   */
+  const rateTypeId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+  const routeParam = (request: { params: unknown }): string => (request.params as { route_id: string }).route_id;
+  app.get('/v1/rate-types', async (request) => ({ rate_types: await store.listRateTypes(rateTypeListQuery(request.query as Record<string, unknown>)) }));
+  app.get('/v1/rate-types/:id', async (request) => (await store.rateType(rateTypeId(request))) ?? rateTypeNotFound(rateTypeId(request)));
+  app.post('/v1/rate-types', async (request, reply) => {
+    const input = parseRateTypeCreate(request.body);
+    return reply.code(201).send(await store.transaction(() => store.createRateType(input)));
+  });
+  app.patch('/v1/rate-types/:id', async (request) => {
+    const patch = parseRateTypePatch(request.body);
+    return store.transaction(async () => (await store.patchRateType(rateTypeId(request), patch)) ?? rateTypeNotFound(rateTypeId(request)));
+  });
+  app.put('/v1/rate-types/:id/routes/:route_id', async (request) => {
+    const block = parseRouteBlock(request.body, '');
+    const named = (request.body as Record<string, unknown>).route_id;
+    if (named !== undefined && named !== routeParam(request)) badRequest(`route_id ${String(named)} does not match the path's ${routeParam(request)}`);
+    return store.transaction(async () => (await store.putRateTypeRoute(rateTypeId(request), routeParam(request), block)) ?? rateTypeNotFound(rateTypeId(request)));
+  });
+  app.delete('/v1/rate-types/:id/routes/:route_id', async (request, reply) => {
+    const removed = await store.transaction(async () => await store.deleteRateTypeRoute(rateTypeId(request), routeParam(request)));
+    if (removed === undefined) rateTypeNotFound(rateTypeId(request));
+    if (removed === false) notFound(`Route ${routeParam(request)} is not on rate type ${rateTypeId(request)}`);
+    return reply.code(204).send();
+  });
+  app.delete('/v1/rate-types/:id', async (request, reply) => {
+    if (!(await store.transaction(async () => await store.deleteRateType(rateTypeId(request))))) rateTypeNotFound(rateTypeId(request));
+    return reply.code(204).send();
   });
 
   app.get('/v1/seat-locks', { schema: docs.listLocks }, async (request) => {

@@ -190,11 +190,110 @@ Field notes:
   entered, and `null` means open. Travel dates are not stored: they come from the rate type, which
   has no endpoint yet.
 - **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
-- **`rate_type_id`** is the rate type the agent is priced with. It is not validated yet, because
-  there is no rate type table. `GET /v1/rate-types` comes with the Rate Types port.
+- **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). It
+  is not validated yet. The foreign key is a migration that can only ship after the import has run
+  in production: before it, agents hold rate type ids that `rate_types` does not have yet.
 - **Not here yet:** credit used and available (needs invoices and payments, which this service
   doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
   contract history (the Contracts port).
+
+### Rate types
+
+A rate type is a price list: what an agent pays per seat on each route and pickup zone, per charter
+boat, and per add-on. All of these are under `booking:read` / `booking:write`, like agents. Nothing
+prices a booking from them yet; that is the quote, a later slice (`todo/rate-types-model.md`).
+
+Rate types arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids
+(`rt003`, `rt_staff`, …), which are the ids `agents.rate_type_id` and `bookings.rate_type_ref`
+already hold. Until cutover legacy is the master, and each import run replaces only what legacy's
+tables can hold: seat prices in zones PK, KL and NoTransfer, speedboat and catamaran charters, the
+longtail add-on, and transfers on r4, r5, r6, r10, r11 and r12. Legacy dropped everything else on
+save, so it can only be entered here, and the import keeps it: RN prices, longtail charters,
+transfers on other routes, a bundle's `applies_to`. A legacy price changed here is put back by the
+next import run, so change those in legacy until cutover.
+
+- `GET /v1/rate-types?active=&q=`: summary rows, A–Z by name (case-insensitive), then id.
+  - `active` is `true` (the default), `false`, or `all`.
+  - `q` matches code or name, case-insensitively.
+
+  ```jsonc
+  { "rate_types": [ { "id": "rt003", "code": "NOK-STD", "name": "Standard 2026", "color": "#1683C7",
+    "active": true, "owner": "s1", "valid_from": "2026-01-01", "valid_to": "2026-10-31",
+    "nationality_scope": "both", "priced_routes": ["r5", "r6"],
+    "route_validity": { "r5": { "from": "2025-11-01", "to": "2026-04-30" } } } ] }
+  ```
+- `GET /v1/rate-types/{id}`: the summary's fields plus `note`, `transfer_unit`, `created_on`,
+  `created_at`, `updated_at` and every price, route by route in the rate's order. `404` if unknown.
+
+  ```jsonc
+  { "id": "rt003", "code": "NOK-STD", "name": "Standard 2026", "…": "the summary's fields",
+    "note": null, "transfer_unit": "per trip", "created_on": null,
+    "created_at": "2026-10-07T09:00:00.000Z", "updated_at": "2026-10-07T09:00:00.000Z",
+    "routes": [ {
+      "route_id": "r5", "travel_from": "2025-11-01", "travel_to": "2026-04-30",
+      "longtail_bundle": { "mode": "paid", "adult": 300, "child": 200, "applies_to": "seat" },
+      "zones": {
+        "PK": { "net": { "ad_fr": 2900, "chd_fr": 1900, "ad_th": 1900, "chd_th": 1200 },
+                "sell": { "ad_fr": 3400 }, "min_sell": { "ad_fr": 3100 } },
+        "KL": { "net": { "ad_fr": 3100, "chd_fr": 2100 } } },
+      "charter": { "speedboat": { "starter_price": 45000, "starter_includes": 20, "extra_per_pax": 1500 } },
+      "longtail": { "join_adult": 400, "join_child": 300, "charter_price": 3500, "charter_capacity": 8 },
+      "transfer": { "PK": { "sedan": 1200, "van": 1800 } } } ] }
+  ```
+- `POST /v1/rate-types`: creates one. `201` with the detail.
+  - The body has the header fields (`name` required; `id`, `code`, `note`, `color`, `owner`,
+    `valid_from`, `valid_to`, `active`, `nationality_scope`, `transfer_unit` optional) and an
+    optional `routes` array. Each entry is a route block, as in the detail, plus its `route_id`.
+  - `id` is generated (`rt_<uuid>`) when absent.
+  - `code` is generated from the name when absent: `Standard 2026` → `STANDARD-2026`, then
+    `-2`, `-3`… on a clash.
+  - `409` with `code: "exists"` when the `id` or `code` is taken.
+- `PATCH /v1/rate-types/{id}`: changes the header fields it names. A field it doesn't mention is
+  left alone, and `null` clears one that may be empty. `code` and `id` cannot change (`400`):
+  an import matches rate types on the code. Deactivate with `{ "active": false }`.
+- `PUT /v1/rate-types/{id}/routes/{route_id}`: replaces that route's whole block, and adds the
+  route at the end of the rate's routes if it is new. A zone, a charter boat or a transfer left out
+  of the body is removed, not kept. The body may repeat `route_id`, but it must match the path.
+  Returns the detail.
+- `DELETE /v1/rate-types/{id}/routes/{route_id}`: takes a route and its prices off the rate.
+  `204`, or `404` if the rate type or the route on it is unknown.
+- `DELETE /v1/rate-types/{id}`: `204`. If an agent or a booking names the rate type, it answers
+  `409` with `code: "in_use"` and the counts in the message; deactivate it instead.
+
+Field notes:
+
+- **Seat prices are keyed like a booking's pax grid:** `ad_fr`, `chd_fr`, `inf_fr`, `ad_th`,
+  `chd_th`, `inf_th`. A rate is always foreign or Thai. Legacy prices a booking pax with no
+  residency (`ad`) as foreign.
+- **Tiers:** only `net` is what the agent pays. `sell` and `min_sell` are the agent's suggested
+  and minimum selling prices, printed on contracts and never billed.
+- **A zone is offered on a route when it has a net adult price above 0** (foreign or Thai). A zone
+  with no prices, or both adult prices at 0, is not offered. `priced_routes` lists the routes with
+  at least one offered zone, in the rate's order.
+- **Zones depend on the route's pier:** Ranong routes take `RN` and `NoTransfer`; every other
+  route, land routes included, takes `PK`, `KL` and `NoTransfer`. Transfer zones follow the same
+  rule.
+- **Charter `boat_type`** is `speedboat`, `catamaran` or `longtail`. It is matched against the
+  chartered boat's type, lowercased. `starter_price` covers `starter_includes` passengers, and each
+  one more costs `extra_per_pax`.
+- **`longtail_bundle`** folds the longtail into the seat price. `mode` is `free` or `paid` (a free
+  bundle has no price). `applies_to` is `seat`, `charter` or `both`; `null` means `seat`.
+- **Transfer `vehicle`** is `sedan` or `van`.
+- **`travel_from`/`travel_to` and `valid_from`/`valid_to` do not stop a sale.** They feed agent
+  programmes and contracts, as in legacy.
+- **`nationality_scope`** is `both`, `thai` or `foreign`; `null` means never set, read as `both`.
+- **`owner`** is a salesperson id; `null` means shared, visible to every salesperson.
+- **Present values only:** a price map lists only the cells that are set, so `null` in a request
+  means "not set" and is dropped. Header fields are always present, `null` when empty.
+
+Validation errors are `400` and name the path, for example:
+
+- `routes[1].charter.yacht is not a boat type: use speedboat, catamaran, longtail`
+- `zones.PK.net.ad_fr must be a number ≥ 0`
+- `routes[0].zones.RN does not apply to route r5 (pier panwa): use PK, KL, NoTransfer`
+- `routes[0].route_id r99 is not a route`
+- `travel_to must be a real date, YYYY-MM-DD`; `valid_from must not be after valid_to`
+- `owner s9 is not a salesperson`
 
 ### Operations
 
@@ -668,11 +767,12 @@ on `POST` it simply means the field was never filled in, since there is nothing 
 partially: `{"guides": {"english": true}}` sets `guide_english` and leaves the other three guide
 columns alone.
 
-> **`booking_data` is deprecated and will be removed.** It still appears on responses and still
-> holds the payload exactly as it was sent at create time. It is deliberately *not* rewritten by
-> `PATCH` — the columns are the ones that move — so on any amended booking the blob is a record of
-> what was first sent, not of what the booking now says. Read the columns. A future release stops
-> returning it, and a later one drops it.
+> **`booking_data` is deprecated and will be removed.** It still appears on responses, but nothing
+> writes it any more: a booking created since 2026-09-22 has `{}`, and so does every imported one.
+> Only a booking created through this API before that date carries the payload as it was sent at
+> create time, and `PATCH` never rewrote it, so even there it records what was first sent, not what
+> the booking now says. Read the columns. A future release stops returning it, and a later one
+> drops it.
 
 #### Passengers
 

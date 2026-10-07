@@ -5,7 +5,7 @@ import { buildApp } from '../src/app.js';
 const app = buildApp();
 after(async () => app.close());
 
-test('source booking payload is normalized while retaining its booking data', async () => {
+test('a source booking payload is normalized into columns, and the request is not kept as a blob', async () => {
   const date = '2030-02-03';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-source', route_id: 'r4', service_date: date, capacity: 20 } });
   const response = await app.inject({
@@ -29,7 +29,9 @@ test('source booking payload is normalized while retaining its booking data', as
   assert.equal(created.service_date, date);
   assert.equal(created.external_id, 'BK-source-1');
   assert.equal(created.booking_mode, 'charter');
-  assert.equal(created.booking_data.passengers[0].name, 'Example passenger');
+  // The blob stopped being written on 2026-09-22 (todo/booking-model.md, "The blob is being deleted"):
+  // a field the API knows is a column, and one it does not is dropped. Both stores answer `{}`.
+  assert.deepEqual(created.booking_data, {}, 'the request is not echoed back as a blob');
   assert.deepEqual(created.passengers, [{ seq: 0, name: 'Example passenger' }], 'the passenger list is a real column, not just retained in the blob');
 
   const amended = await app.inject({
