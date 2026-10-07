@@ -248,7 +248,8 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const path = request.url.split('?')[0];
     if (path === '/v1/login') return;
     const isOperations = path.startsWith('/operations/') || path === '/v1/manifest';
-    const isWrite = request.method !== 'GET';
+    // GET, HEAD and OPTIONS change nothing, so they need only the read scope.
+    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
     const user = await authenticator.authenticate(request);
     requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
   });
