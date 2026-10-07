@@ -14,7 +14,8 @@
     "test": "node --import tsx --test test/**/*.test.ts",
     "check": "tsc --noEmit -p tsconfig.check.json",
     "db:migrate": "tsx src/migrate.ts",
-    "sync:routes": "tsx src/tools/sync-routes.ts"
+    "sync:routes": "tsx src/tools/sync-routes.ts",
+    "sync:boats": "tsx src/tools/sync-boats.ts"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
