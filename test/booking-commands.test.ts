@@ -167,3 +167,14 @@ test('a command on an unknown booking is 404, and a bad note is 400', async () =
   const booking = await booked('2038-01-14', { intent: 'quote' });
   assert.equal((await request('POST', `/v1/bookings/${booking.id}/confirm`, { note: 42 })).statusCode, 400);
 });
+
+test('a second create with the same external_id is 409 naming the booking, not a second booking', async () => {
+  const externalId = `LOV-dup-${Date.now().toString(36)}`;
+  const first = await booked('2038-01-15', { external_id: externalId });
+  const seats = await seatsLeft('2038-01-15');
+  const retry = await request('POST', '/v1/bookings', { external_id: externalId, trips: [{ routeId: 'r2', date: '2038-01-15', pax: { ad: 2 } }] });
+  assert.equal(retry.statusCode, 409);
+  assert.equal(retry.json().code, 'duplicate_external_id');
+  assert.equal(retry.json().message, `external_id ${externalId} is already booking ${first.id}`);
+  assert.equal(await seatsLeft('2038-01-15'), seats, 'nothing was written');
+});

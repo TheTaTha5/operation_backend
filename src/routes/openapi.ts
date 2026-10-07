@@ -275,7 +275,7 @@ export const docs = {
     body: bookingIn,
     response: {
       201: booking, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
-      409: err('Seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
+      409: err('Seats held by seat locks, the registered seats full, lock short, boat already chartered, or `external_id` already used (`duplicate_external_id`)'), ...UNAUTHORIZED,
     },
   },
   amendBooking: {

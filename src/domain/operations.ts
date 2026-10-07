@@ -7,7 +7,7 @@ import { withSeq, type BookingPassenger, type BookingPassengerInput } from './bo
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  confirmationStamp, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
+  confirmationStamp, externalIdTaken, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelRequest, type HistoryEntry, type HistoryLine,
   type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
@@ -517,6 +517,10 @@ export class OperationsStore {
   }
 
   createBooking(input: BookingInput, actor?: string): Booking {
+    if (input.external_id !== undefined) {
+      const taken = [...this.bookings.values()].find((booking) => booking.external_id === input.external_id);
+      if (taken) externalIdTaken(input.external_id, taken.id);
+    }
     const planned = planTrips([], input.trips, () => this.id('trip'));
     this.assertRoutes(input.trips);
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.

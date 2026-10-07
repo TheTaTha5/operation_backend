@@ -10,7 +10,7 @@ import {
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  confirmationStamp, planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
+  confirmationStamp, externalIdTaken, planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
@@ -503,6 +503,10 @@ export class PostgresOperationsStore {
   }
 
   async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
+    if (input.external_id !== undefined) {
+      const { rows: [taken] } = await this.client().query('SELECT id FROM bookings WHERE external_id = $1', [input.external_id]);
+      if (taken) externalIdTaken(input.external_id, String(taken.id));
+    }
     const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
@@ -529,7 +533,14 @@ export class PostgresOperationsStore {
     columns.push('booking_data');
     values.push(JSON.stringify(input.booking_data ?? {}));
     placeholders.push(`$${values.length}::jsonb`);
-    await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
+    try {
+      await this.client().query(`INSERT INTO bookings (${columns.join(', ')}) VALUES (${placeholders.join(', ')})`, values);
+    } catch (error) {
+      // A concurrent create with the same external_id committed after the check above.
+      const e = error as Error & { code?: string; constraint?: string };
+      if (e.code === '23505' && e.constraint === 'bookings_external_id_unique') externalIdTaken(input.external_id!);
+      throw error;
+    }
     await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
     await this.writeAddOns(id, input.add_ons ?? []);

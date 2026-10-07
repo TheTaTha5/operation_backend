@@ -641,7 +641,10 @@ with a `409`. (A booking is never created in a released status: it is cancelled 
   whole booking waits for approval. A booking has **at most one
   trip per route per day** (`400` otherwise); send one trip with the combined pax. A trip must name a route in the catalogue (`GET /v1/routes`); an
   unknown one is a `400` naming the route, and `booking_trips_route_fk` is the database backstop
-  behind it.
+  behind it. `external_id` names one booking: a second create with the same one is `409` with
+  `code: "duplicate_external_id"`, its message naming the existing booking
+  (`external_id LOV-4190737 is already booking booking_…`), and nothing is written. A client
+  retrying after a timeout reads that booking instead.
 - `PATCH /v1/bookings/{id}` — send `trips` to replace the itinerary outright (echo each kept trip's
   `id`, see [Trip ids](#trip-ids)), or `route_id`,
   `service_date` and/or `pax` to move a single-departure booking. Days being vacated are
@@ -826,7 +829,8 @@ Imported bookings carry legacy's own lines, whose `kind` values are wider than t
 
 **Errors** keep the shape `{ statusCode, error, message }`. `message` names the field or the rule
 and is fit to show to a person. Where a client needs to branch, a machine-readable `code` is added:
-`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`, `wrong_status`.
+`not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`, `wrong_status`,
+`duplicate_external_id`.
 
 #### Booking header fields
 
