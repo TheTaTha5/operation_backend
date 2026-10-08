@@ -23,6 +23,7 @@ import {
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
+import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import { pickupFields } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
@@ -102,6 +103,9 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', a.seq, 'type', a.type, 'label', a.label, 'amount', a.amount, 'qty', a.qty, 'note', a.note,
       'join_adults', a.join_adults, 'join_children', a.join_children) ORDER BY a.seq)
     FROM booking_addons a WHERE a.booking_id = b.id), '[]'::jsonb) AS add_ons,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('seq', j.seq, 'kind', j.kind, 'mode', j.mode, 'value', j.value, 'label', j.label, 'note', j.note) ORDER BY j.seq)
+    FROM booking_adjustments j WHERE j.booking_id = b.id), '[]'::jsonb) AS adjustments,
   (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
     FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
   COALESCE((
@@ -182,6 +186,11 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(addOn.note == null ? {} : { note: String(addOn.note) }),
     ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
     ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
+  })),
+  adjustments: (row.adjustments as Record<string, unknown>[]).map((a): BookingAdjustment => ({
+    seq: Number(a.seq), kind: a.kind as BookingAdjustment['kind'], mode: a.mode as BookingAdjustment['mode'], value: Number(a.value),
+    ...(a.label == null ? {} : { label: String(a.label) }),
+    ...(a.note == null ? {} : { note: String(a.note) }),
   })),
   ...(row.cancellation ? { cancellation: cancellation(row.cancellation as Record<string, unknown>) } : {}),
   reschedules: (row.reschedules as Record<string, unknown>[]).map((r): BookingReschedule => ({
@@ -453,6 +462,15 @@ export class PostgresOperationsStore {
     }
   }
 
+  /** Replaces the whole list, as `writeAddOns` does. */
+  private async writeAdjustments(bookingId: string, adjustments: readonly BookingAdjustmentInput[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_adjustments WHERE booking_id = $1', [bookingId]);
+    for (const [seq, a] of adjustments.entries()) {
+      await this.client().query('INSERT INTO booking_adjustments (booking_id, seq, kind, mode, value, label, note) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [bookingId, seq, a.kind, a.mode, a.value, a.label ?? null, a.note ?? null]);
+    }
+  }
+
   /** Replaces the whole list, the same delete-and-insert `writePassengers` does. */
   private async writeAddOns(bookingId: string, addOns: readonly BookingAddOnInput[]): Promise<void> {
     await this.client().query('DELETE FROM booking_addons WHERE booking_id = $1', [bookingId]);
@@ -580,6 +598,7 @@ export class PostgresOperationsStore {
     await this.writeTrips(id, [], planned);
     await this.writePassengers(id, input.passengers ?? []);
     await this.writeAddOns(id, input.add_ons ?? []);
+    await this.writeAdjustments(id, input.adjustments ?? []);
     await this.requestApprovals(id, decision.approvals);
     await this.log(id, createdLine(actor));
     for (const line of decision.history) await this.log(id, line);
@@ -649,6 +668,7 @@ export class PostgresOperationsStore {
     // out, and re-serialising an amendment into it would grow the thing being deleted.
     if (changes.passengers) await this.writePassengers(id, changes.passengers);
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
+    if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
     if (reweighed?.request) await this.requestApprovals(id, [reweighed.request]);
     else if (reweighed) await this.replacePending(id, 'approval');
     for (const line of reweighed?.history ?? []) await this.log(id, line);

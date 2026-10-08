@@ -34,10 +34,6 @@
 
 | Data | State | Where it is |
 |---|---|---|
-| agent rate seasons `[{rt, from, to}]` | **lost on legacy's server** (relational mode drops them) | only in browsers' localStorage `loveandaman_v2` (`sb_agents[].rateSeasons`, `sb_agents_rate_bindings`) |
-| promo contracts | in legacy's DB | `sb_contracts` (`kind = 'promo'`), `sb_contracts__programperiods` |
-| main contracts (rate type per agent) | in legacy's DB | `sb_contracts` (`kind = 'main'`) |
-| adjustments `{kind, mode, value, label, note}` | dropped by our booking save | — |
 | per-trip `rt_ref`, `promo_id`, `ovn_charge`, charter manual price | not columns here | `promo_id` in `sb_bookings__trips`; `rt_ref` lost by legacy too |
 | B2C add-on prices | Love Kingdom's DB | `program_own_addons` |
 
@@ -45,8 +41,7 @@
 
 1. **Contracts:** built (README → "Contracts"); what they leave open is in `contracts-model.md`.
 2. **Agent rate seasons:** built (README → "Rate seasons"); the quote reads `rateTypeFor`.
-3. **Adjustments:** `booking_adjustments (booking_id, seq, kind discount|extra, mode amount|percent,
-   value, label, note)` — a client fact; the discount it yields is computed.
+3. **Adjustments:** built (README → "Adjustments"); the quote computes what they add up to.
 4. **`POST /v1/quote`:** the booking body in, the price out — `{trips: [{subtotal, rate_type_id,
    promo_id}], seat, add_on, foc_discount, discount, extra, total}`. One pure function
    `priceBooking(input, catalogue)` that both stores call. **Characterization test:** re-price

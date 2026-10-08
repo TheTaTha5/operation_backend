@@ -163,6 +163,7 @@ async function main() {
     const legacyBookings = await read('SELECT * FROM sb_bookings');
     const legacyTrips = await read('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx');
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
+    const legacyAdjustments = await read('SELECT * FROM sb_bookings__adjustments ORDER BY sb_bookings_id, idx');
     const legacyAddOns = await read('SELECT sb_bookings_id, type FROM sb_bookings__addons');
     const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
     const legacyFeeItems = await read('SELECT * FROM sb_bookings__feeitems ORDER BY sb_bookings_id, idx');
@@ -366,6 +367,7 @@ async function main() {
       return byBooking;
     };
     const partialCancelsOf = childrenOf(legacyPartialCancels), feeItemsOf = childrenOf(legacyFeeItems), historyOf = childrenOf(legacyHistory);
+    const adjustmentsOf = childrenOf(legacyAdjustments);
     const addOnsOf = new Map<string, string[]>();
     for (const a of legacyAddOns) { const k = str(a.sb_bookings_id); (addOnsOf.get(k) ?? addOnsOf.set(k, []).get(k)!).push(str(a.type)); }
 
@@ -416,7 +418,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
     // Approvals (`legacy-approvals.ts`). Legacy's `licFree` goes to the approval day when this schema keeps it (025).
@@ -548,6 +550,13 @@ async function main() {
         const name = str(p.name);
         if (!name) { note('passengers dropped: no name'); continue; }
         passengers.push({ booking_id: id, seq: seq++, name, nationality: str(p.nationality) || null, type: str(p.type) || null, foc: p.foc ?? null });
+      }
+      // Discounts and extras (migration 031), as legacy saved them: a row that does not fit is dropped and counted.
+      let adjustmentSeq = 0;
+      for (const a of adjustmentsOf.get(legacyId) ?? []) {
+        const kind = str(a.kind), mode = str(a.mode) || 'amount', value = Number(a.value);
+        if ((kind !== 'discount' && kind !== 'extra') || (mode !== 'amount' && mode !== 'percent') || !(value > 0)) { note('adjustments dropped: kind, mode or value does not fit'); continue; }
+        adjustments.push({ booking_id: id, seq: adjustmentSeq++, kind, mode, value, label: str(a.label) || null, note: str(a.note) || null });
       }
     }
 
@@ -817,6 +826,7 @@ async function main() {
     await insert('booking_trip_pax', pax);
     await insert('booking_trip_lock_draws', draws);
     await insert('booking_passengers', passengers);
+    await insert('booking_adjustments', adjustments);
     await insert('booking_cancellations', cancellations);
     await insert('booking_reschedules', reschedules);
     await insert('booking_partial_cancels', partialCancels);

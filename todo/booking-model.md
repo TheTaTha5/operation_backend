@@ -15,14 +15,6 @@ way: `guides {english, russian, chinese, otherLang}` is four columns, not a coll
 
 ## Tables not built yet
 
-### `booking_adjustments`
-
-```
-booking_id → bookings, seq, kind, mode ('amount'|'percent'), value, label, note
-```
-
-With pricing (`pricing-model.md`): who may give a discount is part of it.
-
 ### `booking_attachments`
 
 ```
