@@ -59,7 +59,7 @@ GET    /v1/seat-locks/{id}/log
 POST   /v1/agents, PATCH /v1/agents/{id}, PUT /v1/agents/{id}/programs        (agents.md)
 POST   /v1/agents/{id}/deactivate, /v1/agents/{id}/activate
 PUT    /v1/agents/{id}/rate-bindings
-GET    /v1/contracts, POST /v1/contracts, PATCH /v1/contracts/{id}
+POST   /v1/contracts, PATCH /v1/contracts/{id}           (contracts-model.md)
 GET    /v1/contract-templates, PUT /v1/contract-templates/{id}
 GET    /v1/add-ons                    add-on catalogue (legacy sb_extras)
 GET    /v1/nationalities

@@ -18,6 +18,7 @@ import {
 import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
+import { parseContractListQuery } from '../domain/contracts.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -639,6 +640,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * to their own agents needs their salesperson id in the token, which is not decided yet.
    */
   app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));
+  /** Agents' contracts, read-only (todo/contracts-model.md); any login may read them. */
+  app.get('/v1/contracts', async (request) => ({ contracts: await store.listContracts(parseContractListQuery(request.query as Record<string, unknown>)) }));
+  app.get('/v1/contracts/:id', async (request) => (await store.contract((request.params as { id: string }).id)) ?? notFound('Contract not found'));
   app.get('/v1/sales', async () => ({ sales: await store.listSalesPeople() }));
   app.get('/v1/agents', async (request) => ({ agents: await store.listAgents(agentListQuery(request.query as Record<string, unknown>)) }));
   app.get('/v1/agents/:id', async (request) => (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found'));

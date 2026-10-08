@@ -26,6 +26,7 @@ import {
 } from './booking-approvals.js';
 import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
+import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 
 export type Deployment = {
   boat_id: string;
@@ -358,6 +359,12 @@ export class OperationsStore {
   private salesIds(): Set<string> | undefined {
     return this.directory.sales.length === 0 ? undefined : new Set(this.directory.sales.map((person) => person.id));
   }
+  /** Agents' contracts (migration 029). Empty unless seeded: PostgreSQL gets them from `import:contracts`. */
+  private contracts: Contract[] = [];
+  seedContracts(contracts: readonly Contract[]): void { this.contracts = contracts.map(contractView); }
+  listContracts(query: ContractListQuery): Contract[] { return selectContracts(this.contracts, query).map(contractView); }
+  contract(id: string): Contract | undefined { const found = this.contracts.find((c) => c.id === id); return found && contractView(found); }
+
   /** Staff logins (migration 027), held as the rows PostgreSQL holds. Usernames are unique ignoring case. */
   private users: StoredUser[] = [];
   listUsers(): StoredUser[] { return this.users.map((user) => ({ ...user })).sort((a, b) => a.id - b.id); }

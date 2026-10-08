@@ -43,8 +43,7 @@
 
 ## Proposal, in order (each its own approval and branch)
 
-1. **Contracts:** `contracts` (main and promo) and `contract_program_periods`, imported from
-   `sb_contracts`. Read endpoints.
+1. **Contracts:** built (README → "Contracts"); what they leave open is in `contracts-model.md`.
 2. **Agent rate seasons:** `agent_rate_seasons (agent_id, rate_type_id, from_date, to_date)` plus
    write endpoints (area `sales`). Not imported: sales re-enter the seasons through these endpoints
    (decided 2026-10-09; legacy keeps them only in browsers' localStorage).

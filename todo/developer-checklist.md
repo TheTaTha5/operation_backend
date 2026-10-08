@@ -10,6 +10,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 3. **Import the users — nobody can log in until you do:**
    `SOURCE_DATABASE_URL=<legacy> TARGET_DATABASE_URL=<railway> npm run import:users -- --commit`,
    after the agents import (so the sales staff's `sales_id` connects). Rerun until cutover.
+3b. **Import the contracts:** `npm run import:contracts -- --commit` against Railway, after
+   `sync:routes` and the agents and rate types imports. Rerun until cutover.
 4. **Create Love Kingdom's service user**: `POST /v1/users` with `agent_id: "a_b2c"`,
    `edit_areas: ["operations"]`. Send them the username and password.
 5. **Give `act-approve`** to the staff who approve over the allotment and FOC

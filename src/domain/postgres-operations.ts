@@ -25,6 +25,7 @@ import type { BookingPassenger, BookingPassengerInput } from './booking-passenge
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import { pickupFields } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
+import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -965,6 +966,41 @@ export class PostgresOperationsStore {
     });
     for (const r of transfer) of(r)?.transfer.push({ rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), zone: String(r.zone), vehicle: String(r.vehicle), price: Number(r.price) });
     return [...all.values()];
+  }
+
+  async listContracts(query: ContractListQuery): Promise<Contract[]> { return selectContracts(await this.readContracts(query), query).map(contractView); }
+  async contract(id: string): Promise<Contract | undefined> { const [found] = await this.readContracts({ id }); return found && contractView(found); }
+  /** Contracts with their periods and prices; ordering and the view are `selectContracts`/`contractView`'s. */
+  private async readContracts(filter: ContractListQuery & { id?: string }): Promise<Contract[]> {
+    const { rows } = await this.client().query(
+      `SELECT id, agent_id, kind, status, rate_type_id, active_from::text, active_to::text, priority, version, price_mode, discount_mode,
+              discount_value, bonus_buy, bonus_free, bonus_basis, book_window, created_date::text, created_by, note, doc_id
+       FROM contracts WHERE ($1::text IS NULL OR id = $1) AND ($2::text IS NULL OR agent_id = $2) AND ($3::text IS NULL OR kind = $3) AND ($4::text IS NULL OR status = $4)`,
+      [filter.id ?? null, filter.agentId ?? null, filter.kind ?? null, filter.status ?? null]);
+    if (rows.length === 0) return [];
+    const ids = rows.map((row) => String(row.id));
+    const periods = new Map<string, ContractPeriod[]>(), prices = new Map<string, ContractSeatPrice[]>();
+    for (const p of (await this.client().query(
+      `SELECT contract_id, route_id, book_from::text, book_to::text, travel_from::text, travel_to::text, note
+       FROM contract_program_periods WHERE contract_id = ANY($1::text[]) ORDER BY contract_id, seq`, [ids])).rows) {
+      (periods.get(p.contract_id) ?? periods.set(p.contract_id, []).get(p.contract_id)!)
+        .push({ route_id: p.route_id, book_from: p.book_from, book_to: p.book_to, travel_from: p.travel_from ?? null, travel_to: p.travel_to ?? null, note: p.note ?? null });
+    }
+    for (const p of (await this.client().query(
+      'SELECT contract_id, route_id, zone, category, residency, price FROM contract_seat_prices WHERE contract_id = ANY($1::text[])', [ids])).rows) {
+      (prices.get(p.contract_id) ?? prices.set(p.contract_id, []).get(p.contract_id)!)
+        .push({ route_id: p.route_id, zone: p.zone, category: p.category, residency: p.residency, price: Number(p.price) });
+    }
+    return rows.map((row): Contract => ({
+      id: row.id, agent_id: row.agent_id, kind: row.kind, status: row.status, rate_type_id: row.rate_type_id ?? null,
+      active_from: row.active_from ?? null, active_to: row.active_to ?? null, priority: Number(row.priority), version: row.version ?? null,
+      price_mode: row.price_mode ?? null,
+      discount: row.discount_mode === null ? null : { mode: row.discount_mode, value: Number(row.discount_value) },
+      bonus: row.bonus_buy === null ? null : { buy: Number(row.bonus_buy), free: Number(row.bonus_free), basis: row.bonus_basis ?? null },
+      book_window: row.book_window === true, created_date: row.created_date ?? null, created_by: row.created_by ?? null,
+      note: row.note ?? null, doc_id: row.doc_id ?? null,
+      program_periods: periods.get(row.id) ?? [], seat_prices: prices.get(row.id) ?? [],
+    }));
   }
 
   async listUsers(): Promise<StoredUser[]> { return (await this.client().query('SELECT * FROM users ORDER BY id')).rows.map(storedUser); }
