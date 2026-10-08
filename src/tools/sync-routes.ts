@@ -8,10 +8,14 @@
  * happens inside one transaction on the target, the diff is printed, and the transaction is rolled
  * back. The source is opened read-only either way.
  *
- * Legacy wins for every route it has: the row is updated, and its departure times, seasons and day
- * overrides are replaced by legacy's set — including deletions, so an override ops removed in legacy
- * is removed here. A route only this service has is reported and left alone, never deleted, because
+ * Legacy wins for every route it has: the row is updated, and its departure times are replaced by
+ * legacy's set. A route only this service has is reported and left alone, never deleted, because
  * bookings may refer to it. A legacy row that does not map is skipped and listed, never guessed.
+ *
+ * **The calendar is not legacy's any more** (2026-10-08, `todo/route-calendar-rules-model.md`): it
+ * is edited through `/v1/routes/{id}/seasons` and `/days`. A route new to this service brings its
+ * seasons and day overrides once, so it does not start open every day; after that they are never
+ * overwritten, and where legacy's differ the run only reports it.
  *
  * Needs migration 021 (`routes.kind`, `routes.ext_id`) on the target.
  */
@@ -122,7 +126,8 @@ async function main() {
       for (const id of synced) {
         const o = ours.get(id) ?? new Set<string>(), t = theirs.get(id) ?? new Set<string>();
         const plus = [...t].filter((k) => !o.has(k)).length, minus = [...o].filter((k) => !t.has(k)).length;
-        if (plus || minus) childChanges.push(`${id.padEnd(16)} ${what.padEnd(9)} +${plus} −${minus}`);
+        const kept = what !== 'times' && before.has(id) ? '  (legacy differs; not copied)' : '';
+        if (plus || minus) childChanges.push(`${id.padEnd(16)} ${what.padEnd(9)} +${plus} −${minus}${kept}`);
       }
     }
 
@@ -138,10 +143,12 @@ async function main() {
     };
     await insert('routes', routes, `ON CONFLICT (id) DO UPDATE SET ${ROUTE_FIELDS.map((f) => `${f} = EXCLUDED.${f}`).join(', ')}`);
     const ids = [...synced];
-    for (const table of ['route_times', 'route_seasons', 'route_day_overrides']) await target.query(`DELETE FROM ${table} WHERE route_id = ANY($1::text[])`, [ids]);
+    await target.query('DELETE FROM route_times WHERE route_id = ANY($1::text[])', [ids]);
     await insert('route_times', times);
-    await insert('route_seasons', seasons);
-    await insert('route_day_overrides', overrides);
+    // The calendar is copied for new routes only: an existing route's is edited here now.
+    const isNew = (row: Row) => !before.has(String(row.route_id));
+    await insert('route_seasons', seasons.filter(isNew));
+    await insert('route_day_overrides', overrides.filter(isNew));
 
     const { rows: [after] } = await target.query(`SELECT
       (SELECT count(*) FROM routes)::int routes, (SELECT count(*) FROM routes WHERE kind = 'land')::int land_routes,

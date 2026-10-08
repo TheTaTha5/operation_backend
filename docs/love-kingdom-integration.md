@@ -122,7 +122,8 @@ the decision: `confirmed`, or `rejected`.
 
 ### CS (staff booking for a customer)
 
-1. `GET /v1/availability` for the date. Show `available_seats`.
+1. `GET /v1/availability` for the date. Show `available_seats`. It is `null` on a land route
+   (`unlimited: true`): there is no seat limit to show.
 2. Staff saves → `POST /v1/bookings` with `intent`. On `201`, store our `id` and show our
    `status` (§4). On `409`, show "sold out" and nothing is written.
 3. An edit to date or pax → `PATCH /v1/bookings/{id}` with the full `trips`. It is weighed
@@ -138,7 +139,8 @@ The order is: hold the seats, take payment, then book from the hold.
 1. **Customer clicks "Pay"** → `POST /v1/seat-locks`
    `{ "route_id": "r10", "service_date": "2030-01-04", "pax": 3, "agent_id": "a_b2c" }`.
    - `201` gives a lock `id`. Keep it with the PayPal order.
-   - `409` means sold out. Don't send them to PayPal.
+   - `409` means sold out, or (`code: "route_closed"`) the trip does not run that day. Don't send
+     them to PayPal.
 2. **Payment captured** → `POST /v1/bookings`, with the trip drawing on the lock:
    `"trips": [{ "routeId": "r10", "date": "2030-01-04", "pax": { "ad_fr": 2, "chd_fr": 1 }, "lockDraws": { "<lock id>": 3 } }]`.
    Then `POST /v1/seat-locks/{lockId}/release` to free anything left over. That is a no-op when
@@ -159,7 +161,7 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 | `400` | Bad input: missing field, unknown route or lock, bad pax key, a `status` other than `quote`/`confirmed`, FOC without `focReason` | Bug in the mapping. Log the `message`, and don't retry. |
 | `401` / `403` | No token, or a token without `booking:write` | Fetch a new token. Check the client's scopes. |
 | `404` | Booking or lock id not found | |
-| `409` | Seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, or the state changed. Show it to the user, and don't retry blindly. |
+| `409` | The route does not run that day (`route_closed`), seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, closed, or the state changed. Show it to the user, and don't retry blindly. |
 | `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |
 
 ## 7. Known gaps, read before going live

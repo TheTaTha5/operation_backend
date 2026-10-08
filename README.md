@@ -39,7 +39,7 @@ npm run dev
 | `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
-| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes, times, seasons, day overrides) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes and times) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. Seasons and day overrides are copied only for a route new to this service; after that the calendar is edited here (see "Editing the calendar"), and the run only reports where legacy's differs. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:boats [-- --commit]` | Copy the boat catalogue from the legacy database, the same way: dry run unless `--commit`, legacy wins, never deletes. Legacy's `totalcap` is never read, and a boat selling more seats than its licence is skipped and listed, not clamped. Run the import afterwards so deployments pick up new or changed boats. |
 
 Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed, with line endings normalized to LF so a Windows checkout (`core.autocrlf`) and a Railway build agree: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
@@ -109,6 +109,8 @@ Reference data every other endpoint refers to by id.
   decided it. The range is capped at 400 days, and `from`/`to` must be supplied together.
   Each route is `{ id, name, kind, ext_id?, pier?, family_id?, color?, islands?, sort?, times }`.
   `kind=marine` or `kind=land` lists only that kind (`400` for anything else).
+  Each route also carries its calendar as stored, for the screen that edits it:
+  `seasons: [{ id, kind, from_date, to_date }]` by start date, and `overrides: [{ service_date, kind }]`.
 - `GET /v1/boats` — the boat catalogue: `{ id, name, type?, pier?, capacity, license_pax,
   charter_ceiling, crew? }`.
 
@@ -141,6 +143,32 @@ own bookings (`LOV-…`) are checked like any other.
 
 Seasons may overlap; the one that starts first decides a day, as in legacy.
 
+#### Editing the calendar
+
+Legacy's Settings → Programs, as an API. The calendar is edited here and only here: `sync:routes`
+no longer copies it from legacy. Every write needs `operations:write`.
+
+- `POST /v1/routes/{id}/seasons` `{ kind: "open"|"closed", from_date, to_date, close_anyway? }` →
+  `201` with the season and its `id`. A season is added or deleted, never edited, as in legacy.
+  Overlaps are allowed.
+- `DELETE /v1/routes/{id}/seasons/{season_id}[?close_anyway=true]` → `204`.
+- `PUT /v1/routes/{id}/days/{date}` `{ kind: "open"|"closed", close_anyway? }` → `200` with the
+  override: that day is open or closed whatever the seasons say.
+- `DELETE /v1/routes/{id}/days/{date}[?close_anyway=true]` → `204`: the seasons decide it again.
+
+**Closing a day that holds something.** Any change that turns a day from open to closed while it
+holds a booking (any status but `cancelled`, `rejected`, `cancelled_weather`) or a deployed boat,
+from today (Thai time) on, is `409` with `code: "bookings_on_closed_day"` and a message listing them:
+`This closes days on r3 that hold 2 bookings (BK-1 on 2027-01-04, …) and 1 boat deployment (…).`
+Send it again with `close_anyway: true` (a query parameter on `DELETE`) to close them anyway; the
+bookings stay as they are. This is legacy's "Close anyway" dialog. Legacy only asks when a closed
+season is added or a day is toggled closed; here it is asked for every change that can close a day,
+including an open season added to a route that had none (which closes every date outside it) and a
+deleted open season.
+
+`400` for a bad `kind` or date, or `to_date` before `from_date`; `404` for an unknown route, season,
+or a day with no override to remove.
+
 #### Land routes and days with no boat
 
 Both sell without a seat check, as legacy does (`hasAllotment` false):
@@ -154,8 +182,8 @@ Both sell without a seat check, as legacy does (`hasAllotment` false):
 
 Seats drawn from a lock are still limited by the lock, and a charter still needs its boat deployed.
 
-The route and boat catalogues are still edited in legacy. `npm run sync:routes` and
-`npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
+Routes and boats are still edited in legacy (the calendar is not: see "Editing the calendar").
+`npm run sync:routes` and `npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
 Commands). A boat missing here is not just a missing row: the import skips every deployment on it,
 so its seats are absent from `GET /v1/availability`. Run `sync:boats` before the import.
 

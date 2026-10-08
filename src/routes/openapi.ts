@@ -232,13 +232,47 @@ const seatLock = {
 };
 
 const idParam = { type: 'object', required: ['id'], properties: { id: { type: 'string' } } };
+const calendarKindSchema = { type: 'string', enum: ['open', 'closed'] };
+const calendarSeason = { type: 'object', properties: { id: { type: 'string' }, kind: calendarKindSchema, from_date: isoDate, to_date: isoDate } };
 
 export const docs = {
   routes: {
     tags: ['Catalogue'], summary: 'List routes (programmes)', security: BEARER,
     description: 'The route ids a booking trip must use. With `from` and `to`, each route carries its operating calendar per day. `kind=marine` lists boat programmes only; `kind=land` lists transfers, tours and tickets.',
     querystring: { type: 'object', properties: { from: isoDate, to: isoDate, kind: { type: 'string', enum: ['marine', 'land'] } } },
-    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, kind: { type: 'string', enum: ['marine', 'land'] }, ext_id: { type: 'string', description: 'Love Kingdom product code, e.g. PTP-005:VT-002' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } } } } } } }, 400: err('Bad date range or kind'), ...UNAUTHORIZED },
+    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: {
+      id: { type: 'string' }, name: { type: 'string' }, kind: { type: 'string', enum: ['marine', 'land'] }, ext_id: { type: 'string', description: 'Love Kingdom product code, e.g. PTP-005:VT-002' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } },
+      seasons: { type: 'array', description: 'The calendar as stored, by start date. Overlaps are allowed; the one that starts first decides a day.', items: calendarSeason },
+      overrides: { type: 'array', description: 'Single days that beat any season, by date.', items: { type: 'object', properties: { service_date: isoDate, kind: calendarKindSchema } } },
+    } } } } }, 400: err('Bad date range or kind'), ...UNAUTHORIZED },
+  },
+  addSeason: {
+    tags: ['Catalogue'], summary: 'Add an open or closed season to a route', security: BEARER,
+    description: 'Legacy\'s Settings → Programs "add season". Needs `operations:write`. Seasons may overlap. A season that closes a day holding bookings or a deployed boat (from today on) is `409 bookings_on_closed_day`, listing them, unless the body says `close_anyway: true`.',
+    params: idParam,
+    body: { type: 'object', required: ['kind', 'from_date', 'to_date'], properties: { kind: calendarKindSchema, from_date: isoDate, to_date: isoDate, close_anyway: { type: 'boolean', default: false } } },
+    response: { 201: calendarSeason, 400: err('Bad kind or dates'), 404: err('Route not found'), 409: err('Closes days that hold bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  deleteSeason: {
+    tags: ['Catalogue'], summary: 'Delete a season', security: BEARER,
+    description: 'Needs `operations:write`. Deleting an open season can close days; then the same `409 bookings_on_closed_day` applies, and `?close_anyway=true` overrides it.',
+    params: { type: 'object', properties: { id: { type: 'string' }, season_id: { type: 'string' } } },
+    querystring: { type: 'object', properties: { close_anyway: { type: 'boolean' } } },
+    response: { 204: { type: 'null', description: 'Deleted' }, 404: err('Route or season not found'), 409: err('Closes days that hold bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  setDay: {
+    tags: ['Catalogue'], summary: 'Open or close one day, whatever the seasons say', security: BEARER,
+    description: 'Needs `operations:write`. Replaces any override on that day. Closing a day that holds bookings or a deployed boat is `409 bookings_on_closed_day` unless `close_anyway: true`.',
+    params: { type: 'object', properties: { id: { type: 'string' }, date: isoDate } },
+    body: { type: 'object', required: ['kind'], properties: { kind: calendarKindSchema, close_anyway: { type: 'boolean', default: false } } },
+    response: { 200: { type: 'object', properties: { route_id: { type: 'string' }, service_date: isoDate, kind: calendarKindSchema } }, 400: err('Bad kind or date'), 404: err('Route not found'), 409: err('Closes a day that holds bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  clearDay: {
+    tags: ['Catalogue'], summary: 'Remove a day\'s override, so the seasons decide it again', security: BEARER,
+    description: 'Needs `operations:write`. Removing an override that opened a day can close it; then `?close_anyway=true` is needed if it holds bookings or a deployed boat.',
+    params: { type: 'object', properties: { id: { type: 'string' }, date: isoDate } },
+    querystring: { type: 'object', properties: { close_anyway: { type: 'boolean' } } },
+    response: { 204: { type: 'null', description: 'Removed' }, 404: err('Route not found, or no override that day'), 409: err('Closes a day that holds bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
   },
   availability: {
     tags: ['Availability'], summary: 'Seats left on a route and day, or over a range', security: BEARER,

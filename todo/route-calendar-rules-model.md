@@ -144,3 +144,37 @@ new data"; each is the developer's call):
 | Q6 overlapping seasons | saved, earliest wins silently | refused (only once writes exist, Q7) |
 | Q7 Settings → Programs | editable | read-only until the catalogue cutover |
 | P2 land routes, P3 no boat | saves | saves; no change from legacy (refused here today) |
+
+## Built — 2026-10-08
+
+Branch `feat/route-calendar-rules`. As decided above, with these choices made while building:
+
+- **Field names follow the stored shape:** a season is `{ kind, from_date, to_date }` and a day is
+  `{ kind }`, as `GET /v1/routes?from=&to=` and the tables already name them (not legacy's
+  `type`/`from`/`to` or the note's `status`).
+- **`GET /v1/routes` carries each route's `seasons` (with ids) and `overrides`,** because the
+  Settings screen deletes a season by id and lists the overrides.
+- **Calendar writes need `operations:write`,** like deployments: a `config` area does not exist
+  until `todo/login-permissions-model.md` is built.
+- **The impact check counts deployed boats too,** as legacy's `progCountBookingImpact` does, and
+  only days from today (Thai time) on: deleting an old season must not be blocked by last year's
+  bookings.
+- **`sync:routes` copies the calendar for new routes only** and reports where legacy's differs.
+- **Tests on PostgreSQL:** the seeded calendars end by 2027 and the suite books from 2028, so
+  `test/setup.ts` opens 2028–2099 on the seeded routes and adds `test-land` and `test-calendar`.
+
+Client changes owed (`wt-operation-backend-integration`):
+
+1. **Settings → Programs** calls the four endpoints instead of `save('config')`. On
+   `409 bookings_on_closed_day` it shows its existing impact modal and resends with
+   `close_anyway: true`. Legacy's toggle maps to `PUT …/days/{date}` (set the opposite) or
+   `DELETE` (clear an override). `r.seasons` and `r.overrides` come from `GET /v1/routes`
+   (`kind` → `type`, `from_date` → `from`, `to_date` → `to`).
+2. **Narrow `bookingV2CommitBooking`'s closed-day guard** to added or moved trips (question 2), or
+   the lighter server rule is never seen.
+3. **`mapRoute` keeps `kind`,** and the client stops deciding land from `dailyCap`.
+4. **Read `unlimited` and `unplaced_pax`;** `available_seats: null` means no limit, not 0.
+5. **Restore** must not void the cancellation-fee invoice before the server has answered.
+
+Love Kingdom: a booking or lock on a closed day is now `409 route_closed`
+(`docs/love-kingdom-integration.md`).

@@ -1,4 +1,4 @@
-import { assertRoutesOpen, eachDate, isLegacyB2C, routeCalendar, type Route, type RouteDate, type RouteDayOverride, type RouteSeason } from './calendar.js';
+import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, isLegacyB2C, routeCalendar, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
@@ -427,6 +427,28 @@ export class OperationsStore {
   listDayOverrides(from?: string, to?: string): RouteDayOverride[] {
     return this.catalogue.overrides.filter((o) => (!from || o.service_date >= from) && (!to || o.service_date <= to)).map((o) => ({ ...o }));
   }
+
+  /**
+   * One edit to a route's calendar (`applyCalendarChange`), refused when it would close a day that
+   * holds bookings or a boat from `today` on, unless `closeAnyway` (`assertCloseAllowed`). Unseeded,
+   * any route id is accepted, as bookings accept any.
+   */
+  changeCalendar(routeId: string, change: CalendarChange, closeAnyway: boolean, today: string): void {
+    if (this.catalogue.routes.length > 0 && !this.catalogue.routes.some((route) => route.id === routeId)) refuse('Route not found', 404);
+    const seasons = this.catalogue.seasons.filter((s) => s.route_id === routeId);
+    const overrides = this.catalogue.overrides.filter((o) => o.route_id === routeId);
+    const next = applyCalendarChange(seasons, overrides, change);
+    const holds: CalendarHold[] = [];
+    for (const booking of this.bookings.values()) {
+      if (!holdsSeats(booking.status)) continue;
+      for (const trip of booking.trips) if (trip.route_id === routeId && trip.service_date >= today) holds.push({ service_date: trip.service_date, booking_ref: booking.voucher_ref ?? booking.id });
+    }
+    for (const d of this.deployments) if (d.route_id === routeId && d.service_date >= today) holds.push({ service_date: d.service_date, boat_id: d.boat_id });
+    assertCloseAllowed(routeId, routeCalendar(seasons, overrides), routeCalendar(next.seasons, next.overrides), holds, closeAnyway);
+    this.catalogue.seasons = [...this.catalogue.seasons.filter((s) => s.route_id !== routeId), ...next.seasons];
+    this.catalogue.overrides = [...this.catalogue.overrides.filter((o) => o.route_id !== routeId), ...next.overrides];
+  }
+  newSeasonId(): string { return this.id('season'); }
 
   async transaction<T>(work: () => T | Promise<T>): Promise<T> {
     const prior = this.tail;

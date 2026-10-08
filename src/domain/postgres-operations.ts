@@ -10,13 +10,13 @@ import {
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  confirmationStamp, planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
+  confirmationStamp, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
 import { SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
-import { assertRoutesOpen, eachDate, routeCalendar, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
+import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, routeCalendar, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
 import {
   BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
   type BookingHeader,
@@ -794,6 +794,44 @@ export class PostgresOperationsStore {
     return rowCount === 0 ? undefined : (await this.readLocks({ id }))[0];
   }
   async allotment(routeId: string, date: string, exclude: Exclusion = {}): Promise<Capacity & { route_id: string; service_date: string; deployments: Deployment[] }> { return { route_id: routeId, service_date: date, ...(await this.capacity(routeId,date,exclude)), deployments: await this.listDeployments(date,date,routeId) }; }
+
+  /**
+   * One edit to a route's calendar: the rules are `applyCalendarChange` and `assertCloseAllowed`, and
+   * this gathers the rows and writes the result. The route's row is locked first, so two edits to
+   * one route cannot both judge the calendar as it was before the other.
+   */
+  async changeCalendar(routeId: string, change: CalendarChange, closeAnyway: boolean, today: string): Promise<void> {
+    const { rows: [route] } = await this.client().query('SELECT id FROM routes WHERE id = $1 FOR UPDATE', [routeId]);
+    if (!route) refuse('Route not found', 404);
+    const { rows: seasons } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons WHERE route_id = $1', [routeId]);
+    const { rows: overrides } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE route_id = $1', [routeId]);
+    const current = { seasons: seasons.map(season), overrides: overrides.map(dayOverride) };
+    const next = applyCalendarChange(current.seasons, current.overrides, change);
+    const { rows: trips } = await this.client().query(
+      `SELECT DISTINCT t.service_date::text AS service_date, COALESCE(b.voucher_ref, b.id) AS booking_ref
+       FROM booking_trips t JOIN bookings b ON b.id = t.booking_id
+       WHERE t.route_id = $1 AND t.service_date >= $2 AND b.status <> ALL($3::text[])`, [routeId, today, [...SEAT_RELEASING_STATUSES]]);
+    const { rows: boats } = await this.client().query('SELECT service_date::text AS service_date, boat_id FROM deployments WHERE route_id = $1 AND service_date >= $2', [routeId, today]);
+    const holds: CalendarHold[] = [
+      ...trips.map((row) => ({ service_date: String(row.service_date), booking_ref: String(row.booking_ref) })),
+      ...boats.map((row) => ({ service_date: String(row.service_date), boat_id: String(row.boat_id) })),
+    ];
+    assertCloseAllowed(routeId, routeCalendar(current.seasons, current.overrides), routeCalendar(next.seasons, next.overrides), holds, closeAnyway);
+    switch (change.op) {
+      case 'add-season': {
+        const s = change.season;
+        await this.client().query('INSERT INTO route_seasons (id, route_id, kind, from_date, to_date) VALUES ($1,$2,$3,$4,$5)', [s.id, routeId, s.kind, s.from_date, s.to_date]);
+        break;
+      }
+      case 'delete-season': await this.client().query('DELETE FROM route_seasons WHERE id = $1 AND route_id = $2', [change.season_id, routeId]); break;
+      case 'set-day':
+        await this.client().query(`INSERT INTO route_day_overrides (route_id, service_date, kind) VALUES ($1,$2,$3)
+          ON CONFLICT (route_id, service_date) DO UPDATE SET kind = EXCLUDED.kind`, [routeId, change.override.service_date, change.override.kind]);
+        break;
+      case 'clear-day': await this.client().query('DELETE FROM route_day_overrides WHERE route_id = $1 AND service_date = $2', [routeId, change.service_date]); break;
+    }
+  }
+  newSeasonId(): string { return `season_${randomUUID()}`; }
 
   /** Reference data. Dates are cast in SQL so the driver never hands back a Date to re-render. */
   async listRoutes(): Promise<Route[]> {

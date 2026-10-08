@@ -7,7 +7,9 @@
  * route; a test about the calendar closes its own days with a day override, which beats a season.
  *
  * It also adds `test-land`, a land route, because the seed has none and the land-route rules need
- * one to run against.
+ * one to run against; and `test-calendar`, a marine route with no seasons, which only the calendar
+ * write tests touch: test files run in parallel, and a season added there must not close a day
+ * another file books.
  *
  * Fixed ids and `ON CONFLICT DO NOTHING`, because every test file runs it in its own process.
  */
@@ -17,9 +19,10 @@ const url = process.env.DATABASE_URL;
 if (url) {
   const pool = new pg.Pool({ connectionString: url });
   try {
-    await pool.query(`INSERT INTO routes (id, name, kind) VALUES ('test-land', 'Test land transfer', 'land') ON CONFLICT (id) DO NOTHING`);
+    await pool.query(`INSERT INTO routes (id, name, kind) VALUES ('test-land', 'Test land transfer', 'land'), ('test-calendar', 'Test calendar', 'marine')
+      ON CONFLICT (id) DO NOTHING`);
     await pool.query(`INSERT INTO route_seasons (id, route_id, kind, from_date, to_date)
-      SELECT 'test-open-' || id, id, 'open', '2028-01-01', '2099-12-31' FROM routes WHERE kind = 'marine'
+      SELECT 'test-open-' || id, id, 'open', '2028-01-01', '2099-12-31' FROM routes WHERE kind = 'marine' AND id NOT LIKE 'test-%'
       ON CONFLICT (id) DO NOTHING`);
   } finally {
     await pool.end();
