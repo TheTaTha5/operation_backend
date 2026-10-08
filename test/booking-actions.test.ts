@@ -356,14 +356,16 @@ test('a charter keeps its boat when rescheduled', async () => {
   assert.equal(await seatsLeft('r2', to), 0, 'the new day lost it');
 });
 
-test('a reschedule clears the moved trip\'s day-of-operations data', { skip: !url && 'PostgreSQL only: the in-process store holds no trip operations' }, async () => {
+test('a reschedule clears the moved trip\'s day-of-operations data, but its pier note', async () => {
   const [day, to] = ['2037-03-25', '2037-03-26'];
   await deploy('r1', day, 20); await deploy('r1', to, 20);
   const booking = await create({ route_id: 'r1', service_date: day, pax: 2 });
   const trip = booking.trips[0].id as string;
-  await pool!.query(`INSERT INTO booking_trip_operations (booking_trip_id, pickup_time_final) VALUES ($1, '07:15')`, [trip]);
-  assert.equal((await request('POST', `/v1/bookings/${booking.id}/reschedule`, { from_date: day, to_date: to, reason: 'x' })).statusCode, 200);
-  assert.equal((await pool!.query('SELECT count(*)::int AS n FROM booking_trip_operations WHERE booking_trip_id = $1', [trip])).rows[0].n, 0);
+  assert.equal((await request('PATCH', `/operations/trip-ops/${trip}`, { pickup_time_final: '07:15', pier_note: 'gate 2' })).statusCode, 200);
+  const moved = await request('POST', `/v1/bookings/${booking.id}/reschedule`, { from_date: day, to_date: to, reason: 'x' });
+  assert.equal(moved.statusCode, 200);
+  const ops = moved.json().trips[0].operations;
+  assert.deepEqual([ops.pickup_time_final, ops.pier_note?.text], [null, 'gate 2'], 'legacy bkOpsClear keeps the pier note');
 });
 
 test('a reschedule or partial cancel is refused on a closed booking', async () => {

@@ -6,7 +6,7 @@ import { Authenticator } from '../auth.js';
 import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserPatch, password, userView, verifyPassword, type StoredUser } from '../domain/users.js';
 import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
-import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
+import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
@@ -20,6 +20,8 @@ import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
+import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
@@ -803,6 +805,25 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       } as BookingHeaderPatch,
     };
   }
+
+  /**
+   * Dispatch for one departure (todo/trip-ops-and-vans-model.md, slice A1): the boat, or boats it is
+   * split across, the final pickup time, `return_same_van` and the pier note. An absent field is
+   * unchanged and `null` clears it. Answers the trip with its `operations`.
+   */
+  app.patch('/operations/trip-ops/:trip_id', async (request) => {
+    const tripId = (request.params as { trip_id: string }).trip_id;
+    const patch = parseDispatchPatch(record(request.body));
+    return store.transaction(async () => {
+      const found = (await store.tripForDispatch(tripId)) ?? notFound('Trip not found');
+      if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(found.booking.status)) {
+        refuseWith(`Booking ${found.booking.id} is ${found.booking.status}: its dispatch cannot change`, 409, 'cancelled');
+      }
+      const next = applyDispatch(found.dispatch, patch, { pax: parsePaxGrid(found.trip.pax), deployedBoats: found.deployedBoats, now: new Date().toISOString(), by: actorOf(request.user) ?? null });
+      await store.setDispatch(tripId, next);
+      return { trip: (await store.tripForDispatch(tripId))!.trip, warnings: [] };
+    });
+  });
 
   /** Agents' contracts, read-only (todo/contracts-model.md); any login may read them. */
   app.get('/v1/contracts', async (request) => ({ contracts: await store.listContracts(parseContractListQuery(request.query as Record<string, unknown>)) }));

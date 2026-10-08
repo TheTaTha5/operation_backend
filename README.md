@@ -1388,6 +1388,38 @@ refuses; `404` for an unknown `booking_id`. A booking is priced by this same rul
 `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/build-quote-fixture.ts`. It lists what
 it could not reproduce and why.
 
+### Dispatch: boats, final pickup, pier note
+
+Every trip in a booking read carries its day-of-operations dispatch as `operations`, always present
+and empty until set:
+
+```jsonc
+"operations": { "boat_id": "b2", "boat_splits": [], "boat_pulled": false,
+  "pickup_time_final": "06:40", "pickup_time_final_end": null, "pickup_final_at_pier": false, "return_same_van": false,
+  "pier_note": { "text": "Late, call guide", "at": "2026-09-12T05:50:00.000Z", "by": "Ploy" } }
+```
+
+`PATCH /operations/trip-ops/{trip_id}` sets it (the `operations` edit area). An absent field is
+unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
+
+| Field | Meaning |
+|---|---|
+| `boat_id` | The boat the whole trip goes on. It must be deployed on the trip's route that day, else `409 boat_not_deployed` |
+| `boat_splits` | `[{boat_id, ad, chd, inf, foc}]`: the trip split across two boats or more (each deployed), whose passengers add up to the trip's. Send `boat_id` or `boat_splits`, not both; a split clears `boat_id` |
+| `pickup_time_final`, `pickup_time_final_end`, `pickup_final_at_pier` | The dispatcher's final pickup, a time, a window or a pier deadline, by the same rules as a trip's pickup |
+| `return_same_van` | The group comes back on the van it went out on |
+| `pier_note` | Text; the server stamps `at` and `by` (the login) |
+
+- `boat_pulled` (computed) is `true` when a boat the trip is on no longer sails on its route that day:
+  legacy's "boat pulled · re-plan".
+- **A trip moved** to another route or day (an edit or a reschedule) loses its dispatch, which was
+  arranged for the old departure, but keeps its pier note (legacy `bkOpsClear`). **A change of
+  passengers** clears a boat split, which no longer adds up.
+- A cancelled or rejected booking's dispatch cannot change (`409 cancelled`); an unknown trip is `404`.
+- The legacy import brings each active booking's boat, boat split, final pickup and pier note.
+
+Vans and van groups, reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+
 ### Agent seat locks
 
 - `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).

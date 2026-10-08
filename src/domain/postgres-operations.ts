@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds,
   licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
@@ -25,6 +25,7 @@ import type { BookingPassenger, BookingPassengerInput } from './booking-passenge
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import { pickupFields } from './pickup.js';
+import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
@@ -92,6 +93,12 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'zone', t.zone, 'pickup_time', t.pickup_time, 'pickup_time_end', t.pickup_time_end, 'pickup_at_pier', t.pickup_at_pier, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
       'ovn_charge', t.ovn_charge, 'charter_price_mode', t.charter_price_mode, 'charter_price_manual', t.charter_price_manual, 'charter_price_note', t.charter_price_note,
       'subtotal', t.subtotal, 'rate_type_id', t.rate_type_id, 'promo_id', t.promo_id,
+      'dispatch', (SELECT jsonb_build_object('boat_id', o.boat_id, 'pickup_time_final', o.pickup_time_final, 'pickup_time_final_end', o.pickup_time_final_end,
+          'pickup_final_at_pier', o.pickup_final_at_pier, 'return_same_van', o.return_same_van, 'pier_note', o.pier_note, 'pier_note_at', o.pier_note_at, 'pier_note_by', o.pier_note_by)
+        FROM booking_trip_operations o WHERE o.booking_trip_id = t.id),
+      'boat_splits', COALESCE((SELECT jsonb_agg(jsonb_build_object('boat_id', s.boat_id, 'ad', s.ad, 'chd', s.chd, 'inf', s.inf, 'foc', s.foc) ORDER BY s.idx)
+        FROM booking_trip_boat_splits s WHERE s.booking_trip_id = t.id), '[]'::jsonb),
+      'deployed', COALESCE((SELECT jsonb_agg(d.boat_id) FROM deployments d WHERE d.route_id = t.route_id AND d.service_date = t.service_date), '[]'::jsonb),
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -229,7 +236,25 @@ const cancellation = (c: Record<string, unknown>): BookingCancellation => ({
   category: String(c.category), group: c.group as CancelGroup, note: textOrNull(c.note), charge_type: c.charge_type as ChargeType,
   charge_amount: Number(c.charge_amount), at: jsonInstant(c.at), by: textOrNull(c.by),
 });
-const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
+/** A trip's dispatch from the booking query (migration 033), as `dispatchView` reads it. */
+const storedDispatch = (trip: Record<string, unknown>): StoredDispatch | undefined => {
+  const d = trip.dispatch as Record<string, unknown> | null;
+  const splits = (trip.boat_splits as Record<string, unknown>[]).map((s): BoatSplit => ({ boat_id: String(s.boat_id), ad: Number(s.ad), chd: Number(s.chd), inf: Number(s.inf), foc: Number(s.foc) }));
+  if (!d && splits.length === 0) return undefined;
+  return {
+    boat_id: (d?.boat_id as string | null) ?? null, boat_splits: splits,
+    pickup_time_final: (d?.pickup_time_final as string | null) ?? null, pickup_time_final_end: (d?.pickup_time_final_end as string | null) ?? null,
+    pickup_final_at_pier: d?.pickup_final_at_pier === true, return_same_van: d?.return_same_van === true,
+    pier_note: d?.pier_note ? { text: String(d.pier_note), at: jsonInstant(d.pier_note_at), by: (d.pier_note_by as string | null) ?? null } : null,
+  };
+};
+const booking = (row: QueryResultRow): Booking => {
+  const raw = new Map((row.trips as Record<string, unknown>[]).map((t) => [String(t.id), t]));
+  return bookingView(stored(row), (trip) => {
+    const t = raw.get(trip.id)!;
+    return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []));
+  });
+};
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
 
 const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
@@ -430,9 +455,15 @@ export class PostgresOperationsStore {
     if (removed.length > 0) await this.client().query('DELETE FROM booking_trips WHERE booking_id = $1 AND id = ANY($2::text[])', [bookingId, removed]);
     const moved = movedTripIds(current, planned);
     if (moved.length > 0) {
+      // Legacy `bkOpsClear`: the dispatch was arranged for the old departure, so it goes; the pier note stays.
       await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = ANY($1::text[])', [moved]);
-      await this.client().query('DELETE FROM booking_trip_operations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+      await this.client().query('DELETE FROM booking_trip_boat_splits WHERE booking_trip_id = ANY($1::text[])', [moved]);
+      await this.client().query(`UPDATE booking_trip_operations SET boat_id = NULL, pickup_time_final = NULL, pickup_time_final_end = NULL,
+        pickup_final_at_pier = false, return_same_van = false WHERE booking_trip_id = ANY($1::text[])`, [moved]);
     }
+    // A boat split no longer adds up once the trip's passengers change, so it is cleared (decided 2026-10-06).
+    const repaxed = paxChangedTripIds(current, planned);
+    if (repaxed.length > 0) await this.client().query('DELETE FROM booking_trip_boat_splits WHERE booking_trip_id = ANY($1::text[])', [repaxed]);
     const existing = new Set(current.map((trip) => trip.id).filter((id) => keep.has(id)));
     // `UNIQUE (booking_id, seq)` is checked row by row, so reordering in place would collide halfway
     // through a swap. The kept rows are first moved above every position the new list uses.
@@ -1069,6 +1100,29 @@ export class PostgresOperationsStore {
       note: row.note ?? null, doc_id: row.doc_id ?? null,
       program_periods: periods.get(row.id) ?? [], seat_prices: prices.get(row.id) ?? [],
     }));
+  }
+
+  /** The trip, its booking and its dispatch as stored, for a dispatch write; undefined for an unknown trip. */
+  async tripForDispatch(tripId: string): Promise<{ booking: Booking; trip: Booking['trips'][number]; dispatch: StoredDispatch | undefined; deployedBoats: Set<string> } | undefined> {
+    const { rows: [row] } = await this.client().query('SELECT booking_id FROM booking_trips WHERE id = $1', [tripId]);
+    if (!row) return undefined;
+    const { rows: [full] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [row.booking_id]);
+    const view = booking(full);
+    const raw = (full.trips as Record<string, unknown>[]).find((t) => t.id === tripId)!;
+    return { booking: view, trip: view.trips.find((t) => t.id === tripId)!, dispatch: storedDispatch(raw), deployedBoats: new Set((raw.deployed as string[]) ?? []) };
+  }
+  /** Writes a trip's dispatch whole: its row in booking_trip_operations and its boat splits. */
+  async setDispatch(tripId: string, d: StoredDispatch): Promise<void> {
+    await this.client().query(`INSERT INTO booking_trip_operations (booking_trip_id, boat_id, pickup_time_final, pickup_time_final_end, pickup_final_at_pier,
+        return_same_van, pier_note, pier_note_at, pier_note_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT (booking_trip_id) DO UPDATE SET boat_id = EXCLUDED.boat_id, pickup_time_final = EXCLUDED.pickup_time_final,
+        pickup_time_final_end = EXCLUDED.pickup_time_final_end, pickup_final_at_pier = EXCLUDED.pickup_final_at_pier, return_same_van = EXCLUDED.return_same_van,
+        pier_note = EXCLUDED.pier_note, pier_note_at = EXCLUDED.pier_note_at, pier_note_by = EXCLUDED.pier_note_by`,
+      [tripId, d.boat_id, d.pickup_time_final, d.pickup_time_final_end, d.pickup_final_at_pier, d.return_same_van, d.pier_note?.text ?? null, d.pier_note?.at ?? null, d.pier_note?.by ?? null]);
+    await this.client().query('DELETE FROM booking_trip_boat_splits WHERE booking_trip_id = $1', [tripId]);
+    for (const [idx, s] of d.boat_splits.entries()) {
+      await this.client().query('INSERT INTO booking_trip_boat_splits (booking_trip_id, idx, boat_id, ad, chd, inf, foc) VALUES ($1,$2,$3,$4,$5,$6,$7)', [tripId, idx, s.boat_id, s.ad, s.chd, s.inf, s.foc]);
+    }
   }
 
   async listUsers(): Promise<StoredUser[]> { return (await this.client().query('SELECT * FROM users ORDER BY id')).rows.map(storedUser); }

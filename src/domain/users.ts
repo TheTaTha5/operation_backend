@@ -75,6 +75,8 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-locks')) return { kind: 'area', areas: ['operations'] };
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).
   if (path.startsWith('/operations/deployments')) return { kind: 'area', areas: ['operations', 'fleet'] };
+  // Dispatch: which boat and van a trip goes on, its final pickup, the pier note.
+  if (path.startsWith('/operations/trip-ops/')) return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
   if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   return { kind: 'admin' };
