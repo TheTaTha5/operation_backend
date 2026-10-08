@@ -34,7 +34,7 @@ commands"), checked against a local operation-backend in 12 scenarios:
 
 ## Run it locally
 
-From `D:\projects\operation-backend` (branch `chore/docker-local` until it is merged):
+From `D:\projects\operation-backend`, on `main`:
 
 ```bash
 docker compose up -d --build                  # API :3000, this app :8791, PostgreSQL :55433
@@ -171,9 +171,9 @@ makes this more likely.
   records the token's user. Reasons go in `note`.
 - **Show the server's message as it is.** Errors are `{ statusCode, code, error, message }`, and the
   message is written for staff. `O.fail` already shows it.
-- **Known server gap:** on operation-backend `main`, a create resent with the same `external_id`
-  answers `500`, not "already exists". The fix is on the unmerged branch
-  `fix/duplicate-external-id`. Don't build retry logic that relies on either answer yet.
+- **A create resent with the same `external_id`** (a retry after a timeout) is `409` with
+  `code: "duplicate_external_id"` and the existing booking's id in the message. Nothing is written
+  twice. Read that booking instead of creating it again.
 - **Commit style** in this repo: one sentence saying what changed for the user, then a `(§tag)`, e.g.
   `Bookings: the server decides the status, through its commands (opsAuthority)`. Mark code with the
   same `§tag` and a date in comments.

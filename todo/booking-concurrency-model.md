@@ -3,10 +3,9 @@
 - **Source:** wt-lk-inbox@658298d — `01-auth-sync.js` `save`, `laDiffToOps`, `_laTryRefresh`;
   `server.js` `restTxn`, `restApplyOp`; `08-app.js` `bkV2SetEditLock`, `bkV2GenerateBookingCode`,
   `bkV2CommitBooking`, `bkV2FindDuplicateBookings`.
-- **Already here:** nothing. ~~A duplicate `external_id` is `409 duplicate_external_id` naming the
-  booking (fixed 2026-10-07).~~ **Corrected 2026-10-08:** that fix is on branch
-  `fix/duplicate-external-id` (`6abb2f1`) and was never merged, so `main` still answers `500` and
-  the in-process store still creates a second booking.
+- **Already here:** a duplicate `external_id` is `409 duplicate_external_id` naming the booking, in
+  both stores. Written 2026-10-07 on `fix/duplicate-external-id` (`6abb2f1`), merged 2026-10-08
+  (`83a8848`). Nothing else.
 
 ## What legacy does
 
