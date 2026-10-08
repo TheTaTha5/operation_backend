@@ -28,6 +28,45 @@ npm run db:migrate
 npm run dev
 ```
 
+## Run locally with Docker
+
+`docker-compose.yml` runs PostgreSQL 18 (as on Railway), the API, built by `Dockerfile` the way
+Railway builds it and migrated on start, and the legacy app from the integration worktree.
+
+```bash
+docker compose up -d --build                 # API on :3000 (docs on /docs), legacy app on :8791
+docker compose --profile pull run --rm pull  # copy Railway's and legacy's data into the local db
+```
+
+- **The database** listens on host port **55433** (5432 and 5433 are often a local PostgreSQL, and 55432 is the legacy repo's dev database), user and
+  password `postgres`. It holds two databases: `operations`, the API's, and `legacy`, a copy of
+  legacy's.
+- **`pull`** dumps the database at `.env`'s `DATABASE_URL` (Railway) into `operations` and the one
+  at `ORIGINAL_DATABASE_URL` (legacy production, about 860 MB) into `legacy`, replacing both. The
+  dumps run in read-only sessions and are kept in `.docker/dumps` (git-ignored);
+  `SKIP_DUMP=1 docker compose --profile pull run --rm pull` restores those again without
+  fetching. The API's connections are closed while it restores; it reconnects on its own.
+- **The legacy app** (`integration`) runs the `integration/operation-backend` worktree at
+  `../wt-operation-backend-integration` (`INTEGRATION_DIR` in `.env` to change it), mounted
+  read-only, on http://localhost:8791/allotment_v2/allotment_v2.html. It runs as that branch is
+  deployed: `LA_LEGACY_SYNC=false`, so all its data comes from the local API, and server.js gets no
+  database. Log in as `admin` / `admin`, the local API's only user (`AUTH_PASSWORD_USERS` in the
+  compose file). A change to its files shows on reload; a change to its `server.js` needs
+  `docker compose restart integration`.
+- **The API ignores `.env`.** Its `DATABASE_URL` is set in the compose file, so it can never write
+  to Railway. Authentication is off (`AUTH_REQUIRED=false`). `LOCAL_CORS_ORIGIN` in `.env`
+  changes the browser origin allowed to call it (default `http://localhost:5173`).
+- **The sync tools and the import** run from the host against the local copies:
+
+  ```bash
+  SOURCE_DATABASE_URL=postgres://postgres:postgres@localhost:55433/legacy \
+  TARGET_DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations npm run sync:routes
+  ```
+
+- **Tests** want an empty database, not the copy: `docker compose exec db createdb -U postgres
+  ops_test`, then `DATABASE_URL=postgres://postgres:postgres@localhost:55433/ops_test npm run db:migrate`
+  and `npm test` with the same `DATABASE_URL`.
+
 ## Commands
 
 | Command | Description |

@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.github
+.claude
+.agent-reports
+.docker
+.env
+.env.*
+docs
+todo
+test
+coverage
+*.md
