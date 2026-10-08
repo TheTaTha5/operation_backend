@@ -1,4 +1,4 @@
-import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
+import { assertRoutesOpen, eachDate, isLegacyB2C, routeCalendar, type Route, type RouteDate, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
@@ -458,7 +458,14 @@ export class OperationsStore {
     const locks = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
       .map((l) => ({ id: l.id, pax: l.pax, drawn: drawn.get(l.id) ?? 0 }));
-    return dayCapacity(deployments, trips, locks);
+    return dayCapacity(deployments, trips, locks, this.catalogue.routes.find((route) => route.id === routeId)?.kind);
+  }
+
+  /** `assertRoutesOpen` against the seeded calendar. Unseeded, every route runs every day. */
+  private assertOpen(trips: readonly RouteDate[]): void {
+    if (trips.length === 0) return;
+    const names = new Map(this.catalogue.routes.map((route) => [route.id, route.name]));
+    assertRoutesOpen(routeCalendar(this.catalogue.seasons, this.catalogue.overrides), trips, names);
   }
 
   capacity(routeId: string, serviceDate: string, exclude: Exclusion = {}): Capacity {
@@ -519,6 +526,7 @@ export class OperationsStore {
   createBooking(input: BookingInput, actor?: string): Booking {
     const planned = planTrips([], input.trips, () => this.id('trip'));
     this.assertRoutes(input.trips);
+    this.assertOpen(tripsToCheckOpen(input.external_id, [], planned));
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
@@ -617,6 +625,7 @@ export class OperationsStore {
     const replacement = nextTrips(booking.trips, changes);
     const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
     this.assertRoutes(replacement);
+    this.assertOpen(tripsToCheckOpen(booking.external_id, booking.trips, planned));
     const reweighed = reweighs(booking, changes, claimsMoreSeats(booking.trips, planned))
       ? reweigh(booking, this.weighTrips(replacement, { bookingId: id }), actor) : undefined;
     const line = entry ?? editedLine(actor, changes, booking.status);
@@ -687,6 +696,7 @@ export class OperationsStore {
     assertRestorable(booking.status);
     const days = new Map(booking.trips.map((trip) => [dayKey(trip.route_id, trip.service_date), this.day(trip.route_id, trip.service_date, { bookingId: id })]));
     const { trips, warnings } = restoreTrips(booking.trips, days);
+    this.assertOpen(booking.trips);
     this.assertTrips(trips, { bookingId: id });
     booking.trips = planTrips(booking.trips, trips, () => this.id('trip'));
     booking.status = 'confirmed';
@@ -729,6 +739,7 @@ export class OperationsStore {
     const { trips, locksReturned } = rescheduleTrips(booking.trips, request.from_date, request.to_date);
     const planned = planTrips(booking.trips, trips, () => this.id('trip'));
     this.assertRoutes(trips);
+    this.assertOpen(tripsToCheckOpen(undefined, booking.trips, planned));
     if (claimsMoreSeats(booking.trips, planned)) this.assertTrips(trips, { bookingId: id });
     const plan = planRescheduleRecord(booking, request, actor, locksReturned);
     const now = this.now();
@@ -741,6 +752,7 @@ export class OperationsStore {
   }
 
   createLock(input: Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>): SeatLock {
+    this.assertOpen([input]);
     assertLockFits(this.day(input.route_id, input.service_date), input.pax, 0);
     const now = this.now();
     const lock: SeatLock = { ...input, id: this.id('lock'), status: 'active', created_at: now, updated_at: now };
@@ -873,6 +885,22 @@ export function movedTripIds(current: readonly StoredTrip[], planned: readonly S
     const old = before.get(trip.id);
     return old !== undefined && (old.route_id !== trip.route_id || old.service_date !== trip.service_date);
   }).map((trip) => trip.id);
+}
+
+/**
+ * The trips a write must find running on their day (`assertRoutesOpen`): those it adds or moves to
+ * another route or day. A trip the write leaves where it is was sold already, and a day that closed
+ * after the sale must not stop a notes edit — legacy's save blocks it, which is the hole this
+ * closes. A booking from legacy's B2C sync (`isLegacyB2C`) is saved anyway, as legacy saves it.
+ * Pass no `externalId` where legacy has no such exception (reschedule).
+ */
+export function tripsToCheckOpen(externalId: string | null | undefined, current: readonly StoredTrip[], planned: readonly StoredTrip[]): StoredTrip[] {
+  if (isLegacyB2C(externalId)) return [];
+  const before = new Map(current.map((trip) => [trip.id, trip]));
+  return planned.filter((trip) => {
+    const old = before.get(trip.id);
+    return old === undefined || old.route_id !== trip.route_id || old.service_date !== trip.service_date;
+  });
 }
 
 const sortedDraws = (draws: readonly LockDraw[]): LockDraw[] => draws.map((draw) => ({ ...draw })).sort((a, b) => a.lock_id.localeCompare(b.lock_id));

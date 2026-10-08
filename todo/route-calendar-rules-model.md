@@ -84,6 +84,26 @@ catalogue's master moves here.
 7. **Calendar writes now, or at the catalogue cutover?** Recommended: at the cutover, with sync
    stopped for seasons in the same change.
 
+## Decisions — 2026-10-08
+
+Decided under `CLAUDE.md`'s "Same screens, new data": where the proposal changed a screen, legacy's
+behaviour was kept unless the change only blocks less or catches a real mistake.
+
+1. **B2C exception: kept, as legacy has it.** A booking whose `external_id` carries legacy's B2C
+   marker (`b2c_`, `bookingV2IsB2CBk`) is saved on a closed day, on create and `PATCH` (legacy's
+   save). Love Kingdom's own bookings (`LOV-…`) are not marked, so they are refused: they are made
+   before payment and can be refused in time, and the staff screens are unaffected.
+2. **Only trips added or moved are checked** on `PATCH` (recommended).
+3. **Reschedule and restore are checked** (recommended).
+4. **Land routes are unlimited** (recommended).
+5. **A marine day with no boat sells ungated**, bookings *and* seat locks (addition 1 below), with
+   `unplaced_pax` on the capacity reads.
+6. **Overlapping seasons are allowed**, and the one that starts first wins, as legacy (which keeps
+   `r.seasons` sorted by `from`, `saveNewSeason`). `routeCalendar` sorts by start, then id, so both
+   stores agree however their rows arrive.
+7. **Settings → Programs stays editable:** the calendar writes are built now, and `sync:routes`
+   stops copying seasons and day overrides in the same change. The calendar's master moves here.
+
 ## Checked against the integration client — 2026-10-08
 
 Read against `wt-operation-backend-integration` (`integration/operation-backend`, `50c41ae`). The

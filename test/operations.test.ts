@@ -20,7 +20,7 @@ test('deployment capacity feeds availability, bookings, and manifest', async () 
   assert.equal(deployment.statusCode, 201);
 
   const availability = await request('GET', `/v1/availability?route_id=r1&date=${date}`);
-  assert.deepEqual(availability.json(), { route_id: 'r1', service_date: date, deployed_capacity: 10, licensed_capacity: 10, booked_pax: 0, charter_pax: 0, locked_pax: 0, available_seats: 10 });
+  assert.deepEqual(availability.json(), { route_id: 'r1', service_date: date, deployed_capacity: 10, licensed_capacity: 10, booked_pax: 0, charter_pax: 0, locked_pax: 0, available_seats: 10, unlimited: false, unplaced_pax: 0 });
 
   const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 6 });
   assert.equal(created.statusCode, 201);
@@ -49,7 +49,7 @@ test('availability over a range answers every day as a single-date read would', 
   // `open` comes from the route's calendar, which differs between the seeded and unseeded catalogue.
   const { open: emptyOpen, ...emptyDay } = days[1];
   assert.equal(typeof emptyOpen, 'boolean');
-  assert.deepEqual(emptyDay, { route_id: 'r1', service_date: empty, deployed_capacity: 0, licensed_capacity: 0, booked_pax: 0, charter_pax: 0, locked_pax: 0, available_seats: 0, deployments: [] }, 'a day with no deployment is zeros, not missing');
+  assert.deepEqual(emptyDay, { route_id: 'r1', service_date: empty, deployed_capacity: 0, licensed_capacity: 0, booked_pax: 0, charter_pax: 0, locked_pax: 0, available_seats: 0, unlimited: false, unplaced_pax: 0, deployments: [] }, 'a day with no deployment is zeros, not missing');
   assert.equal(days[0].available_seats, 6);
   assert.equal(days[2].available_seats, 13, 'two boats add up, less the lock');
   assert.deepEqual(days[2].deployments, [

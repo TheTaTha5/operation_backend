@@ -98,7 +98,7 @@ The `admin` group grants every permission. `CORS_ORIGIN` must contain the fronte
 
 ## API
 
-Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A deployment is required before seats become available.
+Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A booking or seat lock on a day the route does not run is refused (`409 route_closed`, see "Closed days"). A marine day with no boat deployed yet sells without a seat check, and a land route has no seat limit (see "Land routes and days with no boat").
 
 ### Catalogue
 
@@ -115,11 +115,44 @@ Reference data every other endpoint refers to by id.
 **Not every route is a boat trip.** `kind` is `marine` for a boat programme (it has a pier,
 deployments and seats) and `land` for a transfer, city tour or show/park ticket, which has none of
 these. `ext_id` is a land product's Love Kingdom code, e.g. `PTP-005:VT-002` (product, then variant);
-treat it as opaque. A calendar or seat view wants `kind=marine`. A land route is in the catalogue
-so that legacy bookings on it have a route to point at, but **it cannot be booked through this API
-yet**: `POST /v1/bookings` checks boat seats, a land route has no deployments, and the answer is
-`409 Insufficient available seats`. Selling land products needs its own capacity rule, which is
-undecided.
+treat it as opaque. A calendar or seat view wants `kind=marine`. A land route has no seat limit:
+see "Land routes and days with no boat" below.
+
+#### Closed days
+
+A booking cannot be sold on a day its route does not run, the calendar `GET /v1/routes?from=&to=`
+shows. The answer is `409` with `code: "route_closed"` and a message a staff screen can show as it
+is: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` (several, joined by `; `).
+
+| Write | What is checked |
+| --- | --- |
+| `POST /v1/bookings` | every trip |
+| `PATCH /v1/bookings/{id}` | only trips it adds, or moves to another route or day |
+| `POST /v1/bookings/{id}/reschedule` | the trips it moves |
+| `POST /v1/bookings/{id}/restore` | every trip |
+| `POST /v1/seat-locks` | its day |
+| `/confirm`, `/approve`, `/reject`, `/cancel`, partial cancel | nothing: they do not choose a day |
+
+A trip a `PATCH` leaves where it is was sold already, so a booking whose day closed after the sale
+can still have its notes edited. (Legacy blocks every save of such a booking.) A booking whose
+`external_id` starts with `b2c_`, legacy's mark for one synced from the B2C website, is saved on a
+closed day on create and `PATCH`, as legacy saves it: it was paid before it arrived. Love Kingdom's
+own bookings (`LOV-…`) are checked like any other.
+
+Seasons may overlap; the one that starts first decides a day, as in legacy.
+
+#### Land routes and days with no boat
+
+Both sell without a seat check, as legacy does (`hasAllotment` false):
+
+- **A land route** (`kind: "land"`) has no seat pool. Any number of passengers can be booked or
+  locked, and availability answers `available_seats: null` with `unlimited: true`.
+- **A marine day with no boat deployed yet** is sold before the boats are assigned. Availability
+  answers `available_seats: 0` and `unplaced_pax`: the passengers sold and the seats locked that
+  day, waiting for a boat. Once a boat is deployed the day is checked as usual, and a day already
+  sold past the boat shows a negative `available_seats`.
+
+Seats drawn from a lock are still limited by the lock, and a charter still needs its boat deployed.
 
 The route and boat catalogues are still edited in legacy. `npm run sync:routes` and
 `npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
@@ -303,7 +336,8 @@ Validation errors are `400` and name the path, for example:
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
 - `GET /v1/availability?route_id=&date=` — booking-form availability for one route on one day:
-  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats }`.
+  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats, unlimited, unplaced_pax }`.
+  `available_seats` is `null` on a land route (`unlimited: true`); see "Land routes and days with no boat".
 - `GET /v1/availability?from=&to=[&route_id=]` — the same numbers for a range, both ends inclusive,
   for one route or, without `route_id`, every route in the catalogue:
 
@@ -311,14 +345,14 @@ Validation errors are `400` and name the path, for example:
   { "days": [
     { "route_id": "r1", "service_date": "2031-03-01", "open": true,
       "deployed_capacity": 40, "licensed_capacity": 45, "booked_pax": 8, "charter_pax": 4,
-      "locked_pax": 0, "available_seats": 22,
+      "locked_pax": 0, "available_seats": 22, "unlimited": false, "unplaced_pax": 0,
       "deployments": [
         { "boat_id": "b1", "capacity": 30, "license_pax": 35, "chartered": false },
         { "boat_id": "b2", "capacity": 10, "license_pax": null, "chartered": true } ] } ] }
   ```
 
   Ordered by date, then by route in catalogue order; boats are ordered by id. Every route-day is
-  present, and a day with no deployment is all zeros, not missing. `open` is the route calendar's
+  present, and a day with no deployment is all zeros (apart from `unplaced_pax`), not missing. `open` is the route calendar's
   answer for that date (see `GET /v1/routes?from=&to=`), and is what tells a closed day apart from
   an open one nobody has staffed yet — both have zero seats. `deployments[].capacity` is the boat's
   sellable seats that day after any override and the licence clamp, so they sum to

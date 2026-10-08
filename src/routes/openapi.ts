@@ -39,7 +39,9 @@ const capacity = {
   booked_pax: { type: 'integer' },
   charter_pax: { type: 'integer' },
   locked_pax: { type: 'integer', description: 'Seats held by seat locks and not yet drawn by a booking' },
-  available_seats: { type: 'integer', description: 'What can be sold right now. The only number to sell against.' },
+  available_seats: { type: 'integer', nullable: true, description: 'What can be sold right now. The only number to sell against. `null` on a land route, which has no seat limit (`unlimited`). `0` on a marine day with no boat deployed, which still sells (see `unplaced_pax`).' },
+  unlimited: { type: 'boolean', description: 'A land route: no seat pool, so a booking or lock is never refused for seats.' },
+  unplaced_pax: { type: 'integer', description: 'On a marine day with no boat deployed: passengers sold and seats locked, waiting for a boat. Such a day sells ungated, as legacy does. `0` once a boat is deployed.' },
 };
 
 const tripIn = {
@@ -275,7 +277,7 @@ export const docs = {
     body: bookingIn,
     response: {
       201: booking, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
-      409: err('Seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
+      409: err('A trip on a day its route does not run (`route_closed`), seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
     },
   },
   amendBooking: {
@@ -287,7 +289,7 @@ export const docs = {
     body: bookingPatchIn,
     response: {
       200: booking, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
-      404: err('Booking not found'), 409: err('Over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
+      404: err('Booking not found'), 409: err('An added or moved trip on a day its route does not run (`route_closed`), over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
     },
   },
   statusCommand: (command: string) => ({
@@ -332,7 +334,7 @@ export const docs = {
     tags: ['Seat locks'], summary: 'Hold seats for an agent', security: BEARER,
     description: 'Takes seats out of the pool until released or drawn by a booking (`lockDraws`). There is no expiry: a lock you do not release holds its seats forever.',
     body: { type: 'object', required: ['route_id', 'service_date', 'pax'], properties: { route_id: { type: 'string' }, service_date: isoDate, pax: { type: 'integer', minimum: 1 }, agent_id: { type: 'string' } } },
-    response: { 201: seatLock, 400: err('Invalid input'), 409: err('Not enough seats'), ...UNAUTHORIZED },
+    response: { 201: seatLock, 400: err('Invalid input'), 409: err('The route does not run that day (`route_closed`), or not enough seats'), ...UNAUTHORIZED },
   },
   releaseLock: {
     tags: ['Seat locks'], summary: 'Release a seat lock', security: BEARER, params: idParam,
