@@ -287,3 +287,12 @@ More client changes owed, found in the same check:
   "undefined/undefined".
 - **Seats held by `pending_approval`.** A booking loaded from the server has no local `approval`,
   so `bkPendHoldsSeat` counts its seats; the server does not (`bookingHoldsSeats`).
+
+**Client changes made — 2026-10-08** (`wt-operation-backend-integration` `39ff405`): create sends
+`intent` and none of the server-stamped fields, `focReason` goes with the booking, the browser takes
+the server's status and stamps after every save, an edit is a `PATCH` without `status` followed by
+`/confirm` for Submit on a quote, approve/reject/FOC use `/approve` and `/reject`, weather uses
+`/cancel-weather`, adjustments survive a refresh, and `over_licence` warnings have their own toast.
+Checked against the local stack, 12 of 12 scenarios. Still open on the client: showing the server's
+`approvals` instead of the locally kept `approval`/`focApproval`, and a `pending_approval` loaded
+from the server still counted as holding seats by `bkPendHoldsSeat`.
