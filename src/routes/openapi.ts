@@ -42,6 +42,7 @@ const capacity = {
   available_seats: { type: 'integer', nullable: true, description: 'What can be sold right now. The only number to sell against. `null` on a land route, which has no seat limit (`unlimited`). `0` on a marine day with no boat deployed, which still sells (see `unplaced_pax`).' },
   unlimited: { type: 'boolean', description: 'A land route: no seat pool, so a booking or lock is never refused for seats.' },
   unplaced_pax: { type: 'integer', description: 'On a marine day with no boat deployed: passengers sold and seats locked, waiting for a boat. Such a day sells ungated, as legacy does. `0` once a boat is deployed.' },
+  licensed_free: { type: 'integer', nullable: true, description: 'Registered passenger seats left on the unchartered boats, locks not subtracted: how far an over-allotment approval may still go (legacy "Real seats left"). `null` on a land route; `0` with no boat deployed.' },
 };
 
 const tripIn = {
@@ -186,7 +187,7 @@ const booking = {
           decided_by: { type: 'string', nullable: true }, decided_at: { type: 'string', format: 'date-time', nullable: true }, note: { type: 'string', nullable: true },
           days: {
             type: 'array', description: 'The days over the allotment, as they were when asked',
-            items: { type: 'object', properties: { route_id: { type: 'string' }, service_date: isoDate, need: { type: 'integer' }, over_by: { type: 'integer' } } },
+            items: { type: 'object', properties: { route_id: { type: 'string' }, service_date: isoDate, need: { type: 'integer' }, over_by: { type: 'integer' }, licensed_free: { type: 'integer', nullable: true, description: 'Registered seats left that day when the approval was asked for (legacy "Real seats left"); at least `need`. `null` on a day recorded before it was kept.' } } },
           },
         },
       },

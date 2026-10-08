@@ -417,7 +417,7 @@ Validation errors are `400` and name the path, for example:
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
 - `GET /v1/availability?route_id=&date=` — booking-form availability for one route on one day:
-  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats, unlimited, unplaced_pax }`.
+  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats, unlimited, unplaced_pax, licensed_free }`.
   `available_seats` is `null` on a land route (`unlimited: true`); see "Land routes and days with no boat".
 - `GET /v1/availability?from=&to=[&route_id=]` — the same numbers for a range, both ends inclusive,
   for one route or, without `route_id`, every route in the catalogue:
@@ -426,7 +426,7 @@ Validation errors are `400` and name the path, for example:
   { "days": [
     { "route_id": "r1", "service_date": "2031-03-01", "open": true,
       "deployed_capacity": 40, "licensed_capacity": 45, "booked_pax": 8, "charter_pax": 4,
-      "locked_pax": 0, "available_seats": 22, "unlimited": false, "unplaced_pax": 0,
+      "locked_pax": 0, "available_seats": 22, "unlimited": false, "unplaced_pax": 0, "licensed_free": 27,
       "deployments": [
         { "boat_id": "b1", "capacity": 30, "license_pax": 35, "chartered": false },
         { "boat_id": "b2", "capacity": 10, "license_pax": null, "chartered": true } ] } ] }
@@ -459,6 +459,11 @@ purpose, because a charter buys the whole boat.
 
 A boat with no licence on file — three Ranong boats have none — falls back to its capacity. A
 missing licence is not a licence of zero.
+
+`licensed_free` is the registered passenger seats still left on the unchartered boats: their
+licensed seats less the passengers booked (locks are not subtracted). It is how far an
+over-allotment approval may still go, and the approval card's **Real seats left** (legacy
+`licenseAvailable`). Never negative; `0` with no boat deployed; `null` on a land route.
 
 #### What `available_seats` subtracts
 
@@ -660,10 +665,17 @@ FOC passengers asks for both, and approves in two steps (`pending_approval` → 
   "approvals": [{
     "kind": "approval", "status": "pending", "over_capacity": true, "over_total": 2, "discount": null, "foc_count": null,
     "target_status": "confirmed", "requested_by": "ops1", "requested_at": "…", "decided_by": null, "decided_at": null, "note": null,
-    "days": [{ "route_id": "r3", "service_date": "2039-02-01", "need": 22, "over_by": 2 }]
+    "days": [{ "route_id": "r3", "service_date": "2039-02-01", "need": 22, "over_by": 2, "licensed_free": 25 }]
   }]
 }
 ```
+
+Each of `days` is a day over the allotment: the seats it needs (`need`), how many the allotment
+lacks (`over_by`), and the registered seats left when the approval was asked (`licensed_free`, the
+approval card's **Real seats left**, legacy `licFree`). It is never below `need`, since past the
+licence the booking is refused instead. It is a record of that moment and does not change as the
+day sells; `GET /v1/availability` gives today's figure. It is `null` on an approval asked before
+migration 025.
 
 `approvals` is every approval asked for, oldest first, kept after it is decided: `kind` `approval`
 (over the allotment and/or a discount) or `foc`; `status` `pending`, `approved`, `rejected`, or

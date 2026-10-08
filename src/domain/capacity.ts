@@ -59,10 +59,13 @@ export function deploymentSeats(limits: DeploymentLimits): { sellable: number; l
  * `unlimited` is a land route, which has no seat pool: `available_seats` is then `null`.
  * `unplaced_pax` is what a marine day with no boat deployed holds (bookings, charters and undrawn
  * locks), sold ungated as legacy sells it, waiting for a boat.
+ * `licensed_free` is the registered passenger seats left on the unchartered boats, locks not
+ * subtracted (legacy `licenseAvailable`, the approval card's "Real seats left"): how far an
+ * over-allotment approval may still go. Never negative; `null` on a land route, like `available_seats`.
  */
 export type Capacity = {
   deployed_capacity: number; licensed_capacity: number; booked_pax: number; charter_pax: number; locked_pax: number;
-  available_seats: number | null; unlimited: boolean; unplaced_pax: number;
+  available_seats: number | null; unlimited: boolean; unplaced_pax: number; licensed_free: number | null;
 };
 
 /** A boat deployed on the route that day, with its per-day override if it has one. */
@@ -79,7 +82,7 @@ export type LockDay = HeldLock & { remaining: number };
  * `licensed_free` is the registered passenger seats still unsold on the day's open boats, locks not
  * subtracted: the ceiling legacy's over-allotment approval may reach, and no further.
  */
-export type DayState = Omit<Capacity, 'available_seats'> & { available_seats: number; boats: BoatDay[]; locks: LockDay[]; licensed_free: number };
+export type DayState = Omit<Capacity, 'available_seats' | 'licensed_free'> & { available_seats: number; boats: BoatDay[]; locks: LockDay[]; licensed_free: number };
 
 /**
  * Whether a sale on this day goes unchecked against seats, as legacy's `hasAllotment` false lets it:
@@ -140,7 +143,7 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
 export const capacityNumbers = (day: DayState): Capacity => ({
   deployed_capacity: day.deployed_capacity, licensed_capacity: day.licensed_capacity, booked_pax: day.booked_pax,
   charter_pax: day.charter_pax, locked_pax: day.locked_pax, available_seats: day.unlimited ? null : day.available_seats,
-  unlimited: day.unlimited, unplaced_pax: day.unplaced_pax,
+  unlimited: day.unlimited, unplaced_pax: day.unplaced_pax, licensed_free: day.unlimited ? null : Math.max(day.licensed_free, 0),
 });
 
 /** What one booking asks of one route and day, all its trips on that day weighed together. */
@@ -201,7 +204,7 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
  *   for an approval to decide;
  * - it is over the licensed seats too → refused (`409`): there is no registered seat left.
  */
-export function weighDay(day: DayState, demand: DayDemand): { need: number; over_by: number } | undefined {
+export function weighDay(day: DayState, demand: DayDemand): { need: number; over_by: number; licensed_free: number } | undefined {
   const where = `on ${demand.route_id} ${demand.service_date}`;
   let drawn = 0;
   for (const [lockId, qty] of demand.draws) {
@@ -231,7 +234,8 @@ export function weighDay(day: DayState, demand: DayDemand): { need: number; over
   if (need <= physical) refuse(`Insufficient available seats ${where}: the rest are held by seat locks`, 409);
   const licensed = day.licensed_free - charterLicensed;
   if (need > licensed) refuse(`Insufficient available seats ${where}: the boats' registered seats are full (${Math.max(licensed, 0)} left)`, 409);
-  return { need, over_by: need - physical };
+  // `licensed` is legacy's `licFree`, the approval card's "Real seats left".
+  return { need, over_by: need - physical, licensed_free: licensed };
 }
 
 /**

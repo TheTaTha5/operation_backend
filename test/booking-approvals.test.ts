@@ -37,7 +37,7 @@ test('over the allotment but within the licence, a booking waits for approval ho
   assert.equal(waiting.confirmed_at, undefined);
   assert.deepEqual(waiting.approvals.map(shape), [{
     kind: 'approval', status: 'pending', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
-    requested_by: null, decided_by: null, note: null, decided: false, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2 }],
+    requested_by: null, decided_by: null, note: null, decided: false, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2, licensed_free: 25 }],
   }]);
   assert.equal(await seatsLeft(date), 20, 'the allotment is untouched');
   assert.deepEqual((await history(waiting.id)).slice(-1), [`Waiting for approval · over the allotment by 2 (r3 ${date} +2)`]);
@@ -62,6 +62,7 @@ test('seats held by seat locks are refused, not sent for approval', async () => 
   const over = await book(date, 21);
   assert.equal(over.status, 'pending_approval', 'past the locked seats too, it is over the allotment');
   assert.equal(over.approvals[0].days[0].over_by, 1);
+  assert.equal(over.approvals[0].days[0].licensed_free, 30, 'the registered seats left: locks are not subtracted, as legacy');
 });
 
 test('approving gives the seats; past the licence it still approves, with a warning', async () => {
@@ -80,7 +81,7 @@ test('approving gives the seats; past the licence it still approves, with a warn
   assert.deepEqual(body.warnings, [{ code: 'over_licence', route_id: 'r3', service_date: date, over_by: 17 }], 'legacy: add a boat before the travel date');
   assert.deepEqual(body.approvals.map(shape)[0], {
     kind: 'approval', status: 'approved', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
-    requested_by: null, decided_by: null, note: 'second boat coming', decided: true, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2 }],
+    requested_by: null, decided_by: null, note: 'second boat coming', decided: true, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2, licensed_free: 25 }],
   });
 
   const calm = '2039-02-04';
@@ -185,4 +186,24 @@ test('an edit is weighed again: growing past the allotment waits, shrinking back
   assert.equal(back.allocated_pax, 18);
   assert.deepEqual(back.approvals.map((a: Record<string, unknown>) => a.status), ['replaced', 'replaced']);
   assert.deepEqual((await history(booking.id)).slice(-1), ['Fits the allotment now · confirmed']);
+});
+
+test('"Real seats left": the approval keeps the licensed seats as asked, availability gives them now', async () => {
+  const date = '2039-02-20';
+  await day(date);
+  const licensedFree = async () => (await request('GET', `/v1/availability?route_id=r3&date=${date}`)).json().licensed_free as number;
+  assert.equal(await licensedFree(), 25);
+  const waiting = await book(date, 22);
+  assert.equal(waiting.approvals[0].days[0].licensed_free, 25);
+  assert.equal(await licensedFree(), 25, 'a booking waiting for approval holds no seats');
+
+  await book(date, 10);
+  assert.equal(await licensedFree(), 15, 'live: the seats sold since');
+  const read = (await request('GET', `/v1/bookings/${waiting.id}`)).json();
+  assert.equal(read.approvals[0].days[0].licensed_free, 25, 'the approval keeps what was true when it was asked');
+  const range = (await request('GET', `/v1/availability?route_id=r3&from=${date}&to=${date}`)).json();
+  assert.equal(range.days[0].licensed_free, 15, 'a range entry carries it too');
+
+  assert.equal((await request('POST', `/v1/bookings/${waiting.id}/approve`)).statusCode, 200);
+  assert.equal(await licensedFree(), 0, 'approved past the licence: none left, never negative');
 });

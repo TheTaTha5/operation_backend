@@ -234,6 +234,7 @@ erDiagram
     date service_date PK
     integer need "seats asked for"
     integer over_by "seats the allotment lacks"
+    integer licensed_free "registered seats left when asked"
   }
   routes {
     text id PK
