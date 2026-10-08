@@ -17,6 +17,7 @@ import {
 } from '../domain/booking-actions.js';
 import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
+import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -28,6 +29,13 @@ const badRequest = (message: string): never => { const error = new Error(message
 const notFound = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 404; throw error; };
 const unauthorized = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 401; throw error; };
 const forbidden = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number; code: string }).statusCode = 403; (error as Error & { code: string }).code = 'forbidden'; throw error; };
+const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+/** A command's body without `version`, which is the write's precondition, not part of the command. */
+const withoutVersion = (body: unknown, required = false): Record<string, unknown> => {
+  const { version: _version, ...rest } = record(body ?? (required ? body : {}));
+  return rest;
+};
+const lockId = (request: { params: unknown }): string => (request.params as { id: string }).id;
 const userId = (request: { params: unknown }): number => {
   const id = Number((request.params as { id: string }).id);
   return Number.isInteger(id) && id > 0 ? id : notFound('User not found');
@@ -255,9 +263,9 @@ function closeAnyway(value: unknown): boolean {
   return badRequest('close_anyway must be true or false');
 }
 
-function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'> {
+function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'version' | 'created_at' | 'updated_at'> {
   const input = record(body);
-  return { ...input, route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), pax: pax(input.pax), agent_id: optionalString(input.agent_id) };
+  return { route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), pax: pax(input.pax), agent_id: optionalString(input.agent_id) };
 }
 
 export type Store = OperationsStore | PostgresOperationsStore;
@@ -313,6 +321,31 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const salesId = booking.agent_id ? (await store.agent(booking.agent_id))?.sales_id ?? null : null;
     assertMayDecide(user, approval, salesId);
   };
+
+  /**
+   * Refuse a write made from a stale copy (`src/domain/versions.ts`): the version sent as `If-Match`
+   * or `version` against the record's own. Called first inside the write's transaction, so the version
+   * checked is the one the write replaces. A record not found is left to the write, which answers 404.
+   */
+  const sentVersion = (request: { headers: Record<string, unknown>; body?: unknown }): number | undefined =>
+    expectedVersion(request.headers['if-match'], isRecord(request.body) ? request.body.version : undefined);
+  const assertBookingFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown }): Promise<void> => {
+    const expected = sentVersion(request);
+    if (expected === undefined) return;
+    const current = await store.booking(bookingId(request));
+    if (current) assertFresh(`Booking ${current.id}`, expected, current.version);
+  };
+  const assertLockFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown }): Promise<void> => {
+    const expected = sentVersion(request);
+    if (expected === undefined) return;
+    const current = await store.lock(lockId(request));
+    if (current) assertFresh(`Seat lock ${current.id}`, expected, current.version);
+  };
+  // The version of the booking or lock a response carries, as its `ETag`, so a client can send it back.
+  app.addHook('preSerialization', async (_request, reply, payload) => {
+    if (isRecord(payload) && typeof payload.version === 'number') reply.header('etag', `"${payload.version}"`);
+    return payload;
+  });
 
   /** The caller's login; `401` when authentication is off, where there is none. */
   const me = (request: { user?: { user?: StoredUser } }): StoredUser => request.user?.user ?? unauthorized('Not logged in');
@@ -528,14 +561,19 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   });
   app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
     const actor = actorOf(request.user);
-    const changes = bookingChanges(request.body);
+    const { version: _version, ...body } = record(request.body);
+    const changes = bookingChanges(body);
     const signed = { ...changes, header: stampActor(changes.header, actor) };
-    return store.transaction(async () => (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found'));
+    return store.transaction(async () => {
+      await assertBookingFresh(request);
+      return (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found');
+    });
   });
   for (const command of STATUS_COMMANDS) {
     app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
-      const body = parseStatusCommandRequest(record(request.body ?? {}));
+      const body = parseStatusCommandRequest(withoutVersion(request.body));
       const changed = await store.transaction(async () => {
+        await assertBookingFresh(request);
         if (command === 'approve' || command === 'reject') await assertMayDecideOn(request, bookingId(request));
         return (await store.changeBookingStatus(bookingId(request), command, body, actorOf(request.user))) ?? notFound('Booking not found');
       });
@@ -544,20 +582,32 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     });
   }
   app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request) => {
-    const cancel = parseCancelRequest(record(request.body ?? {}));
-    return store.transaction(async () => (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found'));
+    const cancel = parseCancelRequest(withoutVersion(request.body));
+    return store.transaction(async () => {
+      await assertBookingFresh(request);
+      return (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found');
+    });
   });
   app.post('/v1/bookings/:id/restore', async (request) => {
-    const restored = await store.transaction(async () => (await store.restoreBooking(bookingId(request), actorOf(request.user))) ?? notFound('Booking not found'));
+    const restored = await store.transaction(async () => {
+      await assertBookingFresh(request);
+      return (await store.restoreBooking(bookingId(request), actorOf(request.user))) ?? notFound('Booking not found');
+    });
     return { ...restored.booking, warnings: restored.warnings };
   });
   app.post('/v1/bookings/:id/partial-cancel', async (request) => {
-    const partial = parsePartialCancelRequest(record(request.body));
-    return store.transaction(async () => (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found'));
+    const partial = parsePartialCancelRequest(withoutVersion(request.body, true));
+    return store.transaction(async () => {
+      await assertBookingFresh(request);
+      return (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found');
+    });
   });
   app.post('/v1/bookings/:id/reschedule', async (request) => {
-    const reschedule = parseRescheduleRequest(record(request.body));
-    return store.transaction(async () => (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found'));
+    const reschedule = parseRescheduleRequest(withoutVersion(request.body, true));
+    return store.transaction(async () => {
+      await assertBookingFresh(request);
+      return (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found');
+    });
   });
   /** Oldest first. Not part of the booking read, because it only grows. */
   app.get('/v1/bookings/:id/history', async (request) => ({ history: (await store.bookingHistory(bookingId(request))) ?? notFound('Booking not found') }));
@@ -640,10 +690,19 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.post('/v1/seat-locks', { schema: docs.createLock }, async (request, reply) => reply.code(201).send(await store.transaction(() => store.createLock(lockInput(request.body)))));
   app.patch('/v1/seat-locks/:id', async (request) => {
     const body = record(request.body);
-    if (body.pax !== undefined) pax(body.pax);
-    if (body.agent_id !== undefined) string(body.agent_id, 'agent_id');
-    return store.transaction(async () => (await store.amendLock((request.params as { id: string }).id, body as Partial<SeatLock>)) ?? notFound('Seat lock not found'));
+    // Only these two are a lock's client facts; anything else in the body is ignored, never stored.
+    const changes: Partial<Pick<SeatLock, 'pax' | 'agent_id'>> = {
+      ...(body.pax === undefined ? {} : { pax: pax(body.pax) }),
+      ...(body.agent_id === undefined ? {} : { agent_id: string(body.agent_id, 'agent_id') }),
+    };
+    return store.transaction(async () => {
+      await assertLockFresh(request);
+      return (await store.amendLock(lockId(request), changes)) ?? notFound('Seat lock not found');
+    });
   });
-  app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => store.transaction(async () => (await store.releaseLock((request.params as { id: string }).id)) ?? notFound('Seat lock not found')));
+  app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => store.transaction(async () => {
+    await assertLockFresh(request);
+    return (await store.releaseLock(lockId(request))) ?? notFound('Seat lock not found');
+  }));
   done();
 }

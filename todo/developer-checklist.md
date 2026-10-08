@@ -22,15 +22,20 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   - the approval card reads `approvals[].days[].licensed_free`;
   - log in with `POST /v1/login`; Users screen on `/v1/users`, delete becomes `disabled: true`,
     an `act-approve` tick box; show a `403` on approve/reject as it is.
+  - send the `version` it read as `If-Match` on every booking and seat-lock save, and show a
+    `409 stale_version` as "someone changed this; reload".
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
-  `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2).
+  `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
+  amend and cancel.
 
 ## Decisions waiting for you
 
 - **Live updates** (`change-feed-model.md`): the 5 questions at the end.
 - **Overnight charters** (`ovn-charter-return-model.md`): the importer skips them until decided.
-- **Next slice:** pricing (`pricing-model.md`), edit conflicts (`booking-concurrency-model.md`) or
-  deployment guards (`deployment-guards-model.md`) — each has questions to answer.
+- **Next slice:** pricing (`pricing-model.md`, decided: contracts first) or deployment guards
+  (`deployment-guards-model.md`, has questions to answer).
+- **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
+  optional: a save without it is last-write-wins).
 
 ## Ask ops
 

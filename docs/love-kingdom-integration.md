@@ -33,6 +33,10 @@ we create for you: it books for agent `a_b2c` only, and sees and changes only `a
   as `404`. Any write outside `/v1/bookings` is `403`.
 - 15 failed logins in 3 minutes lock the username for up to 3 minutes (`429`).
 
+**Edit conflicts (optional):** every booking response carries `version` (and an `ETag`). Send it
+back as `If-Match: "<version>"` on `PATCH` or `cancel` and a booking someone changed since you read it
+answers `409 stale_version` instead of being overwritten. Without it, the last write wins.
+
 **Availability only:** `GET /v1/availability` also accepts your existing `X-Api-Key` header (the
 `B2C_API_KEY` you send legacy's `/api/b2c/availability`) instead of a token. The key opens nothing
 else: every other call answers `403` with it, so booking still needs the token.
