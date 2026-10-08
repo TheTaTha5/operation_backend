@@ -1,42 +1,33 @@
 import type { FastifyRequest } from 'fastify';
-import { createRemoteJWKSet, jwtVerify, SignJWT, type JWTPayload } from 'jose';
+import { jwtVerify, SignJWT } from 'jose';
 import { timingSafeEqual } from 'node:crypto';
+import { hashPassword, verifyPassword, type StoredUser } from './domain/users.js';
 
-export type AuthenticatedUser = {
-  subject: string;
-  username?: string;
-  email?: string;
-  scopes: string[];
-  groups: string[];
-};
+/**
+ * Who is calling. A staff login carries its `users` row, read fresh on every request, so a change
+ * of rights, a disable or a sign-out takes effect at once (legacy kept them in a 30-day cookie).
+ * Love Kingdom's API key carries no row: it opens availability and nothing else.
+ */
+export type AuthenticatedUser = { subject: string; username: string; user?: StoredUser; apiKey?: true };
 
 declare module 'fastify' {
   interface FastifyRequest { user?: AuthenticatedUser }
 }
 
-type OidcConfiguration = { jwks_uri: string };
-type PasswordUser = { username: string; password: string; groups: string[] };
+/** Where logins are looked up: either store. */
+export type UserSource = {
+  user(id: number): StoredUser | undefined | Promise<StoredUser | undefined>;
+  userByUsername(username: string): StoredUser | undefined | Promise<StoredUser | undefined>;
+};
 
-/**
- * Not an OIDC claim — scopes this authenticator's own HS256 tokens to itself, so a token minted by
- * `/v1/login` is never mistaken for (or accidentally accepted as) one from the OIDC issuer.
- */
-const PASSWORD_AUTH_ISSUER = 'operation-backend-password-auth';
-
-function parsePasswordUsers(raw: string | undefined): PasswordUser[] {
-  if (!raw) return [];
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch { throw new Error('AUTH_PASSWORD_USERS must be valid JSON'); }
-  if (!Array.isArray(parsed)) throw new Error('AUTH_PASSWORD_USERS must be a JSON array');
-  return parsed.map((entry, index) => {
-    if (typeof entry !== 'object' || entry === null) throw new Error(`AUTH_PASSWORD_USERS[${index}] must be an object`);
-    const { username, password, groups } = entry as Record<string, unknown>;
-    if (typeof username !== 'string' || !username) throw new Error(`AUTH_PASSWORD_USERS[${index}].username is required`);
-    if (typeof password !== 'string' || !password) throw new Error(`AUTH_PASSWORD_USERS[${index}].password is required`);
-    if (!Array.isArray(groups) || !groups.every((group): group is string => typeof group === 'string')) throw new Error(`AUTH_PASSWORD_USERS[${index}].groups must be a string array`);
-    return { username, password, groups };
-  });
-}
+/** Marks this service's own tokens, so no other HS256 token signed with the same secret passes. */
+const ISSUER = 'operation-backend';
+const TOKEN_SECONDS = 12 * 60 * 60;
+/** Failed logins for one username: 15 within 3 minutes locks it until the oldest is 3 minutes old. */
+const FAILURE_LIMIT = 15;
+const FAILURE_WINDOW_MS = 3 * 60 * 1000;
+/** Checked when the username is unknown, so a wrong username costs the same time as a wrong password. */
+const DECOY_HASH = hashPassword('decoy');
 
 /** Constant-time regardless of where the strings first differ, and safe when their lengths differ. */
 function safeEqual(a: string, b: string): boolean {
@@ -44,112 +35,87 @@ function safeEqual(a: string, b: string): boolean {
   return bufferA.length === bufferB.length && timingSafeEqual(bufferA, bufferB);
 }
 
-export class OidcAuthenticator {
-  private readonly issuer?: string;
-  private readonly audience?: string;
-  private discovery?: Promise<OidcConfiguration>;
-  private jwks?: ReturnType<typeof createRemoteJWKSet>;
-  private readonly passwordSecret?: Uint8Array;
-  private readonly passwordUsers: PasswordUser[];
+export class Authenticator {
+  private readonly secret?: Uint8Array;
+  /** Per instance, in memory: a restart or a second instance starts its own count. */
+  private readonly failures = new Map<string, number[]>();
 
   constructor() {
-    const issuer = process.env.OIDC_ISSUER;
-    const required = process.env.AUTH_REQUIRED === 'true';
     const secret = process.env.AUTH_JWT_SECRET;
-    this.passwordSecret = secret ? new TextEncoder().encode(secret) : undefined;
-    this.passwordUsers = parsePasswordUsers(process.env.AUTH_PASSWORD_USERS);
-    if (required && !(issuer && process.env.OIDC_AUDIENCE) && !this.passwordSecret) {
-      throw new Error('OIDC_ISSUER and OIDC_AUDIENCE, or AUTH_JWT_SECRET, are required when AUTH_REQUIRED=true');
-    }
-    this.issuer = issuer;
-    this.audience = process.env.OIDC_AUDIENCE;
+    if (process.env.AUTH_REQUIRED === 'true' && !secret) throw new Error('AUTH_JWT_SECRET is required when AUTH_REQUIRED=true');
+    this.secret = secret ? new TextEncoder().encode(secret) : undefined;
   }
 
-  get enabled(): boolean { return Boolean((this.issuer && this.audience) || this.passwordSecret); }
-
-  /** Whether `/v1/login` has anyone to issue a token to. */
-  get passwordAuthEnabled(): boolean { return Boolean(this.passwordSecret && this.passwordUsers.length > 0); }
-
-  private async keySet() {
-    if (!this.issuer) throw new Error('OIDC is not configured');
-    this.discovery ??= fetch(`${this.issuer.replace(/\/$/, '')}/.well-known/openid-configuration`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error(`OIDC discovery failed: ${response.status}`);
-        return response.json() as Promise<OidcConfiguration>;
-      });
-    const configuration = await this.discovery;
-    this.jwks ??= createRemoteJWKSet(new URL(configuration.jwks_uri));
-    return this.jwks;
-  }
-
-  async authenticate(request: FastifyRequest): Promise<AuthenticatedUser | undefined> {
-    if (!this.enabled) return undefined;
-    const header = request.headers.authorization;
-    if (!header?.startsWith('Bearer ')) unauthorized('A Bearer access token is required');
-    const token = header.slice('Bearer '.length);
-
-    // A token is tried against whichever issuers are configured; unrecognised-issuer/signature
-    // failures fall through so both an OIDC access token and a password-login token can be live
-    // at once. Any other failure (expiry, malformed token) still surfaces as 401.
-    if (this.passwordSecret) {
-      try {
-        const { payload } = await jwtVerify(token, this.passwordSecret, { issuer: PASSWORD_AUTH_ISSUER });
-        const user = userFromPayload(payload);
-        request.user = user;
-        return user;
-      } catch { /* not a password-auth token (or expired) — try OIDC below if configured */ }
-    }
-    if (this.issuer && this.audience) {
-      try {
-        const { payload } = await jwtVerify(token, await this.keySet(), { issuer: this.issuer, audience: this.audience });
-        const user = userFromPayload(payload);
-        request.user = user;
-        return user;
-      } catch (error) {
-        if ((error as Error & { statusCode?: number }).statusCode) throw error;
-      }
-    }
-    unauthorized('Invalid or expired access token');
-  }
+  /** Off only without `AUTH_JWT_SECRET`: local development and the tests that do not test login. */
+  get enabled(): boolean { return this.secret !== undefined; }
 
   /**
-   * Temporary testing login: exchanges a username/password from `AUTH_PASSWORD_USERS` for a
-   * short-lived HS256 token signed with `AUTH_JWT_SECRET`. This is a deliberate, scoped exception
-   * to this service's normal "validate tokens, do not issue them" boundary — see CLAUDE.md.
+   * Love Kingdom's server reads availability with the `X-Api-Key` header it already sends legacy's
+   * `/api/b2c/availability`, matched against `B2C_API_KEY`. Undefined when the request carries no
+   * key: the Bearer token decides then. A key that is sent and wrong is `401`, never a silent
+   * fall-through to Bearer.
    */
-  async issuePasswordToken(username: string, password: string): Promise<{ token: string; expiresIn: number }> {
-    if (!this.passwordSecret) unauthorized('Password login is not configured');
-    const user = this.passwordUsers.find((candidate) => safeEqual(candidate.username, username));
-    if (!user || !safeEqual(user.password, password)) unauthorized('Invalid username or password');
-    const expiresIn = 12 * 60 * 60;
-    const token = await new SignJWT({ preferred_username: user.username, groups: user.groups })
+  authenticateApiKey(request: FastifyRequest): AuthenticatedUser | undefined {
+    const sent = request.headers['x-api-key'];
+    if (sent === undefined) return undefined;
+    const key = process.env.B2C_API_KEY;
+    if (!key) unauthorized('X-Api-Key is not accepted: B2C_API_KEY is not set');
+    if (typeof sent !== 'string' || !safeEqual(sent, key)) unauthorized('Invalid X-Api-Key');
+    const user: AuthenticatedUser = { subject: 'love-kingdom', username: 'love-kingdom', apiKey: true };
+    request.user = user;
+    return user;
+  }
+
+  async authenticate(request: FastifyRequest, users: UserSource): Promise<AuthenticatedUser | undefined> {
+    if (!this.secret) return undefined;
+    const header = request.headers.authorization;
+    if (!header?.startsWith('Bearer ')) unauthorized('A Bearer access token is required: POST /v1/login');
+    let payload;
+    try {
+      ({ payload } = await jwtVerify(header.slice('Bearer '.length), this.secret, { issuer: ISSUER }));
+    } catch { unauthorized('Invalid or expired access token'); }
+    const user = await users.user(Number(payload!.sub));
+    if (!user || user.disabled_at !== null) unauthorized('This login no longer exists or is disabled');
+    // Legacy `logout_after`: a sign-out, a disable or a password reset ends every earlier session.
+    const issuedAt = Number(payload!.iat_ms);
+    if (user!.tokens_valid_after !== null && !(issuedAt > Date.parse(user!.tokens_valid_after))) unauthorized('This session has ended; log in again');
+    const authenticated: AuthenticatedUser = { subject: String(user!.id), username: user!.username, user: user! };
+    request.user = authenticated;
+    return authenticated;
+  }
+
+  /** Legacy's login: a username matched ignoring case, and its scrypt hash checked as it is. */
+  async login(username: string, password: string, users: UserSource): Promise<{ token: string; expiresIn: number; user: StoredUser }> {
+    if (!this.secret) refuse('Login is not configured: AUTH_JWT_SECRET is not set', 503);
+    const key = username.trim().toLowerCase();
+    const now = Date.now();
+    const recent = (this.failures.get(key) ?? []).filter((at) => now - at < FAILURE_WINDOW_MS);
+    if (recent.length >= FAILURE_LIMIT) {
+      refuse(`Too many failed logins for ${username}; try again in ${Math.ceil((recent[0] + FAILURE_WINDOW_MS - now) / 1000)} seconds`, 429);
+    }
+    const user = await users.userByUsername(username.trim());
+    const matches = verifyPassword(password, user?.pass_hash ?? DECOY_HASH);
+    if (!user || !matches || user.disabled_at !== null) {
+      this.failures.set(key, [...recent, now]);
+      unauthorized('Invalid username or password');
+    }
+    this.failures.delete(key);
+    // Always after the user's cutoff, so a login in the same millisecond as a sign-out still counts.
+    const issuedAt = Math.max(now, user!.tokens_valid_after === null ? 0 : Date.parse(user!.tokens_valid_after) + 1);
+    const token = await new SignJWT({ preferred_username: user!.username, iat_ms: issuedAt })
       .setProtectedHeader({ alg: 'HS256' })
-      .setSubject(user.username)
-      .setIssuer(PASSWORD_AUTH_ISSUER)
+      .setSubject(String(user!.id))
+      .setIssuer(ISSUER)
       .setIssuedAt()
-      .setExpirationTime(`${expiresIn}s`)
-      .sign(this.passwordSecret);
-    return { token, expiresIn };
+      .setExpirationTime(`${TOKEN_SECONDS}s`)
+      .sign(this.secret!);
+    return { token, expiresIn: TOKEN_SECONDS, user: user! };
   }
 }
 
-export function requireAnyScope(user: AuthenticatedUser | undefined, scopes: string[]): void {
-  if (!user) return; // Local development mode: OIDC has not been configured.
-  if (scopes.some((scope) => user.scopes.includes(scope) || user.groups.includes(scope) || user.groups.includes('admin'))) return;
-  const error = new Error(`Missing required permission: ${scopes.join(' or ')}`);
-  (error as Error & { statusCode: number }).statusCode = 403;
-  throw error;
-}
-
-function userFromPayload(payload: JWTPayload): AuthenticatedUser {
-  if (!payload.sub) unauthorized('Access token has no subject');
-  const groups = Array.isArray(payload.groups) ? payload.groups.filter((value): value is string => typeof value === 'string') : [];
-  const scope = typeof payload.scope === 'string' ? payload.scope.split(' ').filter(Boolean) : [];
-  return { subject: payload.sub, username: typeof payload.preferred_username === 'string' ? payload.preferred_username : undefined, email: typeof payload.email === 'string' ? payload.email : undefined, scopes: scope, groups };
-}
-
-function unauthorized(message: string): never {
+function refuse(message: string, statusCode: number): never {
   const error = new Error(message);
-  (error as Error & { statusCode: number }).statusCode = 401;
+  (error as Error & { statusCode: number }).statusCode = statusCode;
   throw error;
 }
+function unauthorized(message: string): never { return refuse(message, 401); }

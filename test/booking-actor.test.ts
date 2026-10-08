@@ -4,9 +4,11 @@ import { after, test } from 'node:test';
 // A real token, so the actor comes from where it does in production. Password login is the
 // service's own HS256 issuer; the env is set before the app is imported, as `auth.test.ts` does.
 process.env.AUTH_JWT_SECRET = 'booking-actor-test-secret';
-process.env.AUTH_PASSWORD_USERS = JSON.stringify([{ username: 'ops1', password: 'pw', groups: ['admin'] }]);
 const { buildApp } = await import('../src/app.js');
-const app = buildApp();
+const { seedUser, testStore } = await import('./users-helper.js');
+const store = testStore();
+const app = buildApp({ store });
+await seedUser(store, { username: 'ops1', role: 'admin' });
 after(async () => app.close());
 
 test('every write is signed by the token\'s user, whatever the body says', async () => {

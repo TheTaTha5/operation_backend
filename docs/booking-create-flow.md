@@ -19,7 +19,7 @@ If any day is refused, nothing is saved.
 
 ```mermaid
 flowchart TD
-    A["Client sends POST /v1/bookings<br/>trips + intent: quote or confirm"] --> B{"Valid Bearer token<br/>with booking:write?"}
+    A["Client sends POST /v1/bookings<br/>trips + intent: quote or confirm"] --> B{"Valid Bearer token<br/>with the operations area?"}
     B -- no --> X1["401 / 403"]
     B -- yes --> C{"Every route in<br/>the catalogue?"}
     C -- no --> X2["400 unknown route"]
@@ -69,7 +69,7 @@ sequenceDiagram
 
     Staff->>API: POST /v1/bookings {trips, intent, header, passengers, addOns}
     API->>Auth: authenticate(Bearer token)
-    Auth-->>API: user + scopes (needs booking:write)
+    Auth-->>API: user + edit areas (needs operations)
     API->>API: bookingInput() parse, createHeader() sets created_by/booked_at from the token
     API->>Store: transaction(createBooking)
     Store->>DB: BEGIN ISOLATION LEVEL SERIALIZABLE

@@ -25,6 +25,7 @@ import {
   type ApprovalDay, type ApprovalKind, type ApprovalWarning, type BookingApproval, type Intent, type NewApproval,
 } from './booking-approvals.js';
 import { pickupFields, type PickupWindow } from './pickup.js';
+import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 
 export type Deployment = {
   boat_id: string;
@@ -353,6 +354,28 @@ export class OperationsStore {
   private salesIds(): Set<string> | undefined {
     return this.directory.sales.length === 0 ? undefined : new Set(this.directory.sales.map((person) => person.id));
   }
+  /** Staff logins (migration 027), held as the rows PostgreSQL holds. Usernames are unique ignoring case. */
+  private users: StoredUser[] = [];
+  listUsers(): StoredUser[] { return this.users.map((user) => ({ ...user })).sort((a, b) => a.id - b.id); }
+  user(id: number): StoredUser | undefined { const found = this.users.find((user) => user.id === id); return found && { ...found }; }
+  userByUsername(username: string): StoredUser | undefined {
+    const found = this.users.find((user) => user.username.toLowerCase() === username.toLowerCase());
+    return found && { ...found };
+  }
+  createUser(input: NewUser): StoredUser {
+    if (this.userByUsername(input.username)) usernameTaken(input.username);
+    const now = this.now();
+    const user: StoredUser = { ...input, id: this.users.reduce((max, u) => Math.max(max, u.id), 0) + 1, created_at: now, updated_at: now };
+    this.users.push(user);
+    return { ...user };
+  }
+  updateUser(id: number, patch: UserPatch): StoredUser | undefined {
+    const index = this.users.findIndex((user) => user.id === id);
+    if (index < 0) return undefined;
+    this.users[index] = { ...this.users[index], ...patch, updated_at: this.now() };
+    return { ...this.users[index] };
+  }
+
   listRateTypes(query: RateTypeListQuery): RateTypeSummary[] { return selectRateTypes([...this.rateTypes.values()], query); }
   rateType(id: string): RateType | undefined { const rows = this.rateTypes.get(id); return rows && rateTypeView(rows); }
 

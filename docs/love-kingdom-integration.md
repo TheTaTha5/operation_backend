@@ -24,14 +24,18 @@ the day.
 
 ## 2. Authentication
 
-Every call sends `Authorization: Bearer <token>`. Your server needs a token with **`booking:read`**
-and **`booking:write`**.
+Every call sends `Authorization: Bearer <token>`. Your server logs in as **your service user**, which
+we create for you: it books for agent `a_b2c` only, and sees and changes only `a_b2c`'s bookings.
 
-- **Production:** a machine-to-machine client in our Authentik (OAuth2 *client credentials*). Your
-  Express server gets a token from Authentik and calls us server-to-server. *Not set up yet. Ask us
-  for a client id and secret.*
-- **Testing now:** `POST /v1/login` with a test username and password that we issue. It returns a
-  12-hour token. It is temporary and will be removed.
+- `POST /v1/login {"username": "…", "password": "…"}` returns a 12-hour token (`access_token`,
+  `expires_in`). Log in again when it expires, or on any `401`.
+- A booking without `agent_id` gets `a_b2c`; another agent is `403`. Another agent's booking reads
+  as `404`. Any write outside `/v1/bookings` is `403`.
+- 15 failed logins in 3 minutes lock the username for up to 3 minutes (`429`).
+
+**Availability only:** `GET /v1/availability` also accepts your existing `X-Api-Key` header (the
+`B2C_API_KEY` you send legacy's `/api/b2c/availability`) instead of a token. The key opens nothing
+else: every other call answers `403` with it, so booking still needs the token.
 
 Never call us from the browser or ship the credentials to the public `book/` page. Our server does
 not allow your browser origin (CORS), and a token in the page would let anyone book.
@@ -159,7 +163,7 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 | Status | Meaning | What to do |
 |---|---|---|
 | `400` | Bad input: missing field, unknown route or lock, bad pax key, a `status` other than `quote`/`confirmed`, FOC without `focReason` | Bug in the mapping. Log the `message`, and don't retry. |
-| `401` / `403` | No token, or a token without `booking:write` | Fetch a new token. Check the client's scopes. |
+| `401` / `403` | No token or an expired one (`401`); a call your service user may not make (`403`) | Log in again on `401`. A `403` is a bug in the mapping: log the `message`. |
 | `404` | Booking or lock id not found | |
 | `409` | The route does not run that day (`route_closed`), seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, closed, or the state changed. Show it to the user, and don't retry blindly. |
 | `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |

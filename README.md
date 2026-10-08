@@ -50,8 +50,9 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
   `../wt-operation-backend-integration` (`INTEGRATION_DIR` in `.env` to change it), mounted
   read-only, on http://localhost:8791/allotment_v2/allotment_v2.html. It runs as that branch is
   deployed: `LA_LEGACY_SYNC=false`, so all its data comes from the local API, and server.js gets no
-  database. Log in as `admin` / `admin`, the local API's only user (`AUTH_PASSWORD_USERS` in the
-  compose file). A change to its files shows on reload; a change to its `server.js` needs
+  database. Log in with a login from the local `users` table: the data pull brings Railway's, and on a
+  fresh database `DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations npm run
+  user:create -- admin admin --admin` makes one. A change to its files shows on reload; a change to its `server.js` needs
   `docker compose restart integration`.
 - **The API ignores `.env`.** Its `DATABASE_URL` is set in the compose file, so it can never write
   to Railway. Every request needs a Bearer token: get one with
@@ -123,67 +124,110 @@ Migrations are applied once and recorded in `schema_migrations`, so re-running i
 
 Deploys migrate themselves. `railway.json` runs `node dist/migrate.js` as `preDeployCommand`, so the schema moves after the build and before the new version takes traffic; if the migration fails the deploy is aborted and the previous version keeps serving. It runs the compiled migrator rather than `npm run db:migrate`, because that script goes through `tsx`, a devDependency the production build prunes. Run `npm run db:migrate` by hand for local databases, or against a production URL when you want to watch a destructive migration go in before deploying the code that needs it.
 
-## Authentik OIDC authentication
+## Login and permissions
 
-> **Planned:** login moves to this service. Legacy's users are imported here and `POST /v1/login`
-> becomes the real login. The design (users, permissions, approvals) is pending in
-> `todo/login-permissions-model.md`. Until it ships, the two sections below describe what the code
-> does today (`src/auth.ts`).
+Legacy's logins live here (`users`, migration 027): its users are imported with their usernames and
+password hashes as they are, so everyone logs in with the password they have. The server checks
+every write against the caller's rights, which legacy checked only in the browser.
 
-Once authentication is on, every API route needs a Bearer token, except `POST /v1/login`,
-`/health` and `/docs`. It is on when `OIDC_ISSUER` and `OIDC_AUDIENCE` are both set, or when
-`AUTH_JWT_SECRET` is set (see the next section):
+Authentication is on when `AUTH_JWT_SECRET` is set; then every route needs a Bearer token except
+`POST /v1/login`, `/api/health` and `/docs`. Set `AUTH_REQUIRED=true` in Railway, so a missing
+secret stops the service at startup instead of leaving it open. Without the secret nothing is
+checked: local development and most tests.
 
 ```text
 AUTH_REQUIRED=true
-OIDC_ISSUER=https://auth.example.com/application/o/operation-backend
-OIDC_AUDIENCE=operation-backend
-```
-
-`OIDC_ISSUER` is the issuer URL displayed by the Authentik OAuth2/OIDC provider; do not substitute the Authentik root URL. The API obtains the provider's JWKS URL from OIDC discovery and validates Bearer access tokens for the configured issuer and audience. A token must have a `sub` claim.
-
-Send `Authorization: Bearer <access token>` on every request. A missing, invalid or expired token is `401`. Permissions come from the token's `scope` claim (space-separated) or its `groups` claim; either may carry these names:
-
-| API area | Read permission | Write permission |
-| --- | --- | --- |
-| Everything under `/v1/` except `/v1/manifest`: routes, boats, availability, bookings, seat locks, agents, markets, salespeople, rate types | `booking:read` | `booking:write` |
-| `/operations/…` (deployments, allotment) and `/v1/manifest` | `operations:read` | `operations:write` |
-
-A `GET` needs the read permission; any other method needs the write permission. A token without it is `403`.
-
-## Temporary password login (testing only)
-
-`POST /v1/login` exchanges a username/password for a short-lived Bearer token this service will
-itself accept. Today its users are a plain-text list in an environment variable, so it is for
-testing only and not meant to stay configured as it is. The plan (above) is to make it the real
-login, with users imported from legacy.
-
-```text
 AUTH_JWT_SECRET=<random string, e.g. `openssl rand -base64 32`>
-AUTH_PASSWORD_USERS=[{"username":"ops","password":"...","groups":["admin"]}]
 ```
 
-`AUTH_PASSWORD_USERS` is a JSON array of `{username, password, groups}`; a malformed value stops
-the service at startup. `groups` follows the same permission table above (`admin` grants
-everything). Setting `AUTH_JWT_SECRET` turns authentication on by itself, even without OIDC. Both
-variables can be set alongside `OIDC_ISSUER`/`OIDC_AUDIENCE` — a request's Bearer token is checked
-against whichever of the two are configured. `POST /v1/login` itself is always public. It answers
-`400` when `username` or `password` is missing, and `401` for a wrong pair or when
-`AUTH_JWT_SECRET` is not set.
+### Logging in
 
 ```bash
 curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
-  -d '{"username":"ops","password":"..."}'
-# {"access_token":"...","token_type":"Bearer","expires_in":43200}
+  -d '{"username":"RSVN01","password":"..."}'
+# {"access_token":"…","token_type":"Bearer","expires_in":43200,"user":{…as GET /v1/me…}}
 ```
 
-The token is HS256, signed with `AUTH_JWT_SECRET`, expires after 12 hours, and is otherwise an
-ordinary Bearer token: `Authorization: Bearer <access_token>` on any request. Its `sub` and
-`preferred_username` are the username, and it carries the user's `groups`. Rotate
-`AUTH_JWT_SECRET` (which invalidates every outstanding token) and remove these two variables once
-testing is done.
+- The username is matched ignoring case, and the password against legacy's scrypt hash (`salt:key`,
+  hex), unchanged. A wrong pair, an unknown username and a disabled user all answer the same `401`.
+- **15 failed logins in 3 minutes** lock that username (`429`, saying how many seconds to wait) until
+  the oldest of them is 3 minutes old. Counted per server instance, in memory.
+- The token lasts 12 hours. Send `Authorization: Bearer <access_token>` on every request.
+- Rights are read from `users` on every request, not from the token: a change of rights, a disable,
+  a password reset or `POST /v1/logout` takes effect at once. The last three end every session the
+  user already has (legacy `logout_after`).
 
-The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. The health endpoint remains public. Authentication is off only when neither complete OIDC configuration (`OIDC_ISSUER` and `OIDC_AUDIENCE`) nor `AUTH_JWT_SECRET` is set, which supports local tests; set `AUTH_REQUIRED=true` in Railway so that case stops the service at startup instead.
+| Endpoint | Who | What |
+|---|---|---|
+| `POST /v1/login` | anyone | `{username, password}` → token and user |
+| `POST /v1/logout` | any login | ends all of the caller's sessions; `204` |
+| `GET /v1/me` | any login | `{id, username, name, role, can_edit, edit_areas, can_edit_any, actions, view_perms, sales_id, agent_id, dept, …}` |
+| `POST /v1/me/password` | any login | `{old_password, new_password}`; `403` when the old one is wrong. Ends the other sessions and answers a fresh token |
+| `GET /v1/users` | admin | every login |
+| `POST /v1/users` | admin | `{username, password, name?, role?, edit_areas?, can_edit?, actions?, view_perms?, sales_id?, agent_id?, dept?}` → `201`; `409` for a username taken (ignoring case) |
+| `PATCH /v1/users/{id}` | admin | the same fields, and `disabled: true/false`. `password`, `username` and the stamps are refused (`400` naming what to use). An admin cannot disable or demote their own login |
+| `POST /v1/users/{id}/password` | admin | `{password}`; ends the user's sessions |
+
+A user is disabled, never deleted. Legacy's spellings `editAreas`, `canEdit`, `salesId` and `perms`
+are accepted on `POST` and `PATCH`.
+
+### What each login may do
+
+Any login may read everything. A write needs an **edit area**, as legacy assigns them:
+
+| Area | Writes |
+|---|---|
+| `operations` | bookings and their commands, seat locks, deployments |
+| `fleet` | deployments (legacy's Fleet Deployment) |
+| `sales` | rate types, agents |
+| `config` | the route calendar |
+
+- `role: admin` may do everything, including the user screens.
+- **Edit areas follow legacy's `editInfo`:** a list in `edit_areas` decides, and `can_edit` is read
+  only when there is no list, where `true` means every area. An empty list is read-only.
+- A write no area covers is admin-only, so a new endpoint is closed until it is given one.
+- `view_perms` (the pages legacy shows) is returned for the client and never enforced here.
+- A refusal is `403` naming what is missing: `Needs the operations area`.
+
+**Approving.** `approve` and `reject` need, beyond `operations`:
+
+| The booking waits for | Who may decide |
+|---|---|
+| over the allotment | an admin, or a login with the `act-approve` right |
+| FOC passengers | an admin, or `act-approve` |
+| a discount | an admin, or the agent's salesperson (`users.sales_id` = the agent's `sales_id`) |
+
+An approval carrying both an over-allotment and a discount needs both. The decision is stamped with
+the caller's username. Action rights are `act-approve` and legacy's `act-capunlock` and `act-tmpl`;
+any other is `400`.
+
+**A login tied to one agent** (`agent_id`, for Love Kingdom's service user, `a_b2c`) books for that
+agent only: a create without `agent_id` gets it, another agent is `403`, the list shows only its
+bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`.
+
+### Love Kingdom's API key
+
+Love Kingdom's server may read `GET /v1/availability` with an `X-Api-Key` header instead of a Bearer
+token, as it does legacy's `/api/b2c/availability`. The key is `B2C_API_KEY`, the same value legacy
+uses. It grants **availability only**: any other route answers `403`, so the key can never book.
+A wrong key is `401` even when a valid Bearer token is also sent, and so is any key while
+`B2C_API_KEY` is unset. Booking needs the service user's Bearer token.
+
+### Importing the users
+
+```bash
+SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:users [-- --commit]
+```
+
+A dry run unless `--commit`. Rerunnable, matched by legacy id: until cutover legacy is the master
+for its users, so a rerun brings their password changes and areas here, while what is set only here
+(`act-approve`, `agent_id`, a disable) stays. A login made here is never touched, and a legacy user
+whose username one already has is skipped and listed. Run it after the agents import, so each
+salesperson's `sales_id` is found. A row that does not fit (an unknown area or right, a hash not in
+legacy's format) is noted, never guessed.
+
+`CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be
+comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`.
 
 ## API
 
@@ -235,7 +279,7 @@ Seasons may overlap; the one that starts first decides a day, as in legacy.
 #### Editing the calendar
 
 Legacy's Settings → Programs, as an API. The calendar is edited here and only here: `sync:routes`
-no longer copies it from legacy. Every write needs `operations:write`.
+no longer copies it from legacy. Every write needs the `config` edit area.
 
 - `POST /v1/routes/{id}/seasons` `{ kind: "open"|"closed", from_date, to_date, close_anyway? }` →
   `201` with the season and its `id`. A season is added or deleted, never edited, as in legacy.
@@ -292,7 +336,7 @@ vessel does not hold is worse than saying it has none; read `charter_ceiling` fo
 Resellers, the markets they sell into, and the salespeople who own them. **Read-only for now.**
 Agents arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids (`a01`,
 `a_b2c`, …), which are the ids `bookings.agent_id` and `seat_locks.agent_id` already hold. Creating
-and editing agents comes later. All of these are under `booking:read`.
+and editing agents comes later. Any login may read them.
 
 **Every caller sees every agent.** Legacy hid other salespeople's agents only in the browser. Doing
 it here needs the caller's salesperson id in the token, and that has not been decided yet.
@@ -350,7 +394,7 @@ Field notes:
 ### Rate types
 
 A rate type is a price list: what an agent pays per seat on each route and pickup zone, per charter
-boat, and per add-on. All of these are under `booking:read` / `booking:write`, like agents. Nothing
+boat, and per add-on. Reads are open to any login; writes need the `sales` edit area. Nothing
 prices a booking from them yet; that is the quote, a later slice (`todo/pricing-model.md`).
 
 Rate types arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids

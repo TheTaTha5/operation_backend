@@ -6,11 +6,12 @@ import fastifySwaggerUi from '@fastify/swagger-ui';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { registerHealthRoutes } from './routes/health.js';
-import { registerOperationsRoutes } from './routes/operations.js';
+import { registerOperationsRoutes, type Store } from './routes/operations.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export function buildApp(): FastifyInstance {
+/** `store` lets a test hold the store the app uses (to seed users); otherwise `DATABASE_URL` picks it. */
+export function buildApp(options: { store?: Store } = {}): FastifyInstance {
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
@@ -46,7 +47,7 @@ export function buildApp(): FastifyInstance {
 
   app.get('/', async (_request, reply) => reply.sendFile('index.html'));
   app.register(registerHealthRoutes, { prefix: '/api' });
-  app.register(registerOperationsRoutes);
+  app.register(registerOperationsRoutes, { store: options.store });
 
   return app;
 }

@@ -16,6 +16,8 @@
     "db:migrate": "tsx src/migrate.ts",
     "sync:routes": "tsx src/tools/sync-routes.ts",
     "sync:boats": "tsx src/tools/sync-boats.ts",
+    "import:users": "tsx src/tools/import-users.ts",
+    "user:create": "tsx src/tools/create-user.ts",
     "verify:import": "tsx src/tools/verify-import.ts"
   },
   "dependencies": {

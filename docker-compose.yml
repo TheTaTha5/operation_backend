@@ -33,11 +33,11 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/operations
       LOG_LEVEL: info
-      # With AUTH_JWT_SECRET set every request needs a Bearer token, which `/v1/login` issues to the
-      # users below: that is how the legacy app logs in. For curl, POST /v1/login as admin first.
+      # With AUTH_JWT_SECRET set every request needs a Bearer token from `/v1/login`, which checks the
+      # `users` table: that is how the legacy app logs in. The data pull brings Railway's users; on a
+      # fresh database create one (README, "Run locally with Docker").
       AUTH_REQUIRED: "false"
       AUTH_JWT_SECRET: local-development-only-not-a-real-secret
-      AUTH_PASSWORD_USERS: '[{"username":"admin","password":"admin","groups":["admin"]}]'
       CORS_ORIGIN: ${LOCAL_CORS_ORIGIN:-http://localhost:8791,http://localhost:5173}
     ports: ["3000:3000"]
     healthcheck:

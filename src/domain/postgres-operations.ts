@@ -24,6 +24,7 @@ import {
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import { pickupFields } from './pickup.js';
+import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -56,6 +57,16 @@ type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
 const TRANSACTION_ATTEMPTS = 8;
 const isRetryable = (error: unknown): boolean => error instanceof Error && ['40001', '40P01'].includes((error as Error & { code?: string }).code ?? '');
 const asIso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
+const isoOrNull = (value: unknown): string | null => (value === null || value === undefined ? null : asIso(value));
+const storedUser = (row: Record<string, unknown>): StoredUser => ({
+  id: Number(row.id), username: String(row.username), pass_hash: (row.pass_hash as string | null) ?? null, name: (row.name as string | null) ?? null,
+  role: row.role as StoredUser['role'], can_edit: row.can_edit === true, edit_areas: (row.edit_areas as StoredUser['edit_areas']) ?? null,
+  actions: (row.actions as StoredUser['actions']) ?? [], view_perms: (row.view_perms as string[] | null) ?? null,
+  sales_id: (row.sales_id as string | null) ?? null, agent_id: (row.agent_id as string | null) ?? null, dept: (row.dept as string | null) ?? null,
+  disabled_at: isoOrNull(row.disabled_at), tokens_valid_after: isoOrNull(row.tokens_valid_after),
+  legacy_id: row.legacy_id === null || row.legacy_id === undefined ? null : Number(row.legacy_id),
+  created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
+});
 const dateOnly = (value: unknown): string => value instanceof Date ? `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}` : String(value);
 
 /**
@@ -953,6 +964,36 @@ export class PostgresOperationsStore {
     });
     for (const r of transfer) of(r)?.transfer.push({ rate_type_id: String(r.rate_type_id), route_id: String(r.route_id), zone: String(r.zone), vehicle: String(r.vehicle), price: Number(r.price) });
     return [...all.values()];
+  }
+
+  async listUsers(): Promise<StoredUser[]> { return (await this.client().query('SELECT * FROM users ORDER BY id')).rows.map(storedUser); }
+  async user(id: number): Promise<StoredUser | undefined> {
+    const { rows: [row] } = await this.client().query('SELECT * FROM users WHERE id = $1', [id]);
+    return row && storedUser(row);
+  }
+  async userByUsername(username: string): Promise<StoredUser | undefined> {
+    const { rows: [row] } = await this.client().query('SELECT * FROM users WHERE lower(username) = lower($1)', [username]);
+    return row && storedUser(row);
+  }
+  async createUser(input: NewUser): Promise<StoredUser> {
+    try {
+      const { rows: [row] } = await this.client().query(
+        `INSERT INTO users (username, pass_hash, name, role, can_edit, edit_areas, actions, view_perms, sales_id, agent_id, dept, disabled_at, tokens_valid_after, legacy_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+        [input.username, input.pass_hash, input.name, input.role, input.can_edit, input.edit_areas, input.actions, input.view_perms,
+          input.sales_id, input.agent_id, input.dept, input.disabled_at, input.tokens_valid_after, input.legacy_id]);
+      return storedUser(row);
+    } catch (error) {
+      if ((error as { code?: string; constraint?: string }).constraint === 'users_username') usernameTaken(input.username);
+      throw error;
+    }
+  }
+  async updateUser(id: number, patch: UserPatch): Promise<StoredUser | undefined> {
+    const keys = Object.keys(patch) as (keyof UserPatch)[];
+    const sets = keys.map((key, i) => `${key} = $${i + 2}`);
+    const { rows: [row] } = await this.client().query(
+      `UPDATE users SET ${[...sets, 'updated_at = now()'].join(', ')} WHERE id = $1 RETURNING *`, [id, ...keys.map((key) => patch[key])]);
+    return row && storedUser(row);
   }
 
   async listRateTypes(query: RateTypeListQuery): Promise<RateTypeSummary[]> { return selectRateTypes(await this.readRateTypes(), query); }
