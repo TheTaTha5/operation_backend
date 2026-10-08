@@ -6,8 +6,7 @@ stores has a home here, behind a domain endpoint. This replaces the *data* its g
 routes. What exists is in `README.md`; this lists only what is still to build. Paths are proposals,
 settled when built.
 
-**Next:** login and permissions (`login-permissions-model.md`, waiting for approval). After that:
-pricing (`POST /v1/quote`), booking extras (4), the rest of sales (6), vans (8), money (7).
+**Next:** pricing (`POST /v1/quote`), booking extras (4), the rest of sales (6), vans (8), money (7).
 
 **This list was derived from `operation_frontend`, which is not production.** Re-derive it from
 wt-lk-inbox's `server.js` and `os-backend/src/mapping/os_repo.js`.
@@ -15,7 +14,6 @@ wt-lk-inbox's `server.js` and `os-backend/src/mapping/os_repo.js`.
 ## 1. Identity and system
 
 ```
-GET    /v1/me                  caller identity + permissions (replaces /api/me, /api/users*)
 GET    /v1/changes?since=      what changed since version N (replaces /api/version, /api/events; change-feed-model.md)
 ```
 
@@ -107,8 +105,7 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 ## Not replaced
 
 - **Whole-state data routes:** `/api/load`, `/api/save`, `/api/v1/:resource`, `/api/v1/_batch`.
-- **Cookie login:** `/api/login`, `/api/logout`. Login moves here as Bearer tokens
-  (`login-permissions-model.md`).
+- **Cookie login:** `/api/login`, `/api/logout`. Replaced by `POST /v1/login` and Bearer tokens.
 - **Browser-side state:** `_app_hooks`, `nat_learn` (a nationality-guessing cache),
   `agent_artifacts`.
 
@@ -116,10 +113,8 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 
 - **Is fleet maintenance ours?** Section 9 may belong in a separate service.
 - **The B2C booking sync** (`/api/b2c/raw`, `/reset`, `/health`): do we take it over?
-  (`/v1/availability` already accepts Love Kingdom's `X-Api-Key`, branch
-  `feat/availability-api-key`.)
+  (`/v1/availability` already accepts Love Kingdom's `X-Api-Key`.)
 - **Live updates:** `change-feed-model.md`.
-- **Permissions:** `login-permissions-model.md`.
 - **Email images** (`/api/mailimg`, `/m/:id`) look like marketing, not operations. Confirm they can go.
 - **Resources mapped from field names only.** Check with someone who uses the screens:
   - `trips`: looks like the old per-day boat board, which deployments replace.

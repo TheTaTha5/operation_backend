@@ -11,13 +11,13 @@ The read slice exists: migration 017, `src/domain/agents.ts`, both stores, the i
   (spec Q6).
 - **Writes** (spec phase 2): `POST /v1/agents`, `PATCH /v1/agents/{id}`,
   `PUT /v1/agents/{id}/programs`, deactivate/activate. Activity rows stamped from `request.user`.
-  Who may write: the `sales` area (`todo/login-permissions-model.md`).
+  Who may write: the `sales` edit area (README, "Login and permissions").
 - **Later:** rate seasons (`todo/pricing-model.md`), add-on prices, credit used.
 
 ## Open questions (from the spec)
 
 - **Q2, sales scoping.** Needs the caller's salesperson: `users.sales_id` in
-  `todo/login-permissions-model.md`. Until then every `booking:read` caller sees every agent.
+  README, "Login and permissions". Until then every login sees every agent.
 - **Q4, credit used.** No invoices or payments here yet, so the detail has no `credit` block.
 - **Foreign keys** `bookings.agent_id` and `seat_locks.agent_id` → `agents(id)`: after the import has
   run on the shared database and dangling ids are listed.

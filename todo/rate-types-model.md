@@ -19,8 +19,7 @@ ALTER TABLE agents ADD CONSTRAINT agents_rate_type_fk FOREIGN KEY (rate_type_id)
    `localStorage['loveandaman_v2'].sb_agents_rate_bindings` from the machine that set them up, or
    re-enter them.
 3. **Custom add-ons:** keep (priced once a quote exists) or drop? Left out until decided.
-4. **Permissions:** legacy edits rates under its `sales` area (`login-permissions-model.md`).
-5. **`nationality_scope` does not restrict pricing in legacy** (spec Q2). Decided with the quote.
+4. **`nationality_scope` does not restrict pricing in legacy** (spec Q2). Decided with the quote.
 
 ## Pricing a booking still needs
 

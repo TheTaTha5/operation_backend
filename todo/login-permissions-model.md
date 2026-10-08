@@ -5,14 +5,7 @@ permissions"). What remains is outside this repo, or a known limit.
 
 ## To do when it deploys
 
-1. On Railway: keep `AUTH_JWT_SECRET` and `AUTH_REQUIRED=true`; remove `OIDC_ISSUER`,
-   `OIDC_AUDIENCE` and `AUTH_PASSWORD_USERS` (no longer read). Nobody can log in until step 2.
-2. `npm run import:users -- --commit` against Railway (after the agents import, so `sales_id`
-   resolves). Rerun until cutover: legacy is the master for its users until then.
-3. Create Love Kingdom's service user (`POST /v1/users` with `agent_id: "a_b2c"`, area
-   `operations`) and give them its password. Their test login from `AUTH_PASSWORD_USERS` stops working.
-4. Give `act-approve` to the staff who approve over the allotment and FOC (`PATCH /v1/users/{id}`).
-   Today only `admin` and `Tata` can.
+In `todo/developer-checklist.md`.
 
 ## The integration client (legacy's screens)
 
