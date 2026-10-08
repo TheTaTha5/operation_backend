@@ -106,7 +106,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object('kind', ap.kind, 'status', ap.status, 'over_capacity', ap.over_capacity, 'over_total', ap.over_total,
       'discount', ap.discount, 'foc_count', ap.foc_count, 'target_status', ap.target_status, 'requested_by', ap.requested_by, 'requested_at', ap.requested_at,
       'decided_by', ap.decided_by, 'decided_at', ap.decided_at, 'note', ap.note,
-      'days', COALESCE((SELECT jsonb_agg(jsonb_build_object('route_id', ad.route_id, 'service_date', ad.service_date::text, 'need', ad.need, 'over_by', ad.over_by)
+      'days', COALESCE((SELECT jsonb_agg(jsonb_build_object('route_id', ad.route_id, 'service_date', ad.service_date::text, 'need', ad.need, 'over_by', ad.over_by, 'licensed_free', ad.licensed_free)
                                          ORDER BY ad.service_date, ad.route_id COLLATE "C")
                         FROM booking_approval_days ad WHERE ad.approval_id = ap.id), '[]'::jsonb)) ORDER BY ap.requested_at, ap.id)
     FROM booking_approvals ap WHERE ap.booking_id = b.id), '[]'::jsonb) AS approvals
@@ -191,7 +191,7 @@ const approval = (a: Record<string, unknown>): BookingApproval => ({
   over_total: numberOrNull(a.over_total), discount: numberOrNull(a.discount), foc_count: numberOrNull(a.foc_count),
   target_status: a.target_status as Booking['status'], requested_by: textOrNull(a.requested_by), requested_at: jsonInstant(a.requested_at),
   decided_by: textOrNull(a.decided_by), decided_at: a.decided_at == null ? null : jsonInstant(a.decided_at), note: textOrNull(a.note),
-  days: (a.days as Record<string, unknown>[]).map((d): ApprovalDay => ({ route_id: String(d.route_id), service_date: String(d.service_date), need: Number(d.need), over_by: Number(d.over_by) })),
+  days: (a.days as Record<string, unknown>[]).map((d): ApprovalDay => ({ route_id: String(d.route_id), service_date: String(d.service_date), need: Number(d.need), over_by: Number(d.over_by), licensed_free: d.licensed_free == null ? null : Number(d.licensed_free) })),
 });
 const cancellation = (c: Record<string, unknown>): BookingCancellation => ({
   category: String(c.category), group: c.group as CancelGroup, note: textOrNull(c.note), charge_type: c.charge_type as ChargeType,
@@ -475,8 +475,8 @@ export class PostgresOperationsStore {
          VALUES ($1,$2,'pending',$3,$4,$5,$6,$7,$8) RETURNING id`,
         [bookingId, request.kind, request.over_capacity, request.over_total, request.discount, request.foc_count, request.target_status, request.requested_by]);
       for (const day of request.days) {
-        await this.client().query('INSERT INTO booking_approval_days (approval_id, route_id, service_date, need, over_by) VALUES ($1,$2,$3,$4,$5)',
-          [row.id, day.route_id, day.service_date, day.need, day.over_by]);
+        await this.client().query('INSERT INTO booking_approval_days (approval_id, route_id, service_date, need, over_by, licensed_free) VALUES ($1,$2,$3,$4,$5,$6)',
+          [row.id, day.route_id, day.service_date, day.need, day.over_by, day.licensed_free]);
       }
     }
   }

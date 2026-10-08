@@ -24,8 +24,12 @@ export type Intent = typeof INTENTS[number];
 /** `approval`: over the allotment and/or a discount (legacy `approval`). `foc`: free passengers (legacy `focApproval`). */
 export type ApprovalKind = 'approval' | 'foc';
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'replaced';
-/** A day an over-allotment approval is about: the seats asked for, and how many the allotment lacks. */
-export type ApprovalDay = { route_id: string; service_date: string; need: number; over_by: number };
+/**
+ * A day an over-allotment approval is about: the seats asked for, how many the allotment lacks, and
+ * the registered seats left when it was asked (legacy `licFree`, "Real seats left"; never below
+ * `need`). `licensed_free` is null on a day recorded before migration 025.
+ */
+export type ApprovalDay = { route_id: string; service_date: string; need: number; over_by: number; licensed_free: number | null };
 
 export type BookingApproval = {
   kind: ApprovalKind; status: ApprovalStatus;

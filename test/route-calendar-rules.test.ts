@@ -53,7 +53,7 @@ test('a save checks only the trips it adds or moves, and a legacy B2C booking no
 test('a land route has no seat pool: any number sells, and available_seats is null', () => {
   const day = dayCapacity([], [{ booking_mode: 'seat', pax: 40 }], [{ id: 'l1', pax: 10, drawn: 0 }], 'land');
   assert.deepEqual(capacityNumbers(day), {
-    deployed_capacity: 0, licensed_capacity: 0, booked_pax: 40, charter_pax: 0, locked_pax: 10, available_seats: null, unlimited: true, unplaced_pax: 0,
+    deployed_capacity: 0, licensed_capacity: 0, booked_pax: 40, charter_pax: 0, locked_pax: 10, available_seats: null, unlimited: true, unplaced_pax: 0, licensed_free: null,
   });
   assert.doesNotThrow(() => assertDayFits(day, demand('land', 500)));
   assert.equal(weighDay(day, demand('land', 500)), undefined, 'never over the allotment, so never waits for approval');
