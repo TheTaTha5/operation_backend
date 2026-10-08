@@ -391,6 +391,47 @@ Field notes:
   doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
   contract history (the Contracts port).
 
+### Contracts
+
+An agent's contracts, from legacy (`sb_contracts`): one `main` contract (its rate type and the
+routes it covers), and time-boxed `promo` overlays. Read-only for now; nothing prices from them
+until the quote (`todo/pricing-model.md`). Any login may read them.
+
+- `GET /v1/contracts?agent_id=&kind=&status=` → `{ "contracts": [...] }`, by agent, then main
+  before promo, then the latest `active_from` first. `kind` is `main` or `promo`, `status` is
+  `active`, `expired` or `void`; anything else is `400`.
+- `GET /v1/contracts/{id}` → one contract; `404` when unknown.
+
+```jsonc
+{ "id": "ctmuzot869guphq", "agent_id": "amuzop15vupelw", "kind": "promo", "status": "active",
+  "rate_type_id": null, "active_from": "2026-10-08", "active_to": "2026-10-15", "priority": 10,
+  "version": "promo-2026-10-08", "price_mode": "own", "discount": null, "bonus": null, "book_window": true,
+  "created_date": "2026-10-08", "created_by": "SALES.MAM", "note": null, "doc_id": null,
+  "program_periods": [{ "route_id": "r10", "book_from": "2026-10-08", "book_to": "2026-10-15",
+                        "travel_from": "2026-10-08", "travel_to": "2026-10-15", "note": null }],
+  "seat_prices": [{ "route_id": "r10", "zone": "PK", "category": "ad", "residency": "thai", "price": 1500 }] }
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Legacy's id, kept: bookings will refer to a promo by it |
+| `rate_type_id` | A main contract's rate; a promo's when `price_mode` is `rate`. `null` when none |
+| `active_from`, `active_to` | The travel dates the contract covers |
+| `priority` | Between promos covering one trip, the higher wins (then the later `active_from`) |
+| `price_mode` | Promos only: `rate` (a rate type), `own` (`seat_prices`) or `discount` (off the main rate). `null` on a main contract |
+| `discount` | `{ mode: "pct" \| "amt", value }` on a discount promo, else `null` |
+| `bonus` | `{ buy, free, basis }`, "buy N get one free", else `null` |
+| `book_window` | The promo also checks the booking date against each period's `book_from`..`book_to` |
+| `program_periods` | The routes covered, with their booking and travel windows, in legacy's order. A `null` travel bound is open |
+| `seat_prices` | An own-price promo's prices, in rate types' vocabulary (`ad`/`chd` × `thai`/`foreign`) |
+
+**Importing them:** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts [-- --commit]`,
+a dry run unless `--commit`, after `sync:routes` and the agents and rate types imports. Rerunnable:
+legacy wins for every contract it has (its periods and prices are replaced whole); one only this
+service has is left alone. What does not fit is listed: a contract whose agent is gone is skipped, a
+rate type that no longer exists becomes `null`, a period whose window runs backwards is dropped
+(legacy could never match it).
+
 ### Rate types
 
 A rate type is a price list: what an agent pays per seat on each route and pickup zone, per charter
