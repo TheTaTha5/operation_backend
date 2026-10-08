@@ -255,3 +255,35 @@ on top of phase 1's:
   `pending_approval` that holds no seats.
 - The approval note and `approval`/`focApproval` it keeps locally (`keep`) can come from
   `approvals` instead.
+
+## Checked against the integration client — 2026-10-08
+
+`wt-operation-backend-integration` (`integration/operation-backend`, `50c41ae`): **none of the client
+changes above are made.** Its ops layer last changed in `af03e95` (2026-10-05), before both phases.
+Today every create is `400`: legacy always sets `bookedAt` (`booking/bookingV2CommitBooking.js:491`),
+`toServer` sends it (`ops/40-ops-bookings.js:36,65`), and `createHeader` refuses it. Approve,
+reject, FOC and weather cancel `PATCH {status}` and are `400` too. Cancel, restore,
+partial cancel and reschedule already use the commands and work.
+
+Corrections to this note:
+
+- **`pending_foc` on create is not `400`.** It is accepted as an alias for `confirm` (decision 2),
+  then refused because the client sends no `focReason`. Only `pending_approval` is refused.
+- **"Its other fields can stay as they are" (phase 1) holds only after a merge.** After a create,
+  `upsert` skips the merge because `updatedAt` already matches (`ops/40-ops-bookings.js:210`), so
+  the local `bookedAt`, `createdBy` and `confirmed*` stay the browser's own. An edit before the next
+  refresh sends values that differ from the stored ones and is `400`. The client must merge the
+  create's response.
+
+More client changes owed, found in the same check:
+
+- **Create must not send `bookedAt`, `confirmedBy`, `confirmedAt`,** nor a `createdBy` other than
+  the login (`bookingV2CommitBooking.js:276,491,495-501`). This blocks every create today.
+- **Keep `adjustments` locally.** `fromServer` sets `adjustments: []` and `mergeInto` does not keep
+  it (`ops/40-ops-bookings.js:158,190-191`), so a refresh erases discounts in the browser and the
+  next edit re-prices without them.
+- **Show `over_licence` warnings on their own.** The `tx` wrapper renders every warning as a
+  seat-lock shortfall (`lock_id`/`got`/`wanted`, `ops/40-ops-bookings.js:289-291`), printing
+  "undefined/undefined".
+- **Seats held by `pending_approval`.** A booking loaded from the server has no local `approval`,
+  so `bkPendHoldsSeat` counts its seats; the server does not (`bookingHoldsSeats`).

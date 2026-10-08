@@ -83,3 +83,44 @@ catalogue's master moves here.
 6. **Overlapping seasons:** refuse (recommended), or allow with earliest-wins like legacy?
 7. **Calendar writes now, or at the catalogue cutover?** Recommended: at the cutover, with sync
    stopped for seasons in the same change.
+
+## Checked against the integration client — 2026-10-08
+
+Read against `wt-operation-backend-integration` (`integration/operation-backend`, `50c41ae`). The
+legacy description above holds for that branch too, apart from renames (`bkV2*` → `bookingV2*`,
+moved into `js/booking/`). The client already shows a refusal's `message` in a toast and puts the
+local change back, so a `409 route_closed` needs no new screen. Its message is shown to staff as is.
+
+**Additions to the proposal:**
+
+1. **Proposal 3 covers seat locks too.** Legacy treats a day with no boat as "no limit" for a lock
+   (`booking/bookingV2LockFreeOn.js:5`), and the client syncs locks before every booking save
+   (`ops/40-ops-bookings.js:220`). If only bookings are accepted, the lock `POST` is still `409` and
+   the whole save rolls back, so selling before boats are assigned still fails.
+2. **Land "unlimited" applies to every capacity read:** `/v1/availability` (day and range),
+   `/operations/allotment` and `/v1/manifest`. The client reads all three.
+3. **Who decides "land".** `GET /v1/routes` returns `kind`, but the client's `mapRoute` drops it
+   (`ops/10-ops-catalogue.js:56-63`) and decides land itself from `dailyCap`, which is always
+   empty. The client must take `kind` from the server, or the two disagree.
+4. **Question 2 needs a client change to be seen.** The browser blocks every save with a closed
+   trip (`bookingV2CommitBooking.js:122-128`), so the lighter server rule is invisible until the
+   browser's guard is narrowed the same way. A trip without `opsTripId` looks "added".
+
+**Client follow-ups found (legacy repo, not this note's scope):**
+
+- A refused `/restore` leaves the cancellation-fee invoice voided: the browser voids it before
+  asking the server, and `putBack` does not restore it (`bookingV2RestoreBooking.js:11`).
+- Settings → Programs edits only the local copy, and the server's calendar replaces it on screen,
+  so an edit seems to vanish. Until the catalogue cuts over, that screen should say it is read-only.
+
+**Where the proposal makes a screen behave differently from legacy** (`CLAUDE.md`, "Same screens,
+new data"; each is the developer's call):
+
+| Item | Legacy screen | With the proposal |
+|---|---|---|
+| Q2 untouched trips | a notes edit on a booking whose day closed is blocked | allowed (needs the client guard narrowed) |
+| Q3 reschedule / restore | never refused for a closed day | refused, with the server's message |
+| Q1 B2C exception | a B2C booking on a closed day saves with a warning | refused |
+| Q6 overlapping seasons | saved, earliest wins silently | refused (only once writes exist, Q7) |
+| Q7 Settings → Programs | editable | read-only until the catalogue cutover |
+| P2 land routes, P3 no boat | saves | saves; no change from legacy (refused here today) |

@@ -21,7 +21,7 @@ Order follows the cutover decision: **bookings first**.
 
 | Value | Today | Should be | Change |
 |---|---|---|---|
-| `status` | any of 10 via `PATCH` | **validated** | a state machine copied from legacy; changes only through commands (`confirm`, `approve`, `reject`, `complete`, `cancel-weather`, next to `cancel`, `restore`); `PATCH {status}` → 400 |
+| `status` | any of 10 via `PATCH` | **validated** | a state machine copied from legacy; changes only through commands (`confirm`, `approve`, `reject`, `cancel-weather`, next to `cancel`, `restore`; built 2026-10-07. A `complete` command was listed here but not built: no client sets `completed`); `PATCH {status}` → 400 |
 | `confirmed_by`, `confirmed_at` | taken from the body | **computed** | stamped by `confirm` from the token |
 | `cancellation_reason` | settable by `PATCH` | **computed** | written by `/cancel` only |
 | `created_by` | token, or the body if sent | decide | keep the "entered on someone's behalf" case, or always the token |
