@@ -1,5 +1,13 @@
 # Importing legacy's approvals, modelled
 
+**Approved 2026-10-08, built on `feat/import-gaps`** (migration 026, `src/tools/legacy-approvals.ts`).
+Answers: question 1, yes, `booking_approvals.reason` (this service now writes `over_capacity`,
+`discount` or `over_capacity+discount` on the approvals it asks for); question 2, FOC `RM` imported as
+is. Data check on the 2026-10-08 dump: 168 approvals (108 discount, 31 b2c_hold, 24 over capacity,
+5 closed_day, …; 3 pending), 213 FOC approvals (15 pending), 24 with days. No booking is
+`pending_approval` today, so every pending approval is stale (its booking moved on) and holds
+nothing; they are imported as they are and counted in the report.
+
 - **Source:** wt-lk-inbox@658298d — `08-app.js` `bkV2CommitBooking`, `bkV2EnsureApproval`,
   `bkV2ApproveBooking`, `bkV2RejectBooking`, `bkV2FocApprove`, `bkV2FocReject`;
   `os-backend/src/mapping/os_repo.js` `decomposeBlob`, `field_mapping.json` (`sb_bookings`).

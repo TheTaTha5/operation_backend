@@ -25,6 +25,12 @@
  * route taken off a rate in legacy is taken off here, with its prices. A rate type legacy no longer
  * has is kept and listed, as agents are, since bookings may name it.
  *
+ * A booking's approvals (`legacy-approvals.ts`) come with it: legacy's one over-allotment/discount
+ * approval and one FOC approval per booking, with the days and reason, so an imported booking waiting
+ * over the allotment holds no seats here either. Its `foc_reason` is its own, else its FOC
+ * approval's. A seat lock spanning days (bulk or month) becomes one lock per departure on the days
+ * the route runs (`legacy-locks.ts`), `lg_<legacy id>_<date>`; a booking's draw lands on its day's.
+ *
  * Rows go in as SQL, not through the API, so the capacity check is skipped on purpose: legacy days
  * that were oversold arrive oversold rather than half-imported. The mapping itself reuses the domain
  * parsers (`bookingHeader`, `parsePaxGrid`, `isBookingStatus`) so an imported row obeys the same rules
@@ -40,6 +46,9 @@ import { legacyPickup } from './legacy-pickup.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
+import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
+import { lockDays, spansDays } from './legacy-locks.js';
+import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -224,25 +233,50 @@ async function main() {
     const parentOf = new Map<string, string>();
     for (const l of legacyLocks) if (str(l.parentid)) parentOf.set(str(l.id), str(l.parentid));
     const locks: Row[] = [];
-    const lockAt = new Map<string, { id: string; route: string; day: string }>(); // legacy parent id → imported lock
+    // legacy parent id → its route and the imported lock of each date (one date for a day lock)
+    const lockAt = new Map<string, { route: string; days: Map<string, string> }>();
+    // A lock spanning days becomes one per departure, on the days the route runs here (legacy-locks.ts).
+    const calendar = routeCalendar(
+      (await target.query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons')).rows as RouteSeason[],
+      (await target.query('SELECT route_id, service_date::text, kind FROM route_day_overrides')).rows as RouteDayOverride[]);
     for (const l of legacyLocks) {
       const legacyId = str(l.id);
       if (parentOf.has(legacyId)) { note('sub-locks folded into their parent'); continue; }
       const day = str(l.date), routeId = str(l.routeid), qty = int(l.qty);
-      if (str(l.scope) === 'bulk' || !day) { skip('seat lock', legacyId, `${str(l.scope) || 'undated'} lock has no single date`); continue; }
-      if (!ISO_DAY.test(day)) { skip('seat lock', legacyId, `bad date ${day}`); continue; }
+      const scope = str(l.scope) || 'day';
+      if (!spansDays(l) && !day) { skip('seat lock', legacyId, 'undated lock has no date'); continue; }
+      if (!spansDays(l) && !ISO_DAY.test(day)) { skip('seat lock', legacyId, `bad date ${day}`); continue; }
       if (!routes.has(routeId)) { skip('seat lock', legacyId, `route ${routeId || '(none)'} not in catalogue`); continue; }
       if (qty <= 0) { skip('seat lock', legacyId, `qty ${qty}`); continue; }
       const created = instant(l.createdat) ?? new Date().toISOString();
+      const agentId = str(l.holdertype) === 'agent' && str(l.holderid) ? str(l.holderid) : null;
       const active = str(l.status) === 'active';
-      const id = PREFIX + legacyId;
-      locks.push({
-        id, route_id: routeId, service_date: day, pax: qty,
-        agent_id: str(l.holdertype) === 'agent' && str(l.holderid) ? str(l.holderid) : null,
-        status: active ? 'active' : 'released', created_at: created, updated_at: created, released_at: null,
-      });
-      lockAt.set(legacyId, { id, route: routeId, day });
-      note(`locks ${str(l.status) || '(blank)'} → ${active ? 'active' : 'released'}`);
+      const days = new Map<string, string>();
+      if (spansDays(l)) {
+        const rounds = lockDays(l, (date) => calendar.isOpen(routeId, date));
+        if (typeof rounds === 'string') { skip('seat lock', legacyId, `${scope} lock: ${rounds}`); continue; }
+        if (rounds.length === 0) { note(`${scope} locks with no departure left (no day the route runs, or every seat pending)`); continue; }
+        for (const round of rounds) {
+          const id = `${PREFIX}${legacyId}_${round.service_date}`;
+          locks.push({
+            id, route_id: routeId, service_date: round.service_date, pax: round.pax, agent_id: agentId,
+            status: round.released ? 'released' : 'active', created_at: created, updated_at: created, released_at: null,
+          });
+          days.set(round.service_date, id);
+        }
+        note(`${scope} locks split into one lock per departure`);
+        note(`${scope} lock departures (${str(l.status) || '(blank)'} lock) → ${rounds.filter((r) => !r.released).length ? 'active, released where legacy released the round' : 'released'}`);
+        if (rounds.length) note(`${scope} lock departures written`, rounds.length);
+      } else {
+        const id = PREFIX + legacyId;
+        locks.push({
+          id, route_id: routeId, service_date: day, pax: qty, agent_id: agentId,
+          status: active ? 'active' : 'released', created_at: created, updated_at: created, released_at: null,
+        });
+        days.set(day, id);
+        note(`locks ${str(l.status) || '(blank)'} → ${active ? 'active' : 'released'}`);
+      }
+      lockAt.set(legacyId, { route: routeId, days });
     }
 
     // ── Vans: the catalogue keeps legacy's ids (upserted, like deployments), and everything dated
@@ -385,6 +419,10 @@ async function main() {
     const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
+    // Approvals (`legacy-approvals.ts`). Legacy's `licFree` goes to the approval day when this schema keeps it (025).
+    const approvals: Row[] = [], approvalDays: ApprovalDayRow[] = [];
+    const approvalDayLicensedFree = (await target.query(`SELECT 1 FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'booking_approval_days' AND column_name = 'licensed_free'`)).rowCount === 1;
     const report = { skip, note };
     for (const b of legacyBookings) {
       const legacyId = str(b.id);
@@ -445,12 +483,14 @@ async function main() {
           const lock = lockAt.get(parentOf.get(legacyLock) ?? legacyLock);
           if (charter) { note('draws dropped: on a charter'); continue; }
           if (!lock) { note('draws dropped: lock not imported'); continue; }
-          if (lock.route !== routeId || lock.day !== day) { note('draws dropped: lock on another route or day'); continue; }
+          // a bulk lock has one lock per departure: the draw lands on its day's
+          const lockId = lock.route === routeId ? lock.days.get(day) : undefined;
+          if (!lockId) { note('draws dropped: lock on another route or day'); continue; }
           const take = Math.min(qty, budget);
           if (take < qty) note('draws trimmed to the trip pax');
           if (take <= 0) continue;
           budget -= take;
-          byLock.set(lock.id, (byLock.get(lock.id) ?? 0) + take);
+          byLock.set(lockId, (byLock.get(lockId) ?? 0) + take);
         }
         for (const [lockId, qty] of byLock) myDraws.push({ booking_trip_id: tripId, seat_lock_id: lockId, qty });
       }
@@ -461,6 +501,9 @@ async function main() {
 
       const doc: Record<string, unknown> = {};
       for (const [column, legacyColumn] of Object.entries(HEADER_FROM_LEGACY)) if (b[legacyColumn] != null) doc[column] = b[legacyColumn];
+      // The FOC reason confirming free passengers needs: the booking's own, else its FOC approval's.
+      const foc = focReason(b, report);
+      if (foc) doc.foc_reason = foc;
       const header: Record<string, unknown> = { ...bookingHeader(doc) };
       for (const column of TIMESTAMP_HEADER) {
         if (header[column] !== undefined && instant(header[column]) === undefined) { delete header[column]; note(`${column} dropped: not a timestamp`); }
@@ -485,6 +528,9 @@ async function main() {
       partialCancels.push(...partialCancelRows(partialCancelsOf.get(legacyId) ?? [], id, myTrips.map((t) => String(t.id)), myTrips.map((t) => String(t.service_date)), lastChange, report));
       feeItems.push(...feeItemRows(feeItemsOf.get(legacyId) ?? [], id, lastChange, report));
       historyLines.push(...historyRows(historyOf.get(legacyId) ?? [], id, lastChange, report));
+      // A request with no time of its own was asked when the booking was made.
+      const asked = approvalRows(b, id, instant(header.booked_at) ?? created, report, approvalDayLicensedFree);
+      approvals.push(...asked.approvals); approvalDays.push(...asked.days);
 
       // Van data: day 1 of the booking lives on the booking's own `ops_*`, every later day on that
       // trip's (legacy `bkOpsRead`, booking.js:1917). A booking that releases its seats takes no part
@@ -775,6 +821,15 @@ async function main() {
     await insert('booking_reschedules', reschedules);
     await insert('booking_partial_cancels', partialCancels);
     await insert('booking_fee_items', feeItems);
+    await insert('booking_approvals', approvals);
+    // Each imported booking has at most one approval of each kind, so (booking, kind) finds its id.
+    if (approvalDays.length) {
+      const free = approvalDayLicensedFree ? ', licensed_free' : '';
+      await target.query(`INSERT INTO booking_approval_days (approval_id, route_id, service_date, need, over_by${free})
+        SELECT ap.id, d.route_id, d.service_date, d.need, d.over_by${approvalDayLicensedFree ? ', d.licensed_free' : ''}
+        FROM jsonb_to_recordset($1::jsonb) AS d(booking_id text, route_id text, service_date date, need int, over_by int, licensed_free int)
+        JOIN booking_approvals ap ON ap.booking_id = d.booking_id AND ap.kind = 'approval'`, [JSON.stringify(approvalDays)]);
+    }
     // In legacy's order, so the serial id keeps two lines written at the same instant in sequence.
     await target.query(`INSERT INTO booking_history (booking_id, at, by, kind, tag, text)
       SELECT r.booking_id, r.at, r.by, r.kind, r.tag, r.text FROM jsonb_populate_recordset(NULL::booking_history, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(historyLines)]);
@@ -785,7 +840,7 @@ async function main() {
     const { rows: [after] } = await target.query(`SELECT
       (SELECT count(*) FROM bookings)::int bookings, (SELECT count(*) FROM booking_trips)::int trips,
       (SELECT count(*) FROM booking_trip_pax)::int pax_cells, (SELECT count(*) FROM booking_passengers)::int passengers,
-      (SELECT count(*) FROM booking_trip_lock_draws)::int lock_draws, (SELECT count(*) FROM seat_locks)::int seat_locks,
+      (SELECT count(*) FROM booking_trip_lock_draws)::int lock_draws, (SELECT count(*) FROM seat_locks)::int seat_locks, (SELECT count(*) FROM booking_approvals)::int approvals,
       (SELECT count(*) FROM deployments)::int deployments, (SELECT count(*) FROM boat_capacity_overrides)::int capacity_overrides,
       (SELECT count(*) FROM vans)::int vans, (SELECT count(*) FROM van_day_routes)::int van_day_routes, (SELECT count(*) FROM van_days)::int van_days,
       (SELECT count(*) FROM van_groups)::int van_groups, (SELECT count(*) FROM booking_trip_van_allocations)::int van_allocations,
@@ -801,6 +856,7 @@ async function main() {
     console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks`);
     console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
     console.log(`action records: ${cancellations.length} cancellations, ${reschedules.length} reschedules, ${partialCancels.length} partial cancels, ${feeItems.length} fee items, ${historyLines.length} history lines`);
+    console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);

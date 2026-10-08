@@ -663,7 +663,7 @@ FOC passengers asks for both, and approves in two steps (`pending_approval` → 
 {
   "status": "pending_approval", "allocated_pax": 0,
   "approvals": [{
-    "kind": "approval", "status": "pending", "over_capacity": true, "over_total": 2, "discount": null, "foc_count": null,
+    "kind": "approval", "status": "pending", "reason": "over_capacity", "over_capacity": true, "over_total": 2, "discount": null, "foc_count": null,
     "target_status": "confirmed", "requested_by": "ops1", "requested_at": "…", "decided_by": null, "decided_at": null, "note": null,
     "days": [{ "route_id": "r3", "service_date": "2039-02-01", "need": 22, "over_by": 2, "licensed_free": 25 }]
   }]
@@ -680,6 +680,10 @@ migration 025.
 `approvals` is every approval asked for, oldest first, kept after it is decided: `kind` `approval`
 (over the allotment and/or a discount) or `foc`; `status` `pending`, `approved`, `rejected`, or
 `replaced` (a later edit asked again before it was decided). At most one per kind is `pending`.
+`reason` says why an `approval` was asked, in legacy's labels: `over_capacity`, `discount`, or
+`over_capacity+discount`; one imported from legacy may also say `closed_day` (sold on a day the
+route did not run) or `b2c_hold` (held by the B2C sync). An `foc` approval has none: its reason is
+the booking's `foc_reason`.
 
 **`status` on create is deprecated.** Until both clients send `intent`, a create may still send the
 old `status`, read as the intent it meant: `quote` or `draft` → `quote`; `confirmed` or
