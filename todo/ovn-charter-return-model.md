@@ -29,8 +29,8 @@ stay**, the nights between included:
 
 | Booking | Boat | Outbound | Return | `trips__boat` days chartered to it |
 |---|---|---|---|---|
-| BK-26090351-ENOG (Zeus, 12 pax, ฿15,000) | b13 | r10 2026-09-16 | 2026-09-19 | 16, 17, 18, 19 Sep |
-| BK-26100056-MYJC (44 pax) | b11 | r10 2026-10-26 | 2026-10-28 | 26, 27, 28 Oct |
+| BK-26090351-ENOG (Zeus, 12 pax, ฿139,800; ฿15,000 of it the overnight charge) | b13 | r10 2026-09-16 | 2026-09-19 | 16, 17, 18, 19 Sep |
+| BK-26100056-MYJC (44 pax, ฿75,000) | b11 | r10 2026-10-26 | 2026-10-28 | 26, 27, 28 Oct |
 
 These two are all of legacy's overnight charters today.
 
