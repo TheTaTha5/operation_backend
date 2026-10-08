@@ -107,7 +107,7 @@ POST /v1/bookings
 | `pickupZone`, `pickupHotel` | `trips[].zone`, `hotelName` (`pickupZone` on the header too) | |
 | `addonsSelected[{addonId,qty}]` | `addOns[{type,amount,qty}]` | `type` is the ops code (`longtail-join`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). `amount` is the **line total**, not a unit price. |
 | `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
-| `total` | `total` | THB, as a number. |
+| `total` | `total` | THB, as a number. Kept as you send it: your bookings are B2C (agent `a_b2c`), which this service does not re-price, unlike staff bookings. The add-on `amount`s are kept too. |
 | private charter item | `trips[].bookingMode: "charter"` + `charterBoatId` | The boat must be deployed that day. |
 
 Fields not in the README's "Booking header fields" table are **dropped, not stored**. If you need

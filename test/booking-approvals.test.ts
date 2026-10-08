@@ -89,7 +89,7 @@ test('approving gives the seats; past the licence it still approves, with a warn
   const alone = await book(calm, 22);
   assert.deepEqual((await request('POST', `/v1/bookings/${alone.id}/approve`)).json().warnings, [], 'within the licence: no warning');
 
-  const refused = await book(calm, 1, { price_discount: -100 });
+  const refused = await book(calm, 1, { adjustments: [{ kind: 'discount', value: 100 }] });
   const rejected = (await request('POST', `/v1/bookings/${refused.id}/reject`, { note: 'too generous' })).json();
   assert.equal(rejected.status, 'rejected');
   assert.deepEqual(rejected.warnings, []);
@@ -134,12 +134,12 @@ test('over the allotment with free passengers: the approval first, then the FOC 
 test('a discount on a confirm waits for approval, holding its seats', async () => {
   const date = '2039-02-07';
   await day(date);
-  const discounted = await book(date, 4, { price_discount: -500 });
+  const discounted = await book(date, 4, { adjustments: [{ kind: 'discount', value: 500 }] });
   assert.equal(discounted.status, 'pending_approval');
   assert.equal(discounted.allocated_pax, 4);
   assert.deepEqual(discounted.approvals.map((a: Record<string, unknown>) => [a.over_capacity, a.discount, a.target_status, a.reason]), [[false, 500, 'confirmed', 'discount']]);
   assert.deepEqual((await history(discounted.id)).slice(-1), ['Waiting for approval · discount ฿500']);
-  assert.equal((await book(date, 4, { price_discount: -500, intent: 'quote' })).status, 'quote', 'a quote is not weighed for its discount');
+  assert.equal((await book(date, 4, { adjustments: [{ kind: 'discount', value: 500 }], intent: 'quote' })).status, 'quote', 'a quote is not weighed for its discount');
   assert.equal((await request('POST', `/v1/bookings/${discounted.id}/approve`)).json().status, 'confirmed');
 });
 

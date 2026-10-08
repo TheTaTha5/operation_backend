@@ -134,13 +134,13 @@ test('confirm moves a quote to confirmed, or to pending_foc when it carries free
 
 test('reject gives the seats back; approve does not apply to a confirmed booking', async () => {
   const date = '2038-01-11';
-  const waiting = await booked(date, { price_discount: -500 });
+  const waiting = await booked(date, { adjustments: [{ kind: 'discount', value: 500 }] });
   assert.equal(waiting.status, 'pending_approval', 'a discount waits for approval');
   assert.equal(await seatsLeft(date), 18, 'waiting only for a discount, it holds its seats');
   assert.equal((await request('POST', `/v1/bookings/${waiting.id}/approve`)).statusCode, 200);
   assert.equal((await request('POST', `/v1/bookings/${waiting.id}/approve`)).statusCode, 409, 'already confirmed');
 
-  const other = await booked('2038-01-12', { price_discount: -500 });
+  const other = await booked('2038-01-12', { adjustments: [{ kind: 'discount', value: 500 }] });
   const rejected = await request('POST', `/v1/bookings/${other.id}/reject`, { note: 'over the boat' });
   assert.equal(rejected.json().status, 'rejected');
   assert.equal(await seatsLeft('2038-01-12'), 20, 'the seats are back');

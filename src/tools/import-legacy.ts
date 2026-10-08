@@ -67,6 +67,8 @@ const note = (what: string, n = 1) => notes.set(what, (notes.get(what) ?? 0) + n
 
 const str = (value: unknown): string => (value == null ? '' : String(value).trim());
 const int = (value: unknown): number => { const n = Number(value); return Number.isFinite(n) ? Math.trunc(n) : 0; };
+/** A money amount legacy stored, or null when it stored none (or a negative one, which no column takes). */
+const amountOrNull = (value: unknown): number | null => { if (value === null || value === undefined || value === '') return null; const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : null; };
 /** An instant the database will accept, or undefined. Date-only strings are instants at midnight UTC. */
 const instant = (value: unknown): string | undefined => { const s = str(value); return s && !Number.isNaN(Date.parse(s)) ? s : undefined; };
 
@@ -467,6 +469,11 @@ async function main() {
           id: tripId, booking_id: id, seq, route_id: routeId, service_date: day, booking_mode: charter ? 'charter' : 'seat', charter_boat_id: boatId,
           zone: details.zone ?? null, pickup_time: pickup.pickup_time ?? null, pickup_time_end: pickup.pickup_time_end ?? null,
           pickup_at_pier: pickup.pickup_at_pier === true, ovn: ovn ?? null, ovn_return_date: returnDate ?? null, ovn_leg: leg,
+          // What legacy priced the trip at, and the price facts it read (migration 032). Legacy never kept the
+          // rate, so `rate_type_id` stays empty and an edit falls back to the booking's rate, as legacy does.
+          subtotal: amountOrNull(t.subtotal), ovn_charge: amountOrNull(t.ovncharge),
+          charter_price_mode: str(t.charterpricemode) === 'manual' ? 'manual' : str(t.charterpricemode) === 'rate' ? 'rate' : null,
+          charter_price_manual: amountOrNull(t.charterpricemanual), charter_price_note: str(t.charterpricenote) || null,
           ovn_of: of === undefined ? null : `trip_${id}_${of}`,
         });
         for (const r of rows) myPax.push({ booking_trip_id: tripId, category: r.category, residency: r.residency, count: r.count });

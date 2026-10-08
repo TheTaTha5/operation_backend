@@ -4,7 +4,7 @@ import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
   licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
-  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
@@ -90,6 +90,8 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode, 'charter_boat_id', t.charter_boat_id,
       'zone', t.zone, 'pickup_time', t.pickup_time, 'pickup_time_end', t.pickup_time_end, 'pickup_at_pier', t.pickup_at_pier, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
+      'ovn_charge', t.ovn_charge, 'charter_price_mode', t.charter_price_mode, 'charter_price_manual', t.charter_price_manual, 'charter_price_note', t.charter_price_note,
+      'subtotal', t.subtotal, 'rate_type_id', t.rate_type_id, 'promo_id', t.promo_id,
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -166,6 +168,13 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     lock_draws: (trip.lock_draws as Record<string, unknown>[]).map((draw): LockDraw => ({ lock_id: String(draw.lock_id), qty: Number(draw.qty) })),
     ...(trip.zone ? { zone: String(trip.zone) } : {}),
     ...pickupFields({ pickup_time: trip.pickup_time ? String(trip.pickup_time) : undefined, pickup_time_end: trip.pickup_time_end ? String(trip.pickup_time_end) : undefined, pickup_at_pier: trip.pickup_at_pier === true }),
+    ...(trip.ovn_charge == null ? {} : { ovn_charge: Number(trip.ovn_charge) }),
+    ...(trip.charter_price_mode ? { charter_price_mode: trip.charter_price_mode as 'rate' | 'manual' } : {}),
+    ...(trip.charter_price_manual == null ? {} : { charter_price_manual: Number(trip.charter_price_manual) }),
+    ...(trip.charter_price_note ? { charter_price_note: String(trip.charter_price_note) } : {}),
+    ...(trip.subtotal == null ? {} : { subtotal: Number(trip.subtotal) }),
+    ...(trip.rate_type_id ? { rate_type_id: String(trip.rate_type_id) } : {}),
+    ...(trip.promo_id ? { promo_id: String(trip.promo_id) } : {}),
     ...(trip.ovn ? { ovn: trip.ovn as OvnMode } : {}),
     ...(trip.ovn_return_date ? { ovn_return_date: String(trip.ovn_return_date) } : {}),
     ovn_leg: trip.ovn_leg === true,
@@ -434,16 +443,20 @@ export class PostgresOperationsStore {
     for (const trip of planned) {
       const values = [trip.id, bookingId, trip.seq, trip.route_id, trip.service_date, trip.booking_mode, trip.charter_boat_id ?? null,
         trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null,
-        trip.pickup_time_end ?? null, trip.pickup_at_pier === true];
+        trip.pickup_time_end ?? null, trip.pickup_at_pier === true,
+        trip.ovn_charge ?? null, trip.charter_price_mode ?? null, trip.charter_price_manual ?? null, trip.charter_price_note ?? null,
+        trip.subtotal ?? null, trip.rate_type_id ?? null, trip.promo_id ?? null];
       if (existing.has(trip.id)) {
         await this.client().query(`UPDATE booking_trips SET seq = $3, route_id = $4, service_date = $5, booking_mode = $6, charter_boat_id = $7,
-          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13, pickup_time_end = $14, pickup_at_pier = $15
+          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13, pickup_time_end = $14, pickup_at_pier = $15,
+          ovn_charge = $16, charter_price_mode = $17, charter_price_manual = $18, charter_price_note = $19, subtotal = $20, rate_type_id = $21, promo_id = $22
           WHERE id = $1 AND booking_id = $2`, values);
         await this.client().query('DELETE FROM booking_trip_pax WHERE booking_trip_id = $1', [trip.id]);
         await this.client().query('DELETE FROM booking_trip_lock_draws WHERE booking_trip_id = $1', [trip.id]);
       } else {
         await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of,
-          pickup_time_end, pickup_at_pier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, values);
+          pickup_time_end, pickup_at_pier, ovn_charge, charter_price_mode, charter_price_manual, charter_price_note, subtotal, rate_type_id, promo_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, values);
       }
       for (const cell of trip.pax) {
         await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [trip.id, cell.category, cell.residency, cell.count]);
@@ -550,6 +563,20 @@ export class PostgresOperationsStore {
     const { rows } = await this.client().query('SELECT at, by, kind, tag, text FROM booking_history WHERE booking_id = $1 ORDER BY at, id', [id]);
     return rows.map((row) => ({ at: asIso(row.at), by: textOrNull(row.by), kind: String(row.kind), tag: textOrNull(row.tag), text: String(row.text) }));
   }
+  /**
+   * What `priceBooking` priced each trip and add-on at, written beside them by position, in the
+   * create's or amendment's own transaction. The trips themselves are left alone.
+   */
+  async setPrices(id: string, prices: BookingPrices): Promise<void> {
+    for (const [seq, p] of prices.trips.entries()) {
+      await this.client().query('UPDATE booking_trips SET subtotal = $3, rate_type_id = $4, promo_id = $5 WHERE booking_id = $1 AND seq = $2',
+        [id, seq, p.subtotal, p.rate_type_id, p.promo_id]);
+    }
+    for (const [seq, amount] of prices.add_ons.entries()) {
+      await this.client().query('UPDATE booking_addons SET amount = $3 WHERE booking_id = $1 AND seq = $2', [id, seq, amount]);
+    }
+  }
+
   /** Every action's write is signed by the token's user; without one (auth off) the column is left alone. */
   private async touch(id: string, actor: string | undefined, extra = '', values: unknown[] = []): Promise<void> {
     await this.client().query(`UPDATE bookings SET updated_at = now(), version = version + 1, updated_by = COALESCE($2, updated_by)${extra} WHERE id = $1`, [id, actor ?? null, ...values]);

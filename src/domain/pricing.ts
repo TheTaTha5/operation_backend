@@ -18,7 +18,7 @@ import { refuse } from './booking-actions.js';
 export type QuoteTrip = {
   route_id: string; service_date: string; booking_mode?: string; charter_boat_id?: string; zone?: string;
   ovn?: string; ovn_leg?: boolean; ovn_charge?: number;
-  charter_price_mode?: 'rate' | 'manual'; charter_price_manual?: number;
+  charter_price_mode?: 'rate' | 'manual'; charter_price_manual?: number; charter_price_note?: string;
   pax: readonly PaxRow[];
   /** On an edit that keeps the old rate: the rate this trip was sold at, when it is the same trip. */
   kept_rate_type_id?: string | null;
