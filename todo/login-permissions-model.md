@@ -60,7 +60,8 @@ Legacy's `perms` (which pages to show) is a client concern: kept as `view_perms 
 - Permissions are read from `users` on every request, not baked into the token. A change of role,
   a disable or a password reset takes effect at once (fixes legacy).
 - `POST /v1/logout` sets `tokens_valid_after`.
-- Failed logins: 5 in 15 minutes for one username → `429` for 15 minutes.
+- Failed logins: 15 in 3 minutes for one username → `429` until the oldest of them is 3 minutes
+  old (so at most 3 minutes).
 
 **Permissions** (validated on every write, in one hook):
 
@@ -87,14 +88,20 @@ Legacy's `perms` (which pages to show) is a client concern: kept as `view_perms 
 **Import:** `src/tools/import-legacy.ts` copies `users` (read-only from legacy) by `legacy_id`,
 hashes as they are. Users made here are never touched by the import.
 
-## Questions
+## Decided 2026-10-08
 
-1. **Authentik:** drop the Authentik token path once users are imported (recommended: one login,
-   CLAUDE.md), or keep both?
-2. **Who approves over the allotment:** `admin` + `act-approve` as proposed? Legacy checks no one;
-   this is a new rule.
-3. **Discount approval by the agent's salesperson only** (what legacy's UI says), plus `admin`?
-4. **FOC approval:** who, given legacy hard-codes `'RM'`?
-5. **Love Kingdom** calls the API as a machine. A service user with area `operations` limited to its
-   own agent (`a_b2c`): recommended. Or a separate API key?
-6. **Rate limit numbers** (5 in 15 min): fine?
+- **Authentik is dropped.** One login: `POST /v1/login` against the imported users. The JWKS
+  path and `AUTH_PASSWORD_USERS` go once the users are imported.
+- **Discounts** are approved by the agent's salesperson or `admin`.
+- **Love Kingdom** books as a service user, area `operations`, limited to its agent (`a_b2c`).
+  Availability already accepts its `X-Api-Key`.
+- **Failed logins:** 15 in 3 minutes.
+
+## Open
+
+1. **Approve over the allotment:** `admin` only, or `admin` plus a per-user `act-approve` right?
+   Legacy has no such right today (its action rights are `act-capunlock` and `act-tmpl`); the
+   approver is whoever types a name. Two users are `admin`: `admin` and `Tata`.
+2. **Approve FOC:** "RM and admin". Legacy has no `RM` user or role: `RM` is a name its code writes
+   as the approver whoever clicks (`bk.focApproval.approvedBy = 'RM'`). Which users are RM? They
+   get a new `act-foc` right.
