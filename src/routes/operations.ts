@@ -15,6 +15,7 @@ import {
   actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
 } from '../domain/booking-actions.js';
 import { parseIntent } from '../domain/booking-approvals.js';
+import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -85,11 +86,18 @@ function tripInput(value: unknown, index: number): BookingTripInput {
  * legacy writes an unset field; a value that is present and malformed is refused. The rules that
  * span trips — a leg matching its outbound — are `assertItinerary`'s.
  */
-function tripDetails(trip: Record<string, unknown>, label: string): Pick<BookingTripInput, 'zone' | 'pickup_time' | 'ovn' | 'ovn_return_date' | 'ovn_leg' | 'ovn_of'> {
+function tripDetails(trip: Record<string, unknown>, label: string): Pick<BookingTripInput, 'zone' | 'pickup_time' | 'pickup_time_end' | 'pickup_at_pier' | 'ovn' | 'ovn_return_date' | 'ovn_leg' | 'ovn_of'> {
   const unset = (value: unknown) => value === undefined || value === null || value === '';
   const text = (value: unknown, name: string): string | undefined => unset(value) ? undefined : typeof value === 'string' ? value : badRequest(`${label}.${name} must be a string`);
-  const pickup_time = text(trip.pickup_time ?? trip.pickupTime, 'pickup_time');
-  if (pickup_time !== undefined && !isIsoTime(pickup_time)) badRequest(`${label}.pickup_time must be an ISO time, HH:MM`);
+  const atPier = trip.pickup_at_pier ?? trip.pickupAtPier;
+  if (!unset(atPier) && typeof atPier !== 'boolean') badRequest(`${label}.pickup_at_pier must be true or false`);
+  const pickup = pickupFields({
+    pickup_time: text(trip.pickup_time ?? trip.pickupTime, 'pickup_time'),
+    pickup_time_end: text(trip.pickup_time_end ?? trip.pickupTimeEnd, 'pickup_time_end'),
+    pickup_at_pier: atPier === true,
+  });
+  const pickupError = pickupProblem(pickup);
+  if (pickupError) badRequest(`${label}.${pickupError}`);
   const ovn = text(trip.ovn, 'ovn');
   if (ovn !== undefined && ovn !== 'return' && ovn !== 'self') badRequest(`${label}.ovn must be return or self`);
   const ovn_return_date = text(trip.ovn_return_date ?? trip.ovnReturnDate, 'ovn_return_date');
@@ -101,7 +109,7 @@ function tripDetails(trip: Record<string, unknown>, label: string): Pick<Booking
   const zone = text(trip.zone, 'zone');
   return {
     ...(zone === undefined ? {} : { zone }),
-    ...(pickup_time === undefined ? {} : { pickup_time }),
+    ...pickup,
     ...(ovn === undefined ? {} : { ovn: ovn as OvnMode }),
     ...(ovn_return_date === undefined ? {} : { ovn_return_date }),
     ...(leg === true ? { ovn_leg: true } : {}),

@@ -239,7 +239,9 @@ nothing else.
 | `booking_mode` | `TEXT` | **NOT NULL** | `seat` or `charter`, default `seat`. Constrained. |
 | `charter_boat_id` | `TEXT` | null ok | The boat a charter takes whole (014). Only on a charter. No foreign key: both stores check the boat is deployed on this route that day, which is stronger. |
 | `zone` | `TEXT` | null ok | Transfer/pricing zone, e.g. `PK`, or `NoTransfer` for a self-arrival (015). |
-| `pickup_time` | `TEXT` | null ok | Hotel pickup, `HH:MM` local time (015). Text, so it reads back as written. |
+| `pickup_time` | `TEXT` | null ok | Hotel pickup, or the start of the pickup window, `HH:MM` local time (015). Text, so it reads back as written. |
+| `pickup_time_end` | `TEXT` | null ok | End of the pickup window, or the pier deadline when `pickup_at_pier` (024). Legacy `07:30-07:45` is `07:30` + `07:45`. |
+| `pickup_at_pier` | `BOOLEAN` | `false` | The guest meets the boat at the pier by `pickup_time_end`, with no `pickup_time` (024). Legacy `Before 08:30 at pier`. |
 | `ovn` | `TEXT` | null ok | Marks an outbound overnight trip (015): `return` (we bring them back) or `self` (they make their own way). |
 | `ovn_return_date` | `DATE` | null ok | Set exactly when `ovn = 'return'`, and after `service_date` (015). |
 | `ovn_leg` | `BOOLEAN` | **NOT NULL** | `true` on the return leg itself, default `false` (015). It holds seats on the return day like any seat trip. |

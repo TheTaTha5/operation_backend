@@ -78,7 +78,7 @@ the `booking_trips` row of that date. The counts are active legacy bookings, 202
 | `ops.vanGroup` / `vanId` / `vanSeq` / `vanReturnId` | Reference / scalar | `van_groups`, `booking_trip_van_allocations` (exist) | The van lives on the group. Legacy has 0 vans set without a group (3,048 vans, 3,119 grouped). |
 | `ops.vanSplits[]` | Repeating group | `booking_trip_van_allocations` (exists) + **new** `pick_time`, `alt_who` | `pax` and `main` derived (sum; idx 0). `fromAlt` → `source='alt_pickup'`. |
 | `ops.altSplitAuto` | Derived | — | Never had a legacy column (`_bkV2IsAltAutoSplit` reads the parts instead); `source='alt_pickup'` carries it. |
-| `ops.pickupTimeFinal` | Scalar | `booking_trip_operations.pickup_time_final` (exists, `HH:MM` CHECK) | 791 rows: 577 `HH:MM`, 45 `H:MM`/`HH.MM` (rewritable), **83 ranges and 86 free text that don't fit** (see Open). |
+| `ops.pickupTimeFinal` | Scalar | `booking_trip_operations.pickup_time_final` (exists, `HH:MM` CHECK) | 791 rows: 577 `HH:MM`, 45 `H:MM`/`HH.MM` (rewritable), **83 ranges and 86 free text that don't fit** (see Open). *2026-10-08: the 86 are `08.00 a.m.`-style single times and pier deadlines; all fit migration 024's window fields.* |
 | `ops.returnSameVan` | Scalar | `booking_trip_operations.return_same_van` (exists) | 11 rows. |
 | `ops.pierNote {t,at,by}` | Fixed-size struct | **new** `booking_trip_operations.pier_note`, `pier_note_at`, `pier_note_by` | 126 rows, all objects. |
 | `ops.vanCheckin`, `ops.pierCheckin` | Overwritten record + repeating group | **new** `booking_trip_checkins` + `booking_trip_checkin_events` | 1,738 van and 2,040 pier rows. **Not imported today.** |
@@ -430,7 +430,9 @@ check-ins, nothing else.
 - 1–4 and 6 as proposed below.
 - 5: add a `pickup_note` text column. `pickup_time_final` keeps its `HH:MM` CHECK, and the importer
   moves any value that is not a single time (a range, or text such as `Before 09:40 at pier`) into
-  `pickup_note` instead of dropping it.
+  `pickup_note` instead of dropping it. *(Replaced 2026-10-08 by `todo/pickup-window-model.md`: the
+  values are windows and pier deadlines, not free text, so migration 024 adds
+  `pickup_time_final_end` and `pickup_final_at_pier` instead, and every legacy value imports.)*
 - 7: keep the staff name the client sends inside check-in records, and always stamp `updated_by`
   from the token. Logins are per person: legacy accounts move into this service with their existing
   usernames and passwords.

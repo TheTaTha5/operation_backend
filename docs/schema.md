@@ -174,7 +174,9 @@ erDiagram
     text booking_mode "seat or charter"
     text charter_boat_id "no FK, charters only"
     text zone "pickup zone, e.g. PK"
-    text pickup_time "HH:MM"
+    text pickup_time "HH:MM, or window start"
+    text pickup_time_end "HH:MM, window end or pier deadline"
+    boolean pickup_at_pier "meet at the pier by pickup_time_end"
     text ovn "overnight: return or self"
     date ovn_return_date
     boolean ovn_leg "this trip is a return leg"
@@ -411,7 +413,9 @@ erDiagram
   booking_trip_operations {
     text booking_trip_id PK, FK
     text boat_id "no FK"
-    text pickup_time_final "HH:MM"
+    text pickup_time_final "HH:MM, or window start"
+    text pickup_time_final_end "HH:MM, window end or pier deadline"
+    boolean pickup_final_at_pier
     boolean return_same_van
     text upgrade
     text pier_checkin
@@ -445,7 +449,9 @@ erDiagram
     text zone "pickup zone or charter marker"
     text van_id FK "outbound van"
     text return_van_id FK
-    text pickup_time "HH:MM"
+    text pickup_time "HH:MM, or window start"
+    text pickup_time_end "HH:MM, window end or pier deadline"
+    boolean pickup_at_pier "meet at the pier by pickup_time_end"
   }
   vans {
     text id PK

@@ -23,6 +23,7 @@ import {
 } from './booking-header.js';
 import type { BookingPassenger, BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
+import { pickupFields } from './pickup.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -74,7 +75,7 @@ const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${colu
 const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode, 'charter_boat_id', t.charter_boat_id,
-      'zone', t.zone, 'pickup_time', t.pickup_time, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
+      'zone', t.zone, 'pickup_time', t.pickup_time, 'pickup_time_end', t.pickup_time_end, 'pickup_at_pier', t.pickup_at_pier, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -147,7 +148,7 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(trip.charter_boat_id ? { charter_boat_id: String(trip.charter_boat_id) } : {}),
     lock_draws: (trip.lock_draws as Record<string, unknown>[]).map((draw): LockDraw => ({ lock_id: String(draw.lock_id), qty: Number(draw.qty) })),
     ...(trip.zone ? { zone: String(trip.zone) } : {}),
-    ...(trip.pickup_time ? { pickup_time: String(trip.pickup_time) } : {}),
+    ...pickupFields({ pickup_time: trip.pickup_time ? String(trip.pickup_time) : undefined, pickup_time_end: trip.pickup_time_end ? String(trip.pickup_time_end) : undefined, pickup_at_pier: trip.pickup_at_pier === true }),
     ...(trip.ovn ? { ovn: trip.ovn as OvnMode } : {}),
     ...(trip.ovn_return_date ? { ovn_return_date: String(trip.ovn_return_date) } : {}),
     ovn_leg: trip.ovn_leg === true,
@@ -410,15 +411,17 @@ export class PostgresOperationsStore {
     }
     for (const trip of planned) {
       const values = [trip.id, bookingId, trip.seq, trip.route_id, trip.service_date, trip.booking_mode, trip.charter_boat_id ?? null,
-        trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null];
+        trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null,
+        trip.pickup_time_end ?? null, trip.pickup_at_pier === true];
       if (existing.has(trip.id)) {
         await this.client().query(`UPDATE booking_trips SET seq = $3, route_id = $4, service_date = $5, booking_mode = $6, charter_boat_id = $7,
-          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13 WHERE id = $1 AND booking_id = $2`, values);
+          zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13, pickup_time_end = $14, pickup_at_pier = $15
+          WHERE id = $1 AND booking_id = $2`, values);
         await this.client().query('DELETE FROM booking_trip_pax WHERE booking_trip_id = $1', [trip.id]);
         await this.client().query('DELETE FROM booking_trip_lock_draws WHERE booking_trip_id = $1', [trip.id]);
       } else {
-        await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, values);
+        await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of,
+          pickup_time_end, pickup_at_pier) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`, values);
       }
       for (const cell of trip.pax) {
         await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [trip.id, cell.category, cell.residency, cell.count]);

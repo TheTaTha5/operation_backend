@@ -24,6 +24,7 @@ import {
   bookingHoldsSeats, decidedRecord, decideStatus, discountOf, focCountOf, pendingApproval, reweigh, sortApprovalDays,
   type ApprovalDay, type ApprovalKind, type ApprovalWarning, type BookingApproval, type Intent, type NewApproval,
 } from './booking-approvals.js';
+import { pickupFields, type PickupWindow } from './pickup.js';
 
 export type Deployment = {
   boat_id: string;
@@ -59,9 +60,10 @@ export type LockDraw = { lock_id: string; qty: number };
  * `charter_boat_id` is the boat a charter takes whole, and only a charter carries one.
  * `lock_draws` are the seats a seat trip takes from locks; they never exceed the trip's pax.
  * `id` names the stored trip an amendment is editing; a trip without one is new. See `planTrips`.
- * The pickup and overnight fields are described in migration 015 and checked by `assertItinerary`.
+ * The overnight fields are described in migration 015 and checked by `assertItinerary`; the pickup
+ * window is `src/domain/pickup.ts`'s.
  */
-export type TripDetails = { zone?: string; pickup_time?: string; ovn?: OvnMode; ovn_return_date?: string; ovn_leg?: boolean };
+export type TripDetails = PickupWindow & { zone?: string; ovn?: OvnMode; ovn_return_date?: string; ovn_leg?: boolean };
 export type OvnMode = 'return' | 'self';
 /** `ovn_of` is an index into the same trip list, on input and on the wire. */
 export type BookingTripInput = TripDetails & { id?: string; route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[]; ovn_of?: number };
@@ -836,12 +838,12 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
 
 /** The input a stored trip would have come from, id included, so an edit derived from it stays that trip. */
 const asInput = (trip: StoredTrip, all: readonly StoredTrip[]): BookingTripInput => {
-  const { id, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of } = trip;
+  const { id, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, pickup_time_end, pickup_at_pier, ovn, ovn_return_date, ovn_leg, ovn_of } = trip;
   return {
     id, route_id, service_date, booking_mode, pax: trip.pax.map((row) => ({ ...row })),
     ...(charter_boat_id ? { charter_boat_id } : {}),
     lock_draws: trip.lock_draws.map((draw) => ({ ...draw })),
-    ...tripDetails({ zone, pickup_time, ovn, ovn_return_date, ovn_leg }),
+    ...tripDetails({ zone, pickup_time, pickup_time_end, pickup_at_pier, ovn, ovn_return_date, ovn_leg }),
     ...ovnOfIndex(all, ovn_of),
   };
 };
@@ -849,8 +851,8 @@ const asInput = (trip: StoredTrip, all: readonly StoredTrip[]): BookingTripInput
 /** The pickup and overnight fields with the unset ones left out, so both stores return the same keys. */
 const tripDetails = (trip: TripDetails): TripDetails => ({
   ...(trip.zone ? { zone: trip.zone } : {}),
-  ...(trip.pickup_time ? { pickup_time: trip.pickup_time } : {}),
-  ...(trip.ovn ? { ovn: trip.ovn } : {}),
+  ...pickupFields(trip),
+  ...(trip.ovn ?{ ovn: trip.ovn } : {}),
   ...(trip.ovn_return_date ? { ovn_return_date: trip.ovn_return_date } : {}),
   ...(trip.ovn_leg ? { ovn_leg: true } : {}),
 });

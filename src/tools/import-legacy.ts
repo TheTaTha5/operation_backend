@@ -35,7 +35,8 @@ import { bookingHeader } from '../domain/booking-header.js';
 import { holdsSeats, isBookingStatus } from '../domain/booking-status.js';
 import { parsePaxGrid, type PaxRow } from '../domain/pax.js';
 import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/operations.js';
-import { isIsoTime } from '../domain/calendar.js';
+import type { PickupWindow } from '../domain/pickup.js';
+import { legacyPickup } from './legacy-pickup.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
@@ -86,18 +87,13 @@ const HEADER_FROM_LEGACY: Record<string, string> = {
 const TIMESTAMP_HEADER = ['booked_at', 'confirmed_at'] as const;
 
 /**
- * A legacy time of day as ISO `HH:MM`, or undefined. Legacy kept free text: `8:30`, `06.30` and
- * `07:30:00` are the same clock time and are rewritten; a range such as `07:30-07:45` or a phrase
- * such as `Before 08:30 at pier` is not one time, so it is dropped and counted rather than guessed.
+ * A legacy pickup text as a pickup window (`legacyPickup`), `{}` when empty. A text that is none of
+ * legacy's shapes is dropped and counted rather than guessed.
  */
-function isoTime(value: unknown, what: string): string | undefined {
-  const s = str(value);
-  if (!s) return undefined;
-  const m = /^(\d{1,2})[:.](\d{2})(?::\d{2})?$/.exec(s);
-  const time = m ? `${m[1].padStart(2, '0')}:${m[2]}` : '';
-  if (isIsoTime(time)) { if (time !== s) note(`${what}: rewritten as ISO HH:MM`); return time; }
-  note(`${what}: dropped, not a single time of day`);
-  return undefined;
+function pickupWindow(value: unknown, what: string): PickupWindow {
+  const window = legacyPickup(value);
+  if (window === undefined) { note(`${what}: dropped, not a time, a window or a pier deadline`); return {}; }
+  return window;
 }
 
 /** A legacy trip's pax columns as the grid `parsePaxGrid` reads: `pax_ad_fr` → `ad_fr`, untiered `pax_ad` → `ad`. */
@@ -346,8 +342,13 @@ async function main() {
     const hasVanOps = (src: Row): boolean => int(src.ops_vangroup) > 0 || !!str(src.ops_vanid) || !!str(src.ops_vanreturnid)
       || !!str(src.ops_pickuptimefinal) || src.ops_returnsamevan === true || Array.isArray(jsonValue(src.ops_vansplits));
     const vanOpsOf = (src: Row, t: Row, tripId: string, counts: Counts, zone: string) => {
-      const time = isoTime(src.ops_pickuptimefinal, 'final pickup times');
-      if (time || src.ops_returnsamevan === true) tripOps.push({ booking_trip_id: tripId, pickup_time_final: time ?? null, return_same_van: src.ops_returnsamevan === true });
+      const final = pickupWindow(src.ops_pickuptimefinal, 'final pickup times');
+      if (final.pickup_time || final.pickup_time_end || src.ops_returnsamevan === true) {
+        tripOps.push({
+          booking_trip_id: tripId, pickup_time_final: final.pickup_time ?? null, pickup_time_final_end: final.pickup_time_end ?? null,
+          pickup_final_at_pier: final.pickup_at_pier === true, return_same_van: src.ops_returnsamevan === true,
+        });
+      }
 
       // Every part of the trip: the splits when there are any, else the flat fields as one whole part.
       const rawSplits = jsonValue(src.ops_vansplits);
@@ -419,11 +420,13 @@ async function main() {
         const returnDate = ovn === 'return' && str(t.ovnreturndate) ? str(t.ovnreturndate) : undefined;
         const leg = t.ovnleg === true;
         const of = leg ? positionOfIdx.get(str(t.ovnof)) : undefined;
-        const details = { zone: str(t.zone) || undefined, pickup_time: isoTime(t.pickuptime, 'trip pickup times'), ovn, ovn_return_date: returnDate, ovn_leg: leg, ovn_of: of };
+        const pickup = pickupWindow(t.pickuptime, 'trip pickup times');
+        const details = { zone: str(t.zone) || undefined, ...pickup, ovn, ovn_return_date: returnDate, ovn_leg: leg, ovn_of: of };
         myInputs.push({ route_id: routeId, service_date: day, booking_mode: charter ? 'charter' : 'seat', pax: rows, ...details });
         myTrips.push({
           id: tripId, booking_id: id, seq, route_id: routeId, service_date: day, booking_mode: charter ? 'charter' : 'seat', charter_boat_id: boatId,
-          zone: details.zone ?? null, pickup_time: details.pickup_time ?? null, ovn: ovn ?? null, ovn_return_date: returnDate ?? null, ovn_leg: leg,
+          zone: details.zone ?? null, pickup_time: pickup.pickup_time ?? null, pickup_time_end: pickup.pickup_time_end ?? null,
+          pickup_at_pier: pickup.pickup_at_pier === true, ovn: ovn ?? null, ovn_return_date: returnDate ?? null, ovn_leg: leg,
           ovn_of: of === undefined ? null : `trip_${id}_${of}`,
         });
         for (const r of rows) myPax.push({ booking_trip_id: tripId, category: r.category, residency: r.residency, count: r.count });
