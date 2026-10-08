@@ -68,6 +68,7 @@ export function editedLine(by: string | undefined, changes: BookingChanges, from
   for (const key of Object.keys(changes.header ?? {})) if (key !== 'updated_by') keys.push(key);
   if (changes.passengers) keys.push('passengers');
   if (changes.add_ons) keys.push('add_ons');
+  if (changes.adjustments) keys.push('adjustments');
   const confirmed = changes.status === 'confirmed' && from !== 'confirmed';
   return line(by, 'edit', confirmed ? 'Confirmed' : 'Edited', keys.length ? `Edited · ${keys.join(', ')}` : 'Edited');
 }

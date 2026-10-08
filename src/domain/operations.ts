@@ -5,6 +5,7 @@ import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceSho
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
+import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
   confirmationStamp, externalIdTaken, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
@@ -92,6 +93,8 @@ export type BookingInput = {
   passengers?: BookingPassengerInput[];
   /** The add-on list, already parsed by `parseBookingAddOns()`. Defaults to none. */
   add_ons?: BookingAddOnInput[];
+  /** Discounts and extras, already parsed by `parseBookingAdjustments()`. Defaults to none. */
+  adjustments?: BookingAdjustmentInput[];
   /**
    * Original booking payload retained for operations, reconciliation, and audit import.
    *
@@ -117,6 +120,7 @@ export type Booking = BookingHeader & {
   booking_data?: Record<string, unknown>;
   passengers: BookingPassenger[];
   add_ons: BookingAddOn[];
+  adjustments: BookingAdjustment[];
   /** Every approval the booking waited for, oldest first. The last `pending` one of a kind is the one waiting. */
   approvals: BookingApproval[];
   /** The current cancellation's category and charge. Absent unless the booking was cancelled with one. */
@@ -150,6 +154,8 @@ export type BookingChanges = {
   passengers?: BookingPassengerInput[];
   /** Same rule as `passengers`: present replaces outright, `[]` clears, absent leaves it alone. */
   add_ons?: BookingAddOnInput[];
+  /** Same rule again. */
+  adjustments?: BookingAdjustmentInput[];
 };
 
 export type SeatLock = {
@@ -615,14 +621,14 @@ export class OperationsStore {
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, passengers, add_ons, intent: _intent, ...rest } = input;
+    const { trips, header, passengers, add_ons, adjustments, intent: _intent, ...rest } = input;
     // `booking_data` is what PostgreSQL's create writes: the input's blob if it carries one, otherwise
     // the column's `{}`. Nothing sends one since the blob stopped being written (2026-09-22), so both
     // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
       ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}),
       booking_data: rest.booking_data ?? {}, id, status, version: 1, created_at: now, updated_at: now, trips: planned,
-      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
+      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), adjustments: withSeq(adjustments ?? []), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
     };
     this.bookings.set(id, booking);
     this.requestApprovals(booking, decision.approvals);
@@ -719,6 +725,7 @@ export class OperationsStore {
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
     if (changes.passengers) booking.passengers = withSeq(changes.passengers);
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
+    if (changes.adjustments) booking.adjustments = withSeq(changes.adjustments);
     booking.updated_at = this.now();
     booking.version += 1;
     this.log(id, line);

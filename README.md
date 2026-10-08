@@ -1270,6 +1270,31 @@ Validation errors are `400` and name the key you used and the position, for exam
 negative`, `addOns[0].qty must be a positive integer`, `addOns[0].jAd must be a non-negative
 integer`. A refused request writes nothing.
 
+#### Adjustments
+
+The discounts and extra charges added on the booking's review step (legacy's `adjustments`), sent on
+`POST /v1/bookings` and `PATCH /v1/bookings/{id}` and returned on every read. Like `passengers`:
+present replaces the list, `[]` or `null` clears it, absent leaves it; a change is an edit (version
++1, a history line).
+
+```jsonc
+"adjustments": [
+  { "seq": 0, "kind": "discount", "mode": "percent", "value": 10, "label": "Discount", "note": "repeat agent" },
+  { "seq": 1, "kind": "extra", "mode": "amount", "value": 500, "label": "Extra charge" }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `kind` | `discount` or `extra` |
+| `mode` | `amount` (default) or `percent`. Legacy prices a `percent` discount off seats + add-ons; an extra is always an amount |
+| `value` | A number above 0 |
+| `label`, `note` | Free text; left off when unset |
+
+A row that does not fit is `400` naming it (`adjustments[1].value must be a number above 0`). They
+are client facts. What they add up to is still sent as `price_discount` and `price_extra` until the
+quote computes it (`todo/pricing-model.md`). The legacy import brings them with each booking.
+
 ### Agent seat locks
 
 - `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).

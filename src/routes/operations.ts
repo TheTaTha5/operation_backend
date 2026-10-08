@@ -11,6 +11,7 @@ import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
+import { parseBookingAdjustments } from '../domain/booking-adjustments.js';
 import type { AgentListQuery } from '../domain/agents.js';
 import {
   actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
@@ -180,6 +181,7 @@ function bookingInput(body: unknown): BookingInput & { viaStatus: boolean } {
     header: bookingHeader(input),
     passengers: parseBookingPassengers(input.passengers),
     add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)),
+    adjustments: parseBookingAdjustments(input.adjustments),
     // booking_data: input,
   };
 }
@@ -243,6 +245,8 @@ function bookingChanges(body: unknown): BookingChanges {
     ...(Object.keys(header).length === 0 ? {} : { header }),
     ...(input.passengers === undefined ? {} : { passengers: parseBookingPassengers(input.passengers) }),
     ...(addOnsOf(input) === undefined ? {} : { add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)) }),
+    // Present replaces the list, `null` or `[]` clears it, absent leaves it.
+    ...(input.adjustments === undefined ? {} : { adjustments: parseBookingAdjustments(input.adjustments) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {

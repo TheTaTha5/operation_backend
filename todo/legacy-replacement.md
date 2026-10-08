@@ -40,7 +40,6 @@ DELETE /v1/weather-closures/{id}
 ## 4. Bookings
 
 ```
-PUT    /v1/bookings/{id}/adjustments  price adjustments, upgrades (booking-model.md)
 GET    /v1/bookings/{id}/attachments  (replaces /api/attach*)
 POST   /v1/bookings/{id}/attachments
 GET    /v1/attachments/{id}           download one file

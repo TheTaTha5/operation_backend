@@ -7,7 +7,7 @@ its own note:
 |---|---|
 | Login: deploy steps and the legacy screens' changes | `login-permissions-model.md` |
 | Refusing deployment changes that strand sold seats; `license_pax` from the catalogue | `deployment-guards-model.md` |
-| Rate seasons, promo contracts, `POST /v1/quote`, adjustments | `pricing-model.md`, `rate-types-model.md` |
+| `POST /v1/quote` and server-priced bookings | `pricing-model.md`, `rate-types-model.md` |
 | Agent writes | `agents.md` |
 | Day-of-operations: boats, vans, check-in, reconfirm | `trip-ops-and-vans-model.md` |
 | Overnight charters | `ovn-charter-return-model.md` |
@@ -19,8 +19,6 @@ Owned by no other note:
 - **The price exception.** `total`, `price_*` and add-on `amount`/`label` are still taken from the
   client until `POST /v1/quote` prices a booking; then they become computed (add-on `type` and `qty`
   stay client facts).
-- **Adjustments** (`adjustments[]`, dropped on save today) become a validated table, with a rule for
-  who may give a discount (`pricing-model.md`).
 - **A checklist of legacy's business rules**: each rule in `allotment_v2/js` (wt-lk-inbox) and the
   endpoint that will own it. `legacy-replacement.md` lists only the data.
 - **Love Kingdom:** a contract change ships on both sides together
