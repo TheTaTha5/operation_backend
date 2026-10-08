@@ -538,11 +538,22 @@ leave out any field that isn't set, except `ovn_leg`, which is always present.
 | Field (alias) | Meaning |
 |---|---|
 | `zone` | Transfer zone code, e.g. `PK`, or `NoTransfer` for a self-arrival. Free text. |
-| `pickup_time` (`pickupTime`) | Hotel pickup time, `HH:MM`, 24-hour, local time. |
+| `pickup_time` (`pickupTime`) | Hotel pickup time, or the **start** of the pickup window. `HH:MM`, 24-hour, local time. |
+| `pickup_time_end` (`pickupTimeEnd`) | The **end** of the pickup window, `HH:MM`, after `pickup_time`. With `pickup_at_pier`, the time to be at the pier. Refused without `pickup_time` unless `pickup_at_pier`. |
+| `pickup_at_pier` (`pickupAtPier`) | `true` when the guest makes their own way to the pier by `pickup_time_end`. Needs `pickup_time_end` and refuses `pickup_time`. |
 | `ovn` | Marks an **overnight outbound** trip: `return` (we bring them back on `ovn_return_date`) or `self` (they make their own way back). |
 | `ovn_return_date` (`ovnReturnDate`) | The day they come back, `YYYY-MM-DD`. Required when `ovn` is `return`, refused otherwise, and must be after the trip's own date. |
 | `ovn_leg` (`ovnLeg`) | `true` on the **return leg**: the trip that brings them back. It holds seats on that day like any seat trip. |
 | `ovn_of` (`ovnOf`) | On a return leg: the **index in this `trips` list** of its outbound trip. |
+
+Legacy writes the pickup as one text. It maps to the three pickup fields like this, and back again
+for display. A window whose fields disagree is a `400` naming the trip.
+
+| Legacy text | `pickup_time` | `pickup_time_end` | `pickup_at_pier` |
+|---|---|---|---|
+| `07:30` | `07:30` | | |
+| `07:30-07:45` | `07:30` | `07:45` | |
+| `Before 08:30 at pier` | | `08:30` | `true` |
 
 These rules match the legacy booking screen. A return leg must:
 - have `ovn_of` pointing at a *different* trip in the list whose `ovn` is `return`

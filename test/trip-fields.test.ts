@@ -73,3 +73,39 @@ test('moving an overnight outbound past its return date is refused', async () =>
   const bookingId = (created.json() as { id: string }).id;
   assert.equal((await request('POST', `/v1/bookings/${bookingId}/reschedule`, { route_id: 'r1', service_date: '2033-03-04' })).statusCode, 400);
 });
+
+test('a trip keeps a pickup window or a pier deadline, and drops it when cleared', async () => {
+  const day = '2033-04-01';
+  await request('POST', '/operations/deployments', { boat_id: 'boat-trip-fields', route_id: 'r1', service_date: day, capacity: 20 });
+  const pickupOf = (trip: Trip) => [trip.pickup_time, trip.pickup_time_end, trip.pickup_at_pier];
+
+  const created = await request('POST', '/v1/bookings', { trips: [{ routeId: 'r1', date: day, pax: 1, pickupTime: '07:30', pickupTimeEnd: '07:45' }] });
+  assert.equal(created.statusCode, 201, created.body);
+  const bookingId = (created.json() as { id: string }).id;
+  assert.deepEqual(pickupOf(tripsOf(created)[0]), ['07:30', '07:45', undefined], 'legacy 07:30-07:45');
+  assert.deepEqual(pickupOf(tripsOf(await request('GET', `/v1/bookings/${bookingId}`))[0]), ['07:30', '07:45', undefined], 'reads back');
+  assert.deepEqual(pickupOf(tripsOf(await request('PATCH', `/v1/bookings/${bookingId}`, { hotel_name: 'Reef' }))[0]), ['07:30', '07:45', undefined], 'a header edit keeps it');
+
+  const pier = await request('PATCH', `/v1/bookings/${bookingId}`, { trips: [{ routeId: 'r1', date: day, pax: 1, pickup_time_end: '08:30', pickup_at_pier: true }] });
+  assert.equal(pier.statusCode, 200, pier.body);
+  assert.deepEqual(pickupOf(tripsOf(pier)[0]), [undefined, '08:30', true], 'legacy Before 08:30 at pier');
+
+  const cleared = await request('PATCH', `/v1/bookings/${bookingId}`, { trips: [{ routeId: 'r1', date: day, pax: 1, pickupTime: '', pickupTimeEnd: null, pickupAtPier: false }] });
+  assert.deepEqual(pickupOf(tripsOf(cleared)[0]), [undefined, undefined, undefined]);
+});
+
+test('a pickup window is refused when its fields disagree', async () => {
+  const refused = async (pickup: object, message: string) => {
+    const response = await request('POST', '/v1/bookings', { trips: [{ routeId: 'r1', date: '2033-04-02', pax: 1, ...pickup }] });
+    assert.equal(response.statusCode, 400, response.body);
+    assert.ok((response.json() as { message: string }).message.includes(message), response.body);
+  };
+  await refused({ pickupTime: '07:30-07:45' }, 'trips[0].pickup_time must be an ISO time');
+  await refused({ pickupTime: '07:30', pickupTimeEnd: '7:45' }, 'pickup_time_end must be an ISO time');
+  await refused({ pickupTimeEnd: '07:45' }, 'pickup_time_end needs pickup_time');
+  await refused({ pickupTime: '07:45', pickupTimeEnd: '07:30' }, 'pickup_time_end must be after pickup_time');
+  await refused({ pickupTime: '07:30', pickupTimeEnd: '07:30' }, 'pickup_time_end must be after pickup_time');
+  await refused({ pickupAtPier: true }, 'pickup_at_pier needs pickup_time_end');
+  await refused({ pickupAtPier: true, pickupTime: '07:30', pickupTimeEnd: '08:30' }, 'pickup_time does not apply at the pier');
+  await refused({ pickupAtPier: 'yes', pickupTimeEnd: '08:30' }, 'pickup_at_pier must be true or false');
+});
