@@ -37,7 +37,6 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 ## Decisions waiting for you
 
 - **Live updates** (`change-feed-model.md`): the 5 questions at the end.
-- **Overnight charters** (`ovn-charter-return-model.md`): the importer skips them until decided.
 - **Next slice:** pricing (`pricing-model.md`, decided: contracts first) or deployment guards
   (`deployment-guards-model.md`, has questions to answer).
 - **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is

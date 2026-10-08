@@ -689,7 +689,7 @@ leave out any field that isn't set, except `ovn_leg`, which is always present.
 | `pickup_at_pier` (`pickupAtPier`) | `true` when the guest makes their own way to the pier by `pickup_time_end`. Needs `pickup_time_end` and refuses `pickup_time`. |
 | `ovn` | Marks an **overnight outbound** trip: `return` (we bring them back on `ovn_return_date`) or `self` (they make their own way back). |
 | `ovn_return_date` (`ovnReturnDate`) | The day they come back, `YYYY-MM-DD`. Required when `ovn` is `return`, refused otherwise, and must be after the trip's own date. |
-| `ovn_leg` (`ovnLeg`) | `true` on the **return leg**: the trip that brings them back. It holds seats on that day like any seat trip. |
+| `ovn_leg` (`ovnLeg`) | `true` on the **return leg**: the trip that brings them back. A seat leg holds seats on that day like any seat trip; a charter leg takes its boat. Priced ฿0 (the overnight charge is on the outbound). |
 | `ovn_of` (`ovnOf`) | On a return leg: the **index in this `trips` list** of its outbound trip. |
 
 Legacy writes the pickup as one text. It maps to the three pickup fields like this, and back again
@@ -704,7 +704,9 @@ for display. A window whose fields disagree is a `400` naming the trip.
 These rules match the legacy booking screen. A return leg must:
 - have `ovn_of` pointing at a *different* trip in the list whose `ovn` is `return`
 - be on that trip's route, dated its `ovn_return_date`
-- be a seat trip, not a charter
+- be booked as its outbound is: a seat trip under a seat outbound; under a charter outbound, a
+  charter of any boat deployed on the return day (legacy builds it on the same boat; a different one
+  is allowed). The boat is not held on the nights between, so it is free for other work there.
 - carry no `ovn` of its own
 
 `ovn_of` is refused on any trip that is not a leg. Every violation is a `400` naming the trip.
