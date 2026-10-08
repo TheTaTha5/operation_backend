@@ -62,7 +62,7 @@ test('an itinerary is refused when it breaks the per-day or overnight rules', as
   await refused([outbound, { ...leg, date: later }], 'the leg is on the return date');
   await refused([outbound, { ...leg, routeId: 'r2' }], 'the leg is on the same route');
   await refused([outbound, { ...leg, ovn: 'return', ovnReturnDate: later }], 'a leg is not itself an outbound');
-  await refused([outbound, { ...leg, bookingMode: 'charter', charterBoatId: 'boat-trip-fields' }], 'a leg is a seat trip');
+  await refused([outbound, { ...leg, bookingMode: 'charter', charterBoatId: 'boat-trip-fields' }], 'a seat outbound comes back on a seat trip');
   await refused([{ routeId: 'r1', date: out, pax: 1, ovnOf: 0 }], 'ovn_of only on a leg');
 });
 
@@ -108,4 +108,19 @@ test('a pickup window is refused when its fields disagree', async () => {
   await refused({ pickupAtPier: true }, 'pickup_at_pier needs pickup_time_end');
   await refused({ pickupAtPier: true, pickupTime: '07:30', pickupTimeEnd: '08:30' }, 'pickup_time does not apply at the pier');
   await refused({ pickupAtPier: 'yes', pickupTimeEnd: '08:30' }, 'pickup_at_pier must be true or false');
+});
+
+test('an overnight charter comes back on a charter, of any boat deployed that day; the nights between are free', async () => {
+  const [go, between, back] = ['2033-05-01', '2033-05-02', '2033-05-03'];
+  for (const [boat, day] of [['boat-ovn-a', go], ['boat-ovn-a', between], ['boat-ovn-b', back]]) {
+    await request('POST', '/operations/deployments', { boat_id: boat, route_id: 'r1', service_date: day, capacity: 20 });
+  }
+  const charter = { routeId: 'r1', date: go, pax: 6, bookingMode: 'charter', charterBoatId: 'boat-ovn-a', ovn: 'return', ovnReturnDate: back };
+  const created = await request('POST', '/v1/bookings', { trips: [charter, { routeId: 'r1', date: back, pax: 6, bookingMode: 'charter', charterBoatId: 'boat-ovn-b', ovnLeg: true, ovnOf: 0 }] });
+  assert.equal(created.statusCode, 201, created.body);
+  const seats = async (day: string) => (await request('GET', `/v1/availability?route_id=r1&date=${day}`)).json().available_seats;
+  assert.deepEqual([await seats(go), await seats(between), await seats(back)], [0, 20, 0], 'the boat is the group\'s on the way out and back, not in between');
+  const refused = await request('POST', '/v1/bookings', { trips: [{ ...charter, date: '2033-05-05', ovnReturnDate: '2033-05-06' }, { routeId: 'r1', date: '2033-05-06', pax: 6, ovnLeg: true, ovnOf: 0 }] });
+  assert.equal(refused.statusCode, 400);
+  assert.match(refused.json().message, /must be a charter trip, as its outbound is/);
 });

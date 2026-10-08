@@ -255,8 +255,11 @@ const ovnOfIndex = (trips: readonly StoredTrip[], id: string | undefined): { ovn
  *   address a booking's passengers by route and day; a second trip on the same departure would be
  *   a second row nobody can tell apart from the first. Send one trip with the combined pax.
  * - Overnight trips follow legacy's booking screen (`bkV2CreateOvnReturnLeg`): an outbound
- *   `ovn: 'return'` names the day it comes back, and its return leg is a seat trip on that route and
- *   that day, pointing back at it with `ovn_of`.
+ *   `ovn: 'return'` names the day it comes back, and its return leg is a trip on that route and that
+ *   day, pointing back at it with `ovn_of`. The leg is booked as its outbound is: a seat outbound
+ *   comes back on a seat trip; a charter outbound on a charter, of any boat deployed that day
+ *   (decided 2026-10-09; legacy builds it on the same boat). The boat is not held on the nights
+ *   between.
  *
  * Not applied to an amendment that leaves the trips alone, so a booking imported before these rules
  * existed can still have its header edited.
@@ -279,11 +282,12 @@ export function assertItinerary(trips: readonly BookingTripInput[]): void {
       return;
     }
     if (trip.ovn !== undefined) fail(`${label} is a return leg and cannot itself be an overnight outbound`, 400);
-    if (trip.booking_mode === 'charter') fail(`${label} is a return leg and must be a seat trip`, 400);
     if (trip.ovn_of === undefined) fail(`${label}.ovn_of is required on a return leg`, 400);
     const outbound = trip.ovn_of === index ? undefined : trips[trip.ovn_of as number];
     if (!outbound) fail(`${label}.ovn_of must be the index of another trip in this list`, 400);
     if (outbound!.ovn !== 'return') fail(`${label}.ovn_of must point at a trip with ovn return`, 400);
+    const legMode = trip.booking_mode === 'charter' ? 'charter' : 'seat', outboundMode = outbound!.booking_mode === 'charter' ? 'charter' : 'seat';
+    if (legMode !== outboundMode) fail(`${label} is a return leg and must be a ${outboundMode} trip, as its outbound is`, 400);
     if (outbound!.route_id !== trip.route_id || outbound!.ovn_return_date !== trip.service_date) {
       fail(`${label} must be on its outbound's route (${outbound!.route_id}) and return date (${outbound!.ovn_return_date})`, 400);
     }

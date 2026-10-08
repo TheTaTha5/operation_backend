@@ -10,7 +10,6 @@ its own note:
 | `POST /v1/quote` and server-priced bookings | `pricing-model.md`, `rate-types-model.md` |
 | Agent writes | `agents.md` |
 | Day-of-operations: boats, vans, check-in, reconfirm | `trip-ops-and-vans-model.md` |
-| Overnight charters | `ovn-charter-return-model.md` |
 | Live updates | `change-feed-model.md` |
 | Money, fleet maintenance | not designed yet |
 
