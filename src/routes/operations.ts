@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { assertItinerary, OperationsStore, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
-import { OidcAuthenticator, requireAnyScope } from '../auth.js';
+import { Authenticator } from '../auth.js';
+import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserPatch, password, userView, verifyPassword, type StoredUser } from '../domain/users.js';
 import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
@@ -14,7 +15,7 @@ import type { AgentListQuery } from '../domain/agents.js';
 import {
   actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
 } from '../domain/booking-actions.js';
-import { parseIntent } from '../domain/booking-approvals.js';
+import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
@@ -25,6 +26,12 @@ const MAX_ALL_ROUTES_DAYS = 62;
 
 const badRequest = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };
 const notFound = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 404; throw error; };
+const unauthorized = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 401; throw error; };
+const forbidden = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number; code: string }).statusCode = 403; (error as Error & { code: string }).code = 'forbidden'; throw error; };
+const userId = (request: { params: unknown }): number => {
+  const id = Number((request.params as { id: string }).id);
+  return Number.isInteger(id) && id > 0 ? id : notFound('User not found');
+};
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : badRequest('Request body must be an object');
 const string = (value: unknown, name: string): string => typeof value === 'string' && value.length > 0 ? value : badRequest(`${name} is required`);
 const optionalString = (value: unknown): string | undefined => typeof value === 'string' && value.length > 0 ? value : undefined;
@@ -253,9 +260,13 @@ function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at'
   return { ...input, route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), pax: pax(input.pax), agent_id: optionalString(input.agent_id) };
 }
 
-export function registerOperationsRoutes(app: FastifyInstance, _options: object, done: () => void): void {
-  const store = process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
-  const authenticator = new OidcAuthenticator();
+export type Store = OperationsStore | PostgresOperationsStore;
+/** PostgreSQL when `DATABASE_URL` is set, else the in-process store. */
+export const createStore = (): Store => process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
+
+export function registerOperationsRoutes(app: FastifyInstance, options: { store?: Store }, done: () => void): void {
+  const store = options.store ?? createStore();
+  const authenticator = new Authenticator();
   if (store instanceof PostgresOperationsStore) app.addHook('onClose', async () => store.close());
   // Route schemas in this plugin are documentation only (see `openapi.ts`): the hand-written parsers
   // validate, and responses are sent exactly as the store returns them. An error reaches the
@@ -265,28 +276,99 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   app.setSerializerCompiler(({ httpStatus }) => String(httpStatus).startsWith('2')
     ? (data) => JSON.stringify(data)
     : (data) => { const e = data as { statusCode?: number; code?: string; error?: string; message?: string }; return JSON.stringify({ statusCode: e.statusCode, code: e.code, error: e.error, message: e.message }); });
+  /**
+   * Every request but `/v1/login` is authenticated, and every write is checked against the caller's
+   * rights (`assertMayWrite`): what legacy checked only in the browser. Any logged-in user may read.
+   * With authentication off (no `AUTH_JWT_SECRET`) nothing is checked: local development.
+   */
   app.addHook('preHandler', async (request) => {
     const path = request.url.split('?')[0];
     if (path === '/v1/login') return;
-    // GET, HEAD and OPTIONS change nothing, so they need only the read scope.
     const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
-    // A route's calendar is operations configuration, as deployments are, not a booking write.
-    const isOperations = path.startsWith('/operations/') || path === '/v1/manifest' || (isWrite && path.startsWith('/v1/routes/'));
-    const user = authenticator.authenticateApiKey(request) ?? await authenticator.authenticate(request);
-    const scope = isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read');
-    // Love Kingdom's API key (`availability:read`) opens availability and nothing else.
-    requireAnyScope(user, !isWrite && path === '/v1/availability' ? [scope, 'availability:read'] : [scope]);
+    const caller = authenticator.authenticateApiKey(request) ?? await authenticator.authenticate(request, store);
+    if (!caller) return;
+    if (caller.apiKey) {
+      if (isWrite || path !== '/v1/availability') forbidden('The X-Api-Key opens GET /v1/availability only');
+      return;
+    }
+    const user = caller.user!;
+    if (isWrite) assertMayWrite(user, path);
+    else if ((path === '/v1/users' || path.startsWith('/v1/users/')) && user.role !== 'admin') forbidden('Only an admin may do this');
+    // A login tied to one agent sees that agent's bookings only; another booking is not found.
+    const own = user.agent_id === null ? undefined : /^\/v1\/bookings\/([^/]+)/.exec(path);
+    if (own && (await store.booking(decodeURIComponent(own[1])))?.agent_id !== user.agent_id) notFound('Booking not found');
   });
 
   /**
-   * Temporary testing login — exchanges `AUTH_PASSWORD_USERS` credentials for a short-lived Bearer
-   * token this service will itself accept. Deliberate, scoped exception to "validate tokens, do not
-   * issue them" (CLAUDE.md); not part of the OIDC contract and not meant to outlive testing.
+   * Before `approve` or `reject`: may the caller decide what this booking waits for? Read in the
+   * command's own transaction, so the approval checked is the one decided. Off with authentication
+   * off; a booking not waiting is left to the command, which refuses it with `409`.
+   */
+  const assertMayDecideOn = async (request: { user?: { user?: StoredUser } }, id: string): Promise<void> => {
+    const user = request.user?.user;
+    if (!user) return;
+    const booking = await store.booking(id);
+    if (!booking || (booking.status !== 'pending_approval' && booking.status !== 'pending_foc')) return;
+    const approval = pendingApproval(booking.approvals, booking.status === 'pending_foc' ? 'foc' : 'approval');
+    const salesId = booking.agent_id ? (await store.agent(booking.agent_id))?.sales_id ?? null : null;
+    assertMayDecide(user, approval, salesId);
+  };
+
+  /** The caller's login; `401` when authentication is off, where there is none. */
+  const me = (request: { user?: { user?: StoredUser } }): StoredUser => request.user?.user ?? unauthorized('Not logged in');
+  /** A user's `sales_id` and `agent_id` must name a salesperson and an agent that exist. */
+  const assertLinks = async (links: { sales_id?: string | null; agent_id?: string | null }): Promise<void> => {
+    if (links.sales_id && !(await store.listSalesPeople()).some((person) => person.id === links.sales_id)) badRequest(`sales_id ${links.sales_id} is not a salesperson (GET /v1/sales)`);
+    if (links.agent_id && !(await store.agent(links.agent_id))) badRequest(`agent_id ${links.agent_id} is not an agent (GET /v1/agents)`);
+  };
+
+  /**
+   * Legacy's login, moved here (todo/login-permissions-model.md): its users are imported with their
+   * usernames and password hashes, so everyone logs in as before. Answers a 12-hour Bearer token and
+   * the user, as `GET /v1/me` shows it.
    */
   app.post('/v1/login', async (request) => {
     const body = record(request.body);
-    const { token, expiresIn } = await authenticator.issuePasswordToken(string(body.username, 'username'), string(body.password, 'password'));
+    const { token, expiresIn, user } = await authenticator.login(string(body.username, 'username'), string(body.password, 'password'), store);
+    return { access_token: token, token_type: 'Bearer', expires_in: expiresIn, user: userView(user) };
+  });
+  /** Ends every session of the caller's login, on every device (legacy `revokeSessions`). */
+  app.post('/v1/logout', async (request, reply) => {
+    await store.updateUser(me(request).id, { tokens_valid_after: new Date().toISOString() });
+    return reply.code(204).send();
+  });
+  app.get('/v1/me', async (request) => userView(me(request)));
+  /** The caller's own password; needs the old one. Ends the other sessions and answers a new token. */
+  app.post('/v1/me/password', async (request) => {
+    const body = record(request.body);
+    const user = me(request);
+    if (!verifyPassword(password(body.old_password, 'old_password'), user.pass_hash)) forbidden('The old password is wrong');
+    const fresh = password(body.new_password, 'new_password');
+    await store.updateUser(user.id, { pass_hash: hashPassword(fresh), tokens_valid_after: new Date().toISOString() });
+    const { token, expiresIn } = await authenticator.login(user.username, fresh, store);
     return { access_token: token, token_type: 'Bearer', expires_in: expiresIn };
+  });
+
+  /** Admin only (the hook). Legacy's `/api/users*`; a user is disabled, never deleted. */
+  app.get('/v1/users', async () => ({ users: (await store.listUsers()).map(userView) }));
+  app.post('/v1/users', async (request, reply) => {
+    const { password: plain, ...input } = parseNewUser(record(request.body));
+    await assertLinks(input);
+    const user = await store.transaction(async () => store.createUser({ ...input, pass_hash: hashPassword(plain) }));
+    return reply.code(201).send(userView(user));
+  });
+  app.patch('/v1/users/:id', async (request) => {
+    const id = userId(request);
+    const patch = parseUserPatch(record(request.body), new Date().toISOString());
+    if (id === me(request).id && (patch.disabled_at || patch.role === 'staff')) badRequest('An admin cannot disable or demote their own login');
+    await assertLinks(patch);
+    return userView((await store.transaction(async () => store.updateUser(id, patch))) ?? notFound('User not found'));
+  });
+  /** An admin sets a user's password (legacy `/api/users/password`); the user's sessions end. */
+  app.post('/v1/users/:id/password', async (request) => {
+    const body = record(request.body);
+    const update = { pass_hash: hashPassword(password(body.password)), tokens_valid_after: new Date().toISOString() };
+    return userView((await store.transaction(async () => store.updateUser(userId(request), update))) ?? notFound('User not found'));
   });
 
   /**
@@ -417,7 +499,9 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
 
   app.get('/v1/bookings', { schema: docs.listBookings }, async (request) => {
     const query = request.query as Record<string, unknown>;
-    return await store.listBookings(bookingListQuery(query));
+    const agent = request.user?.user?.agent_id;
+    // A login tied to one agent lists that agent's bookings, whatever filter it asks for.
+    return await store.listBookings({ ...bookingListQuery(query), ...(agent ? { agentId: agent } : {}) });
   });
   app.get('/v1/bookings/:id', { schema: docs.getBooking }, async (request) => (await store.booking((request.params as { id: string }).id)) ?? notFound('Booking not found'));
   /**
@@ -430,6 +514,11 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   app.post('/v1/bookings', { schema: docs.createBooking }, async (request, reply) => {
     const actor = actorOf(request.user);
     const { viaStatus, ...input } = bookingInput(request.body);
+    const agent = request.user?.user?.agent_id;
+    if (agent) {
+      if (input.agent_id !== undefined && input.agent_id !== agent) forbidden(`This login books for agent ${agent} only`);
+      input.agent_id = agent;
+    }
     // `status` on create is deprecated for `intent` and goes when both clients send `intent`; the
     // log says who still sends it.
     if (viaStatus) request.log.warn({ status: (request.body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
@@ -446,7 +535,10 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   for (const command of STATUS_COMMANDS) {
     app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
       const body = parseStatusCommandRequest(record(request.body ?? {}));
-      const changed = await store.transaction(async () => (await store.changeBookingStatus(bookingId(request), command, body, actorOf(request.user))) ?? notFound('Booking not found'));
+      const changed = await store.transaction(async () => {
+        if (command === 'approve' || command === 'reject') await assertMayDecideOn(request, bookingId(request));
+        return (await store.changeBookingStatus(bookingId(request), command, body, actorOf(request.user))) ?? notFound('Booking not found');
+      });
       // `warnings` is the days an approval puts past the boats' registered seats; empty otherwise.
       return { ...changed.booking, warnings: changed.warnings };
     });
@@ -493,7 +585,7 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
 
   /**
    * Agents and their reference lists. Read-only for now: agents arrive through the legacy import.
-   * Under `booking:read` like the rest of `/v1`. Every caller sees every agent — scoping a salesperson
+   * Any login may read them. Every caller sees every agent — scoping a salesperson
    * to their own agents needs their salesperson id in the token, which is not decided yet.
    */
   app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));

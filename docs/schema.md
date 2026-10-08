@@ -522,7 +522,8 @@ erDiagram
 
 ## 5. Agents and sales
 
-The resellers who sell trips, the markets they sell into, and the salespeople who own them. The
+The resellers who sell trips, the markets they sell into, and the salespeople who own them. `users` are
+the staff logins (migration 027): a salesperson's login approves discounts on their agents' bookings. The
 API serves this area read-only. The rows arrive through the legacy import, with legacy's ids.
 
 ```mermaid
@@ -598,6 +599,22 @@ erDiagram
   agents ||--o{ agent_programs : "may sell"
   routes ||--o{ agent_programs : "sold by"
   agents ||--o{ agent_activity : "audit log"
+  users {
+    bigint id PK
+    text username "unique ignoring case"
+    text pass_hash "legacy scrypt salt:key"
+    text role "admin or staff"
+    boolean can_edit
+    text_array edit_areas "null = every area when can_edit"
+    text_array actions "act-approve, act-capunlock, act-tmpl"
+    text sales_id FK
+    text agent_id FK "a login that books for one agent"
+    timestamptz disabled_at
+    timestamptz tokens_valid_after
+    integer legacy_id
+  }
+  sales_people ||--o{ users : "is"
+  agents ||--o{ users : "service login"
   agents |o..o{ bookings : "sold"
   agents |o..o{ seat_locks : "holds"
 ```

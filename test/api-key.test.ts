@@ -5,10 +5,12 @@ import { after, test } from 'node:test';
 // `/api/b2c/availability`. Authentication is on, so everything else still needs a Bearer token. The
 // env is set before the app is imported, as `auth.test.ts` does.
 process.env.AUTH_JWT_SECRET = 'api-key-test-secret';
-process.env.AUTH_PASSWORD_USERS = JSON.stringify([{ username: 'ops', password: 'pw', groups: ['admin'] }]);
 process.env.B2C_API_KEY = 'lk-test-key';
 const { buildApp } = await import('../src/app.js');
-const app = buildApp();
+const { seedUser, testStore } = await import('./users-helper.js');
+const store = testStore();
+const app = buildApp({ store });
+await seedUser(store, { username: 'apikey.ops', role: 'admin' });
 after(async () => app.close());
 
 const key = { 'x-api-key': 'lk-test-key' };
@@ -20,7 +22,7 @@ test('the key reads availability, one day or a range', async () => {
 });
 
 test('a wrong key is refused, not passed on to the Bearer check', async () => {
-  const login = await app.inject({ method: 'POST', url: '/v1/login', payload: { username: 'ops', password: 'pw' } });
+  const login = await app.inject({ method: 'POST', url: '/v1/login', payload: { username: 'apikey.ops', password: 'pw' } });
   const wrong = await app.inject({ method: 'GET', url: '/v1/availability?route_id=r1&date=2030-01-02', headers: { 'x-api-key': 'guess', authorization: `Bearer ${login.json().access_token}` } });
   assert.equal(wrong.statusCode, 401);
   assert.equal(wrong.json().message, 'Invalid X-Api-Key');
