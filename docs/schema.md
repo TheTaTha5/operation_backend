@@ -396,8 +396,9 @@ erDiagram
 ## 4. Day-of-operations and vans
 
 Who drives, which van, and who rides with whom. These tables are filled by the legacy import
-(`src/tools/import-legacy.ts`), but **no API endpoint reads or writes them yet**. The planned
-design is in `todo/trip-ops-and-vans-model.md`.
+(`src/tools/import-legacy.ts`) and written through the dispatch, van-group and vans endpoints
+(README: "Dispatch", "Van groups", "Vans and the month matrix"). What is still to build is in
+`todo/trip-ops-and-vans-model.md`.
 
 ```mermaid
 erDiagram

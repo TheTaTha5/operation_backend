@@ -77,6 +77,8 @@ export function writeNeed(path: string): WriteNeed {
   if (path.startsWith('/operations/deployments')) return { kind: 'area', areas: ['operations', 'fleet'] };
   // Dispatch: which boat and van a trip goes on, its final pickup, the pier note.
   if (path.startsWith('/operations/trip-ops/')) return { kind: 'area', areas: ['operations'] };
+  // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`).
+  if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
   if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   return { kind: 'admin' };

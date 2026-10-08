@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Built: slice A1** (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import. Everything below the boat and pier note is still to build: van parts and groups (A2), the vans and month matrix (A3), reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
+Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`). Still to build: reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -263,49 +263,12 @@ The frontend reads dispatch from the booking document, so it's returned there. T
 - `no_show` and `commission` are computed.
 
 For the cross-booking views:
-- **`GET /operations/van-groups?date=&route_id=`** returns the groups of a day, with member count,
-  pax and capacity (R4, R5).
 - The hand-off's computed `GET /operations/van-board` (pools, rounds, warnings) stays a later
   phase. It's the Vue port's need. lk-inbox computes the board client-side from the data above.
 
 ### Writes
 
-**Dispatch, one departure:** `PATCH /operations/trip-ops/{trip_id}` (`operations:write`)
-
-```json
-{ "boat_id": "b2", "pickup_time_final": "06:40", "return_same_van": false,
-  "pier_note": "Late, call guide",
-  "van_parts": [ { "idx": 0, "ad": 2, "chd": 0, "inf": 0, "foc": 0, "group_id": "vgrp_…", "sequence": 1 },
-                 { "idx": 1, "ad": 0, "chd": 1, "inf": 0, "foc": 0, "group_id": null, "source": "manual" } ] }
-```
-
-- **Field semantics:** an absent field is unchanged and `null` clears it. A list (`van_parts`,
-  `boat_splits`) replaces the old one outright. `pier_note` is text; the server stamps `at` and
-  `by` from the token.
-- **Boat:**
-  - Send `boat_id` *or* `boat_splits`. Both → 400.
-  - A boat must be deployed on the trip's route that day → 409 `boat_not_deployed`. Legacy obeys
-    this on 3,742 of 3,743 assignments.
-  - Splits need ≥2 distinct boats whose pax sum to the trip's → 400.
-- **Van parts:**
-  - Pax may not exceed the trip's → 400.
-  - Joining a group from another zone → 409 `zone_mismatch`.
-  - Grouping a NoTransfer part → 409 `self_arrive`.
-  - Any dispatch write on a released booking → 409 `cancelled` (R1).
-  - `return_same_van: true` together with a `return_van_id` → 400 (R11).
-- **Response:** `{ trip, warnings }`, as the hand-off's G2 asks.
-
-**Van groups** (`operations:write`). These are cross-booking, so they're atomic here rather than
-assembled from per-trip patches:
-
-| Method + path | Body | Rule (hand-off) | Refusals |
-|---|---|---|---|
-| `POST /operations/van-groups` | `{service_date, route_id, zone, members:[{trip_id, idx}], van_id?}` | next number under an advisory lock `van:<date>:<route>`; members get `sequence` 1..n | 409 `zone_mismatch` / `self_arrive` / `cancelled` / `van_over_capacity` |
-| `POST /operations/van-groups/{id}/members` | `{members:[…]}` | moves parts out of their old group (R4) | same |
-| `PATCH /operations/van-groups/{id}` | `{van_id?, return_van_id?, pickup_time?, allow_second_round?}` | R2 pool, R4, R6. `pickup_time` also writes each member's `pickup_time_final`, or `pick_time` for an own-pickup part (`bkV2VanGroupSetTime`) | 409 `van_not_in_pool` / `van_over_capacity` / `van_in_other_group` |
-| `PUT /operations/van-groups/{id}/order` | `{members:[…]}` or `{clear:true}` | R12 | 400 if not exactly the members |
-| `DELETE /operations/van-groups/{id}` | — | disband (R13); keeps `pickup_time_final` | 404 |
-| `POST /operations/van-groups/clear` | `{service_date, route_id}` | nulls every group's van (R14) | — |
+**Dispatch, van parts and van groups:** built (README → "Dispatch", "Van groups").
 
 **Check-in** (`operations:write`):
 - `PUT /operations/trip-ops/{trip_id}/checkins/{van|pier}/{slot}` replaces one record, events
@@ -335,36 +298,16 @@ its index (`upgrades[1].sell_price must be a number ≥ 0`).
 - `POST /v1/bookings/{id}/upgrade/undo {trip_id}` reverses it, and drops the charge only if it
   isn't collected.
 
-**Vans and the month matrix** (`operations:*`):
-- `GET /operations/vans`, `POST /operations/vans`, `PATCH /operations/vans/{id}`. There is no
-  delete; set `active=false`.
-- `GET /operations/van-days?from=&to=` returns the matrix routes, status, driver override,
-  `sent_at`, and the status ranges.
-- `PUT /operations/van-days/{date}/{van_id}` with `{route_ids?, status?, driver?, driver_phone?,
-  plate?, sent_at?}`.
-- `POST /operations/vans/{id}/status-ranges` and
-  `DELETE /operations/vans/{id}/status-ranges/{range_id}`.
+**Vans and the month matrix:** built (`src/domain/vans.ts`, README → "Vans and the month matrix").
+Legacy keeps four things the 016 tables have no home for; see Open 8.
 
 ### What both stores need
 
 Pure functions in `src/domain/`, called by both stores (the `calendar.ts` pattern):
-- **`dispatch.ts`:** the `PATCH trip-ops` parser and validator, plus the move rule below.
-- **`effectiveZone(trip, booking, addOnTypes)`:** move `groupZone` out of `import-legacy.ts`.
-- **`vanPool` / `returnPool` / `groupPax` / `rounds`:** R2–R7, unit-tested like `capacity.test.ts`.
 - **`checkin.ts`:** the record parser and the append-only event rule.
-- **`shrinkAllocations(parts, tripPax)`:** idx 0 shrinks first.
-- **`altPickupParts(altPickups, tripPax, current)`:** port of `bkV2SyncAltPickupSplits`, if
-  Decision 4 says the server builds them.
+- **`altPickupParts(altPickups, tripPax, current)`:** port of `bkV2SyncAltPickupSplits` (Decision 4: the server builds them).
 
-`OperationsStore` needs in-memory maps for every table above. It has none of the 016 tables today.
-
-**The move rule needs changing in both stores.**
-- Today `writeTrips` deletes a moved trip's whole `booking_trip_operations` row.
-- Legacy's `bkOpsClear` clears the boat, vans, splits, `pickupTimeFinal` and both check-ins, but
-  **keeps the pier note** (and reconfirm, which is booking level here).
-- So the move should null those columns and delete allocations, boat splits and check-ins, and keep
-  the row with `pier_note`.
-- **A route change isn't a date change** (Decision 6).
+A move clears a trip's check-ins too, once they exist (legacy `bkOpsClear`).
 
 ## Data check — 2026-10-06, legacy production, read-only
 
@@ -451,19 +394,35 @@ The questions as they were asked:
    change on import.
 7. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
    stored.
+8. **Van fields legacy keeps that 016 cannot hold** (legacy, 2026-10-09):
+   - `ownership: "rented"` (เช่า), a third choice on legacy's form; 2 vans. 016's CHECK allows own/partner only, so the import reads them as own and the API refuses it.
+   - `note` on the van, 3 vans ("Khao Lak base", "รถร่วม").
+   - The van's change log (`sb_vehicles__log`, 1,967 lines: zone 1,379, status 379, edit 126, driver 47, created 36), shown on the Vans page.
+   - `dayZone`, a per-day zone override that feeds the return-van pool; 1 cell. `costperday` is never set.
+   - Legacy also deletes a van; here it is `active: false`.
+9. **Van stops** (legacy `VAN_STOPS`, `vsSeatsOfVan`, from late September): guides or staff picked up
+   by a van, outside any booking. They take seats, and legacy counts them in a group's pax for the
+   capacity check. They have no home here, so a group's `pax` and the `van_over_capacity` check
+   leave them out. Needs a design (and a count of legacy rows) before they can be added.
+10. **Overnight legs on the van board (R16).** Legacy skips an overnight return leg in its
+    second-round check and shows "no pickup leg" for it. Here a return-leg trip can be grouped like
+    any other.
+11. **The day's board.** `GET /operations/van-groups` needs a `route_id`; the hand-off's computed
+    `GET /operations/van-board` (pools, rounds, return alerts, warnings across routes) is a later
+    phase for the Vue port.
 
 ## Follow-ups
 
 - **The import** brings boats, splits, final pickups and pier notes (A1). Until the other slices extend
   it, legacy bookings arrive with **no reconfirm (2,669), check-in (3,778), alternate pickups (4) or
-  upgrades (11)**.
+  upgrades (11)**.
 
 ## From the van hand-off
 
 - The Vue port's contract is `operation_frontend/apps/web/docs/handoff/van-endpoints.md`; its §8
   checklist is the definition of done for the van board.
 - Apply 016 on the shared database and run the import there.
-- **A group can be left empty** when its last member's trip is removed or moved (legacy groups had
-  no rows, so they vanished by themselves): hide empty groups on read, or delete them on write?
+- **An emptied group stays and reads hide it** (decided 2026-10-09): when its last member's trip is
+  removed or moved, the row (and its van) is kept, and left out until a member is added again.
 - **Before `--commit` on production,** run a dry run and read the skipped bookings, the van group
   conflicts and the notes.

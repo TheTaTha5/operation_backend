@@ -27,7 +27,9 @@ import {
 } from './booking-approvals.js';
 import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
-import { clearedOnMove, dispatchView, type StoredDispatch, type TripDispatch } from './dispatch.js';
+import { clearedOnMove, dispatchView, EMPTY_DISPATCH, type StoredDispatch, type TripDispatch } from './dispatch.js';
+import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
+import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanPatch, type VanStatusRange, type VanStatusRangeInput } from './vans.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
 
@@ -239,7 +241,7 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 };
 
 /** `dispatch` gives each trip's dispatch as a read shows it; without it, every trip's is empty. */
-export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch = () => dispatchView(undefined, new Set())): Booking {
+export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch): Booking {
   const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
     ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
     ...ovnOfIndex(stored.trips, ovn_of), operations: dispatch({ ovn_of, ...trip }),
@@ -536,7 +538,8 @@ export class OperationsStore {
   private id(prefix: string): string { return `${prefix}_${crypto.randomUUID()}`; }
 
   private view(stored: StoredBooking): Booking {
-    return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date)));
+    return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
+      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups)));
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
@@ -551,9 +554,14 @@ export class OperationsStore {
    */
   private retrip(booking: StoredBooking, planned: StoredTrip[]): void {
     const keep = new Set(planned.map((trip) => trip.id));
-    for (const trip of booking.trips) if (!keep.has(trip.id)) this.dispatch.delete(trip.id);
-    for (const id of movedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) this.dispatch.set(id, clearedOnMove(d)); }
-    for (const id of paxChangedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) d.boat_splits = []; }
+    for (const trip of booking.trips) if (!keep.has(trip.id)) { this.dispatch.delete(trip.id); this.vanParts.delete(trip.id); }
+    for (const id of movedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) this.dispatch.set(id, clearedOnMove(d)); this.vanParts.delete(id); }
+    for (const id of paxChangedTripIds(booking.trips, planned)) {
+      const d = this.dispatch.get(id);
+      if (d) d.boat_splits = [];
+      const parts = this.vanParts.get(id);
+      if (parts) this.setVanParts(id, rebalanceParts(parts, planned.find((t) => t.id === id)!.pax));
+    }
     booking.trips = planned;
   }
   /** The trip, its booking and its dispatch as stored, for a dispatch write; undefined for an unknown trip. */
@@ -568,6 +576,74 @@ export class OperationsStore {
     return undefined;
   }
   setDispatch(tripId: string, dispatch: StoredDispatch): void { this.dispatch.set(tripId, { ...dispatch, boat_splits: dispatch.boat_splits.map((s) => ({ ...s })) }); }
+
+  // ── Van parts and groups (migration 016, slice A2) ──
+  private vanParts = new Map<string, StoredVanPart[]>();
+  private vanGroups = new Map<string, VanGroup>();
+  /** Nothing to lock: the in-process store runs one transaction at a time. */
+  lockVanDay(_date: string, _routeId: string): void {}
+  bookingsOn(date: string, routeId: string): Booking[] {
+    return [...this.bookings.values()].filter((b) => b.trips.some((t) => t.service_date === date && t.route_id === routeId)).map((b) => this.view(b));
+  }
+  vanGroupsOn(date: string, routeId: string): VanGroup[] { return [...this.vanGroups.values()].filter((g) => g.service_date === date && g.route_id === routeId).map((g) => ({ ...g })); }
+  vanGroup(id: string): VanGroup | undefined { const g = this.vanGroups.get(id); return g && { ...g }; }
+  storedVanParts(tripId: string): StoredVanPart[] { return (this.vanParts.get(tripId) ?? []).map((p) => ({ ...p, alt: p.alt && { ...p.alt } })); }
+  writeVanGroup(group: VanGroup): void { this.vanGroups.set(group.id, { ...group }); }
+  deleteVanGroup(id: string): void { this.vanGroups.delete(id); }
+  /** `[]` is no rows: one whole, ungrouped part. */
+  setVanParts(tripId: string, parts: readonly StoredVanPart[]): void {
+    if (parts.length) this.vanParts.set(tripId, parts.map((p) => ({ ...p, alt: p.alt && { ...p.alt } }))); else this.vanParts.delete(tripId);
+  }
+  /** Sets some of a trip's dispatch fields; a new final pickup is a plain time, with no window. */
+  patchDispatch(tripId: string, fields: { pickup_time_final?: string | null; return_same_van?: boolean }): void {
+    const d = { ...(this.dispatch.get(tripId) ?? EMPTY_DISPATCH) };
+    if (fields.pickup_time_final !== undefined) Object.assign(d, { pickup_time_final: fields.pickup_time_final, pickup_time_final_end: null, pickup_final_at_pier: false });
+    if (fields.return_same_van !== undefined) d.return_same_van = fields.return_same_van;
+    this.setDispatch(tripId, d);
+  }
+
+  // ── Vans and the month matrix (migration 016, slice A3) ──
+  private vans = new Map<string, Van>();
+  private vanRanges: VanStatusRange[] = [];
+  private vanRangeSeq = 0;
+  private vanDayRows = new Map<string, StoredVanDay>();
+  private copyDay = (d: StoredVanDay): StoredVanDay => ({ ...d, route_ids: [...d.route_ids] });
+
+  listVans(): Van[] { return sortVans([...this.vans.values()]).map((v) => ({ ...v })); }
+  van(id: string): Van | undefined { const v = this.vans.get(id); return v && { ...v }; }
+  createVan(input: VanInput): Van {
+    const van = { id: nextVanId([...this.vans.keys()]), ...input };
+    this.vans.set(van.id, van);
+    return { ...van };
+  }
+  updateVan(id: string, patch: VanPatch): Van | undefined {
+    const van = this.vans.get(id);
+    if (!van) return undefined;
+    const next = applyVanPatch(van, patch);
+    this.vans.set(id, next);
+    return { ...next };
+  }
+  vanStatusRanges(vanId?: string): VanStatusRange[] { return sortRanges(this.vanRanges.filter((r) => vanId === undefined || r.van_id === vanId)).map((r) => ({ ...r })); }
+  addStatusRange(vanId: string, input: VanStatusRangeInput): VanStatusRange {
+    const range = { id: ++this.vanRangeSeq, van_id: vanId, ...input };
+    this.vanRanges.push(range);
+    return { ...range };
+  }
+  /** Rewrites a range in place, keeping its id and so its place in the order. */
+  putStatusRange(range: VanStatusRange): void { this.vanRanges = this.vanRanges.map((r) => (r.id === range.id ? { ...range } : r)); }
+  deleteStatusRange(vanId: string, id: number): boolean {
+    const before = this.vanRanges.length;
+    this.vanRanges = this.vanRanges.filter((r) => !(r.van_id === vanId && r.id === id));
+    return this.vanRanges.length < before;
+  }
+  /** Stored cells between two dates, inclusive. */
+  vanDays(from: string, to: string): StoredVanDay[] { return [...this.vanDayRows.values()].filter((d) => d.service_date >= from && d.service_date <= to).map(this.copyDay); }
+  vanDay(vanId: string, date: string): StoredVanDay | undefined { const d = this.vanDayRows.get(`${vanId}|${date}`); return d && this.copyDay(d); }
+  /** A cell with nothing set is no row at all. */
+  setVanDay(day: StoredVanDay): void {
+    const key = `${day.van_id}|${day.service_date}`;
+    if (isEmptyVanDay(day)) this.vanDayRows.delete(key); else this.vanDayRows.set(key, this.copyDay(day));
+  }
 
   /** One route's day, with per-boat and per-lock detail. The rules are `dayCapacity`'s; this only gathers rows. */
   day(routeId: string, serviceDate: string, exclude: Exclusion = {}): DayState {
