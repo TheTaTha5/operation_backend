@@ -3,7 +3,7 @@ import { assertItinerary, OperationsStore, type OvnMode, type BookingChanges, ty
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { OidcAuthenticator, requireAnyScope } from '../auth.js';
-import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar } from '../domain/calendar.js';
+import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
@@ -227,6 +227,19 @@ function bookingChanges(body: unknown): BookingChanges {
     ...common,
   };
 }
+const calendarKind = (value: unknown): CalendarKind => (value === 'open' || value === 'closed' ? value : badRequest('kind must be open or closed'));
+/** A real calendar day: `Date.parse` accepts `2048-02-30` and rolls it into March, so the day must survive a round trip. */
+const calendarDate = (value: unknown, name: string): string => {
+  const day = typeof value === 'string' && isIsoDate(value) ? new Date(`${value}T00:00:00Z`) : undefined;
+  return day && !Number.isNaN(day.getTime()) && day.toISOString().startsWith(value as string) ? value as string : badRequest(`${name} must be a YYYY-MM-DD date`);
+};
+/** `close_anyway` in a body (a boolean) or a query string (`true`/`false`). Absent is false. */
+function closeAnyway(value: unknown): boolean {
+  if (value === undefined || value === false || value === 'false') return false;
+  if (value === true || value === 'true') return true;
+  return badRequest('close_anyway must be true or false');
+}
+
 function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'> {
   const input = record(body);
   return { ...input, route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), pax: pax(input.pax), agent_id: optionalString(input.agent_id) };
@@ -247,8 +260,9 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   app.addHook('preHandler', async (request) => {
     const path = request.url.split('?')[0];
     if (path === '/v1/login') return;
-    const isOperations = path.startsWith('/operations/') || path === '/v1/manifest';
     const isWrite = request.method !== 'GET';
+    // A route's calendar is operations configuration, as deployments are, not a booking write.
+    const isOperations = path.startsWith('/operations/') || path === '/v1/manifest' || (isWrite && path.startsWith('/v1/routes/'));
     const user = await authenticator.authenticate(request);
     requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
   });
@@ -277,7 +291,18 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     if ((from === undefined) !== (to === undefined)) badRequest('from and to must be supplied together');
     const kind = optionalString(query.kind);
     if (kind !== undefined && !isRouteKind(kind)) badRequest('kind must be marine or land');
-    const routes = (await store.listRoutes()).filter((route) => kind === undefined || route.kind === kind);
+    // Each route carries its calendar as stored, with ids, for the screen that edits it; `days` below
+    // is the same calendar resolved.
+    const seasons = await store.listSeasons(), overrides = await store.listDayOverrides();
+    const routes = (await store.listRoutes()).filter((route) => kind === undefined || route.kind === kind).map((route) => ({
+      ...route,
+      seasons: seasons.filter((s) => s.route_id === route.id)
+        .sort((a, b) => a.from_date.localeCompare(b.from_date) || a.id.localeCompare(b.id))
+        .map(({ id, kind: k, from_date, to_date }) => ({ id, kind: k, from_date, to_date })),
+      overrides: overrides.filter((o) => o.route_id === route.id)
+        .sort((a, b) => a.service_date.localeCompare(b.service_date))
+        .map(({ service_date, kind: k }) => ({ service_date, kind: k })),
+    }));
     if (from === undefined || to === undefined) return { routes };
 
     if (!isIsoDate(from) || !isIsoDate(to)) badRequest('from and to must be YYYY-MM-DD dates');
@@ -288,6 +313,39 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
 
     const calendar = routeCalendar(await store.listSeasons(), await store.listDayOverrides(from, to));
     return { from, to, routes: routes.map((route) => ({ ...route, days: calendar.range(route.id, from, to) })) };
+  });
+
+  /**
+   * Settings → Programs: a route's calendar is edited here, and only here. `sync:routes` no longer
+   * copies it from legacy. A change that closes a day holding bookings or a boat is `409
+   * bookings_on_closed_day` unless it carries `close_anyway` (`assertCloseAllowed`).
+   */
+  const calendarRoute = (request: { params: unknown }): string => (request.params as { id: string }).id;
+  app.post('/v1/routes/:id/seasons', { schema: docs.addSeason }, async (request, reply) => {
+    const body = record(request.body);
+    const from_date = calendarDate(body.from_date, 'from_date'), to_date = calendarDate(body.to_date, 'to_date');
+    if (to_date < from_date) badRequest('to_date must not precede from_date');
+    const season = { id: store.newSeasonId(), route_id: calendarRoute(request), kind: calendarKind(body.kind), from_date, to_date };
+    await store.transaction(() => store.changeCalendar(season.route_id, { op: 'add-season', season }, closeAnyway(body.close_anyway), todayInThailand()));
+    return reply.code(201).send(season);
+  });
+  app.delete('/v1/routes/:id/seasons/:season_id', { schema: docs.deleteSeason }, async (request, reply) => {
+    const { season_id } = request.params as { season_id: string };
+    const query = request.query as Record<string, unknown>;
+    await store.transaction(() => store.changeCalendar(calendarRoute(request), { op: 'delete-season', season_id }, closeAnyway(query.close_anyway), todayInThailand()));
+    return reply.code(204).send();
+  });
+  app.put('/v1/routes/:id/days/:date', { schema: docs.setDay }, async (request) => {
+    const body = record(request.body);
+    const override = { route_id: calendarRoute(request), service_date: calendarDate((request.params as { date: string }).date, 'date'), kind: calendarKind(body.kind) };
+    await store.transaction(() => store.changeCalendar(override.route_id, { op: 'set-day', override }, closeAnyway(body.close_anyway), todayInThailand()));
+    return override;
+  });
+  app.delete('/v1/routes/:id/days/:date', { schema: docs.clearDay }, async (request, reply) => {
+    const service_date = calendarDate((request.params as { date: string }).date, 'date');
+    const query = request.query as Record<string, unknown>;
+    await store.transaction(() => store.changeCalendar(calendarRoute(request), { op: 'clear-day', service_date }, closeAnyway(query.close_anyway), todayInThailand()));
+    return reply.code(204).send();
   });
 
   /**

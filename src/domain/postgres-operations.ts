@@ -3,20 +3,20 @@ import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
   assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips,
-  licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs,
+  licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
-  confirmationStamp, planStatusCommand, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
+  confirmationStamp, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
 import { SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
-import { eachDate, type Route, type RouteDayOverride, type RouteSeason } from './calendar.js';
+import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, routeCalendar, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
 import {
   BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
   type BookingHeader,
@@ -47,6 +47,9 @@ const WAITING_FOR_SEATS = `(b.status = 'pending_approval' AND EXISTS (
   SELECT 1 FROM booking_approvals ap WHERE ap.booking_id = b.id AND ap.kind = 'approval' AND ap.status = 'pending' AND ap.over_capacity))`;
 
 const optionalInt = (value: unknown): number | undefined => value === null || value === undefined ? undefined : Number(value);
+/** Calendar rows, read with their dates cast to text in SQL. */
+const season = (row: QueryResultRow): RouteSeason => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) });
+const dayOverride = (row: QueryResultRow): RouteDayOverride => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] });
 type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
 const TRANSACTION_ATTEMPTS = 8;
@@ -328,6 +331,8 @@ export class PostgresOperationsStore {
        FROM seat_locks l
        WHERE l.route_id = ANY($1::text[]) AND l.service_date BETWEEN $2 AND $3 AND l.status = 'active' AND l.id IS DISTINCT FROM $6`,
       [ids, from, to, exclude.bookingId ?? null, releasing, exclude.lockId ?? null]);
+    const { rows: kinds } = await this.client().query('SELECT id, kind FROM routes WHERE id = ANY($1::text[])', [ids]);
+    const kindOf = new Map(kinds.map((row) => [String(row.id), row.kind as RouteKind]));
 
     const deployedByDay = byDay(deployed), tripsByDay = byDay(trips), locksByDay = byDay(locks);
     const days: RouteDay[] = [];
@@ -339,7 +344,8 @@ export class PostgresOperationsStore {
           ...dayCapacity(
             (deployedByDay.get(key) ?? []).map((row): DayDeployment => ({ boat_id: String(row.boat_id), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), override_capacity: optionalInt(row.override_capacity) })),
             (tripsByDay.get(key) ?? []).map((row): HeldTrip => ({ booking_mode: String(row.booking_mode), pax: Number(row.pax), charter_boat_id: row.charter_boat_id ?? undefined })),
-            (locksByDay.get(key) ?? []).map((row): HeldLock => ({ id: String(row.id), pax: Number(row.pax), drawn: Number(row.drawn) }))),
+            (locksByDay.get(key) ?? []).map((row): HeldLock => ({ id: String(row.id), pax: Number(row.pax), drawn: Number(row.drawn) })),
+            kindOf.get(routeId)),
         });
       }
     }
@@ -478,6 +484,19 @@ export class PostgresOperationsStore {
     await this.client().query("UPDATE booking_approvals SET status = 'replaced' WHERE booking_id = $1 AND kind = $2 AND status = 'pending'", [bookingId, kind]);
   }
 
+  /** `assertRoutesOpen` against the calendar of the routes and days in question, read alone. */
+  private async assertOpen(trips: readonly RouteDate[]): Promise<void> {
+    if (trips.length === 0) return;
+    const ids = [...new Set(trips.map((trip) => trip.route_id))];
+    const dates = [...new Set(trips.map((trip) => trip.service_date))];
+    const { rows: seasons } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons WHERE route_id = ANY($1::text[])', [ids]);
+    const { rows: overrides } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE route_id = ANY($1::text[]) AND service_date = ANY($2::date[])', [ids, dates]);
+    const { rows: names } = await this.client().query('SELECT id, name FROM routes WHERE id = ANY($1::text[])', [ids]);
+    assertRoutesOpen(
+      routeCalendar(seasons.map(season), overrides.map(dayOverride)),
+      trips, new Map(names.map((row) => [String(row.id), String(row.name)])));
+  }
+
   private async assertRoutes(trips: readonly BookingTripInput[]): Promise<void> {
     const ids = [...new Set(trips.map((trip) => trip.route_id))];
     const { rows } = await this.client().query('SELECT id FROM routes WHERE id = ANY($1::text[])', [ids]);
@@ -505,6 +524,7 @@ export class PostgresOperationsStore {
   async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
     const planned = planTrips([], input.trips, newTripId);
     await this.assertRoutes(input.trips);
+    await this.assertOpen(tripsToCheckOpen(input.external_id, [], planned));
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
@@ -579,6 +599,7 @@ export class PostgresOperationsStore {
     const replacement = nextTrips(current.trips, changes);
     const planned = planTrips(current.trips, replacement, newTripId);
     await this.assertRoutes(replacement);
+    await this.assertOpen(tripsToCheckOpen(current.external_id, current.trips, planned));
     const reweighed = reweighs(current, changes, claimsMoreSeats(current.trips, planned))
       ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips), actor) : undefined;
     const status = reweighed?.status ?? current.status;
@@ -678,6 +699,7 @@ export class PostgresOperationsStore {
       days.set(key, await this.day(trip.route_id, trip.service_date, { bookingId: id }));
     }
     const { trips, warnings } = restoreTrips(current.trips, days);
+    await this.assertOpen(current.trips);
     await this.assertTrips(trips, { bookingId: id });
     await this.writeTrips(id, current.trips, planTrips(current.trips, trips, newTripId));
     await this.touch(id, actor, ", status = 'confirmed', cancellation_reason = NULL");
@@ -718,6 +740,7 @@ export class PostgresOperationsStore {
     const { trips, locksReturned } = rescheduleTrips(current.trips, request.from_date, request.to_date);
     const planned = planTrips(current.trips, trips, newTripId);
     await this.assertRoutes(trips);
+    await this.assertOpen(tripsToCheckOpen(undefined, current.trips, planned));
     if (claimsMoreSeats(current.trips, planned)) await this.assertTrips(trips, { bookingId: id }, current.trips);
     await this.writeTrips(id, current.trips, planned);
     const plan = planRescheduleRecord(current, request, actor, locksReturned);
@@ -745,6 +768,7 @@ export class PostgresOperationsStore {
     return rows.map(lock);
   }
   async createLock(input: LockInput): Promise<SeatLock> {
+    await this.assertOpen([input]);
     await this.lockPool(input.route_id, input.service_date);
     assertLockFits(await this.day(input.route_id, input.service_date), input.pax, 0);
     const id = `lock_${randomUUID()}`;
@@ -771,6 +795,44 @@ export class PostgresOperationsStore {
   }
   async allotment(routeId: string, date: string, exclude: Exclusion = {}): Promise<Capacity & { route_id: string; service_date: string; deployments: Deployment[] }> { return { route_id: routeId, service_date: date, ...(await this.capacity(routeId,date,exclude)), deployments: await this.listDeployments(date,date,routeId) }; }
 
+  /**
+   * One edit to a route's calendar: the rules are `applyCalendarChange` and `assertCloseAllowed`, and
+   * this gathers the rows and writes the result. The route's row is locked first, so two edits to
+   * one route cannot both judge the calendar as it was before the other.
+   */
+  async changeCalendar(routeId: string, change: CalendarChange, closeAnyway: boolean, today: string): Promise<void> {
+    const { rows: [route] } = await this.client().query('SELECT id FROM routes WHERE id = $1 FOR UPDATE', [routeId]);
+    if (!route) refuse('Route not found', 404);
+    const { rows: seasons } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons WHERE route_id = $1', [routeId]);
+    const { rows: overrides } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE route_id = $1', [routeId]);
+    const current = { seasons: seasons.map(season), overrides: overrides.map(dayOverride) };
+    const next = applyCalendarChange(current.seasons, current.overrides, change);
+    const { rows: trips } = await this.client().query(
+      `SELECT DISTINCT t.service_date::text AS service_date, COALESCE(b.voucher_ref, b.id) AS booking_ref
+       FROM booking_trips t JOIN bookings b ON b.id = t.booking_id
+       WHERE t.route_id = $1 AND t.service_date >= $2 AND b.status <> ALL($3::text[])`, [routeId, today, [...SEAT_RELEASING_STATUSES]]);
+    const { rows: boats } = await this.client().query('SELECT service_date::text AS service_date, boat_id FROM deployments WHERE route_id = $1 AND service_date >= $2', [routeId, today]);
+    const holds: CalendarHold[] = [
+      ...trips.map((row) => ({ service_date: String(row.service_date), booking_ref: String(row.booking_ref) })),
+      ...boats.map((row) => ({ service_date: String(row.service_date), boat_id: String(row.boat_id) })),
+    ];
+    assertCloseAllowed(routeId, routeCalendar(current.seasons, current.overrides), routeCalendar(next.seasons, next.overrides), holds, closeAnyway);
+    switch (change.op) {
+      case 'add-season': {
+        const s = change.season;
+        await this.client().query('INSERT INTO route_seasons (id, route_id, kind, from_date, to_date) VALUES ($1,$2,$3,$4,$5)', [s.id, routeId, s.kind, s.from_date, s.to_date]);
+        break;
+      }
+      case 'delete-season': await this.client().query('DELETE FROM route_seasons WHERE id = $1 AND route_id = $2', [change.season_id, routeId]); break;
+      case 'set-day':
+        await this.client().query(`INSERT INTO route_day_overrides (route_id, service_date, kind) VALUES ($1,$2,$3)
+          ON CONFLICT (route_id, service_date) DO UPDATE SET kind = EXCLUDED.kind`, [routeId, change.override.service_date, change.override.kind]);
+        break;
+      case 'clear-day': await this.client().query('DELETE FROM route_day_overrides WHERE route_id = $1 AND service_date = $2', [routeId, change.service_date]); break;
+    }
+  }
+  newSeasonId(): string { return `season_${randomUUID()}`; }
+
   /** Reference data. Dates are cast in SQL so the driver never hands back a Date to re-render. */
   async listRoutes(): Promise<Route[]> {
     const { rows } = await this.client().query(`SELECT r.id, r.name, r.kind, r.ext_id, r.pier, r.family_id, r.color, r.islands, r.sort,
@@ -793,7 +855,7 @@ export class PostgresOperationsStore {
   }
   async listSeasons(): Promise<RouteSeason[]> {
     const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');
-    return rows.map((row) => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) }));
+    return rows.map(season);
   }
   /**
    * Agents, markets and salespeople. There are about 130 agents, so the list is read whole and handed
@@ -989,6 +1051,6 @@ export class PostgresOperationsStore {
 
   async listDayOverrides(from?: string, to?: string): Promise<RouteDayOverride[]> {
     const { rows } = await this.client().query('SELECT route_id, service_date::text, kind FROM route_day_overrides WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) ORDER BY route_id, service_date', [from ?? null, to ?? null]);
-    return rows.map((row) => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] }));
+    return rows.map(dayOverride);
   }
 }

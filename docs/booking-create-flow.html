@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creating a Booking</title>
+<!--
+  The page form of docs/booking-create-flow.md, which is the source: change that file, then this one.
+  The diagrams are drawn by Mermaid, loaded from jsDelivr at a pinned version, so the first open needs
+  the network (docs/schema.html needs none).
+-->
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f6f6f3; --surface: #ffffff; --ink: #1c1c1f; --muted: #66666e;
+  --border: #dcdce1; --rule: #efeff2; --hot: #2563eb; --code-bg: #f1f1ee;
+  --shadow: 0 1px 2px rgb(0 0 0 / .05), 0 3px 10px rgb(0 0 0 / .04);
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #111113; --surface: #1b1b1f; --ink: #ececf0; --muted: #a1a1aa;
+    --border: #2f2f37; --rule: #26262c; --hot: #60a5fa; --code-bg: #24242a;
+    --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 var(--sans); }
+code { font-family: var(--mono); font-size: .88em; background: var(--code-bg); padding: 1px 5px; border-radius: 5px; }
+header { padding: 22px 16px 18px; border-bottom: 1px solid var(--border); background: var(--surface); }
+header .wrap, main { max-width: 1100px; margin: 0 auto; }
+main { padding: 8px 16px 48px; }
+h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.01em; }
+.meta { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+nav { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 12px; font-size: 13.5px; }
+nav a { color: var(--hot); text-decoration: none; }
+nav a:hover { text-decoration: underline; }
+h2 { margin: 34px 0 10px; font-size: 17px; font-weight: 650; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 16px 18px; }
+.diagram { overflow-x: auto; text-align: center; }
+.diagram svg { max-width: none; height: auto; }
+.diagram.pending { color: var(--muted); font-size: 13px; text-align: left; white-space: pre; font-family: var(--mono); }
+ol, ul { padding-left: 22px; margin: 8px 0; }
+li { margin: 4px 0; }
+.note { color: var(--muted); font-size: 13.5px; }
+.error { color: #b91c1c; font-size: 13.5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <h1>Creating a booking: <code>POST /v1/bookings</code></h1>
+    <p class="meta">Drawn from the code on <code>feat/route-calendar-rules</code>, 2026-10-08. Source: <code>docs/booking-create-flow.md</code>.</p>
+    <nav><a href="#short">In short</a><a href="#flowchart">Flowchart</a><a href="#sequence">Sequence diagram</a><a href="#notice">What to notice</a></nav>
+  </div>
+</header>
+<main>
+  <h2 id="short">In short</h2>
+  <div class="card">
+    <p style="margin-top:0">The client never picks the status. It sends the trips and says which button was pressed:
+      <code>intent: "quote"</code> or <code>"confirm"</code>. The server then:</p>
+    <ol>
+      <li>Checks you're logged in.</li>
+      <li>Checks every route exists and runs that day.</li>
+      <li>Weighs the seats day by day.</li>
+      <li>Decides the status from those facts.</li>
+      <li>Saves it all in one transaction (a group of writes that either all succeed or all undo).</li>
+    </ol>
+    <p style="margin-bottom:0">If any day is refused, nothing is saved.</p>
+  </div>
+
+  <h2 id="flowchart">Flowchart</h2>
+  <div class="card diagram"><pre class="mermaid">
+flowchart TD
+    A["Client sends POST /v1/bookings&lt;br/&gt;trips + intent: quote or confirm"] --> B{"Valid Bearer token&lt;br/&gt;with booking:write?"}
+    B -- no --> X1["401 / 403"]
+    B -- yes --> C{"Every route in&lt;br/&gt;the catalogue?"}
+    C -- no --> X2["400 unknown route"]
+    C -- yes --> D{"Route runs that day?&lt;br/&gt;(calendar: seasons + overrides)"}
+    D -- "no, and not a b2c_ booking" --> X3["409 route_closed"]
+    D -- yes --> E["For each route+day:&lt;br/&gt;lock that day's seat pool,&lt;br/&gt;read boats, bookings, seat locks"]
+    E --> F{"Land route, or&lt;br/&gt;no boat deployed yet?"}
+    F -- yes --> OK["Day fits (no seat limit)"]
+    F -- no --> G{"Fits the seats on sale?"}
+    G -- yes --> OK
+    G -- no --> H{"Would only fit by taking&lt;br/&gt;other agents' locked seats?"}
+    H -- yes --> X4["409 rest held by seat locks"]
+    H -- no --> I{"Within the boats'&lt;br/&gt;registered seats (license_pax)?"}
+    I -- no --> X5["409 registered seats full"]
+    I -- yes --> OVER["Day is OVER the allotment&lt;br/&gt;(needs a manager)"]
+    OK --> J["decideStatus"]
+    OVER --> J
+    J --> K{"intent = confirm with FOC pax&lt;br/&gt;but no foc_reason?"}
+    K -- yes --> X6["400 foc_reason is required"]
+    K -- no --> L{"Any day over the allotment,&lt;br/&gt;or confirm with a discount?"}
+    L -- yes --> P["pending_approval&lt;br/&gt;(+ approval record)&lt;br/&gt;over allotment = holds NO seats"]
+    L -- no --> M{"intent?"}
+    M -- quote --> Q["quote"]
+    M -- confirm --> N{"FOC (free) pax?"}
+    N -- yes --> PF["pending_foc"]
+    N -- no --> CF["confirmed&lt;br/&gt;stamp confirmed_by / confirmed_at"]
+    P --> S["INSERT booking, trips, passengers,&lt;br/&gt;add-ons, approvals, history"]
+    Q --> S
+    PF --> S
+    CF --> S
+    S --> T["COMMIT → 201 + booking"]
+</pre></div>
+
+  <h2 id="sequence">Sequence diagram: the same request, step by step</h2>
+  <div class="card diagram"><pre class="mermaid">
+sequenceDiagram
+    autonumber
+    actor Staff as Client (Vue app / legacy / Love Kingdom)
+    participant API as Fastify (routes/operations.ts)
+    participant Auth as Authenticator (auth.ts)
+    participant Store as PostgresOperationsStore
+    participant Cal as calendar.ts
+    participant Cap as capacity.ts
+    participant Appr as booking-approvals.ts
+    participant DB as PostgreSQL
+
+    Staff->>API: POST /v1/bookings {trips, intent, header, passengers, addOns}
+    API->>Auth: authenticate(Bearer token)
+    Auth-->>API: user + scopes (needs booking:write)
+    API->>API: bookingInput() parse, createHeader() sets created_by/booked_at from the token
+    API->>Store: transaction(createBooking)
+    Store->>DB: BEGIN ISOLATION LEVEL SERIALIZABLE
+    Store->>DB: SELECT routes (assertRoutes)
+    Store->>Cal: assertRoutesOpen(calendar, trips)
+    Cal-->>Store: ok, or throws 409 route_closed
+    loop each route+day, in sorted order
+        Store->>DB: pg_advisory_xact_lock("route:date")
+        Store->>DB: read deployments, trips that hold seats, seat locks
+        Store->>Cap: dayCapacity() then weighDay(day, demand)
+        Cap-->>Store: fits / over by N / throws 409
+    end
+    Store->>Appr: decideStatus(intent, {focCount, focReason, discount, overDays})
+    Appr-->>Store: status + approvals + history lines
+    Store->>DB: INSERT bookings, booking_trips, passengers, add-ons
+    Store->>DB: INSERT booking_approvals (+ days), booking history
+    Store->>DB: COMMIT (a serialization conflict rolls back and retries)
+    Store-->>API: booking
+    API-->>Staff: 201 {status, allocated_pax, approvals, ...}
+</pre></div>
+
+  <h2 id="notice">What to notice</h2>
+  <div class="card">
+    <ul style="margin:0">
+      <li><b>Seat-pool lock:</b> <code>pg_advisory_xact_lock</code> is a lock held only until the transaction ends, one per route+day. Two people booking the same boat on the same day wait in line instead of both getting the last seat. Days are locked in sorted order, so two bookings can't each grab one day and block each other.</li>
+      <li><b>Same rules in both stores:</b> the in-process store (<code>src/domain/operations.ts</code>) calls the same <code>weighDay</code> and <code>decideStatus</code>. Only the reading and writing of data differ.</li>
+      <li><b>Seat-holding rule:</b> a waiting over-allotment booking holds 0 seats until it's approved. Otherwise it would take the very room it's waiting for. A booking waiting only for a discount approval does hold its seats.</li>
+      <li><b>After create:</b> the status changes only through commands: <code>/confirm</code>, <code>/approve</code>, <code>/reject</code>, <code>/cancel</code>, <code>/cancel-weather</code>, <code>/restore</code>. <code>PATCH</code> changes client facts (names, notes, trips), and sending it a different <code>status</code> is a <code>400</code>.</li>
+    </ul>
+  </div>
+  <p class="note" id="status">Drawing the diagrams…</p>
+</main>
+<script type="module">
+const status = document.getElementById('status');
+try {
+  const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs');
+  const dark = matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'default', securityLevel: 'strict', flowchart: { htmlLabels: true } });
+  await mermaid.run({ querySelector: 'pre.mermaid' });
+  status.remove();
+} catch (error) {
+  // Offline, or the CDN is blocked: the diagram source stays on the page as text.
+  status.className = 'error';
+  status.textContent = `The diagrams could not be drawn (${error.message}). The Mermaid source is shown instead; paste it into mermaid.live to see it.`;
+}
+</script>
+</body>
+</html>

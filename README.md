@@ -36,10 +36,10 @@ npm run dev
 | `npm run build` | Compile TypeScript into `dist/`. |
 | `npm start` | Run the compiled service. |
 | `npm test` | Run HTTP route tests. |
-| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. |
+| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. Use a fresh, empty database. Three test files run at a time (`--test-concurrency=3`), as on CI's runner: with a test-sized database PostgreSQL watches whole tables for serialization conflicts, so eleven files at once on a many-core machine made unrelated bookings collide until a request ran out of retries (`40001`, a `500`), about one test per run, on `main` too. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
-| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes, times, seasons, day overrides) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes and times) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. Seasons and day overrides are copied only for a route new to this service; after that the calendar is edited here (see "Editing the calendar"), and the run only reports where legacy's differs. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:boats [-- --commit]` | Copy the boat catalogue from the legacy database, the same way: dry run unless `--commit`, legacy wins, never deletes. Legacy's `totalcap` is never read, and a boat selling more seats than its licence is skipped and listed, not clamped. Run the import afterwards so deployments pick up new or changed boats. |
 
 Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed, with line endings normalized to LF so a Windows checkout (`core.autocrlf`) and a Railway build agree: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
@@ -98,7 +98,7 @@ The `admin` group grants every permission. `CORS_ORIGIN` must contain the fronte
 
 ## API
 
-Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A deployment is required before seats become available.
+Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A booking or seat lock on a day the route does not run is refused (`409 route_closed`, see "Closed days"). A marine day with no boat deployed yet sells without a seat check, and a land route has no seat limit (see "Land routes and days with no boat").
 
 ### Catalogue
 
@@ -109,20 +109,81 @@ Reference data every other endpoint refers to by id.
   decided it. The range is capped at 400 days, and `from`/`to` must be supplied together.
   Each route is `{ id, name, kind, ext_id?, pier?, family_id?, color?, islands?, sort?, times }`.
   `kind=marine` or `kind=land` lists only that kind (`400` for anything else).
+  Each route also carries its calendar as stored, for the screen that edits it:
+  `seasons: [{ id, kind, from_date, to_date }]` by start date, and `overrides: [{ service_date, kind }]`.
 - `GET /v1/boats` — the boat catalogue: `{ id, name, type?, pier?, capacity, license_pax,
   charter_ceiling, crew? }`.
 
 **Not every route is a boat trip.** `kind` is `marine` for a boat programme (it has a pier,
 deployments and seats) and `land` for a transfer, city tour or show/park ticket, which has none of
 these. `ext_id` is a land product's Love Kingdom code, e.g. `PTP-005:VT-002` (product, then variant);
-treat it as opaque. A calendar or seat view wants `kind=marine`. A land route is in the catalogue
-so that legacy bookings on it have a route to point at, but **it cannot be booked through this API
-yet**: `POST /v1/bookings` checks boat seats, a land route has no deployments, and the answer is
-`409 Insufficient available seats`. Selling land products needs its own capacity rule, which is
-undecided.
+treat it as opaque. A calendar or seat view wants `kind=marine`. A land route has no seat limit:
+see "Land routes and days with no boat" below.
 
-The route and boat catalogues are still edited in legacy. `npm run sync:routes` and
-`npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
+#### Closed days
+
+A booking cannot be sold on a day its route does not run, the calendar `GET /v1/routes?from=&to=`
+shows. The answer is `409` with `code: "route_closed"` and a message a staff screen can show as it
+is: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` (several, joined by `; `).
+
+| Write | What is checked |
+| --- | --- |
+| `POST /v1/bookings` | every trip |
+| `PATCH /v1/bookings/{id}` | only trips it adds, or moves to another route or day |
+| `POST /v1/bookings/{id}/reschedule` | the trips it moves |
+| `POST /v1/bookings/{id}/restore` | every trip |
+| `POST /v1/seat-locks` | its day |
+| `/confirm`, `/approve`, `/reject`, `/cancel`, partial cancel | nothing: they do not choose a day |
+
+A trip a `PATCH` leaves where it is was sold already, so a booking whose day closed after the sale
+can still have its notes edited. (Legacy blocks every save of such a booking.) A booking whose
+`external_id` starts with `b2c_`, legacy's mark for one synced from the B2C website, is saved on a
+closed day on create and `PATCH`, as legacy saves it: it was paid before it arrived. Love Kingdom's
+own bookings (`LOV-…`) are checked like any other.
+
+Seasons may overlap; the one that starts first decides a day, as in legacy.
+
+#### Editing the calendar
+
+Legacy's Settings → Programs, as an API. The calendar is edited here and only here: `sync:routes`
+no longer copies it from legacy. Every write needs `operations:write`.
+
+- `POST /v1/routes/{id}/seasons` `{ kind: "open"|"closed", from_date, to_date, close_anyway? }` →
+  `201` with the season and its `id`. A season is added or deleted, never edited, as in legacy.
+  Overlaps are allowed.
+- `DELETE /v1/routes/{id}/seasons/{season_id}[?close_anyway=true]` → `204`.
+- `PUT /v1/routes/{id}/days/{date}` `{ kind: "open"|"closed", close_anyway? }` → `200` with the
+  override: that day is open or closed whatever the seasons say.
+- `DELETE /v1/routes/{id}/days/{date}[?close_anyway=true]` → `204`: the seasons decide it again.
+
+**Closing a day that holds something.** Any change that turns a day from open to closed while it
+holds a booking (any status but `cancelled`, `rejected`, `cancelled_weather`) or a deployed boat,
+from today (Thai time) on, is `409` with `code: "bookings_on_closed_day"` and a message listing them:
+`This closes days on r3 that hold 2 bookings (BK-1 on 2027-01-04, …) and 1 boat deployment (…).`
+Send it again with `close_anyway: true` (a query parameter on `DELETE`) to close them anyway; the
+bookings stay as they are. This is legacy's "Close anyway" dialog. Legacy only asks when a closed
+season is added or a day is toggled closed; here it is asked for every change that can close a day,
+including an open season added to a route that had none (which closes every date outside it) and a
+deleted open season.
+
+`400` for a bad `kind` or date, or `to_date` before `from_date`; `404` for an unknown route, season,
+or a day with no override to remove.
+
+#### Land routes and days with no boat
+
+Both sell without a seat check, as legacy does (`hasAllotment` false):
+
+- **A land route** (`kind: "land"`) has no seat pool. Any number of passengers can be booked or
+  locked, and availability answers `available_seats: null` with `unlimited: true`.
+- **A marine day with no boat deployed yet** is sold before the boats are assigned. Availability
+  answers `available_seats: 0` and `unplaced_pax`: the passengers sold and the seats locked that
+  day, waiting for a boat. Once a boat is deployed the day is checked as usual, and a day already
+  sold past the boat shows a negative `available_seats`.
+
+Seats drawn from a lock are still limited by the lock, and a charter still needs its boat deployed.
+
+Routes and boats are still edited in legacy (the calendar is not: see "Editing the calendar").
+`npm run sync:routes` and `npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
 Commands). A boat missing here is not just a missing row: the import skips every deployment on it,
 so its seats are absent from `GET /v1/availability`. Run `sync:boats` before the import.
 
@@ -303,7 +364,8 @@ Validation errors are `400` and name the path, for example:
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
 - `GET /v1/availability?route_id=&date=` — booking-form availability for one route on one day:
-  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats }`.
+  `{ route_id, service_date, deployed_capacity, licensed_capacity, booked_pax, charter_pax, locked_pax, available_seats, unlimited, unplaced_pax }`.
+  `available_seats` is `null` on a land route (`unlimited: true`); see "Land routes and days with no boat".
 - `GET /v1/availability?from=&to=[&route_id=]` — the same numbers for a range, both ends inclusive,
   for one route or, without `route_id`, every route in the catalogue:
 
@@ -311,14 +373,14 @@ Validation errors are `400` and name the path, for example:
   { "days": [
     { "route_id": "r1", "service_date": "2031-03-01", "open": true,
       "deployed_capacity": 40, "licensed_capacity": 45, "booked_pax": 8, "charter_pax": 4,
-      "locked_pax": 0, "available_seats": 22,
+      "locked_pax": 0, "available_seats": 22, "unlimited": false, "unplaced_pax": 0,
       "deployments": [
         { "boat_id": "b1", "capacity": 30, "license_pax": 35, "chartered": false },
         { "boat_id": "b2", "capacity": 10, "license_pax": null, "chartered": true } ] } ] }
   ```
 
   Ordered by date, then by route in catalogue order; boats are ordered by id. Every route-day is
-  present, and a day with no deployment is all zeros, not missing. `open` is the route calendar's
+  present, and a day with no deployment is all zeros (apart from `unplaced_pax`), not missing. `open` is the route calendar's
   answer for that date (see `GET /v1/routes?from=&to=`), and is what tells a closed day apart from
   an open one nobody has staffed yet — both have zero seats. `deployments[].capacity` is the boat's
   sellable seats that day after any override and the licence clamp, so they sum to

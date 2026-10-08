@@ -39,7 +39,9 @@ const capacity = {
   booked_pax: { type: 'integer' },
   charter_pax: { type: 'integer' },
   locked_pax: { type: 'integer', description: 'Seats held by seat locks and not yet drawn by a booking' },
-  available_seats: { type: 'integer', description: 'What can be sold right now. The only number to sell against.' },
+  available_seats: { type: 'integer', nullable: true, description: 'What can be sold right now. The only number to sell against. `null` on a land route, which has no seat limit (`unlimited`). `0` on a marine day with no boat deployed, which still sells (see `unplaced_pax`).' },
+  unlimited: { type: 'boolean', description: 'A land route: no seat pool, so a booking or lock is never refused for seats.' },
+  unplaced_pax: { type: 'integer', description: 'On a marine day with no boat deployed: passengers sold and seats locked, waiting for a boat. Such a day sells ungated, as legacy does. `0` once a boat is deployed.' },
 };
 
 const tripIn = {
@@ -230,13 +232,47 @@ const seatLock = {
 };
 
 const idParam = { type: 'object', required: ['id'], properties: { id: { type: 'string' } } };
+const calendarKindSchema = { type: 'string', enum: ['open', 'closed'] };
+const calendarSeason = { type: 'object', properties: { id: { type: 'string' }, kind: calendarKindSchema, from_date: isoDate, to_date: isoDate } };
 
 export const docs = {
   routes: {
     tags: ['Catalogue'], summary: 'List routes (programmes)', security: BEARER,
     description: 'The route ids a booking trip must use. With `from` and `to`, each route carries its operating calendar per day. `kind=marine` lists boat programmes only; `kind=land` lists transfers, tours and tickets.',
     querystring: { type: 'object', properties: { from: isoDate, to: isoDate, kind: { type: 'string', enum: ['marine', 'land'] } } },
-    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, name: { type: 'string' }, kind: { type: 'string', enum: ['marine', 'land'] }, ext_id: { type: 'string', description: 'Love Kingdom product code, e.g. PTP-005:VT-002' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } } } } } } }, 400: err('Bad date range or kind'), ...UNAUTHORIZED },
+    response: { 200: { type: 'object', properties: { routes: { type: 'array', items: { type: 'object', properties: {
+      id: { type: 'string' }, name: { type: 'string' }, kind: { type: 'string', enum: ['marine', 'land'] }, ext_id: { type: 'string', description: 'Love Kingdom product code, e.g. PTP-005:VT-002' }, pier: { type: 'string' }, times: { type: 'array', items: { type: 'string' } },
+      seasons: { type: 'array', description: 'The calendar as stored, by start date. Overlaps are allowed; the one that starts first decides a day.', items: calendarSeason },
+      overrides: { type: 'array', description: 'Single days that beat any season, by date.', items: { type: 'object', properties: { service_date: isoDate, kind: calendarKindSchema } } },
+    } } } } }, 400: err('Bad date range or kind'), ...UNAUTHORIZED },
+  },
+  addSeason: {
+    tags: ['Catalogue'], summary: 'Add an open or closed season to a route', security: BEARER,
+    description: 'Legacy\'s Settings → Programs "add season". Needs `operations:write`. Seasons may overlap. A season that closes a day holding bookings or a deployed boat (from today on) is `409 bookings_on_closed_day`, listing them, unless the body says `close_anyway: true`.',
+    params: idParam,
+    body: { type: 'object', required: ['kind', 'from_date', 'to_date'], properties: { kind: calendarKindSchema, from_date: isoDate, to_date: isoDate, close_anyway: { type: 'boolean', default: false } } },
+    response: { 201: calendarSeason, 400: err('Bad kind or dates'), 404: err('Route not found'), 409: err('Closes days that hold bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  deleteSeason: {
+    tags: ['Catalogue'], summary: 'Delete a season', security: BEARER,
+    description: 'Needs `operations:write`. Deleting an open season can close days; then the same `409 bookings_on_closed_day` applies, and `?close_anyway=true` overrides it.',
+    params: { type: 'object', properties: { id: { type: 'string' }, season_id: { type: 'string' } } },
+    querystring: { type: 'object', properties: { close_anyway: { type: 'boolean' } } },
+    response: { 204: { type: 'null', description: 'Deleted' }, 404: err('Route or season not found'), 409: err('Closes days that hold bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  setDay: {
+    tags: ['Catalogue'], summary: 'Open or close one day, whatever the seasons say', security: BEARER,
+    description: 'Needs `operations:write`. Replaces any override on that day. Closing a day that holds bookings or a deployed boat is `409 bookings_on_closed_day` unless `close_anyway: true`.',
+    params: { type: 'object', properties: { id: { type: 'string' }, date: isoDate } },
+    body: { type: 'object', required: ['kind'], properties: { kind: calendarKindSchema, close_anyway: { type: 'boolean', default: false } } },
+    response: { 200: { type: 'object', properties: { route_id: { type: 'string' }, service_date: isoDate, kind: calendarKindSchema } }, 400: err('Bad kind or date'), 404: err('Route not found'), 409: err('Closes a day that holds bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
+  },
+  clearDay: {
+    tags: ['Catalogue'], summary: 'Remove a day\'s override, so the seasons decide it again', security: BEARER,
+    description: 'Needs `operations:write`. Removing an override that opened a day can close it; then `?close_anyway=true` is needed if it holds bookings or a deployed boat.',
+    params: { type: 'object', properties: { id: { type: 'string' }, date: isoDate } },
+    querystring: { type: 'object', properties: { close_anyway: { type: 'boolean' } } },
+    response: { 204: { type: 'null', description: 'Removed' }, 404: err('Route not found, or no override that day'), 409: err('Closes a day that holds bookings or boats (`bookings_on_closed_day`)'), ...UNAUTHORIZED },
   },
   availability: {
     tags: ['Availability'], summary: 'Seats left on a route and day, or over a range', security: BEARER,
@@ -275,7 +311,7 @@ export const docs = {
     body: bookingIn,
     response: {
       201: booking, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
-      409: err('Seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
+      409: err('A trip on a day its route does not run (`route_closed`), seats held by seat locks, the registered seats full, lock short, or boat already chartered'), ...UNAUTHORIZED,
     },
   },
   amendBooking: {
@@ -287,7 +323,7 @@ export const docs = {
     body: bookingPatchIn,
     response: {
       200: booking, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
-      404: err('Booking not found'), 409: err('Over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
+      404: err('Booking not found'), 409: err('An added or moved trip on a day its route does not run (`route_closed`), over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
     },
   },
   statusCommand: (command: string) => ({
@@ -332,7 +368,7 @@ export const docs = {
     tags: ['Seat locks'], summary: 'Hold seats for an agent', security: BEARER,
     description: 'Takes seats out of the pool until released or drawn by a booking (`lockDraws`). There is no expiry: a lock you do not release holds its seats forever.',
     body: { type: 'object', required: ['route_id', 'service_date', 'pax'], properties: { route_id: { type: 'string' }, service_date: isoDate, pax: { type: 'integer', minimum: 1 }, agent_id: { type: 'string' } } },
-    response: { 201: seatLock, 400: err('Invalid input'), 409: err('Not enough seats'), ...UNAUTHORIZED },
+    response: { 201: seatLock, 400: err('Invalid input'), 409: err('The route does not run that day (`route_closed`), or not enough seats'), ...UNAUTHORIZED },
   },
   releaseLock: {
     tags: ['Seat locks'], summary: 'Release a seat lock', security: BEARER, params: idParam,

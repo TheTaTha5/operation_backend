@@ -14,6 +14,13 @@ Replace the legacy system with a modern backend that **decides**, not one that o
   catalogue and its calendar, sales and pricing (agents, rate types, seasons, promos, contracts,
   quotes), money (invoices, payments, reports), day-of-operations (vans, pickups, check-in), fleet
   maintenance, and login.
+- **Same screens, new data.** The rebuild keeps legacy's UI and UX identical: the same screens,
+  flows, buttons, dialogs and messages. What changes is how the data works underneath: where it is
+  stored and who decides. So an endpoint serves everything a legacy screen shows and accepts
+  everything it does (legacy's "Close anyway" dialog becomes `close_anyway: true`), and an error
+  carries a message the screen can show as it is. When a server rule would make a screen behave
+  differently from legacy (a new refusal, a lost field, a screen turned read-only), the design note
+  says so and the developer decides.
 - **Clients:** the new Vue staff app (`operation_frontend/apps/web`), legacy `allotment_v2` until it
   is retired, and Love Kingdom (the B2C website).
 - **Cutover is area by area.** Until an area moves, legacy is its master and
