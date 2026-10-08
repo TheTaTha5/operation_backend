@@ -18,7 +18,7 @@ left before deciding a day is over the allotment but within the licence. It was 
 | Field | Where | Authority | Meaning |
 |---|---|---|---|
 | `licensed_free` | `approvals[].days[]`, stored in `booking_approval_days.licensed_free` | Computed | Registered passenger seats left on that day when the approval was asked for, the booking's own seats not counted. Always ≥ `need`: past the licence the booking is refused, not sent for approval. `null` on a day recorded before migration 025. |
-| `licensed_free` | each `GET /v1/availability` range entry and single-day answer | Computed | The same number, now: registered passenger seats left on the day's unchartered boats, locks not subtracted. `0` when no boat is deployed or on a land route. |
+| `licensed_free` | each `GET /v1/availability` range entry and single-day answer | Computed | The same number, now: registered passenger seats left on the day's unchartered boats, locks not subtracted. Never negative. `0` when no boat is deployed; `null` on a land route, like `available_seats`. |
 
 Both are read-only. A snapshot on the approval matches legacy (the card shows what was true when the
 approval was asked for); availability gives the live figure for a manager who wants it.
