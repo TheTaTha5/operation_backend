@@ -14,7 +14,7 @@ after(async () => { await app.close(); await pool?.end(); });
 async function request(method: InjectOptions['method'], path: string, payload?: object) {
   return payload === undefined ? app.inject({ method, url: path }) : app.inject({ method, url: path, payload });
 }
-const tripsOf = (response: { json(): unknown }) => (response.json() as { trips: { id: string }[] }).trips;
+const tripsOf = (response: { json(): unknown }) => (response.json() as { trips: { id: string; operations: { pickup_time_final: string | null } }[] }).trips;
 
 test('a trip keeps its van data through edits that keep it, and loses it when it moves', { skip: !url && 'PostgreSQL only' }, async () => {
   const [first, second, moved] = ['2034-04-01', '2034-04-02', '2034-04-09'];
@@ -41,6 +41,8 @@ test('a trip keeps its van data through edits that keep it, and loses it when it
   const edited = await request('PATCH', `/v1/bookings/${bookingId}`, { trips: [{ id: a.id, route_id: 'r1', date: first, pax: 3 }, { id: b.id, route_id: 'r1', date: moved, pax: 2 }] });
   assert.equal(edited.statusCode, 200, edited.body);
   assert.deepEqual(tripsOf(edited).map((t) => t.id), [a.id, b.id], 'the moved trip keeps its id');
-  assert.deepEqual(await vanData(b.id), { allocations: 0, operations: 0 }, 'its van data was for the old day');
+  // Legacy `bkOpsClear`: the dispatch row stays for its pier note, with the dispatch itself cleared.
+  assert.deepEqual(await vanData(b.id), { allocations: 0, operations: 1 }, 'its van data was for the old day');
+  assert.equal(tripsOf(edited).find((t) => t.id === b.id)!.operations.pickup_time_final, null, 'the final pickup was for the old day');
   assert.deepEqual(await vanData(a.id), { allocations: 1, operations: 1 }, 'the trip that stayed keeps its own');
 });

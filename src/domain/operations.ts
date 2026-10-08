@@ -27,6 +27,7 @@ import {
 } from './booking-approvals.js';
 import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
+import { clearedOnMove, dispatchView, type StoredDispatch, type TripDispatch } from './dispatch.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
 
@@ -78,7 +79,10 @@ export type TripDetails = PickupWindow & { zone?: string; ovn?: OvnMode; ovn_ret
 export type OvnMode = 'return' | 'self';
 /** `ovn_of` is an index into the same trip list, on input and on the wire. */
 export type BookingTripInput = TripDetails & { id?: string; route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[]; ovn_of?: number };
-export type BookingTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number>; ovn_leg: boolean; ovn_of?: number };
+export type BookingTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number>; ovn_leg: boolean; ovn_of?: number;
+  /** Day-of-operations dispatch (src/domain/dispatch.ts): always present, empty when nothing is set. */
+  operations: TripDispatch;
+};
 
 export type BookingInput = {
   trips: BookingTripInput[];
@@ -234,10 +238,11 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
   } catch { return fail('Invalid cursor', 400); }
 };
 
-export function bookingView(stored: StoredBooking): Booking {
+/** `dispatch` gives each trip's dispatch as a read shows it; without it, every trip's is empty. */
+export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch = () => dispatchView(undefined, new Set())): Booking {
   const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
     ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
-    ...ovnOfIndex(stored.trips, ovn_of),
+    ...ovnOfIndex(stored.trips, ovn_of), operations: dispatch({ ovn_of, ...trip }),
   }));
   const pax = trips.reduce((sum, trip) => sum + trip.pax_total, 0);
   const first = stored.trips[0];
@@ -530,7 +535,39 @@ export class OperationsStore {
   private now(): string { return new Date().toISOString(); }
   private id(prefix: string): string { return `${prefix}_${crypto.randomUUID()}`; }
 
-  private view(stored: StoredBooking): Booking { return bookingView(stored); }
+  private view(stored: StoredBooking): Booking {
+    return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date)));
+  }
+  private deployedBoats(routeId: string, date: string): Set<string> {
+    return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
+  }
+
+  /** Each trip's dispatch (migration 033), by trip id. */
+  private dispatch = new Map<string, StoredDispatch>();
+  /**
+   * Replaces a booking's trips. As PostgreSQL's `writeTrips`: a removed trip's dispatch goes, a trip
+   * moved to another route or day keeps only its pier note (legacy `bkOpsClear`), and a trip whose
+   * passengers changed loses its boat split, which no longer adds up.
+   */
+  private retrip(booking: StoredBooking, planned: StoredTrip[]): void {
+    const keep = new Set(planned.map((trip) => trip.id));
+    for (const trip of booking.trips) if (!keep.has(trip.id)) this.dispatch.delete(trip.id);
+    for (const id of movedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) this.dispatch.set(id, clearedOnMove(d)); }
+    for (const id of paxChangedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) d.boat_splits = []; }
+    booking.trips = planned;
+  }
+  /** The trip, its booking and its dispatch as stored, for a dispatch write; undefined for an unknown trip. */
+  tripForDispatch(tripId: string): { booking: Booking; trip: BookingTrip; dispatch: StoredDispatch | undefined; deployedBoats: Set<string> } | undefined {
+    for (const stored of this.bookings.values()) {
+      const trip = stored.trips.find((t) => t.id === tripId);
+      if (trip) {
+        const booking = this.view(stored);
+        return { booking, trip: booking.trips.find((t) => t.id === tripId)!, dispatch: this.dispatch.get(tripId), deployedBoats: this.deployedBoats(trip.route_id, trip.service_date) };
+      }
+    }
+    return undefined;
+  }
+  setDispatch(tripId: string, dispatch: StoredDispatch): void { this.dispatch.set(tripId, { ...dispatch, boat_splits: dispatch.boat_splits.map((s) => ({ ...s })) }); }
 
   /** One route's day, with per-boat and per-lock detail. The rules are `dayCapacity`'s; this only gathers rows. */
   day(routeId: string, serviceDate: string, exclude: Exclusion = {}): DayState {
@@ -743,7 +780,7 @@ export class OperationsStore {
     const reweighed = reweighs(booking, changes, claimsMoreSeats(booking.trips, planned))
       ? reweigh(booking, this.weighTrips(replacement, { bookingId: id }), actor) : undefined;
     const line = entry ?? editedLine(actor, changes, booking.status);
-    booking.trips = planned;
+    this.retrip(booking, planned);
     if (reweighed) {
       if (reweighed.request) this.requestApprovals(booking, [reweighed.request]);
       else this.replacePending(booking, 'approval');
@@ -814,7 +851,7 @@ export class OperationsStore {
     const { trips, warnings } = restoreTrips(booking.trips, days);
     this.assertOpen(booking.trips);
     this.assertTrips(trips, { bookingId: id });
-    booking.trips = planTrips(booking.trips, trips, () => this.id('trip'));
+    this.retrip(booking, planTrips(booking.trips, trips, () => this.id('trip')));
     booking.status = 'confirmed';
     delete booking.cancellation;
     delete booking.cancellation_reason;
@@ -827,7 +864,7 @@ export class OperationsStore {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     if (request.kind === 'count') {
-      booking.trips = planTrips(booking.trips, partialCancelTrips(booking.trips, booking.status, request.count), () => this.id('trip'));
+      this.retrip(booking, planTrips(booking.trips, partialCancelTrips(booking.trips, booking.status, request.count), () => this.id('trip')));
       this.touch(booking, actor);
       this.log(id, partialCountLine(actor, request.count));
       return this.view(booking);
@@ -836,7 +873,7 @@ export class OperationsStore {
     // Seats only go down here, so there is no capacity check — see `claimsMoreSeats`.
     const { trips, trip, count } = partialCancelByKey(booking.trips, request);
     const record = { ...partialCancelRecord(trip, request, count, actor), at: this.now() };
-    booking.trips = planTrips(booking.trips, trips, () => this.id('trip'));
+    this.retrip(booking, planTrips(booking.trips, trips, () => this.id('trip')));
     booking.total = totalAfterRefund(booking.total, request.waived);
     booking.partial_cancels.push(record);
     this.touch(booking, actor);
@@ -859,7 +896,7 @@ export class OperationsStore {
     if (claimsMoreSeats(booking.trips, planned)) this.assertTrips(trips, { bookingId: id });
     const plan = planRescheduleRecord(booking, request, actor, locksReturned);
     const now = this.now();
-    booking.trips = planned;
+    this.retrip(booking, planned);
     booking.reschedules.push({ ...plan.record, at: now });
     if (plan.fee_item) booking.fee_items.push({ ...plan.fee_item, at: now });
     this.touch(booking, actor);
@@ -1003,6 +1040,13 @@ export function planTrips(current: readonly StoredTrip[], next: readonly Booking
  * departure — the van that was booked to collect them then — so it is cleared, as legacy's
  * `bkOpsClear` does when a trip's date moves. The trip itself, and its id, stay.
  */
+/** Kept trips whose passengers changed: a boat split no longer adds up, so it is cleared (decided 2026-10-06). */
+export function paxChangedTripIds(current: readonly StoredTrip[], planned: readonly StoredTrip[]): string[] {
+  const key = (pax: readonly PaxRow[]) => [...pax].map((r) => `${r.category}${r.residency}${r.count}`).sort().join(',');
+  const before = new Map(current.map((trip) => [trip.id, key(trip.pax)]));
+  return planned.filter((trip) => before.has(trip.id) && before.get(trip.id) !== key(trip.pax)).map((trip) => trip.id);
+}
+
 export function movedTripIds(current: readonly StoredTrip[], planned: readonly StoredTrip[]): string[] {
   const before = new Map(current.map((trip) => [trip.id, trip]));
   return planned.filter((trip) => {

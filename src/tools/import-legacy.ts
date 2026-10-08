@@ -375,18 +375,28 @@ async function main() {
 
     // ── Van assignment per trip. Groups are only known once every booking is read, so members are
     //    collected under a legacy key (date, route, zone, number) and resolved after the loop ──
-    const tripOps: Row[] = [], allocations: Row[] = [];
+    const tripOps: Row[] = [], allocations: Row[] = [], boatSplitRows: Row[] = [];
     const groupMembers = new Map<string, { day: string; route: string; zone: string; number: number; vans: string[] }>();
-    const hasVanOps = (src: Row): boolean => int(src.ops_vangroup) > 0 || !!str(src.ops_vanid) || !!str(src.ops_vanreturnid)
+    const hasVanOps = (src: Row): boolean => int(src.ops_vangroup) > 0 || !!str(src.ops_vanid) || !!str(src.ops_vanreturnid) || !!str(src.ops_boatid) || !!jsonValue(src.ops_boatsplits) || !!jsonValue(src.ops_piernote)
       || !!str(src.ops_pickuptimefinal) || src.ops_returnsamevan === true || Array.isArray(jsonValue(src.ops_vansplits));
     const vanOpsOf = (src: Row, t: Row, tripId: string, counts: Counts, zone: string) => {
       const final = pickupWindow(src.ops_pickuptimefinal, 'final pickup times');
-      if (final.pickup_time || final.pickup_time_end || src.ops_returnsamevan === true) {
+      // The boat (or boats) and the pier note (migration 033). A split names two boats or more, each in the catalogue.
+      const rawBoatSplits = jsonValue(src.ops_boatsplits);
+      const boatSplits = Array.isArray(rawBoatSplits) ? (rawBoatSplits as Row[]).map((s) => ({ boat_id: str(s.boatId), ad: int(s.ad), chd: int(s.chd), inf: int(s.inf), foc: int(s.foc) })) : [];
+      const splitOk = boatSplits.length >= 2 && new Set(boatSplits.map((s) => s.boat_id)).size === boatSplits.length && boatSplits.every((s) => boats.has(s.boat_id));
+      if (boatSplits.length && !splitOk) note('boat splits dropped: fewer than two distinct boats, or a boat not in the catalogue');
+      const pier = jsonValue(src.ops_piernote) as Row | null;
+      const pierText = pier && typeof pier === 'object' ? str(pier.t) : '';
+      const boatId = splitOk ? null : str(src.ops_boatid) || null;
+      if (final.pickup_time || final.pickup_time_end || src.ops_returnsamevan === true || boatId || splitOk || pierText) {
         tripOps.push({
-          booking_trip_id: tripId, pickup_time_final: final.pickup_time ?? null, pickup_time_final_end: final.pickup_time_end ?? null,
+          booking_trip_id: tripId, boat_id: boatId, pickup_time_final: final.pickup_time ?? null, pickup_time_final_end: final.pickup_time_end ?? null,
           pickup_final_at_pier: final.pickup_at_pier === true, return_same_van: src.ops_returnsamevan === true,
+          pier_note: pierText || null, pier_note_at: pierText && pier!.at ? str(pier!.at) : null, pier_note_by: pierText ? str(pier!.by) || null : null,
         });
       }
+      if (splitOk) boatSplits.forEach((s, idx) => boatSplitRows.push({ booking_trip_id: tripId, idx, ...s }));
 
       // Every part of the trip: the splits when there are any, else the flat fields as one whole part.
       const rawSplits = jsonValue(src.ops_vansplits);
@@ -852,6 +862,7 @@ async function main() {
       SELECT r.booking_id, r.at, r.by, r.kind, r.tag, r.text FROM jsonb_populate_recordset(NULL::booking_history, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(historyLines)]);
     await insert('van_groups', vanGroups);
     await insert('booking_trip_operations', tripOps);
+    await insert('booking_trip_boat_splits', boatSplitRows);
     await insert('booking_trip_van_allocations', allocations);
 
     const { rows: [after] } = await target.query(`SELECT

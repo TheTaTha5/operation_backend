@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Nothing here is built.**
+Decided 2026-10-06 (see "Decisions"). **Built: slice A1** (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import. Everything below the boat and pier note is still to build: van parts and groups (A2), the vans and month matrix (A3), reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -454,9 +454,9 @@ The questions as they were asked:
 
 ## Follow-ups
 
-- **`src/tools/import-legacy.ts` is not extended by this slice.** Until it is, every legacy booking
-  imported at cutover will have **no boat (3,867), reconfirm (2,669), check-in (3,778), pier note
-  (126), alternate pickups (4) or upgrades (11)**.
+- **The import** brings boats, splits, final pickups and pier notes (A1). Until the other slices extend
+  it, legacy bookings arrive with **no reconfirm (2,669), check-in (3,778), alternate pickups (4) or
+  upgrades (11)**.
 
 ## From the van hand-off
 
