@@ -52,7 +52,7 @@ const optionalInt = (value: unknown): number | undefined => value === null || va
 /** Calendar rows, read with their dates cast to text in SQL. */
 const season = (row: QueryResultRow): RouteSeason => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) });
 const dayOverride = (row: QueryResultRow): RouteDayOverride => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] });
-type LockInput = Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>;
+type LockInput = Omit<SeatLock, 'id' | 'status' | 'version' | 'created_at' | 'updated_at'>;
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
 const TRANSACTION_ATTEMPTS = 8;
 const isRetryable = (error: unknown): boolean => error instanceof Error && ['40001', '40P01'].includes((error as Error & { code?: string }).code ?? '');
@@ -150,7 +150,7 @@ const header = (row: QueryResultRow): BookingHeader => {
 
 const stored = (row: QueryResultRow): StoredBooking => ({
   ...header(row),
-  id: String(row.id), status: row.status as Booking['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
+  id: String(row.id), status: row.status as Booking['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
   cancellation_reason: row.cancellation_reason ?? undefined, external_id: row.external_id ?? undefined, agent_id: row.agent_id ?? undefined,
   voucher_ref: row.voucher_ref ?? undefined, rate_type_ref: row.rate_type_ref ?? undefined, booking_data: row.booking_data ?? undefined,
   trips: (row.trips as Record<string, unknown>[]).map((trip) => ({
@@ -210,7 +210,7 @@ const cancellation = (c: Record<string, unknown>): BookingCancellation => ({
   charge_amount: Number(c.charge_amount), at: jsonInstant(c.at), by: textOrNull(c.by),
 });
 const booking = (row: QueryResultRow): Booking => bookingView(stored(row));
-const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
+const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
 
 const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
 const num = (value: unknown): number | null => value === null || value === undefined ? null : Number(value);
@@ -532,7 +532,7 @@ export class PostgresOperationsStore {
   }
   /** Every action's write is signed by the token's user; without one (auth off) the column is left alone. */
   private async touch(id: string, actor: string | undefined, extra = '', values: unknown[] = []): Promise<void> {
-    await this.client().query(`UPDATE bookings SET updated_at = now(), updated_by = COALESCE($2, updated_by)${extra} WHERE id = $1`, [id, actor ?? null, ...values]);
+    await this.client().query(`UPDATE bookings SET updated_at = now(), version = version + 1, updated_by = COALESCE($2, updated_by)${extra} WHERE id = $1`, [id, actor ?? null, ...values]);
   }
 
   async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
@@ -633,7 +633,7 @@ export class PostgresOperationsStore {
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
     // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
     // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
-    const assignments = ['booking_mode = $2', 'status = $3', 'updated_at = now()'];
+    const assignments = ['booking_mode = $2', 'status = $3', 'updated_at = now()', 'version = version + 1'];
     const values: unknown[] = [id, replacement[0]?.booking_mode ?? null, status];
     if (status === 'confirmed' && reweighed && !current.confirmed_at) { values.push(actor ?? null); assignments.push(`confirmed_at = now(), confirmed_by = ${values.length}`); }
     for (const column of BOOKING_HEADER_COLUMNS) {
@@ -811,11 +811,12 @@ export class PostgresOperationsStore {
       const [locked] = await this.readLocks({ id });
       assertLockFits(await this.day(current.route_id, current.service_date, { lockId: id }), seats, locked.drawn_pax ?? 0);
     }
-    await this.client().query('UPDATE seat_locks SET pax=$2, agent_id=$3, updated_at=now() WHERE id=$1', [id, seats, changes.agent_id ?? current.agent_id ?? null]);
+    await this.client().query('UPDATE seat_locks SET pax=$2, agent_id=$3, version=version+1, updated_at=now() WHERE id=$1', [id, seats, changes.agent_id ?? current.agent_id ?? null]);
     return (await this.readLocks({ id }))[0];
   }
+  async lock(id: string): Promise<SeatLock | undefined> { return (await this.readLocks({ id }))[0]; }
   async releaseLock(id: string): Promise<SeatLock | undefined> {
-    const { rowCount } = await this.client().query("UPDATE seat_locks SET status='released', released_at=COALESCE(released_at, now()), updated_at=now() WHERE id=$1", [id]);
+    const { rowCount } = await this.client().query("UPDATE seat_locks SET version=version+(status='active')::int, status='released', released_at=COALESCE(released_at, now()), updated_at=now() WHERE id=$1", [id]);
     return rowCount === 0 ? undefined : (await this.readLocks({ id }))[0];
   }
   async allotment(routeId: string, date: string, exclude: Exclusion = {}): Promise<Capacity & { route_id: string; service_date: string; deployments: Deployment[] }> { return { route_id: routeId, service_date: date, ...(await this.capacity(routeId,date,exclude)), deployments: await this.listDeployments(date,date,routeId) }; }

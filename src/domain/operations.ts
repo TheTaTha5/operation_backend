@@ -102,6 +102,8 @@ export type BookingInput = {
 export type Booking = BookingHeader & {
   id: string;
   status: BookingStatus;
+  /** 1 on create, +1 on every write. Send it back as `If-Match` to refuse a stale save. */
+  version: number;
   created_at: string;
   updated_at: string;
   cancellation_reason?: string;
@@ -150,6 +152,8 @@ export type BookingChanges = {
 
 export type SeatLock = {
   id: string;
+  /** As a booking's: 1 on create, +1 on every change. */
+  version: number;
   route_id: string;
   service_date: string;
   pax: number;
@@ -594,7 +598,7 @@ export class OperationsStore {
     // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
       ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}),
-      booking_data: rest.booking_data ?? {}, id, status, created_at: now, updated_at: now, trips: planned,
+      booking_data: rest.booking_data ?? {}, id, status, version: 1, created_at: now, updated_at: now, trips: planned,
       passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
     };
     this.bookings.set(id, booking);
@@ -641,6 +645,7 @@ export class OperationsStore {
   /** The actor signs every action's write, the way the route stamps it on create and amend. */
   private touch(booking: StoredBooking, actor: string | undefined): void {
     booking.updated_at = this.now();
+    booking.version += 1;
     if (actor !== undefined) booking.updated_by = actor;
   }
 
@@ -692,6 +697,7 @@ export class OperationsStore {
     if (changes.passengers) booking.passengers = withSeq(changes.passengers);
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     booking.updated_at = this.now();
+    booking.version += 1;
     this.log(id, line);
     for (const extra of reweighed?.history ?? []) this.log(id, extra);
     return this.view(booking);
@@ -802,11 +808,11 @@ export class OperationsStore {
     return this.view(booking);
   }
 
-  createLock(input: Omit<SeatLock, 'id' | 'status' | 'created_at' | 'updated_at'>): SeatLock {
+  createLock(input: Omit<SeatLock, 'id' | 'status' | 'version' | 'created_at' | 'updated_at'>): SeatLock {
     this.assertOpen([input]);
     assertLockFits(this.day(input.route_id, input.service_date), input.pax, 0);
     const now = this.now();
-    const lock: SeatLock = { ...input, id: this.id('lock'), status: 'active', created_at: now, updated_at: now };
+    const lock: SeatLock = { ...input, id: this.id('lock'), status: 'active', version: 1, created_at: now, updated_at: now };
     this.locks.set(lock.id, lock);
     return this.lockView(lock);
   }
@@ -821,13 +827,14 @@ export class OperationsStore {
       assertLockFits(this.day(lock.route_id, lock.service_date, { lockId: id }), pax, drawnByLock(this.bookings.values()).get(id) ?? 0);
       lock.pax = pax;
     }
-    Object.assign(lock, changes, { pax, updated_at: this.now() });
+    Object.assign(lock, changes, { pax, version: lock.version + 1, updated_at: this.now() });
     return this.lockView(lock);
   }
+  lock(id: string): SeatLock | undefined { const found = this.locks.get(id); return found && this.lockView(found); }
   releaseLock(id: string): SeatLock | undefined {
     const lock = this.locks.get(id);
     if (!lock) return undefined;
-    if (lock.status === 'active') Object.assign(lock, { status: 'released', released_at: this.now(), updated_at: this.now() });
+    if (lock.status === 'active') Object.assign(lock, { status: 'released', version: lock.version + 1, released_at: this.now(), updated_at: this.now() });
     return this.lockView(lock);
   }
 

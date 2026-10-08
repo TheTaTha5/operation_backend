@@ -1054,6 +1054,29 @@ and is fit to show to a person. Where a client needs to branch, a machine-readab
 `not_cancelled`, `charter_boat_taken`, `already_cancelled`, `booking_closed`, `wrong_status`,
 `duplicate_external_id`.
 
+#### Edit conflicts: `version` and `If-Match`
+
+Every booking carries a `version`: `1` on create, `+1` on every write (`PATCH`, every command and
+action). A response also sends it as the `ETag` header (`"7"`). It is the server's: a `version` sent
+on create is ignored.
+
+To make sure a save does not overwrite an edit you have not seen, send back the version you read,
+as `If-Match: "7"` or `"version": 7` in the body of `PATCH` or any command. If the booking has
+moved on, the write is refused and nothing changes:
+
+```jsonc
+// PATCH /v1/bookings/BK-1  If-Match: "1"   (someone else saved version 2 meanwhile) → 409
+{ "statusCode": 409, "code": "stale_version", "error": "Conflict",
+  "message": "Booking BK-1 has changed since you read it (you have version 1, it is now 2); reload and try again" }
+```
+
+**Optional for now:** a write without either goes through, last write wins, as legacy does. It
+becomes required once the legacy integration client and Love Kingdom send it. A malformed
+`If-Match`, or a header and a body `version` that disagree, is `400`.
+
+Retries need nothing extra: a retried create with the same `external_id` is `409
+duplicate_external_id` naming the booking already made.
+
 #### Booking header fields
 
 The scalar fields of a booking are stored as columns and returned as columns. Send them in the
@@ -1194,6 +1217,10 @@ integer`. A refused request writes nothing.
   checked, and a lock cannot shrink below `drawn_pax` (`409`) — those seats are sold.
 - `POST /v1/seat-locks/{id}/release` — idempotently releases a lock. Seats already drawn from it stay
   with their bookings; only the undrawn remainder goes back to the pool.
+
+A lock carries a `version` and an `ETag` as a booking does; `PATCH` and `release` accept `If-Match` (or
+`version`) and answer `409 stale_version` when the lock has moved on. A `PATCH` changes `pax` and
+`agent_id` only; any other field in its body is ignored.
 
 Every lock response carries `drawn_pax`: the seats bookings that hold seats have drawn from it. The
 lock itself holds `pax − drawn_pax`, and that is what a new draw may take.

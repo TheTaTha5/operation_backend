@@ -46,9 +46,8 @@
 1. **Contracts:** `contracts` (main and promo) and `contract_program_periods`, imported from
    `sb_contracts`. Read endpoints.
 2. **Agent rate seasons:** `agent_rate_seasons (agent_id, rate_type_id, from_date, to_date)` plus
-   write endpoints (area `sales`). The data must first be **exported from a browser** that has it:
-   a one-off script run in legacy's console, its JSON imported here. Before that, ask which browser
-   holds the true copy.
+   write endpoints (area `sales`). Not imported: sales re-enter the seasons through these endpoints
+   (decided 2026-10-09; legacy keeps them only in browsers' localStorage).
 3. **Adjustments:** `booking_adjustments (booking_id, seq, kind discount|extra, mode amount|percent,
    value, label, note)` — a client fact; the discount it yields is computed.
 4. **`POST /v1/quote`:** the booking body in, the price out — `{trips: [{subtotal, rate_type_id,
@@ -62,20 +61,13 @@ Also, as soon as the import has run on Railway: `agents.rate_type_id` → foreig
 `rate_types (id)` (017 left it out). Data check first:
 `SELECT count(*) FROM agents a WHERE rate_type_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM rate_types r WHERE r.id = a.rate_type_id)`.
 
-## Legacy bugs — copy or fix?
+## Decided 2026-10-09
 
-1. **Pax counting:** seats use `ad_fr || ad`, so a booking with both `ad_fr` and `ad` prices only
-   `ad_fr`. Charter and bundle counts add both.
-2. **`focDiscount` is never subtracted**, though it is in the breakdown.
-3. **A FOC booking skips the discount approval** (it saves `pending_foc`). This service already asks
-   for both.
-4. **Discount promos check one rate and price from another** (`laPromoHasRate` ignores the date).
-5. **The kept rate falls back after a reload** (`rtRef` is not stored).
-
-## Questions
-
-1. Order 1 → 5 as above? Contracts first because they are importable now; seasons need the browser
-   export.
-2. For each bug above: copy (the characterization test then matches legacy exactly) or fix?
-   Recommended: fix 1, 4 and 5; keep 2 as legacy (it is display only); 3 is already decided.
-3. **Who exports the rate seasons,** and from which browser?
+- **Order 1 → 5** as above.
+- **Legacy's price bugs are copied**, so the re-price test matches legacy exactly: pax counted from
+  `ad_fr || ad` (a booking with both prices only `ad_fr`; charters and bundles add both),
+  `focDiscount` shown but never subtracted, discount promos checking one rate and pricing from
+  another (`laPromoHasRate` ignores the date), and the kept rate falling back after a reload
+  (`rtRef` not stored). Fixing them is a later, separate decision. (A FOC booking already asks for
+  the discount approval here too; that stays.)
+- **Rate seasons are re-entered by hand**, not exported from a browser.
