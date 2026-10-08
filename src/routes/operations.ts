@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { assertItinerary, OperationsStore, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
+import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { Authenticator } from '../auth.js';
@@ -21,6 +21,8 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
+import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
+import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -39,6 +41,29 @@ const withoutVersion = (body: unknown, required = false): Record<string, unknown
   return rest;
 };
 const lockId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+/** A trip's price inputs a booking does not store yet (todo/pricing-model.md, step 5). Legacy's spellings too. */
+function quoteTripPrices(raw: unknown, index: number): Pick<QuoteTrip, 'ovn_charge' | 'charter_price_mode' | 'charter_price_manual'> {
+  const trip = isRecord(raw) ? raw : {};
+  const amount = (value: unknown, name: string): number | undefined => {
+    if (value === undefined || value === null || value === '') return undefined;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : badRequest(`trips[${index}].${name} must be a number, 0 or more`);
+  };
+  const mode = trip.charter_price_mode ?? trip.charterPriceMode;
+  if (mode !== undefined && mode !== null && mode !== '' && mode !== 'rate' && mode !== 'manual') badRequest(`trips[${index}].charter_price_mode must be rate or manual`);
+  const ovnCharge = amount(trip.ovn_charge ?? trip.ovnCharge, 'ovn_charge');
+  const manual = amount(trip.charter_price_manual ?? trip.charterPriceManual, 'charter_price_manual');
+  return {
+    ...(ovnCharge === undefined ? {} : { ovn_charge: ovnCharge }),
+    ...(mode === 'manual' ? { charter_price_mode: 'manual' as const } : {}),
+    ...(manual === undefined ? {} : { charter_price_manual: manual }),
+  };
+}
+/** A B2C booking was priced by Love Kingdom; legacy never re-prices it, so its stored price is the answer. */
+const storedQuote = (b: Booking): Quote & { stored: true } => ({
+  stored: true, price_mode: b.price_mode === 'manual' ? 'manual' : 'rate',
+  seat: b.price_seat ?? 0, add_on: b.price_addon ?? 0, foc_discount: b.price_foc_discount ?? 0, discount: b.price_discount ?? 0,
+  extra: b.price_extra ?? 0, total: b.total ?? 0, trips: [], add_ons: [], warnings: [],
+});
 const userId = (request: { params: unknown }): number => {
   const id = Number((request.params as { id: string }).id);
   return Number.isInteger(id) && id > 0 ? id : notFound('User not found');
@@ -645,6 +670,49 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * to their own agents needs their salesperson id in the token, which is not decided yet.
    */
   app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));
+  /**
+   * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
+   * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an
+   * edit of that booking (its old rate kept unless `rate: "agent"`; a B2C booking's stored price is
+   * answered as it is). Nothing is saved.
+   */
+  app.post('/v1/quote', async (request) => {
+    const body = record(request.body);
+    const editing = optionalString(body.booking_id ?? body.bookingId);
+    const stored = editing ? (await store.booking(editing)) ?? notFound('Booking not found') : undefined;
+    const caller = request.user?.user;
+    if (stored && caller?.agent_id && stored.agent_id !== caller.agent_id) notFound('Booking not found');
+    if (stored?.external_id?.startsWith('b2c_')) return storedQuote(stored);
+
+    const { header, ...input } = bookingInput(body);
+    if (caller?.agent_id && input.agent_id !== undefined && input.agent_id !== caller.agent_id) forbidden(`This login quotes for agent ${caller.agent_id} only`);
+    const agentId = caller?.agent_id ?? input.agent_id;
+    const agentRow = agentId ? (await store.agent(agentId)) ?? badRequest(`agent_id ${agentId} is not an agent (GET /v1/agents)`) : undefined;
+    const agent = agentRow && { id: agentRow.id, code: agentRow.code, rate_type_id: agentRow.rate_type_id, rate_seasons: agentRow.rate_seasons };
+    const rate = body.rate === undefined ? (stored ? 'kept' : 'agent') : body.rate === 'kept' || body.rate === 'agent' ? body.rate : badRequest('rate must be kept or agent');
+    const mode = enforcedPriceMode(agent, header?.staff_purpose, header?.price_mode, header?.manual_total);
+    const contracts = agent ? await store.listContracts({ agentId: agent.id }) : [];
+    const rateTypeRef = input.rate_type_ref ?? stored?.rate_type_ref ?? agent?.rate_type_id ?? null;
+    const rateTypes = new Map<string, RateType>();
+    for (const id of new Set([rateTypeRef, agent?.rate_type_id, ...(agent?.rate_seasons ?? []).map((s) => s.rate_type_id), ...contracts.map((c) => c.rate_type_id)])) {
+      if (!id) continue;
+      const found = await store.rateType(id);
+      if (found) rateTypes.set(id, found);
+    }
+    const rawTrips = Array.isArray(body.trips) ? body.trips as unknown[] : [];
+    const quote = priceBooking({
+      agent_id: agent?.id, booking_date: header?.booking_date ?? stored?.booking_date ?? todayInThailand(),
+      price_mode: mode.price_mode, manual_total: mode.manual_total, rate_type_ref: rateTypeRef, rate,
+      trips: input.trips.map((trip, i) => {
+        // On an edit, a trip that is still the trip it was sold as keeps its rate (by id, else route and day).
+        const same = stored?.trips.find((t) => (trip.id ? t.id === trip.id : t.route_id === trip.route_id && t.service_date === trip.service_date));
+        return { ...trip, ...quoteTripPrices(rawTrips[i], i), ...(same ? { kept_rate_type_id: null } : {}) };
+      }),
+      add_ons: input.add_ons ?? [], adjustments: input.adjustments ?? [],
+    }, { rateTypes, agent, contracts, boatTypes: new Map((await store.listBoats()).map((b) => [b.id, b.type ?? ''])) });
+    return quote;
+  });
+
   /** Agents' contracts, read-only (todo/contracts-model.md); any login may read them. */
   app.get('/v1/contracts', async (request) => ({ contracts: await store.listContracts(parseContractListQuery(request.query as Record<string, unknown>)) }));
   app.get('/v1/contracts/:id', async (request) => (await store.contract((request.params as { id: string }).id)) ?? notFound('Contract not found'));

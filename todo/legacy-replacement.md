@@ -6,7 +6,7 @@ stores has a home here, behind a domain endpoint. This replaces the *data* its g
 routes. What exists is in `README.md`; this lists only what is still to build. Paths are proposals,
 settled when built.
 
-**Next:** pricing (`POST /v1/quote`), booking extras (4), the rest of sales (6), vans (8), money (7).
+**Next:** bookings priced by the server (`pricing-model.md`, step 5), booking extras (4), the rest of sales (6), vans (8), money (7).
 
 **This list was derived from `operation_frontend`, which is not production.** Re-derive it from
 wt-lk-inbox's `server.js` and `os-backend/src/mapping/os_repo.js`.

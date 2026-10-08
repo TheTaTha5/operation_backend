@@ -69,7 +69,8 @@ export const userView = ({ pass_hash, tokens_valid_after: _t, ...user }: StoredU
  */
 export type WriteNeed = { kind: 'admin' } | { kind: 'self' } | { kind: 'area'; areas: Area[] };
 export function writeNeed(path: string): WriteNeed {
-  if (path === '/v1/logout' || path === '/v1/me/password') return { kind: 'self' };
+  // A quote saves nothing: any login may ask for one (a login tied to an agent, for its own agent).
+  if (path === '/v1/logout' || path === '/v1/me/password' || path === '/v1/quote') return { kind: 'self' };
   if (path === '/v1/users' || path.startsWith('/v1/users/')) return { kind: 'admin' };
   if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-locks')) return { kind: 'area', areas: ['operations'] };
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).
