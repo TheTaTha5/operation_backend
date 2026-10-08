@@ -391,6 +391,26 @@ Field notes:
   doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
   contract history (the Contracts port).
 
+#### Rate seasons
+
+Which rate type an agent is priced at, by travel date (legacy's season table on the agent). A season
+is a rate type from a travel date, to a date or with no end. For a date, the covering season with
+the latest `from` wins; a date no season covers is priced at the agent's own `rate_type_id`.
+Legacy keeps seasons only in browsers, so they start empty here and sales re-enter them.
+
+- `GET /v1/agents/{id}/rate-seasons` → `{ "seasons": [{ "rate_type_id": "rt003", "from": "2026-11-01", "to": "2027-04-30" }, …] }`,
+  by `from`; `to` is `null` for no end. Also on `GET /v1/agents/{id}` as `rate_seasons`.
+- `PUT /v1/agents/{id}/rate-seasons` with `{ "seasons": [...] }` replaces the whole table (`[]`
+  clears). Legacy's `{ "rt", "from", "to" }` is accepted, a blank `to` meaning no end. Needs the
+  `sales` edit area. Answers the table, and writes legacy's line to the agent's activity
+  (`ตั้งตารางฤดูกาล 2 ช่วง · …`). `404` for an unknown agent; `400` for an unknown rate type, a date
+  not `YYYY-MM-DD`, a season ending before it starts, or two starting the same day.
+- `GET /v1/agents/{id}/rate-type?date=YYYY-MM-DD` → the rate type for that travel date:
+  `{ "rate_type_id": "rt003", "source": "season", "season": {…} }`, or `"source": "agent"` and
+  `"season": null` when no season covers it.
+
+A rate type a season uses is in use: `DELETE /v1/rate-types/{id}` refuses it (`409`).
+
 ### Contracts
 
 An agent's contracts, from legacy (`sb_contracts`): one `main` contract (its rate type and the

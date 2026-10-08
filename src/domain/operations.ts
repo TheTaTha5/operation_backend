@@ -27,6 +27,7 @@ import {
 import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
+import type { RateSeason } from './rate-seasons.js';
 
 export type Deployment = {
   boat_id: string;
@@ -340,7 +341,22 @@ export class OperationsStore {
   listAgents(query: AgentListQuery): AgentSummary[] {
     return selectAgents(this.directory.agents, this.directory.markets, this.directory.sales, query).map(agentSummary);
   }
-  agent(id: string): Agent | undefined { const found = this.directory.agents.find((agent) => agent.id === id); return found && agentView(found); }
+  agent(id: string): Agent | undefined { const found = this.directory.agents.find((agent) => agent.id === id); return found && agentView(found, this.seasons.get(id)); }
+  /** An agent's rate seasons by `from` (migration 030); undefined for an unknown agent. */
+  private seasons = new Map<string, RateSeason[]>();
+  rateSeasons(agentId: string): RateSeason[] | undefined {
+    if (!this.directory.agents.some((agent) => agent.id === agentId)) return undefined;
+    return (this.seasons.get(agentId) ?? []).map((season) => ({ ...season }));
+  }
+  /** Replaces the table and appends `activity` to the agent's log, as legacy's `rtmSave` does. */
+  setRateSeasons(agentId: string, seasons: readonly RateSeason[], activity: AgentActivity): RateSeason[] | undefined {
+    if (!this.directory.agents.some((agent) => agent.id === agentId)) return undefined;
+    this.seasons.set(agentId, seasons.map((season) => ({ ...season })));
+    const log = this.directory.activity.get(agentId) ?? [];
+    log.push({ ...activity, seq: log.reduce((max, entry) => Math.max(max, entry.seq), -1) + 1 });
+    this.directory.activity.set(agentId, log);
+    return this.rateSeasons(agentId);
+  }
   /** Undefined for an unknown agent, so the route can answer 404 rather than an empty log. */
   agentActivity(id: string, limit: number): AgentActivity[] | undefined {
     if (!this.directory.agents.some((agent) => agent.id === id)) return undefined;
@@ -437,7 +453,7 @@ export class OperationsStore {
   deleteRateType(id: string): boolean {
     if (!this.rateTypes.has(id)) return false;
     assertRateTypeUnused(id, {
-      agents: this.directory.agents.filter((agent) => agent.rate_type_id === id).length,
+      agents: this.directory.agents.filter((agent) => agent.rate_type_id === id || (this.seasons.get(agent.id) ?? []).some((season) => season.rate_type_id === id)).length,
       bookings: [...this.bookings.values()].filter((booking) => booking.rate_type_ref === id).length,
     });
     this.rateTypes.delete(id);

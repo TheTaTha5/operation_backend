@@ -19,6 +19,7 @@ import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
+import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
@@ -651,6 +652,28 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const limit = query.limit === undefined ? 50 : Number(query.limit);
     if (!Number.isInteger(limit) || limit < 1 || limit > 200) badRequest('limit must be an integer between 1 and 200');
     return { activity: (await store.agentActivity((request.params as { id: string }).id, limit)) ?? notFound('Agent not found') };
+  });
+  /** Which rate type an agent is priced at, by travel date (README, "Rate seasons"). */
+  app.get('/v1/agents/:id/rate-seasons', async (request) => ({ seasons: (await store.rateSeasons((request.params as { id: string }).id)) ?? notFound('Agent not found') }));
+  /** Replaces the table, area `sales` (the hook), and logs legacy's line in the agent's activity. */
+  app.put('/v1/agents/:id/rate-seasons', async (request) => {
+    const agentId = (request.params as { id: string }).id;
+    const seasons = parseRateSeasons(record(request.body));
+    const names = new Map<string, string>();
+    for (const id of new Set(seasons.map((season) => season.rate_type_id))) {
+      const rateType = await store.rateType(id);
+      if (!rateType) badRequest(`Rate type ${id} does not exist (GET /v1/rate-types)`);
+      names.set(id, rateType!.name || rateType!.code || id);
+    }
+    const activity = { at: new Date().toISOString(), by: actorOf(request.user) ?? null, kind: 'rate', text: seasonsActivityText(seasons, (id) => names.get(id) ?? id) };
+    return { seasons: (await store.transaction(async () => store.setRateSeasons(agentId, seasons, activity))) ?? notFound('Agent not found') };
+  });
+  /** The rate type for one travel date: the covering season with the latest `from`, else the agent's own. */
+  app.get('/v1/agents/:id/rate-type', async (request) => {
+    const date = (request.query as Record<string, unknown>).date;
+    if (typeof date !== 'string' || !isIsoDate(date)) badRequest('date must be YYYY-MM-DD');
+    const agent = (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found');
+    return rateTypeFor(agent.rate_type_id, agent.rate_seasons, date as string);
   });
 
   /**
