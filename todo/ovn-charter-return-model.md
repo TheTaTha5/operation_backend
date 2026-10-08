@@ -32,18 +32,23 @@ stay**, the nights between included:
 | BK-26090351-ENOG (Zeus, 12 pax, ฿139,800; ฿15,000 of it the overnight charge) | b13 | r10 2026-09-16 | 2026-09-19 | 16, 17, 18, 19 Sep |
 | BK-26100056-MYJC (44 pax, ฿75,000) | b11 | r10 2026-10-26 | 2026-10-28 | 26, 27, 28 Oct |
 
-These two are all of legacy's overnight charters today.
+
 
 ## What this service does
 
 1. **The booking is refused.** `assertItinerary`: `trips[1] is a return leg and must be a seat
    trip` (`400`). The importer lists both as skipped, and the legacy integration client gets the same
    `400` if anyone saves one.
-2. **The nights between sell the boat's seats.** The importer deploys the boat on the route for each
-   `trips__boat` day, but a boat counts as chartered only on a day a charter *trip* names it
-   (`capacity.ts`, `chartered`). No trip names it on the nights between, so its seats join the pool:
-   b13's 38 seats on r10 on 17–18 Sep, and **b11's 65 seats on r10 on 27 Oct**, which is still ahead.
-   Legacy sells none of them (`baDayBoats` leaves a charter boat out).
+2. **The boat's seats are sold while the group has it.** The importer deploys the boat on the route
+   for each `trips__boat` day, but a boat counts as chartered only on a day a charter *trip* names it
+   (`capacity.ts`, `chartered`). Today the booking is skipped, so no trip names it on **any** day of
+   the stay: b13's 38 seats on r10 on 16–19 Sep, and **b11's 65 seats on r10 on 26, 27 and 28 Oct**,
+   which are still ahead, all join the pool (checked on the 2026-10-08 import). Once A below lets
+   the booking in, its outbound and return trips charter the boat on their days, and only the nights
+   between are left selling it. Legacy sells none of them (`baDayBoats` leaves a charter boat out).
+
+   Legacy has 8 overnight bookings; the other 6 are seat bookings (r10, Jul 2026 to Apr 2027) and
+   import as they are. These two are the only charters.
 
 ## Proposal
 
