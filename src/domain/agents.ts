@@ -6,6 +6,7 @@
  * decided here, once, so the in-process store and PostgreSQL cannot drift (CLAUDE.md, "Logic that
  * both stores need goes in a pure function both call").
  */
+import type { RateSeason } from './rate-seasons.js';
 
 /** Legacy SB_PAYMENT_TYPES (08-app.js:111). */
 export const PAY_TYPES = ['invoice', 'proforma', 'bt', 'cot'] as const;
@@ -90,10 +91,13 @@ export type Agent = Omit<AgentSummary, 'program_route_ids'> & {
   signatory: { name: string | null; designation: string | null; tel: string | null; signed_date: string | null };
   booking_channel: { method: string | null; cutoff: string | null; cancel_policy: string | null; email: string | null; phone: string | null };
   programs: AgentProgram[];
+  /** Which rate type the agent is priced at, by travel date (`src/domain/rate-seasons.ts`). */
+  rate_seasons: RateSeason[];
   created_at: string; updated_at: string;
 };
 
-export function agentView(agent: StoredAgent): Agent {
+/** `seasons` are the agent's rate seasons, read from their own table (migration 030). */
+export function agentView(agent: StoredAgent, seasons: readonly RateSeason[] = []): Agent {
   const { program_route_ids: _routes, ...summary } = agentSummary(agent);
   return {
     ...summary,
@@ -103,6 +107,7 @@ export function agentView(agent: StoredAgent): Agent {
     signatory: { name: agent.signatory_name, designation: agent.signatory_designation, tel: agent.signatory_tel, signed_date: agent.signatory_signed_date },
     booking_channel: { method: agent.booking_method, cutoff: agent.booking_cutoff, cancel_policy: agent.booking_cancel_policy, email: agent.booking_email, phone: agent.booking_phone },
     programs: agent.programs.map((program) => ({ ...program })),
+    rate_seasons: seasons.map((season) => ({ ...season })),
     created_at: agent.created_at, updated_at: agent.updated_at,
   };
 }

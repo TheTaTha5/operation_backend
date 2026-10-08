@@ -26,6 +26,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     an `act-approve` tick box; show a `403` on approve/reject as it is.
   - send the `version` it read as `If-Match` on every booking and seat-lock save, and show a
     `409 stale_version` as "someone changed this; reload".
+  - the agent's season table reads and saves `GET/PUT /v1/agents/{id}/rate-seasons`, and prices can
+    use `GET /v1/agents/{id}/rate-type?date=` instead of computing it.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
   amend and cancel.
@@ -38,6 +40,11 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   (`deployment-guards-model.md`, has questions to answer).
 - **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
   optional: a save without it is last-write-wins).
+
+## Ask sales
+
+- **Re-enter the agents' rate seasons** once the season screen saves to this API: legacy kept them
+  only in browsers, so none came across.
 
 ## Ask ops
 

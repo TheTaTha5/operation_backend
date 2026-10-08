@@ -44,9 +44,7 @@
 ## Proposal, in order (each its own approval and branch)
 
 1. **Contracts:** built (README → "Contracts"); what they leave open is in `contracts-model.md`.
-2. **Agent rate seasons:** `agent_rate_seasons (agent_id, rate_type_id, from_date, to_date)` plus
-   write endpoints (area `sales`). Not imported: sales re-enter the seasons through these endpoints
-   (decided 2026-10-09; legacy keeps them only in browsers' localStorage).
+2. **Agent rate seasons:** built (README → "Rate seasons"); the quote reads `rateTypeFor`.
 3. **Adjustments:** `booking_adjustments (booking_id, seq, kind discount|extra, mode amount|percent,
    value, label, note)` — a client fact; the discount it yields is computed.
 4. **`POST /v1/quote`:** the booking body in, the price out — `{trips: [{subtotal, rate_type_id,

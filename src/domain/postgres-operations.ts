@@ -26,6 +26,7 @@ import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import { pickupFields } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
+import type { RateSeason } from './rate-seasons.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -906,7 +907,27 @@ export class PostgresOperationsStore {
   }
   async agent(id: string): Promise<Agent | undefined> {
     const { rows: [row] } = await this.client().query(`${AGENT_SELECT} WHERE a.id = $1`, [id]);
-    return row && agentView(storedAgent(row));
+    return row && agentView(storedAgent(row), await this.readSeasons(id));
+  }
+  private async readSeasons(agentId: string): Promise<RateSeason[]> {
+    const { rows } = await this.client().query(
+      'SELECT rate_type_id, from_date::text AS "from", to_date::text AS "to" FROM agent_rate_seasons WHERE agent_id = $1 ORDER BY from_date', [agentId]);
+    return rows.map((row) => ({ rate_type_id: String(row.rate_type_id), from: String(row.from), to: row.to ?? null }));
+  }
+  /** An agent's rate seasons by `from` (migration 030); undefined for an unknown agent. */
+  async rateSeasons(agentId: string): Promise<RateSeason[] | undefined> {
+    if (!(await this.client().query('SELECT 1 FROM agents WHERE id = $1', [agentId])).rowCount) return undefined;
+    return this.readSeasons(agentId);
+  }
+  /** Replaces the table and appends `activity` to the agent's log, as legacy's `rtmSave` does. */
+  async setRateSeasons(agentId: string, seasons: readonly RateSeason[], activity: AgentActivity): Promise<RateSeason[] | undefined> {
+    if (!(await this.client().query('SELECT 1 FROM agents WHERE id = $1 FOR UPDATE', [agentId])).rowCount) return undefined;
+    await this.client().query('DELETE FROM agent_rate_seasons WHERE agent_id = $1', [agentId]);
+    for (const s of seasons) {
+      await this.client().query('INSERT INTO agent_rate_seasons (agent_id, from_date, to_date, rate_type_id) VALUES ($1,$2,$3,$4)', [agentId, s.from, s.to, s.rate_type_id]);
+    }
+    await this.client().query('INSERT INTO agent_activity (agent_id, at, by, kind, text) VALUES ($1,$2,$3,$4,$5)', [agentId, activity.at, activity.by, activity.kind, activity.text]);
+    return this.readSeasons(agentId);
   }
   /** Undefined for an unknown agent. The serial id orders two entries written at the same instant. */
   async agentActivity(id: string, limit: number): Promise<AgentActivity[] | undefined> {
@@ -1134,7 +1155,7 @@ export class PostgresOperationsStore {
 
   async deleteRateType(id: string): Promise<boolean> {
     if (!(await this.client().query('SELECT 1 FROM rate_types WHERE id = $1', [id])).rowCount) return false;
-    const { rows: [used] } = await this.client().query(`SELECT (SELECT count(*) FROM agents WHERE rate_type_id = $1)::int AS agents,
+    const { rows: [used] } = await this.client().query(`SELECT (SELECT count(*) FROM agents a WHERE a.rate_type_id = $1 OR EXISTS (SELECT 1 FROM agent_rate_seasons s WHERE s.agent_id = a.id AND s.rate_type_id = $1))::int AS agents,
       (SELECT count(*) FROM bookings WHERE rate_type_ref = $1)::int AS bookings`, [id]);
     assertRateTypeUnused(id, { agents: Number(used.agents), bookings: Number(used.bookings) });
     await this.client().query('DELETE FROM rate_types WHERE id = $1', [id]);
