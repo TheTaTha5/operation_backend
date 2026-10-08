@@ -1272,6 +1272,40 @@ Validation errors are `400` and name the key you used and the position, for exam
 negative`, `addOns[0].qty must be a positive integer`, `addOns[0].jAd must be a non-negative
 integer`. A refused request writes nothing.
 
+#### Prices
+
+The server prices a booking, with the same rule as `POST /v1/quote` ("Quote"):
+
+- **On create**, and **on a `PATCH` that changes something the price reads**: trips, pax, add-ons,
+  adjustments, `price_mode`, `manual_total`, `staff_purpose`, `booking_date`, or `rate: "agent"`.
+  A `PATCH` that changes only a name, a note or a phone leaves the price alone.
+- **Commands keep the price**, as legacy: confirm, approve, reject, cancel, restore and reschedule
+  never re-price. A partial cancel takes its refund off `total`.
+- On an edit each trip that is still the trip it was sold as keeps the rate it was priced at
+  (`trips[].rate_type_id`); `rate: "agent"` re-prices at today's rate instead (legacy's "use today's
+  rate"). A booking's `rate_type_ref` is its agent's rate when it was made.
+
+What the server sets: `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`,
+`price_extra`, `price_mode` and `manual_total` (by the rules in "Quote"), each add-on's `amount`, and
+each trip's `subtotal`, `rate_type_id` and `promo_id`. The client still sends a trip's
+`ovn_charge` (`ovnCharge`) and charter price (`charter_price_mode`, `charter_price_manual`,
+`charter_price_note`, legacy's spellings too), which are returned on the trip.
+
+A price the client sends anyway is replaced by the server's, and the response says so:
+
+```jsonc
+"price_warnings": [
+  { "code": "price_replaced", "field": "total", "sent": 99, "used": 4000, "message": "total 99 was replaced by the server's 4000 (POST /v1/quote shows how)" },
+  { "code": "not_offered", "trip": 0, "message": "trips[0]: r12 zone PK has no price: ฿0" }
+]
+```
+
+`price_warnings` also carries the quote's warnings (a ฿0 trip or add-on), and appears only when
+there is something to say. The discount approval reads the computed discount.
+
+**B2C bookings keep the price their client sends:** a booking whose `external_id` starts `b2c_`
+(legacy's B2C sync) or whose agent is `a_b2c` (Love Kingdom). Legacy never re-prices them.
+
 #### Adjustments
 
 The discounts and extra charges added on the booking's review step (legacy's `adjustments`), sent on
@@ -1294,8 +1328,8 @@ present replaces the list, `[]` or `null` clears it, absent leaves it; a change 
 | `label`, `note` | Free text; left off when unset |
 
 A row that does not fit is `400` naming it (`adjustments[1].value must be a number above 0`). They
-are client facts. What they add up to is still sent as `price_discount` and `price_extra` until the
-quote computes it (`todo/pricing-model.md`). The legacy import brings them with each booking.
+are client facts. What they add up to is computed into `price_discount` and `price_extra` (see
+"Prices"). The legacy import brings them with each booking.
 
 ### Quote
 
@@ -1346,8 +1380,8 @@ How a price is reached, as legacy reaches it:
   set, as stored (`"stored": true`); legacy never re-prices them.
 
 `400` for an unknown `agent_id`, a bad `rate`, a negative charge, or anything a booking create
-refuses; `404` for an unknown `booking_id`. Bookings still store the price the client sends; the
-server pricing them itself is the next step (`todo/pricing-model.md`).
+refuses; `404` for an unknown `booking_id`. A booking is priced by this same rule when it is saved (see
+"Prices").
 
 **Rebuilding the proof** after a deliberate pricing change: load a scratch database with
 `sync:routes`, `sync:boats`, `import-legacy.ts --commit` and `import:contracts --commit`, then

@@ -89,8 +89,9 @@ async function request(method: InjectOptions['method'], path: string, payload?: 
 }
 const deploy = (route: string, date: string, capacity: number, boat = `boat-act-${route}-${date}`) =>
   request('POST', '/operations/deployments', { boat_id: boat, route_id: route, service_date: date, capacity });
+// B2C (agent a_b2c): its price stays as sent, so these tests can state the total the actions work from.
 async function create(payload: object): Promise<Record<string, any>> {
-  const response = await request('POST', '/v1/bookings', payload);
+  const response = await request('POST', '/v1/bookings', { agent_id: 'a_b2c', ...payload });
   assert.equal(response.statusCode, 201, response.body);
   return response.json();
 }

@@ -60,8 +60,8 @@ API shape follows from it:
   naming the command to use. Never silently dropped, never silently applied.
 - **Every computed or validated field has a test that sends a wrong value** and expects it refused
   or overridden.
-- **Temporary exceptions are written down.** Today `total` and the price fields are still taken from
-  the client, because the server cannot price a booking until `POST /v1/quote` exists.
+- **Temporary exceptions are written down.** A booking's price is the server's (`priceBooking`), except a
+  B2C booking (`b2c_…` id or agent `a_b2c`): Love Kingdom prices it, and its price stays as sent.
 
 ## Business rules come from legacy
 

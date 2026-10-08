@@ -43,7 +43,7 @@ test('FOC passengers: act-approve or an admin', async () => {
 
 test('a discount: the agent\'s salesperson or an admin, and act-approve is not enough', async () => {
   await seedAgents(store, ['rights_s1', 'rights_s2'], { rights_a1: 'rights_s1' });
-  const discounted = await waiting('2041-02-03', { agent_id: 'rights_a1', price_discount: -100 });
+  const discounted = await waiting('2041-02-03', { agent_id: 'rights_a1', adjustments: [{ kind: 'discount', value: 100 }] });
   const approver = await as('rights.approver2', { actions: ['act-approve'] });
   assert.equal((await decide(approver, discounted)).json().message, 'A discount is approved by the agent\'s salesperson or an admin');
   assert.equal((await decide(await as('rights.s2', { sales_id: 'rights_s2' }), discounted)).statusCode, 403, 'another agent\'s salesperson');

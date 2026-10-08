@@ -20,7 +20,7 @@ test('the booking list filters by status, voucher and free text, and counts what
   const agent = `tag_list_${run}`;
   // Each status is reached the way a client reaches it: a discount waits for approval, the cancels are commands.
   const make = async (status: string, voucher: string | undefined, lead: string) => {
-    const discount = status === 'pending_approval' ? { price_discount: -500 } : {};
+    const discount = status === 'pending_approval' ? { adjustments: [{ kind: 'discount', value: 500 }] } : {};
     const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, agent_id: agent, voucher_ref: voucher, lead_pax: lead, ...discount });
     assert.equal(created.statusCode, 201, created.body);
     const id = created.json().id as string;

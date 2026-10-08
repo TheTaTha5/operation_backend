@@ -67,7 +67,14 @@ export type LockDraw = { lock_id: string; qty: number };
  * The overnight fields are described in migration 015 and checked by `assertItinerary`; the pickup
  * window is `src/domain/pickup.ts`'s.
  */
-export type TripDetails = PickupWindow & { zone?: string; ovn?: OvnMode; ovn_return_date?: string; ovn_leg?: boolean };
+/** What `priceBooking` priced a booking's trips (by position) and add-ons at (src/domain/pricing.ts). */
+export type BookingPrices = { trips: { subtotal: number; rate_type_id: string | null; promo_id: string | null }[]; add_ons: number[] };
+export type TripDetails = PickupWindow & { zone?: string; ovn?: OvnMode; ovn_return_date?: string; ovn_leg?: boolean;
+  /** Client facts the price reads (migration 032). */
+  ovn_charge?: number; charter_price_mode?: 'rate' | 'manual'; charter_price_manual?: number; charter_price_note?: string;
+  /** What the trip was priced at (computed by `priceBooking`, migration 032). */
+  subtotal?: number; rate_type_id?: string; promo_id?: string;
+};
 export type OvnMode = 'return' | 'self';
 /** `ovn_of` is an index into the same trip list, on input and on the wire. */
 export type BookingTripInput = TripDetails & { id?: string; route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[]; ovn_of?: number };
@@ -675,6 +682,24 @@ export class OperationsStore {
     if (!this.bookings.has(id)) return undefined;
     return (this.histories.get(id) ?? []).map((entry) => ({ ...entry }));
   }
+  /**
+   * What `priceBooking` priced each trip and add-on at, written beside them by position, in the
+   * create's or amendment's own transaction. The trips themselves are left alone: re-writing them
+   * would weigh the seats again.
+   */
+  setPrices(id: string, prices: BookingPrices): void {
+    const booking = this.bookings.get(id);
+    if (!booking) return;
+    booking.trips.forEach((trip, i) => {
+      const p = prices.trips[i];
+      if (!p) return;
+      trip.subtotal = p.subtotal;
+      if (p.rate_type_id) trip.rate_type_id = p.rate_type_id; else delete trip.rate_type_id;
+      if (p.promo_id) trip.promo_id = p.promo_id; else delete trip.promo_id;
+    });
+    booking.add_ons.forEach((addOn, i) => { if (prices.add_ons[i] !== undefined) addOn.amount = prices.add_ons[i]; });
+  }
+
   /** The actor signs every action's write, the way the route stamps it on create and amend. */
   private touch(booking: StoredBooking, actor: string | undefined): void {
     booking.updated_at = this.now();
@@ -902,12 +927,12 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
 
 /** The input a stored trip would have come from, id included, so an edit derived from it stays that trip. */
 const asInput = (trip: StoredTrip, all: readonly StoredTrip[]): BookingTripInput => {
-  const { id, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, pickup_time_end, pickup_at_pier, ovn, ovn_return_date, ovn_leg, ovn_of } = trip;
+  const { id, route_id, service_date, booking_mode, charter_boat_id, lock_draws: _draws, pax: _pax, seq: _seq, ovn_of, ...details } = trip;
   return {
     id, route_id, service_date, booking_mode, pax: trip.pax.map((row) => ({ ...row })),
     ...(charter_boat_id ? { charter_boat_id } : {}),
     lock_draws: trip.lock_draws.map((draw) => ({ ...draw })),
-    ...tripDetails({ zone, pickup_time, pickup_time_end, pickup_at_pier, ovn, ovn_return_date, ovn_leg }),
+    ...tripDetails(details),
     ...ovnOfIndex(all, ovn_of),
   };
 };
@@ -919,6 +944,13 @@ const tripDetails = (trip: TripDetails): TripDetails => ({
   ...(trip.ovn ?{ ovn: trip.ovn } : {}),
   ...(trip.ovn_return_date ? { ovn_return_date: trip.ovn_return_date } : {}),
   ...(trip.ovn_leg ? { ovn_leg: true } : {}),
+  ...(trip.ovn_charge === undefined ? {} : { ovn_charge: trip.ovn_charge }),
+  ...(trip.charter_price_mode ? { charter_price_mode: trip.charter_price_mode } : {}),
+  ...(trip.charter_price_manual === undefined ? {} : { charter_price_manual: trip.charter_price_manual }),
+  ...(trip.charter_price_note ? { charter_price_note: trip.charter_price_note } : {}),
+  ...(trip.subtotal === undefined ? {} : { subtotal: trip.subtotal }),
+  ...(trip.rate_type_id ? { rate_type_id: trip.rate_type_id } : {}),
+  ...(trip.promo_id ? { promo_id: trip.promo_id } : {}),
 });
 
 /**

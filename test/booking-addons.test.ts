@@ -46,7 +46,7 @@ test('add-ons are kept on create, replaced on PATCH, left alone when absent, and
   const agent = `tag_addons_${Date.now().toString(36)}`;
 
   const created = await request('POST', '/v1/bookings', {
-    route_id: 'r1', service_date: date, pax: 2, agent_id: agent,
+    route_id: 'r1', service_date: date, pax: 2, agent_id: agent, external_id: `b2c_${agent}`, // B2C: amounts stay as sent
     addOns: [
       { type: 'longtail-join', label: 'Longtail Join (2A + 0C)', amount: 800.5, qty: 1, note: '', jAd: 2, jChd: 0 },
       { type: 'transfer-r1-PK-van', amount: 1200 },
@@ -86,7 +86,7 @@ test('a malformed add-on is a 400 and changes nothing', async () => {
   assert.match(refused.json().message, /addOns\[0\]\.amount must not be negative/);
   assert.equal((await request('GET', `/v1/bookings?agent_id=${agent}`)).json().total, 0, 'nothing was written');
 
-  const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, agent_id: agent, addOns: [{ type: 'longtail-join' }] });
+  const created = await request('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, agent_id: agent, external_id: `b2c_${agent}`, addOns: [{ type: 'longtail-join' }] });
   const id = created.json().id as string;
   const bad = await request('PATCH', `/v1/bookings/${id}`, { add_ons: [{ qty: 1 }] });
   assert.equal(bad.statusCode, 400);

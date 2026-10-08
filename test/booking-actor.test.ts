@@ -58,7 +58,7 @@ test('who confirmed and who approved come from the login, never a typed name', a
   assert.equal(confirmed.status, 'confirmed');
   assert.equal(confirmed.confirmed_by, 'ops1');
 
-  const waiting = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, price_discount: -500 })).json();
+  const waiting = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 1, adjustments: [{ kind: 'discount', value: 500 }] })).json();
   const approved = (await send('POST', `/v1/bookings/${waiting.id}/approve`, { note: 'boss said yes', approved_by: 'mallory' })).json();
   assert.equal(approved.confirmed_by, 'ops1', 'a body cannot name the approver');
   const history = (await send('GET', `/v1/bookings/${waiting.id}/history`)).json().history as { by: string; text: string }[];

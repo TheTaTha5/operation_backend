@@ -15,9 +15,8 @@ its own note:
 
 Owned by no other note:
 
-- **The price exception.** `total`, `price_*` and add-on `amount`/`label` are still taken from the
-  client until `POST /v1/quote` prices a booking; then they become computed (add-on `type` and `qty`
-  stay client facts).
+- **Add-on labels** are still the client's (legacy writes them from its add-on catalogue); `amount` is
+  computed.
 - **A checklist of legacy's business rules**: each rule in `allotment_v2/js` (wt-lk-inbox) and the
   endpoint that will own it. `legacy-replacement.md` lists only the data.
 - **Love Kingdom:** a contract change ships on both sides together

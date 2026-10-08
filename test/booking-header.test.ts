@@ -162,6 +162,7 @@ async function booked(date: string, capacity: number, payload: Record<string, un
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: `boat-${date}`, route_id: 'r6', service_date: date, capacity } });
   const created = await app.inject({
     method: 'POST', url: '/v1/bookings', payload: {
+      agent_id: 'a_b2c', // B2C: its total stays as sent, so the header's money can be edited
       leadPax: 'Somchai R.', leadPhone: '0812345678', hotelName: 'Example Resort',
       notes: 'window seats', total: 12100, bookingDate: '2026-09-01',
       trips: [{ routeId: 'r6', date, pax: { ad: 4 } }], ...payload,
