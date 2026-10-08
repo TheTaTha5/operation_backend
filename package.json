@@ -11,7 +11,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
-    "test": "node --import tsx --import ./test/setup.ts --test test/**/*.test.ts",
+    "test": "node --import tsx --import ./test/setup.ts --test --test-concurrency=3 test/**/*.test.ts",
     "check": "tsc --noEmit -p tsconfig.check.json",
     "db:migrate": "tsx src/migrate.ts",
     "sync:routes": "tsx src/tools/sync-routes.ts",
