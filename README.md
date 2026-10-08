@@ -1396,8 +1396,15 @@ and empty until set:
 ```jsonc
 "operations": { "boat_id": "b2", "boat_splits": [], "boat_pulled": false,
   "pickup_time_final": "06:40", "pickup_time_final_end": null, "pickup_final_at_pier": false, "return_same_van": false,
-  "pier_note": { "text": "Late, call guide", "at": "2026-09-12T05:50:00.000Z", "by": "Ploy" } }
+  "pier_note": { "text": "Late, call guide", "at": "2026-09-12T05:50:00.000Z", "by": "Ploy" },
+  "van_parts": [ { "idx": 0, "source": "main", "ad": 2, "chd": 1, "inf": 0, "foc": 0,
+                   "group": { "id": "vgrp_…", "number": 3, "van_id": "veh07", "return_van_id": null, "pickup_time": "06:40" },
+                   "sequence": 2, "return_van_id": null, "alt": null } ] }
 ```
+
+`van_parts` is who rides which van. A trip with nothing set reads as one whole, ungrouped part
+(`idx 0`). More parts are a split across vans; `source` is `main` (idx 0), `manual` (a split), or
+`alt_pickup` (an alternate pickup point, with its points in `alt`).
 
 `PATCH /operations/trip-ops/{trip_id}` sets it (the `operations` edit area). An absent field is
 unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
@@ -1409,16 +1416,79 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 | `pickup_time_final`, `pickup_time_final_end`, `pickup_final_at_pier` | The dispatcher's final pickup, a time, a window or a pier deadline, by the same rules as a trip's pickup |
 | `return_same_van` | The group comes back on the van it went out on |
 | `pier_note` | Text; the server stamps `at` and `by` (the login) |
+| `van_parts` | `[{idx, ad, chd, inf, foc, group_id?, sequence?, return_van_id?}]` replaces the trip's parts; `null` or `[]` is one whole, ungrouped part again (legacy unsplit). See below |
+
+**`van_parts`:**
+- They must add up to the trip's passengers, category by category, and each carries one or more,
+  else `400`. idx 0 is the main part. A part with children or infants and no adult is allowed, with
+  `"warnings": ["child_without_adult"]` (legacy warns the same way).
+- `group_id` must be a group of the trip's route and day (`400`), of the trip's pickup zone
+  (`409 zone_mismatch`). A NoTransfer trip rides no van (`409 self_arrive`). If the group has a van,
+  it must still seat everyone (`409 van_over_capacity`).
+- `return_van_id` must be in the return pool (`409 van_not_in_pool`; see "Van groups"), and is
+  refused together with `return_same_van: true` (`400`). Setting one sets `return_same_van` to
+  false; `return_same_van: true` clears every part's own return van.
+- An `alt_pickup` part comes from the booking's alternate pickups. Its passengers can't be changed
+  or dropped here (`409 alt_pickup_split`); its group, order and return van can.
 
 - `boat_pulled` (computed) is `true` when a boat the trip is on no longer sails on its route that day:
   legacy's "boat pulled · re-plan".
-- **A trip moved** to another route or day (an edit or a reschedule) loses its dispatch, which was
-  arranged for the old departure, but keeps its pier note (legacy `bkOpsClear`). **A change of
-  passengers** clears a boat split, which no longer adds up.
+- **A trip moved** to another route or day (an edit or a reschedule) loses its dispatch and van
+  parts, which were arranged for the old departure, but keeps its pier note (legacy `bkOpsClear`).
+  **A change of passengers** clears a boat split, which no longer adds up. The van parts follow it:
+  the main part takes the change, and if the passengers fall below what the split parts carry,
+  those shrink from the last one. **A change of pickup zone** (the trip's zone, the booking's
+  pickup zone, or a private-van add-on) takes the trip out of its van group.
 - A cancelled or rejected booking's dispatch cannot change (`409 cancelled`); an unknown trip is `404`.
 - The legacy import brings each active booking's boat, boat split, final pickup and pier note.
 
-Van groups, reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+Reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+
+### Van groups
+
+A van group is the passengers who ride one outbound van run together, on one route and day. It
+holds the van, the members' default return van and the pickup time. Writes need the `operations`
+edit area. Every write answers the group as `GET` shows it, except `DELETE` (`204`).
+
+| Method + path | Body | Rule |
+|---|---|---|
+| `GET /operations/van-groups?service_date=&route_id=` | — | `{service_date, route_id, groups}`, by number |
+| `POST /operations/van-groups` | `{service_date, route_id, zone, members: [{trip_id, idx?}], van_id?, allow_second_round?}` | `201`. Number: one more than the highest that route and day, across zones. Members get `sequence` 1..n in the order sent |
+| `POST /operations/van-groups/{id}/members` | `{members: [...]}` | Moves the parts in from any other group, numbered after the last member |
+| `PATCH /operations/van-groups/{id}` | `{van_id?, return_van_id?, pickup_time?, allow_second_round?}` | See below. `null` clears |
+| `PUT /operations/van-groups/{id}/order` | `{members: [...]}` or `{clear: true}` | The pickup order, 1..n; `clear` goes back to ordering by time. `members` must list each member once (`400`) |
+| `DELETE /operations/van-groups/{id}` | — | Disband: members lose the group, their order and their own return van; their final pickup and `return_same_van` stay |
+| `POST /operations/van-groups/clear` | `{service_date, route_id}` | Every group that route and day loses its van; groups and return vans stay. Answers the day's groups |
+
+```jsonc
+{ "id": "vgrp_…", "service_date": "2026-10-02", "route_id": "r1", "zone": "PK", "number": 3,
+  "van_id": "veh07", "return_van_id": null, "pickup_time": "06:40",
+  "pax": 11, "capacity": 12, "over_capacity": false,
+  "members": [ { "trip_id": "trip_…", "booking_id": "lg_…", "idx": 0, "source": "main", "ad": 2, "chd": 1, "inf": 0, "foc": 0,
+                 "sequence": 1, "pickup_time": "06:40", "return_van_id": null } ] }
+```
+
+- **Members** are van parts (`trip_id`, `idx`, default 0). Each must be on the group's route and
+  day (`400`), from a booking that isn't cancelled (`409 cancelled`), not NoTransfer
+  (`409 self_arrive`), and picked up in the group's `zone` (`409 zone_mismatch`). The zone is the
+  trip's zone, else the booking's pickup zone; a charter is `__CHARTER__`; a NoTransfer seat with a
+  private-van add-on (`transfer-<route>-<PK|KL>-<vehicle>`) is in that van's zone.
+- **`van_id`** must be in the route's van pool that day: vans the month matrix puts on the route
+  and that are usable (`409 van_not_in_pool`). It must seat the group (`409 van_over_capacity`);
+  every passenger takes a seat, infants and FOC included. A van already on another group of the
+  same route and day is a second round, refused (`409 van_in_other_group`, naming those groups and
+  times) unless `allow_second_round: true`. Seats are checked per round, never summed.
+- **`return_van_id`** must be in the return pool (`409 van_not_in_pool`): the outbound pool, plus
+  usable vans whose zone that day is the group's (the pier of the first route they serve, else
+  their base). A charter takes any usable van, NoTransfer none. Setting it sets the members'
+  `return_same_van` to false.
+- **`pickup_time`** (`HH:MM`) is also written as every member's `pickup_time_final`, as legacy does
+  (an alternate-pickup part's own time comes with alternate pickups).
+- **Seats** are checked when a van is set and when members join a group with a van. `pax`,
+  `capacity` and `over_capacity` (computed) show a group pushed over later, e.g. by an edit.
+- **Cancelled bookings** take no part: not in `members`, `pax` or a second-round check.
+- **A group with nobody riding** (its members moved, removed or cancelled) is kept, with its van and
+  number, and left out of `GET` until a member joins again. A new group never reuses its number.
 
 ### Vans and the month matrix
 

@@ -26,6 +26,7 @@ import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import { pickupFields } from './pickup.js';
 import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
+import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanPatch, type VanStatusRange, type VanStatusRangeInput } from './vans.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
@@ -88,6 +89,13 @@ const dateOnly = (value: unknown): string => value instanceof Date ? `${value.ge
  */
 const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${column}::text AS ${column}_text`).join(', ');
 
+// A van part (`a`, booking_trip_van_allocations) and its group (`g`, van_groups), as jsonb fields.
+const VAN_PART_FIELDS = `'idx', a.idx, 'source', a.source, 'ad', a.ad, 'chd', a.chd, 'inf', a.inf, 'foc', a.foc, 'group_id', a.van_group_id,
+  'sequence', a.sequence, 'return_van_id', a.return_van_id, 'pick_area_id', a.pick_area_id, 'pick_hotel', a.pick_hotel, 'pick_zone', a.pick_zone,
+  'drop_area_id', a.drop_area_id, 'drop_hotel', a.drop_hotel, 'drop_zone', a.drop_zone`;
+const VAN_GROUP_JSON = `CASE WHEN g.id IS NULL THEN NULL ELSE jsonb_build_object('id', g.id, 'service_date', g.service_date::text, 'route_id', g.route_id,
+  'zone', g.zone, 'number', g.number, 'van_id', g.van_id, 'return_van_id', g.return_van_id, 'pickup_time', g.pickup_time) END`;
+
 const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
       'id', t.id, 'seq', t.seq, 'route_id', t.route_id, 'service_date', t.service_date::text, 'booking_mode', t.booking_mode, 'charter_boat_id', t.charter_boat_id,
@@ -100,6 +108,8 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'boat_splits', COALESCE((SELECT jsonb_agg(jsonb_build_object('boat_id', s.boat_id, 'ad', s.ad, 'chd', s.chd, 'inf', s.inf, 'foc', s.foc) ORDER BY s.idx)
         FROM booking_trip_boat_splits s WHERE s.booking_trip_id = t.id), '[]'::jsonb),
       'deployed', COALESCE((SELECT jsonb_agg(d.boat_id) FROM deployments d WHERE d.route_id = t.route_id AND d.service_date = t.service_date), '[]'::jsonb),
+      'van_parts', COALESCE((SELECT jsonb_agg(jsonb_build_object(${VAN_PART_FIELDS}, 'group', ${VAN_GROUP_JSON}) ORDER BY a.idx)
+        FROM booking_trip_van_allocations a LEFT JOIN van_groups g ON g.id = a.van_group_id WHERE a.booking_trip_id = t.id), '[]'::jsonb),
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -249,11 +259,24 @@ const storedDispatch = (trip: Record<string, unknown>): StoredDispatch | undefin
     pier_note: d?.pier_note ? { text: String(d.pier_note), at: jsonInstant(d.pier_note_at), by: (d.pier_note_by as string | null) ?? null } : null,
   };
 };
+/** A van part from `VAN_PART_FIELDS`. */
+const vanPart = (p: Record<string, unknown>): StoredVanPart => ({
+  idx: Number(p.idx), source: p.source as StoredVanPart['source'], ad: Number(p.ad), chd: Number(p.chd), inf: Number(p.inf), foc: Number(p.foc),
+  group_id: text(p.group_id), sequence: p.sequence === null || p.sequence === undefined ? null : Number(p.sequence), return_van_id: text(p.return_van_id),
+  alt: p.source === 'alt_pickup' ? { pick_area_id: text(p.pick_area_id), pick_hotel: text(p.pick_hotel), pick_zone: text(p.pick_zone),
+    drop_area_id: text(p.drop_area_id), drop_hotel: text(p.drop_hotel), drop_zone: text(p.drop_zone) } : null,
+});
+const vanGroup = (g: Record<string, unknown>): VanGroup => ({
+  id: String(g.id), service_date: String(g.service_date), route_id: String(g.route_id), zone: String(g.zone), number: Number(g.number),
+  van_id: text(g.van_id), return_van_id: text(g.return_van_id), pickup_time: text(g.pickup_time),
+});
 const booking = (row: QueryResultRow): Booking => {
   const raw = new Map((row.trips as Record<string, unknown>[]).map((t) => [String(t.id), t]));
   return bookingView(stored(row), (trip) => {
     const t = raw.get(trip.id)!;
-    return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []));
+    const parts = (t.van_parts as Record<string, unknown>[]) ?? [];
+    const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
+    return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups));
   });
 };
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
@@ -476,6 +499,11 @@ export class PostgresOperationsStore {
     // A boat split no longer adds up once the trip's passengers change, so it is cleared (decided 2026-10-06).
     const repaxed = paxChangedTripIds(current, planned);
     if (repaxed.length > 0) await this.client().query('DELETE FROM booking_trip_boat_splits WHERE booking_trip_id = ANY($1::text[])', [repaxed]);
+    // The van parts follow the new passengers: the main part takes the change (`rebalanceParts`).
+    for (const id of repaxed) {
+      const parts = await this.storedVanParts(id);
+      if (parts.length) await this.setVanParts(id, rebalanceParts(parts, planned.find((t) => t.id === id)!.pax));
+    }
     const existing = new Set(current.map((trip) => trip.id).filter((id) => keep.has(id)));
     // `UNIQUE (booking_id, seq)` is checked row by row, so reordering in place would collide halfway
     // through a swap. The kept rows are first moved above every position the new list uses.
@@ -1135,6 +1163,48 @@ export class PostgresOperationsStore {
     for (const [idx, s] of d.boat_splits.entries()) {
       await this.client().query('INSERT INTO booking_trip_boat_splits (booking_trip_id, idx, boat_id, ad, chd, inf, foc) VALUES ($1,$2,$3,$4,$5,$6,$7)', [tripId, idx, s.boat_id, s.ad, s.chd, s.inf, s.foc]);
     }
+  }
+
+  // ── Van parts and groups (migration 016, slice A2) ──
+  /** Serializes van-group writes on one route's day across instances, as group numbers come from the day's highest. */
+  async lockVanDay(date: string, routeId: string): Promise<void> { await this.client().query('SELECT pg_advisory_xact_lock(hashtext($1))', [`van:${date}:${routeId}`]); }
+  async bookingsOn(date: string, routeId: string): Promise<Booking[]> {
+    const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.id IN (SELECT booking_id FROM booking_trips WHERE service_date = $1 AND route_id = $2) ORDER BY b.id`, [date, routeId]);
+    return rows.map(booking);
+  }
+  async vanGroupsOn(date: string, routeId: string): Promise<VanGroup[]> {
+    return (await this.client().query(`SELECT ${VAN_GROUP_JSON} AS g FROM van_groups g WHERE service_date = $1 AND route_id = $2 ORDER BY number`, [date, routeId])).rows.map((r) => vanGroup(r.g));
+  }
+  async vanGroup(id: string): Promise<VanGroup | undefined> {
+    const { rows: [row] } = await this.client().query(`SELECT ${VAN_GROUP_JSON} AS g FROM van_groups g WHERE id = $1`, [id]);
+    return row && vanGroup(row.g);
+  }
+  async storedVanParts(tripId: string): Promise<StoredVanPart[]> {
+    return (await this.client().query(`SELECT jsonb_build_object(${VAN_PART_FIELDS}) AS p FROM booking_trip_van_allocations a WHERE booking_trip_id = $1 ORDER BY idx`, [tripId])).rows.map((r) => vanPart(r.p));
+  }
+  async writeVanGroup(g: VanGroup): Promise<void> {
+    await this.client().query(`INSERT INTO van_groups (id, service_date, route_id, zone, number, van_id, return_van_id, pickup_time) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (id) DO UPDATE SET zone = EXCLUDED.zone, number = EXCLUDED.number, van_id = EXCLUDED.van_id, return_van_id = EXCLUDED.return_van_id, pickup_time = EXCLUDED.pickup_time`,
+      [g.id, g.service_date, g.route_id, g.zone, g.number, g.van_id, g.return_van_id, g.pickup_time]);
+  }
+  async deleteVanGroup(id: string): Promise<void> { await this.client().query('DELETE FROM van_groups WHERE id = $1', [id]); }
+  /** `[]` is no rows: one whole, ungrouped part. */
+  async setVanParts(tripId: string, parts: readonly StoredVanPart[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = $1', [tripId]);
+    for (const p of parts) {
+      await this.client().query(`INSERT INTO booking_trip_van_allocations (booking_trip_id, idx, ad, chd, inf, foc, van_group_id, sequence, return_van_id, source,
+          pick_area_id, pick_hotel, pick_zone, drop_area_id, drop_hotel, drop_zone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [tripId, p.idx, p.ad, p.chd, p.inf, p.foc, p.group_id, p.sequence, p.return_van_id, p.source,
+          p.alt?.pick_area_id ?? null, p.alt?.pick_hotel ?? null, p.alt?.pick_zone ?? null, p.alt?.drop_area_id ?? null, p.alt?.drop_hotel ?? null, p.alt?.drop_zone ?? null]);
+    }
+  }
+  /** Sets some of a trip's dispatch fields; a new final pickup is a plain time, with no window. */
+  async patchDispatch(tripId: string, fields: { pickup_time_final?: string | null; return_same_van?: boolean }): Promise<void> {
+    await this.client().query('INSERT INTO booking_trip_operations (booking_trip_id) VALUES ($1) ON CONFLICT (booking_trip_id) DO NOTHING', [tripId]);
+    if (fields.pickup_time_final !== undefined) {
+      await this.client().query('UPDATE booking_trip_operations SET pickup_time_final = $2, pickup_time_final_end = NULL, pickup_final_at_pier = false WHERE booking_trip_id = $1', [tripId, fields.pickup_time_final]);
+    }
+    if (fields.return_same_van !== undefined) await this.client().query('UPDATE booking_trip_operations SET return_same_van = $2 WHERE booking_trip_id = $1', [tripId, fields.return_same_van]);
   }
 
   // ── Vans and the month matrix (migration 016, slice A3) ──

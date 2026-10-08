@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
 import { docs } from './openapi.js';
@@ -21,6 +22,10 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import {
+  addMembers, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
+  vanDayState, visibleGroups, type VanGroup, type VanPlan,
+} from '../domain/van-groups.js';
 import {
   applyVanDayPatch, emptyVanDay, parseNewVan, parseStatusRange, parseVanDayPatch, parseVanDayRange, parseVanPatch, patchStatusRange, vanMatrix, vanStatusOn, usableOn,
 } from '../domain/vans.js';
@@ -668,7 +673,11 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
         }
       }
       const signed = { ...changes, header: stampActor(header, actor) };
-      const amended = (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found');
+      let amended = (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found');
+      // A trip whose pickup zone changed leaves its van group, which holds one zone.
+      const rezoned = rezonedParts(stored, amended);
+      for (const [tripId, parts] of rezoned) await store.setVanParts(tripId, parts);
+      if (rezoned.size) amended = (await store.booking(amended.id))!;
       if (!priced) return warnings.length ? { ...amended, price_warnings: warnings } : amended;
       await store.setPrices(amended.id, { trips: priced.quote.trips, add_ons: priced.quote.add_ons.map((a) => a.amount) });
       const booking = (await store.booking(amended.id))!;
@@ -816,7 +825,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    */
   app.patch('/operations/trip-ops/:trip_id', async (request) => {
     const tripId = (request.params as { trip_id: string }).trip_id;
-    const patch = parseDispatchPatch(record(request.body));
+    const body = record(request.body);
+    const patch = parseDispatchPatch(body);
+    const vanParts = body.van_parts === undefined ? undefined : parseVanParts(body.van_parts);
     return store.transaction(async () => {
       const found = (await store.tripForDispatch(tripId)) ?? notFound('Trip not found');
       if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(found.booking.status)) {
@@ -824,8 +835,101 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       }
       const next = applyDispatch(found.dispatch, patch, { pax: parsePaxGrid(found.trip.pax), deployedBoats: found.deployedBoats, now: new Date().toISOString(), by: actorOf(request.user) ?? null });
       await store.setDispatch(tripId, next);
-      return { trip: (await store.tripForDispatch(tripId))!.trip, warnings: [] };
+      let warnings: string[] = [];
+      if (vanParts) {
+        const day = await vanDayOf(found.trip.service_date, found.trip.route_id);
+        const result = setTripParts(day.state, tripId, vanParts, next.return_same_van, day.vans, day.routePiers);
+        await applyVanPlan(result.plan);
+        warnings = result.warnings;
+      } else if (patch.return_same_van === true) {
+        // R11: coming back on the same van drops every part's own return van (legacy left the splits' set).
+        const parts = partsFromView(found.trip.operations.van_parts);
+        if (parts.some((p) => p.return_van_id)) await store.setVanParts(tripId, partsToStore(parts.map((p) => ({ ...p, return_van_id: null }))));
+      }
+      return { trip: (await store.tripForDispatch(tripId))!.trip, warnings };
     });
+  });
+
+  /**
+   * Van groups (todo/trip-ops-and-vans-model.md, slice A2): the passengers who ride one outbound van run
+   * together, on one route and day. Every write reads the route's day under its lock, decides in
+   * `van-groups.ts`, and writes the plan back. Answers the group as `GET` shows it.
+   */
+  async function vanDayOf(date: string, routeId: string) {
+    await store.lockVanDay(date, routeId);
+    const state = vanDayState(await store.bookingsOn(date, routeId), await store.vanGroupsOn(date, routeId), date, routeId);
+    const [vans, ranges, days, routes] = [await store.listVans(), await store.vanStatusRanges(), await store.vanDays(date, date), await store.listRoutes()];
+    const onDay = vanMatrix(vans, ranges, days, [date]).map((d) => ({ van: vans.find((v) => v.id === d.van_id)!, usable: d.usable, route_ids: d.route_ids }));
+    return { state, vans: onDay, catalogue: vans, routePiers: new Map(routes.map((r) => [r.id, r.pier])) };
+  }
+  async function applyVanPlan(plan: VanPlan): Promise<void> {
+    for (const group of plan.groups) await store.writeVanGroup(group);
+    for (const [tripId, parts] of plan.parts) await store.setVanParts(tripId, parts);
+    for (const [tripId, fields] of plan.dispatch) await store.patchDispatch(tripId, fields);
+    for (const id of plan.deleteGroups) await store.deleteVanGroup(id);
+  }
+  /** One route's day as it reads now. */
+  const vanDayNow = async (date: string, routeId: string) => vanDayState(await store.bookingsOn(date, routeId), await store.vanGroupsOn(date, routeId), date, routeId);
+  /** The group as it reads after a write. */
+  async function groupNow(group: VanGroup) {
+    const state = await vanDayNow(group.service_date, group.route_id);
+    return groupView(state, state.groups.find((g) => g.id === group.id) ?? group, await store.listVans());
+  }
+  const routeDay = (source: Record<string, unknown>): { date: string; routeId: string } => {
+    const date = source.service_date ?? source.date, routeId = source.route_id;
+    if (typeof date !== 'string' || !isIsoDate(date)) badRequest('service_date must be YYYY-MM-DD');
+    if (typeof routeId !== 'string' || !routeId) badRequest('route_id is required');
+    return { date: date as string, routeId: routeId as string };
+  };
+  /** Runs a command on an existing group's day. */
+  const onGroup = <T>(request: { params: unknown }, work: (day: Awaited<ReturnType<typeof vanDayOf>>, group: VanGroup) => Promise<T>) => store.transaction(async () => {
+    const id = (request.params as { id: string }).id;
+    const found = (await store.vanGroup(id)) ?? notFound(`Van group ${id} not found`);
+    return work(await vanDayOf(found.service_date, found.route_id), found);
+  });
+
+  app.get('/operations/van-groups', async (request) => {
+    const { date, routeId } = routeDay(request.query as Record<string, unknown>);
+    return { service_date: date, route_id: routeId, groups: visibleGroups(await vanDayNow(date, routeId), await store.listVans()) };
+  });
+  app.post('/operations/van-groups', async (request, reply) => {
+    const body = record(request.body);
+    const { date, routeId } = routeDay(body);
+    return reply.code(201).send(await store.transaction(async () => {
+      const day = await vanDayOf(date, routeId);
+      const { plan, group } = createGroup(day.state, body, day.vans, `vgrp_${randomUUID()}`);
+      await applyVanPlan(plan);
+      return groupNow(group);
+    }));
+  });
+  app.post('/operations/van-groups/clear', async (request) => {
+    const { date, routeId } = routeDay(record(request.body));
+    return store.transaction(async () => {
+      const day = await vanDayOf(date, routeId);
+      await applyVanPlan(clearRouteVans(day.state));
+      return { service_date: date, route_id: routeId, groups: visibleGroups(await vanDayNow(date, routeId), day.catalogue) };
+    });
+  });
+  app.post('/operations/van-groups/:id/members', async (request) => {
+    const body = record(request.body);
+    return onGroup(request, async (day, group) => { await applyVanPlan(addMembers(day.state, group.id, body, day.vans)); return groupNow(group); });
+  });
+  app.patch('/operations/van-groups/:id', async (request) => {
+    const body = record(request.body);
+    return onGroup(request, async (day, group) => {
+      const plan: VanPlan = { groups: [], deleteGroups: [], parts: new Map(), dispatch: new Map() };
+      setGroup(day.state, group.id, body, day.vans, day.routePiers, plan);
+      await applyVanPlan(plan);
+      return groupNow(group);
+    });
+  });
+  app.put('/operations/van-groups/:id/order', async (request) => {
+    const body = record(request.body);
+    return onGroup(request, async (day, group) => { await applyVanPlan(orderGroup(day.state, group.id, body)); return groupNow(group); });
+  });
+  app.delete('/operations/van-groups/:id', async (request, reply) => {
+    await onGroup(request, async (day, group) => applyVanPlan(disbandGroup(day.state, group.id)));
+    return reply.code(204).send();
   });
 
   /**
