@@ -351,7 +351,7 @@ Field notes:
 
 A rate type is a price list: what an agent pays per seat on each route and pickup zone, per charter
 boat, and per add-on. All of these are under `booking:read` / `booking:write`, like agents. Nothing
-prices a booking from them yet; that is the quote, a later slice (`todo/rate-types-model.md`).
+prices a booking from them yet; that is the quote, a later slice (`todo/pricing-model.md`).
 
 Rate types arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids
 (`rt003`, `rt_staff`, …), which are the ids `agents.rate_type_id` and `bookings.rate_type_ref`

@@ -4,7 +4,7 @@ import type { InjectOptions } from 'fastify';
 import { buildApp } from '../src/app.js';
 
 // The server decides a booking's status from the save button (`intent`) and the facts, as legacy's
-// save does in the browser (todo/booking-authority-model.md, phase 2). Runs against whichever store
+// save does in the browser (`README.md`, how the status is decided). Runs against whichever store
 // DATABASE_URL selects.
 const app = buildApp();
 after(async () => { await app.close(); });

@@ -1,5 +1,5 @@
 /**
- * When a trip's passengers are collected (todo/pickup-window-model.md).
+ * When a trip's passengers are collected (migration 024; README.md, the trip pickup fields).
  *
  * Legacy's pickup-area table gives a trip one of two things: a hotel pickup **window**, `07:30-07:45`
  * (the van comes between these times), or a **pier deadline**, `Before 08:30 at pier` (the guest

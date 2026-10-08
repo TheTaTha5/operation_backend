@@ -1,5 +1,5 @@
 /**
- * Legacy's pickup text as this service's pickup window (todo/pickup-window-model.md). Pure, so
+ * Legacy's pickup text as this service's pickup window (migration 024; README.md, the trip pickup fields). Pure, so
  * `test/legacy-pickup.test.ts` checks it without a legacy database.
  *
  * Legacy keeps the pickup as free text, filled from its pickup-area table. On production it takes

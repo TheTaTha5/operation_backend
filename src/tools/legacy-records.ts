@@ -1,6 +1,6 @@
 /**
  * Legacy's booking action records as rows for this service's tables: the cancellation, the latest
- * reschedule, every partial cancel, the fee items and the history (`todo/legacy-replacement.md`,
+ * reschedule, every partial cancel, the fee items and the history (`README.md`, the booking actions;
  * hand-off §7). Pure, so `test/legacy-records.test.ts` can check the mapping on fixture rows without
  * a legacy database; `import-legacy.ts` reads the source and writes what these return.
  *

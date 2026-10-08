@@ -12,7 +12,7 @@
  * legacy's set. A route only this service has is reported and left alone, never deleted, because
  * bookings may refer to it. A legacy row that does not map is skipped and listed, never guessed.
  *
- * **The calendar is not legacy's any more** (2026-10-08, `todo/route-calendar-rules-model.md`): it
+ * **The calendar is not legacy's any more** (`README.md`, "Editing the calendar"): it
  * is edited through `/v1/routes/{id}/seasons` and `/days`. A route new to this service brings its
  * seasons and day overrides once, so it does not start open every day; after that they are never
  * overwritten, and where legacy's differ the run only reports it.

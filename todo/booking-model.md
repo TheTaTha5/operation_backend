@@ -1,118 +1,19 @@
-# The booking, de-blobbed
+# The booking, de-blobbed: what is still open
 
-`bookings.booking_data JSONB` currently holds the frontend's whole document. That was the right
-holding position while we were guessing; it is the wrong resting place. Nothing in a blob can be
-constrained, joined, or migrated, so every consumer re-parses it and every rule is enforced in
-application code or not at all.
-
-This is the normalized target. It is derived from what the frontend *constructs on save*
-(originally read at `allotment_v2.html:78328`; the code has since been split out, and the save is
-now `const newBk = {` in `allotment_v2/js/08-app.js` of the production checkout,
-`D:\projects\wt-lk-inbox` — search for the symbol, line numbers drift), not from the legacy schema — their `sb_bookings` is ~130 columns of
-wide-column and positional-shred damage and is not a model worth porting.
-
-## The shape being normalized
-
-The document is ~55 header fields and ~24 per-trip fields. Six of those are repeating groups
-(`trips`, `passengers`, `addOns`, `adjustments`, `altPickups`, `attachments`), three are fixed-size
-snapshots (`priceBreakdown`, `paymentSnapshot`, `marketSnapshot`), two are approval records
-(`approval`, `focApproval`), one is a dispatch record (`trip.ops`), and the rest are scalars.
+The booking used to live in `bookings.booking_data JSONB`, the frontend's whole document. Most of it
+is now tables and columns (migrations 007–018, 023, 024; `docs/schema.md`). This lists what is not.
+The shape comes from what the frontend constructs on save: `const newBk = {` in
+`allotment_v2/js/08-app.js` of wt-lk-inbox (search for the symbol; line numbers drift).
 
 ## The rule
 
 **A repeating group becomes a table. A fixed-size struct becomes columns. Nothing stays JSONB.**
 
 Fixed-size means the frontend writes exactly these keys and adding one is a schema change either
-way — `guides {english, russian, chinese, otherLang}` is four booleans-and-a-string, not a
-collection, so it is four columns. `passengers[]` is unbounded, so it is a table.
+way: `guides {english, russian, chinese, otherLang}` is four columns, not a collection.
+`passengers[]` is unbounded, so it is a table.
 
-## Tables
-
-### `bookings` — the sale header
-
-Scalars only. Everything the frontend writes flat, stays flat.
-
-| group | columns |
-|---|---|
-| identity | `id`, `external_id`, `schema_ver`, `voucher_ref` |
-| commercial | `agent_id`, `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` |
-| lead | `lead_pax`, `lead_nationality`, `lead_type`, `lead_foc`, `lead_phone`, `lead_email` |
-| pickup | `pickup_area_id`, `pickup_self`, `pickup_area`, `pickup_zone`, `hotel_name`, `room_number` |
-| dropoff | `dropoff_same`, `dropoff_area_id`, `dropoff_area`, `dropoff_hotel_name` |
-| guides | `guide_english`, `guide_russian`, `guide_chinese`, `guide_other_lang` |
-| service | `pax_type`, `special_meals_veg`, `special_meals_vegan`, `special_meals_halal`, `special_meals_allergies`, `large_luggage` |
-| cash on tour | `cash_on_tour_amount`, `cash_on_tour_currency`, `cash_on_tour_handling`, `cash_on_tour_note` |
-| price | `price_mode`, `manual_total`, `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`, `price_extra` |
-| payment snapshot | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version` |
-| market snapshot | `market`, `market_sub`, `market_agent_id`, `market_at` |
-| lifecycle | `status`, `booking_date`, `booked_at`, `created_at`, `created_by`, `updated_at`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
-| free text | `notes`, `note` |
-
-`status` is a real enum:
-`draft, quote, pending, pending_approval, pending_foc, confirmed, rejected, cancelled, cancelled_weather, completed`.
-We currently accept two of these. Anything not in `(confirmed, pending_approval, pending_foc)`
-holds no seats — that predicate belongs in one pure function both stores call, per the calendar
-pattern, not repeated at every call site.
-
-`pickup_area`/`pickup_zone`/`dropoff_area` are denormalized *by the frontend* for display. Keep
-them denormalized here too, but as columns: they are a snapshot of what the area was called when
-the booking was taken, and renaming an area must not silently rewrite history.
-
-### `booking_trips` — one row per departure
-
-**This is the capacity table.** Every allotment, availability, and manifest query reads this and
-nothing else.
-
-```
-id, booking_id → bookings, route_id → routes, service_date DATE,
-zone, pickup_time, booking_mode ('seat'|'charter'),
-charter_boat_id → boats, charter_price_mode, charter_price_manual,
-charter_price_note, charter_displacement_ack,
-ovn, ovn_return_date, ovn_charge, ovn_leg, ovn_of,
-seats_locked, seats_general, subtotal, seq
-UNIQUE (booking_id, seq)
-INDEX (route_id, service_date)
-```
-
-`seats_locked + seats_general` must equal the trip's total pax — a CHECK we cannot write today
-because the numbers live in a blob.
-
-This table is what removes the one-trip-per-booking restriction, which `bookingInput()` used to
-enforce outright. Measured against the legacy database on 2026-08-28: that restriction blocks
-**3 bookings out of 3,180**, and all three are the same thing — an overnight trip, outbound plus
-return leg. An earlier draft of this note claimed 18,648, which was wrong and came from a count of
-something else entirely. The reason to remove the restriction is that the shape is wrong, not that
-thousands of rows are waiting behind it.
-
-### `booking_trip_pax` — the 4×3 grid
-
-```
-booking_trip_id → booking_trips, category ('ad'|'chd'|'inf'|'foc'),
-residency ('unknown'|'foreign'|'thai'), count INTEGER CHECK (count >= 0)
-PRIMARY KEY (booking_trip_id, category, residency)
-```
-
-The frontend's keys are `ad, ad_fr, ad_th, chd, chd_fr, chd_th, …` — a category crossed with a
-pricing residency, flattened into a string. Twelve nullable integer columns would reproduce the
-wide-column mistake we just finished deleting from `routes`. Adding a category or a tier here is
-a row, not a migration.
-
-Trip pax total is `SUM(count)`, and it is the only definition of a trip's pax. `bookings.pax` as
-a stored scalar goes away.
-
-### `booking_passengers`
-
-```
-booking_id → bookings, seq, name, nationality, type, foc BOOLEAN
-```
-
-### `booking_addons`
-
-**Built — migration 018, see `addons-model.md`.** The sketch that stood here was wrong in one
-place: it gave add-ons a nullable `booking_trip_id` because "the document carries add-ons at both
-levels (`newBk.addOns` and `trip.addOns`)". No writer produces `trip.addOns` — every other `addOns`
-in the frontend is `rt.addOns`, a rate type's price list. Add-ons are booking-level only, keyed
-`(booking_id, seq)`, with `join_adults`/`join_children` added for the longtail-join counts.
+## Tables not built yet
 
 ### `booking_adjustments`
 
@@ -120,17 +21,7 @@ in the frontend is `rt.addOns`, a rate type's price list. Add-ons are booking-le
 booking_id → bookings, seq, kind, mode ('amount'|'percent'), value, label, note
 ```
 
-### `booking_alt_pickups` and `booking_alt_pickup_pax`
-
-```
-booking_alt_pickups: id, booking_id, seq, who, area_id, area, zone, place
-booking_alt_pickup_pax: booking_alt_pickup_id, category, residency, count
-```
-
-Alt pickups carry their own pax grid — the frontend merges it in with `Object.assign(…, _p)`.
-Two pax tables rather than one polymorphic table, because a polymorphic owner column would give
-up the foreign key, and the FK is the entire point of doing this. The *shape* repeats; the
-*logic* does not — one `PaxCounts` type and one summing function serve both.
+With pricing (`pricing-model.md`): who may give a discount is part of it.
 
 ### `booking_attachments`
 
@@ -144,336 +35,50 @@ id, booking_id, name, mime, size, kind, uploaded_by, uploaded_at
 booking_id, seq, name, qty
 ```
 
-The `allergies` free-text field stays on `bookings`; `allergyList` is the structured version the
-kitchen actually counts from.
+The `allergies` free text stays on `bookings`; `allergyList` is the structured version the kitchen
+counts from.
 
-### `booking_approvals`
+### Alternate pickups
 
-```
-id, booking_id, kind ('capacity'|'foc'), status ('pending'|'approved'|'rejected'),
-reason, target_status, over_total, discount, sale_name, foc_count,
-requested_by, requested_at, approved_by, approved_at, note
-```
+Designed in `trip-ops-and-vans-model.md` (slice D).
 
-`approval` and `focApproval` are the same record with different triggers. One table with a `kind`
-keeps the audit history — the current document overwrites, so a booking approved twice remembers
-only the second.
+### `docCheck`
 
-### `booking_trip_lock_draws`
+The saved field is `bk.docCheck`, written by `docCheckToggleItem`, `docCheckSetStatus`,
+`docCheckSetNote` and `docCheckRunPre` in `08-app.js`:
+`{status, by, at, note, items{route,date,lead,pax,voucher,payment}, pre}`. Ready to model; it is
+dropped on every save today. (`_docCheck` is the page's view state, never saved.)
 
-```
-booking_trip_id → booking_trips, seat_lock_id → seat_locks, qty
-PRIMARY KEY (booking_trip_id, seat_lock_id)
-```
+## The blob is being deleted
 
-How a trip consumes an agent's held seats. This is the first real FK between a booking and
-`seat_locks`; today the link is a `{lockId: qty}` map inside a blob, which is why nothing can
-verify that draws sum to `seats_locked` or that a released lock has no live draws against it.
+No overflow column survives: a field the frontend sends is either modelled or dropped, and dropping
+it is the signal that it needs modelling. The blob is no longer written (since 2026-09-22), but:
 
-### `booking_trip_ops` — dispatch, 1:1 with a trip
+1. **Stop returning `booking_data`** in responses. A contract change: tell the clients
+   (`README.md` already calls it deprecated).
+2. **Drop the column**, once nothing reads it.
 
-```
-booking_trip_id PRIMARY KEY → booking_trips,
-boat_id → boats, van_id, van_return_id, van_group, van_seq,
-pickup_time_final, return_same_van, alt_split_auto, upgrade,
-pier_checkin, van_checkin, reconfirm_status, reconfirm_at, reconfirm_by
-```
+## The area catalogue does not exist
 
-**This is a different domain wearing a booking's clothes.** It is day-of-operations dispatch —
-who drives, which boat, did they show up — and it is written by the ops board, not the sales
-form. It gets its own table so it can later get its own endpoints without another migration.
-`van_splits` is the one genuinely open-ended piece and needs its own look before modelling.
+`pickup_area_id` and `dropoff_area_id` (011) are plain `TEXT` pointing at nothing: there is no
+`areas` table. The way out is the one `route_id` took (005 catalogue, 006 seed, 008 FK), but we do
+not own the list yet: whether ids are stable, who edits them, whether an id is unique across zones.
 
-## The blob is being deleted, not kept as an overflow — decided 2026-09-01
+**Next step is a dry run, not a migration:** the distinct area ids in legacy's bookings, checked
+against what the frontend treats as the area list.
 
-The note and the code disagreed. This note's "What this deletes" always said `booking_data` goes;
-the create path meanwhile writes the entire request body into it (`src/routes/operations.ts`), and
-`README.md` documents that as intended — unrecognised fields "retained in `booking_data`". So the
-column had quietly become a junk drawer for anything unmodelled, which is the opposite of deleting
-it.
+The name columns (`pickup_area`, `pickup_zone`, `dropoff_area`) are snapshots of what the area was
+called that day, like `market`. They stay as they are whatever happens to the ids.
 
-**Decided: delete it.** No overflow column survives stage 2. A field the frontend sends is either
-modelled or dropped on the floor, and dropping it is the signal that it needs modelling.
+## Not built yet, deliberately
 
-The reason to close this now is that the blob has already stopped being merely redundant and become
-*wrong*. `UPDATE bookings` touches `booking_mode`, `status` and `updated_at` only, so an amendment
-never rewrites `booking_data`: edit a booking and the blob keeps answering with what the client sent
-at create time, beside columns that have moved on. Every response carries both. An integrator who
-reads `booking_data.leadPax` instead of the column gets the right answer until someone amends, which
-is the worst shape a bug can have.
-
-Deleting it is expand/contract, not one commit, and the destructive half needs the rehearsal
-`CLAUDE.md` asks for:
-
-1. **Add** the header columns. Additive, nothing reads them.
-2. **Dual-write** — the create path fills columns *and* the blob. Both stores. *Amended 2026-09-10:
-   the patch path writes columns **only**.* Re-serialising an amendment into the blob would grow the
-   thing being deleted, and the blob has no answer for a cleared field. So `booking_data` is now
-   precisely a record of what was sent at create time and nothing else, which is a narrower and more
-   defensible claim than "the payload, sort of, until someone amends".
-3. **Backfill** existing rows from the blob into the columns. This is the destructive step: rehearse
-   it against a restored copy and diff the rows, the way 007 was checked.
-
-   **The backfill must not touch a row whose columns have already moved.** Since step 2, an amended
-   booking has correct columns beside a stale blob; a naive `UPDATE … FROM booking_data` would
-   overwrite a corrected phone number with the wrong one it was corrected from, silently, on every
-   booking anyone has ever edited. Scope it to rows the columns were never written for — created
-   before 011, or with the header columns still entirely NULL — and let the diff prove it.
-4. **Stop returning `booking_data`** in responses. This is an API contract change, not an internal
-   one — it is the step that needs the frontend told, and it wants its own note in `README.md`.
-5. **Drop the column**, once nothing reads it and step 4 has been out long enough to trust.
-
-Steps 1–3 are reversible. Step 5 is not, and there is no hurry to reach it.
-
-## What this deletes
-
-- `bookings.booking_data` — the blob
-- `bookings.pax_breakdown` — superseded by `booking_trip_pax`
-- `bookings.pax` / `allocated_pax` as stored scalars — derived from trips
-- the one-trip-per-booking restriction in `bookingInput()`
-
-## Build order
-
-1. ~~`booking_trips` + `booking_trip_pax`, and move `capacity()` onto them.~~ **Done 2026-08-28,
-   migration 007.** Multi-trip bookings work, an itinerary is weighed as a whole, and the pax grid
-   is stored as rows. `bookings` lost `route_id`, `service_date`, `pax`, `allocated_pax` and
-   `pax_breakdown`; all four of the first are now derived in `bookingView`, which both stores call.
-2. `bookings` header columns, `booking_passengers`, `booking_addons`, `booking_adjustments`.
-3. `booking_alt_pickups`, `booking_attachments`, `booking_special_meal_allergies`,
-   `booking_approvals`, `booking_trip_lock_draws`.
-4. `booking_trip_ops`, once the dispatch surface is designed rather than inferred.
-
-Stage 1 was the one with a correctness story. The rest is mechanical now the trip table exists.
-
-## What stage 1 turned up
-
-- **SERIALIZABLE without a retry loop was incomplete.** Capacity is now read from `booking_trips`
-  and written to the same table, so PostgreSQL raises `40001` between transactions that share no
-  route or day — predicate locks are taken per page, and a small table is one page. Unretried, that
-  is a 500 for the caller. `transaction()` now retries `40001` and `40P01` up to five times with a
-  short jittered backoff. This was always latent; the trip table just made it reliable.
-- **Locks must be taken in a fixed order.** A multi-day booking holds several pools, so two
-  bookings covering the same days in opposite order would each hold what the other waits for.
-  `assertTrips` sorts before locking, and locks the days an amendment is vacating as well.
-- **`allocated_pax` took a bug class with it.** See `live-correctness-charter-seats.md` §1.
-- **A bare pax count cannot retarget a tiered booking.** Largest-cell-first, proportional and
-  cheapest-first are all inventions that cancel the wrong passengers. `retargetPax` refuses and asks
-  for a grid; `partial-cancel` and `reschedule` are single-departure, untiered-only as a result.
-
-## Still open from stage 1
-
-*Reviewed 2026-09-01. Two of the three below are closed; struck through rather than deleted, because
-what was open when and what closed it is the useful part.*
-
-- ~~The status enum is still the two values `confirmed` and `cancelled`.~~ **Closed** — migration 010
-  widened the CHECK to all ten, and it did not wait for the header columns as this line predicted;
-  the dry run's 38 unstorable statuses pulled it forward. The rule moved to
-  `src/domain/booking-status.ts`, not `pax.ts`, and it is a denylist rather than the allowlist this
-  line assumed. See "The status enum, and a correction" below.
-- `PATCH /v1/bookings/{id}` no longer passes unrecognised fields through to storage. **Still open,
-  and now a defect rather than an accident.** `UPDATE bookings` writes `booking_mode`, `status` and
-  `updated_at` only, so `booking_data` is frozen at create time while the columns beside it move on.
-  Fixed by the header columns landing in stage 2, per the delete-the-blob decision above.
-- ~~The Postgres suite needs a clean database per run and is still not in CI.~~ **Closed** —
-  `.github/workflows/ci.yml` runs the suite against `postgres:18-alpine` on a per-run database.
-
-## Open
-
-- `docCheck` — **corrected 2026-10-03: the shape is known.** The line here said the only `docCheck`
-  in the source is view state (`date/filter/openId`); that object is `_docCheck`, the Document
-  Check page's own state, and is never saved. The saved field is `bk.docCheck`, written by
-  `docCheckToggleItem`, `docCheckSetStatus`, `docCheckSetNote` and `docCheckRunPre` in
-  `allotment_v2/js/08-app.js` (wt-lk-inbox@ce9769a) and sent by the schemaVer 2 `const newBk = {`:
-  `{status, by, at, note, items{route,date,lead,pax,voucher,payment}, pre}`. Ready to model; it is
-  being dropped on every save today.
-- `trip.ops.van_splits` — shape unknown.
-- Both stores must implement all of this identically. The in-process store has no joins, so the
-  trip-total and status-holds-seats rules go in `src/domain/` pure functions first.
-- **`pickup_area_id` and `dropoff_area_id` point at nothing.** See below.
-
-## The area catalogue does not exist — raised 2026-09-07
-
-Migration 011 lands `pickup_area_id`, `pickup_zone`, `dropoff_area_id` and the two snapshot name
-columns beside them, but there is no `areas` table anywhere in the schema. Both id columns are
-plain `TEXT` holding ids that reference nothing, which puts them in the same bucket as
-`deployments.route_id` and `seat_locks.route_id` — joined by convention, unenforced. A booking may
-carry `dropoff_area_id = 'area_99'` and nothing objects.
-
-**The name columns are not the problem and must not be "fixed".** `pickup_area`, `pickup_zone` and
-`dropoff_area` are snapshots of what the area was called on the day, exactly like `market` and for
-the same reason. They stay denormalized whatever happens to the ids. The FK answers *which area is
-this*; the text answers *what did we call it that day*; they are allowed to disagree, and a rename
-must not rewrite either.
-
-`route_id` was in this position and the way out is already worn:
-
-1. **005** created the `routes` catalogue.
-2. **006** seeded it from the legacy production database.
-3. **008** added the foreign key, once the dry run had proved all 3,183 legacy trips resolved.
-
-Areas want the same three steps. What blocks step 1 is that we do not own the list: areas are a
-frontend/legacy concept today, and this repo does not know whether the ids are stable, who edits
-them, or whether an id is unique across zones. Seeding a catalogue from a list someone else can
-edit out from under us is how a foreign key becomes a failed deploy.
-
-**Next step is the dry run, not the migration.** Extract the distinct `pickup_area_id` and
-`dropoff_area_id` values from the legacy bookings and check them against whatever the frontend
-treats as the area list, the way the booking model was checked on 2026-08-28. If they all resolve,
-this is three migrations and no drama. If they do not, the gaps are the actual finding.
-
-## Dry run against the legacy database — 2026-08-28
-
-Read-only extract of `operation_schemas.sb_bookings` and `sb_bookings__trips` (3,180 bookings,
-3,183 trips) transformed into `bookings` / `booking_trips` / `booking_trip_pax` in a throwaway
-database. This is the first time the model met real data rather than rows written to agree with it.
-
-**The model holds.** 8,740 passengers in, 8,740 out, and not one trip's total changed. Every
-route-day the capacity query produces matches the figure computed independently from the legacy
-columns: 311 route-days compared, 0 differing. No CHECK or foreign key was violated by real data.
-
-Confirmations worth keeping:
-
-- **`booking_mode` really is only `seat` and `charter`** — 3,169 and 14. The CHECK is right.
-- **Every `routeid` resolves** against the catalogue seeded by migration 006. 7 distinct routes.
-- **The 4×3 grid is right, and legacy is missing two of the cells.** `sb_bookings__trips` has ten
-  wide pax columns and no `pax_chd` or `pax_inf` — the untiered child and infant were simply never
-  needed, so the column was never added. That is the wide-column failure mode in miniature: the
-  schema encodes which combinations have occurred so far.
-- **The untiered tier is nearly dead.** `pax_ad` is used by 0 trips of 3,183 and `pax_foc` by 1.
-  Real bookings are all `_fr`/`_th`. `residency = 'unknown'` earns its place for imports and bare
-  `pax: 6` requests, not for anything the frontend writes.
-
-### What does not fit, and what it costs
-
-**38 bookings cannot keep their status** — 24 `cancelled_weather`, 7 `pending_approval`, 5 `quote`,
-2 `rejected` — because the CHECK still allows only `confirmed` and `cancelled`. Seven of those are
-`pending_approval`, which `holdsSeats()` already counts as occupying seats; collapsing them to
-`cancelled` would silently release 7 bookings' worth. Collapsing `quote` to `cancelled` is storable
-but wrong in the other direction. **This is the strongest argument for pulling the status enum
-forward in stage 2** — it is not cosmetic, it decides whether seats are held.
-
-**5 trips are unrepresentable** and their bookings were held back whole:
-
-| id | problem |
-| --- | --- |
-| `b2c_BK-001`, `b2c_BK-002` | `date` is `Sat Jul 04` / `Fri Nov 20` |
-| `b2c_BK-003` | both — bad date and no `routeid` |
-| `b2c_LOV-0542142_1`, `b2c_LOV-7358225_1` | no `routeid` |
-
-The dates are a stringified JS `Date` truncated into a text column — the exact failure the date
-convention in `CLAUDE.md` exists to prevent, preserved in production data. All five are `b2c_`
-prefixed and look like demo rows, but that should be confirmed before an import drops them.
-
-### Corrections to the design
-
-- **`ovn_of` is an index, not an id.** It holds the `idx` of the outbound trip within the same
-  booking, so it maps onto `booking_trips.seq`, and a self-reference on `(booking_id, seq)` will
-  enforce it. Joining it against `row_pk` finds nothing.
-- **`ovn` is an enum**: `return` (3) and `self` (2). Not free text.
-- **Two `ops` fields were missed** in the table sketch above: `ops_boatsplits` and `ops_piernote`.
-- **Stage 1's migration is narrower than the `booking_trips` sketch in this note.** 007 created
-  `id, booking_id, seq, route_id, service_date, booking_mode` only. The charter fields, the OVN
-  fields, `zone`, `pickup_time`, `subtotal` and the `seats_locked`/`seats_general` split are still
-  to come. Nothing reads them yet, so nothing is broken by their absence, but the sketch above
-  describes the destination rather than what exists.
-
-## Charter boats and lock draws landed — 2026-09-24
-
-Migration 014 adds `booking_trips.charter_boat_id` and the `booking_trip_lock_draws` table sketched
-above, and `dayCapacity` (`src/domain/capacity.ts`) now uses both: a chartered boat's sellable seats
-leave the pool whole, and a lock holds only `pax − drawn`. Deliberately not done:
-
-- **No FK from `charter_boat_id` to `boats`.** The rule enforced is "deployed on that route and day",
-  which is stronger, and `deployments.boat_id` has no key either; the two should gain one together.
-- **Historical charters on multi-boat days stay `NULL`.** The backfill fills only days with exactly
-  one boat. The rest subtract their passengers from the pool instead — an undercount, never an
-  overcount. Count them on production before deciding whether to repair them by hand.
-- **A draw does not check the lock's `agent_id` against the booking's agent.** Legacy's
-  `holderType`/`holderId` suggests it should; the seat-lock model gap is the place to decide it.
-- The OVN fields, `zone`, `pickup_time`, `subtotal` and the charter pricing fields remain unbuilt.
-  *(Update: migration 015 lands `zone`, `pickup_time` and the OVN fields except `ovn_charge` — see
-  below.)*
-
-## Trip pickup and overnight fields landed
-
-Migration 015 adds `zone`, `pickup_time`, `ovn`, `ovn_return_date`, `ovn_leg` and `ovn_of` to
-`booking_trips`, and `assertItinerary` (`src/domain/operations.ts`) enforces one trip per route per
-day, plus legacy's return-leg rules. `ovn_of` is stored as the outbound trip's **id**, not the
-legacy index, because trip ids now survive edits and indexes do not survive reordering. Deliberately
-not done:
-
-- **No `UNIQUE (booking_id, route_id, service_date)` in the schema.** The rule is enforced by the
-  API and by the import. Count the violations on production before adding the constraint: a
-  dry run of `src/tools/import-legacy.ts` lists them as skipped bookings.
-- **The import skips any booking that breaks the itinerary rules**, rather than repairing it. Run a
-  dry run and read the skipped list before `--commit`. A skipped booking holds no seats in the
-  new system.
-- Legacy allows a return date equal to the outbound date; we require it to be later, because a
-  same-day leg would be a second trip on the same route and day.
-- `ovn_charge`, `subtotal`, the charter pricing fields and `seats_locked`/`seats_general` remain
-  unbuilt.
-
-## Stage 1 closed out — 2026-08-28
-
-Migration 008 adds `booking_trips_route_fk`, the foreign key the `booking_trips` sketch above
-always called for and 007 did not create. The dry run had already proved all 3,183 legacy trips
-resolve against the catalogue, so it went on clean.
-
-The constraint is a backstop rather than the error path. A foreign key violation reaches the caller
-as a 500 naming a constraint, which tells them nothing, so both stores check the route first and
-answer `400 Unknown route: <id>` from one shared function (`assertKnownRoutes`).
-
-**A store divergence to keep in view.** The in-process store's catalogue is empty unless seeded —
-"with no database there is no catalogue to read" — so with nothing to check against it accepts any
-route, while PostgreSQL always enforces. This is the one place the two stores knowingly differ. It
-is not testable end to end for that reason: `assertKnownRoutes` is covered by unit tests in
-`test/booking-routes.test.ts`, and the constraint itself was verified by direct SQL. If the
-in-process store ever gains a default catalogue, the divergence should go with it.
-
-Still outstanding from stage 1 *(both closed 2026-09-01)*:
-
-- ~~**007 and 008 are not applied to production.** `railway.json` runs build and start only.~~
-  **Closed** — `railway.json` now runs `node dist/migrate.js` as `preDeployCommand`, so the schema
-  moves before new code takes traffic and a failed migration aborts the deploy.
-- ~~**The PostgreSQL suite is not in CI**~~ **Closed** — CI stands up `postgres:18-alpine` and runs
-  the suite against it. The observation that earned it stands: every real defect that week came out
-  of that run — the `40001` retry gap and, before it, the seat-lock date mapper.
-
-## The status enum, and a correction — 2026-08-28
-
-Migration 010 widens the CHECK to all ten statuses the frontend writes. Six are in the legacy data:
-confirmed 2929, cancelled 215, cancelled_weather 24, pending_approval 7, quote 5, rejected 2.
-
-**The seat rule I had written was wrong in two ways.** `holdsSeats` was an allowlist of
-`confirmed, pending_approval, pending_foc`. Legacy (`getSeatsConsumed`) is a denylist —
-`cancelled`, `rejected`, `cancelled_weather` release, everything else holds — plus a conditional
-for `pending_approval` (`bkPendHoldsSeat`). So my version would have silently released the five
-quotes and any status added later.
-
-The direction is the substance. A denylist means an unclassified status holds its seats. Over-holding
-surfaces as a day that looks fuller than it is and someone asks; under-holding surfaces as two
-parties sold the same seat, at the pier, on the day. Adopted as-is, on the user's call, so nothing
-changes at cutover — with one known cost: `BK-26080643-US7A` holds 25 seats on r6 for 2026-12-13
-for a booking that is not a sale.
-
-`claimsSeats(from, to, tripsMoved)` is new and covers a hole: an amendment used to be checked only
-when trips moved, so a `cancelled` booking flipped to `confirmed` with an unchanged itinerary would
-have taken seats without asking. Confirming a quote asks for its seats for the first time.
-
-### Also corrected
-
-**`b2c_` is a live channel, not demo data** — 177 bookings, 96 confirmed, the most recent created
-on 2026-08-28. An earlier note here called those rows demo. The five malformed rows are all `b2c_`
-*and* all `cancelled`, so they hold no seats and cannot distort capacity; repair them for audit
-history rather than dropping them.
-
-**All 7 `pending_approval` bookings carry an empty approval record** — no `approval_totover`, no
-`approval_over` — so `bkPendHoldsSeat` reads them as holding, and all 7 are in the past.
-`pendingApprovalHoldsSeats` is written and unit-tested but not yet wired, because the approval
-record arrives with `booking_approvals` in stage 3. Until then every `pending_approval` holds,
-which is the correct answer for all seven live rows.
-
-### Left over
-
-`npm run check` now type-checks `test/` as well as `src/` (`tsconfig.check.json`). It wasn't before,
-which is why a test importing `holdsSeats` from its old module compiled clean and failed at runtime.
+- **No FK from `booking_trips.charter_boat_id` to `boats`.** Add it together with one on
+  `deployments.boat_id`.
+- **Historical charters on multi-boat days have `charter_boat_id` NULL**; they subtract their
+  passengers from the pool instead. Count them on production before repairing by hand.
+- **A lock draw does not check the lock's agent against the booking's** (legacy's
+  `holderType`/`holderId` suggests it should).
+- **No `UNIQUE (booking_id, route_id, service_date)`**: the API and the import enforce it. Count the
+  violations on production first (the import's dry run lists them as skipped bookings).
+- **Unbuilt fields:** `ovn_charge`, `subtotal`, the charter pricing fields,
+  `seats_locked`/`seats_general`. They come with the quote.

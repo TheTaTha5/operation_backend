@@ -11,14 +11,14 @@ legacy server shreds it into wide `sb_*` tables or keeps it as a blob. This back
 that with real tables. This skill converts one piece at a time — one booking field, or one legacy
 resource — into a schema that can be constrained, joined and migrated.
 
-The rules here are not invented for the skill; they are the decisions already recorded in
-`todo/booking-model.md` and `CLAUDE.md`. Read those two before starting if you have not this
-session — they explain *why* each rule exists, with the production incidents behind them.
+The rules here are not invented for the skill; they are the decisions recorded in `CLAUDE.md` and
+`todo/booking-model.md` ("The rule", and why the blob is being deleted). Read those before starting
+if you have not this session; `git log` holds the production incidents behind them.
 
 Take the notes' *rules* as decided, but their *facts about the frontend* as claims to re-check.
-The notes were written from older reads of the code, and some are wrong now: `booking-model.md`
-calls `docCheck` an unknown shape (it confused the view's `_docCheck` with the saved
-`bk.docCheck`) and sketches a `trip.addOns` that no writer produces. A design built on a stale
+The notes were written from older reads of the code, and some were wrong: an earlier
+`booking-model.md` called `docCheck` an unknown shape (it confused the view's `_docCheck` with the
+saved `bk.docCheck`) and sketched a `trip.addOns` that no writer produces. A design built on a stale
 claim inherits its mistake, so wherever a note says what the frontend sends, confirm it in the
 code — and where it is wrong, say so first in your summary and record the correction in the note.
 
@@ -119,14 +119,15 @@ check *pending* — do not reach for another URL from `.env`.
 
 Count, don't eyeball: rows using the field, distinct values of anything that looks like an enum,
 max array length, nulls, values that would violate a proposed CHECK or FK, orphan references. Write
-the numbers into the note with the date. The 2026-08-28 dry run in `booking-model.md` is the model:
+the numbers into the note with the date. A 2026-08-28 dry run against legacy is the model:
 it is why `booking_mode` has a CHECK (3,169 seat, 14 charter, nothing else) and why the status enum
 was pulled forward (38 rows were unstorable).
 
 ### 7. Write the note and stop
 
-Always a **new** file: `todo/<name>-model.md` (e.g. `todo/addons-model.md`,
-`todo/rate-types-model.md`). Use this outline:
+Always a **new** file: `todo/<name>-model.md` (e.g. `todo/trip-ops-and-vans-model.md`). Once the
+work is built, delete what the note says about it, and the note itself when nothing is left open:
+git history keeps the record. Use this outline:
 
 ```markdown
 # <name>, modelled

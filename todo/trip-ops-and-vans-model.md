@@ -1,7 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Design only, written 2026-10-06. **Nothing here is built.** It waits for approval (see "Decisions
-needed" at the end).
+Decided 2026-10-06 (see "Decisions"). **Nothing here is built.**
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -37,34 +36,6 @@ needed" at the end).
   - **Write path:** the only code that touches them is `movedTripIds` in `writeTrips`. It deletes a
     moved trip's allocations and its whole `booking_trip_operations` row.
 
-## Corrections to existing notes
-
-These are recorded here because this design pass may only write this file.
-`todo/booking-model.md` and `todo/vans.md` still need the same edits.
-
-1. **`booking-model.md` says "`trip.ops.van_splits` — shape unknown". That's stale.**
-   - Legacy has 13 bookings with splits, up to 6 parts each.
-   - The keys are `ad chd inf foc pax vanGroup vanId vanReturnId vanSeq`, plus `fromAlt pickAreaId
-     pickHotel pickZone altWho` on alternate-pickup parts and `main` on part 0.
-   - 016 already models them as allocations. It misses two keys the code writes: **`pickTime`**
-     (`bkV2SetSplitPickTime`, and `bkV2VanGroupSetTime` for a part with its own pickup point) and
-     **`altWho`**.
-2. **013's `upgrade` column is not the `ops.upgrade` flag.**
-   - The flag is retired: `bkV2UpgApply` nulls it.
-   - Legacy's `sb_bookings__trips.ops_upgrade` stores `trips[].upg`, the **route-upgrade record**
-     `{fromRouteId, toRouteId, date, reason, charge, upgId, by, at}`. 0 rows today.
-3. **`pier_checkin` / `van_checkin` are not scalars.** Each is a record with an event list and
-   per-split slots (see Check-in below). 016 already dropped `van_checkin`, "for the check-in port".
-4. **Reconfirm is written on the booking, not per trip.** `rcSetStatus` writes `bk.ops.reconfirm`
-   directly, and legacy's `sb_bookings__trips.ops_reconfirm` has 0 rows. 013's per-trip `reconfirm_*`
-   also lacks the "sent to agent" half (`sent`, `sentAt`, `sentBy`).
-5. **`vans.md` says "the backend does not model add-ons". Stale since 018.** `booking_addons.type`
-   now holds the `transfer-<route>-<PK|KL>-<vehicle>` add-on, so the effective zone (R9) is
-   computable server-side. `groupZone` in `import-legacy.ts` is already a port of it.
-6. **The hand-off's "Decided 2026-09-25: legacy is no longer reachable from the frontend" was for
-   the Vue port.** Production is lk-inbox, which now switches per domain (`legacy | read | ops`).
-   The hand-off also misses boat assignment, the pier note, reconfirm, `pickTime` and `altWho`.
-
 ## Fields
 
 Every key under `bk.ops` / `trip.ops`, plus `upgrades`, `altPickups` and `trip.upg`. Day 1 of a
@@ -78,7 +49,7 @@ the `booking_trips` row of that date. The counts are active legacy bookings, 202
 | `ops.vanGroup` / `vanId` / `vanSeq` / `vanReturnId` | Reference / scalar | `van_groups`, `booking_trip_van_allocations` (exist) | The van lives on the group. Legacy has 0 vans set without a group (3,048 vans, 3,119 grouped). |
 | `ops.vanSplits[]` | Repeating group | `booking_trip_van_allocations` (exists) + **new** `pick_time`, `alt_who` | `pax` and `main` derived (sum; idx 0). `fromAlt` → `source='alt_pickup'`. |
 | `ops.altSplitAuto` | Derived | — | Never had a legacy column (`_bkV2IsAltAutoSplit` reads the parts instead); `source='alt_pickup'` carries it. |
-| `ops.pickupTimeFinal` | Scalar | `booking_trip_operations.pickup_time_final` (exists, `HH:MM` CHECK) | 791 rows: 577 `HH:MM`, 45 `H:MM`/`HH.MM` (rewritable), **83 ranges and 86 free text that don't fit** (see Open). *2026-10-08: the 86 are `08.00 a.m.`-style single times and pier deadlines; all fit migration 024's window fields.* |
+| `ops.pickupTimeFinal` | Scalar | `booking_trip_operations.pickup_time_final`, `pickup_time_final_end`, `pickup_final_at_pier` (024) | 791 rows; every legacy value fits (a time, a window or a pier deadline). |
 | `ops.returnSameVan` | Scalar | `booking_trip_operations.return_same_van` (exists) | 11 rows. |
 | `ops.pierNote {t,at,by}` | Fixed-size struct | **new** `booking_trip_operations.pier_note`, `pier_note_at`, `pier_note_by` | 126 rows, all objects. |
 | `ops.vanCheckin`, `ops.pierCheckin` | Overwritten record + repeating group | **new** `booking_trip_checkins` + `booking_trip_checkin_events` | 1,738 van and 2,040 pier rows. **Not imported today.** |
@@ -94,7 +65,7 @@ the `booking_trips` row of that date. The counts are active legacy bookings, 202
 
 ## Schema
 
-Proposed as `migrations/022_trip_dispatch.sql`. Everything is additive. Nothing here changes a row
+Proposed as a new migration. Everything is additive. Nothing here changes a row
 that exists.
 
 ```sql
@@ -381,7 +352,7 @@ Pure functions in `src/domain/`, called by both stores (the `calendar.ts` patter
 - **`effectiveZone(trip, booking, addOnTypes)`:** move `groupZone` out of `import-legacy.ts`.
 - **`vanPool` / `returnPool` / `groupPax` / `rounds`:** R2–R7, unit-tested like `capacity.test.ts`.
 - **`checkin.ts`:** the record parser and the append-only event rule.
-- **`shrinkAllocations(parts, tripPax)`:** idx 0 shrinks first (`vans.md` open item).
+- **`shrinkAllocations(parts, tripPax)`:** idx 0 shrinks first.
 - **`altPickupParts(altPickups, tripPax, current)`:** port of `bkV2SyncAltPickupSplits`, if
   Decision 4 says the server builds them.
 
@@ -406,7 +377,7 @@ check-ins, nothing else.
 | Boat on a released booking | 124 (skip, like van data: R1) |
 | Boat ids missing from our `boats` | **4**: LKC66 (56 assignments, 25 deployments), LKC77 (8, 2), LKC33 (1, 1), สบายดีทัวร์ (1, 1) |
 | Van set without a group | 0 of 3,048 |
-| `pickupTimeFinal` | 577 `HH:MM`, 45 rewritable, 83 ranges, 86 free text |
+| `pickupTimeFinal` | 629 single times (83 written `08.00 a.m.`), 85 windows, 2 pier deadlines, 1 start only (2026-10-08) |
 | Check-in records | van 1,738 · pier 2,040 · trip-level pier 4. `_s` slots on 6, max 3. Events: 86 (`cxl` 54, `no_show` 32, 3 undone, 3 without `paxBreak`). `flow`: `standby` 657, `pending` 74. Every `at` is ISO; every `reasonAt`, `flowAt` and event `at` is `HH:MM`. |
 | `noShow = max(0, expected − actualPax)` | 3,773 / 3,778 |
 | Reconfirm | 2,669 rows, 5 on multi-day bookings, 0 trip-level. Every status and `via` value is inside the CHECKs above. |
@@ -428,11 +399,8 @@ check-ins, nothing else.
 
 **Decided 2026-10-06:**
 - 1–4 and 6 as proposed below.
-- 5: add a `pickup_note` text column. `pickup_time_final` keeps its `HH:MM` CHECK, and the importer
-  moves any value that is not a single time (a range, or text such as `Before 09:40 at pier`) into
-  `pickup_note` instead of dropping it. *(Replaced 2026-10-08 by `todo/pickup-window-model.md`: the
-  values are windows and pier deadlines, not free text, so migration 024 adds
-  `pickup_time_final_end` and `pickup_final_at_pier` instead, and every legacy value imports.)*
+- 5: the final pickup time uses migration 024's window fields (`pickup_time_final`,
+  `pickup_time_final_end`, `pickup_final_at_pier`).
 - 7: keep the staff name the client sends inside check-in records, and always stamp `updated_by`
   from the token. Logins are per person: legacy accounts move into this service with their existing
   usernames and passwords.
@@ -457,9 +425,6 @@ The questions as they were asked:
    `alt_pickups` (port `bkV2SyncAltPickupSplits`), or does the client send them in `van_parts`?
    This is the hand-off's Q3. Proposed: the server builds them, because otherwise two clients can
    disagree.
-5. **`pickup_time_final` keeps its `HH:MM` CHECK**, so 169 legacy values (83 ranges, 86 free
-   text such as `Before 09:40 at pier`) won't import. The importer already drops and counts them.
-   Accept that loss, or add a separate `pickup_note` text column for them.
 6. **A route upgrade, and the move rule.** Today a route change counts as a move, so it clears the
    **van** as well as the boat. Legacy's upgrade clears only the boat. It keeps the van group
    *number*, which then points at a different route's group: a silent legacy bug. Proposed: keep
@@ -471,32 +436,34 @@ The questions as they were asked:
 
 ## Open
 
-1. ~~**The boat catalogue is stale, like routes were before `sync:routes`.**~~ **Closed
-   2026-10-08:** `npm run sync:boats` (merged in `c68001a`) copies legacy's boats; run it before the
-   import so no deployment is skipped. The original note: Four legacy boats are
-   missing. That's 66 active boat assignments here, and **29 legacy deployments the import skips
-   today** ("boat not in catalogue"), so those seats are missing from our availability now. It
-   needs a `sync:boats` (or an extension of `sync:routes`) before the boat FK, and before any
-   import.
-2. **Upgrade `slips`** (7 rows) are payment-slip attachment references (`/api/attach/{id}`).
+1. **Upgrade `slips`** (7 rows) are payment-slip attachment references (`/api/attach/{id}`).
    Attachments have no home here. They're left out until they do.
-3. **Upgrade `method`:** the shared payment block (`_bkExtraPay`) may also produce `cot` (cash on
+2. **Upgrade `method`:** the shared payment block (`_bkExtraPay`) may also produce `cot` (cash on
    tour). Only `card`/`cash`/blank appear in the data, so it isn't constrained yet.
-4. **`upgrades` money fields overlap the payments model** (`collected`, `settle`, `customer_paid`).
+3. **`upgrades` money fields overlap the payments model** (`collected`, `settle`, `customer_paid`).
    When `paymentStatus` and `invoiceId` are modelled, check whether these move there.
-5. **`ops.pfm`** (unpaid-proforma travel decision) has no legacy column and is lost on every save
+4. **`ops.pfm`** (unpaid-proforma travel decision) has no legacy column and is lost on every save
    today. It belongs with the approval/payments model.
-6. **A deployment deleted under bookings assigned to that boat.** The deployment-delete endpoint
+5. **A deployment deleted under bookings assigned to that boat.** The deployment-delete endpoint
    and the import's mirror delete both leave `boat_id` pointing at a boat that no longer sails that
    day. Clear it, or refuse the delete?
-7. **Five check-in rows** where `noShow` ≠ `expected − actualPax`. The import recomputes, so these
+6. **Five check-in rows** where `noShow` ≠ `expected − actualPax`. The import recomputes, so these
    change on import.
-8. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
+7. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
    stored.
 
 ## Follow-ups
 
 - **`src/tools/import-legacy.ts` is not extended by this slice.** Until it is, every legacy booking
   imported at cutover will have **no boat (3,867), reconfirm (2,669), check-in (3,778), pier note
-  (126), alternate pickups (4) or upgrades (11)**.
-- `todo/booking-model.md` and `todo/vans.md` need the corrections listed at the top.
+  (126), alternate pickups (4) or upgrades (11)**.
+
+## From the van hand-off
+
+- The Vue port's contract is `operation_frontend/apps/web/docs/handoff/van-endpoints.md`; its §8
+  checklist is the definition of done for the van board.
+- Apply 016 on the shared database and run the import there.
+- **A group can be left empty** when its last member's trip is removed or moved (legacy groups had
+  no rows, so they vanished by themselves): hide empty groups on read, or delete them on write?
+- **Before `--commit` on production,** run a dry run and read the skipped bookings, the van group
+  conflicts and the notes.

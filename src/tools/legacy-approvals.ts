@@ -1,6 +1,6 @@
 /**
  * Legacy's approvals as rows for `booking_approvals` and `booking_approval_days`
- * (todo/approvals-import-model.md, approved 2026-10-08). Pure, so `test/legacy-approvals.test.ts`
+ * (migration 026). Pure, so `test/legacy-approvals.test.ts`
  * checks the mapping on fixture rows; `import-legacy.ts` writes what these return.
  *
  * Legacy keeps one approval of each kind on the booking row, overwritten by the next request:

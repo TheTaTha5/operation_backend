@@ -7,7 +7,7 @@
  * The in-process store has no database, so writing any of it as SQL would need a second copy
  * (CLAUDE.md, "Logic that both stores need goes in a pure function both call").
  *
- * Pricing a booking from these rows is a later slice (`todo/rate-types-model.md`, "Not this slice").
+ * Pricing a booking from these rows is a later slice (`todo/pricing-model.md`).
  */
 
 /** A refusal in the existing `{ statusCode, error, message }` shape. */
