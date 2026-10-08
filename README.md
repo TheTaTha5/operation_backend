@@ -82,6 +82,42 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes and times) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. Seasons and day overrides are copied only for a route new to this service; after that the calendar is edited here (see "Editing the calendar"), and the run only reports where legacy's differs. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:boats [-- --commit]` | Copy the boat catalogue from the legacy database, the same way: dry run unless `--commit`, legacy wins, never deletes. Legacy's `totalcap` is never read, and a boat selling more seats than its licence is skipped and listed, not clamped. Run the import afterwards so deployments pick up new or changed boats. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
+
+### Checking an import
+
+The import's own report says what it wrote and what it skipped; `verify:import` says whether what it
+wrote means what legacy meant. It shares no code with the importer (`src/tools/verify-legacy.ts`
+restates the column contract and compares values by meaning: `7:30` is `07:30`, `'4800'` is
+`4800`, no value is `false` for a flag), so a mapping bug shows up as a difference instead of being
+repeated on both sides. Four levels:
+
+1. **Every row:** bookings, trips, passengers, history lines, seat locks, deployments, capacity
+   overrides, agents, markets, salespeople, rate types and vans are on both sides.
+2. **Every column:** legacy columns that hold data but that no import code names. A column read
+   through a name the code builds (`` `pax_${category}${suffix}` ``) counts as read; one built from
+   two lookup tables is listed in `COMPOSED_READS`.
+3. **Every value:** each imported booking's status and header fields, and each trip's route, date,
+   mode, zone, pickup, overnight fields and passengers by category and residency.
+4. **Every total:** seat and charter passengers per route and day, booking totals per month, active
+   locked seats and boats per route and day.
+
+The dry run rolls back, so there is nothing to compare until an import commits; do that on the
+local copy, never on Railway:
+
+```bash
+docker compose --profile pull run --rm pull        # local `legacy` and `operations` from Railway
+SOURCE_DATABASE_URL=postgres://postgres:postgres@localhost:55433/legacy \
+TARGET_DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations \
+  npx tsx src/tools/import-legacy.ts --commit
+SOURCE_DATABASE_URL=postgres://postgres:postgres@localhost:55433/legacy \
+TARGET_DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations \
+  npm run verify:import -- --json=verify.json
+```
+
+A difference is not always a bug: a booking the importer skips on purpose is missing here too, and
+a legacy column that belongs to an area not moved yet (money, check-in) is unread by design. The
+report lists every one so a person can tell which.
 
 Migrations are applied once and recorded in `schema_migrations`, so re-running is a no-op and a migration need not be idempotent. Each file and its ledger row commit together — a failure rolls the whole file back and records nothing. A session advisory lock serializes concurrent deploys. Migrations are checksummed, with line endings normalized to LF so a Windows checkout (`core.autocrlf`) and a Railway build agree: editing one that has already run is reported as a warning, because that database no longer matches a freshly migrated one. Fix such drift with a new migration rather than by editing history.
 
