@@ -36,7 +36,7 @@ test('over the allotment but within the licence, a booking waits for approval ho
   assert.equal(waiting.allocated_pax, 0, 'not granted yet, so it holds nothing');
   assert.equal(waiting.confirmed_at, undefined);
   assert.deepEqual(waiting.approvals.map(shape), [{
-    kind: 'approval', status: 'pending', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
+    kind: 'approval', status: 'pending', reason: 'over_capacity', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
     requested_by: null, decided_by: null, note: null, decided: false, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2 }],
   }]);
   assert.equal(await seatsLeft(date), 20, 'the allotment is untouched');
@@ -79,7 +79,7 @@ test('approving gives the seats; past the licence it still approves, with a warn
   assert.equal(body.allocated_pax, 22, 'now it holds its seats');
   assert.deepEqual(body.warnings, [{ code: 'over_licence', route_id: 'r3', service_date: date, over_by: 17 }], 'legacy: add a boat before the travel date');
   assert.deepEqual(body.approvals.map(shape)[0], {
-    kind: 'approval', status: 'approved', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
+    kind: 'approval', status: 'approved', reason: 'over_capacity', over_capacity: true, over_total: 2, discount: null, foc_count: null, target_status: 'confirmed',
     requested_by: null, decided_by: null, note: 'second boat coming', decided: true, days: [{ route_id: 'r3', service_date: date, need: 22, over_by: 2 }],
   });
 
@@ -107,7 +107,8 @@ test('free passengers need a reason to confirm, and wait for an FOC approval', a
   assert.equal(foc.status, 'pending_foc');
   assert.equal(foc.foc_reason, 'tour leader');
   assert.equal(foc.allocated_pax, 3, 'an FOC wait holds its seats');
-  assert.deepEqual(foc.approvals.map((a: Record<string, unknown>) => [a.kind, a.status, a.foc_count, a.target_status]), [['foc', 'pending', 1, 'confirmed']]);
+  assert.deepEqual(foc.approvals.map((a: Record<string, unknown>) => [a.kind, a.status, a.foc_count, a.target_status, a.reason]), [['foc', 'pending', 1, 'confirmed', null]],
+    'an FOC approval has no reason of its own: it is the booking\'s foc_reason');
   const approved = (await request('POST', `/v1/bookings/${foc.id}/approve`)).json();
   assert.equal(approved.status, 'confirmed');
   assert.equal(approved.approvals[0].status, 'approved');
@@ -122,7 +123,7 @@ test('over the allotment with free passengers: the approval first, then the FOC 
   await day(date);
   const both = await book(date, { ad: 20, foc: 1 }, { focReason: 'guide' });
   assert.equal(both.status, 'pending_approval');
-  assert.deepEqual(both.approvals.map((a: Record<string, unknown>) => [a.kind, a.target_status]), [['foc', 'confirmed'], ['approval', 'pending_foc']]);
+  assert.deepEqual(both.approvals.map((a: Record<string, unknown>) => [a.kind, a.target_status, a.reason]), [['foc', 'confirmed', null], ['approval', 'pending_foc', 'over_capacity']]);
   const first = (await request('POST', `/v1/bookings/${both.id}/approve`)).json();
   assert.equal(first.status, 'pending_foc');
   assert.equal(first.allocated_pax, 21);
@@ -135,7 +136,7 @@ test('a discount on a confirm waits for approval, holding its seats', async () =
   const discounted = await book(date, 4, { price_discount: -500 });
   assert.equal(discounted.status, 'pending_approval');
   assert.equal(discounted.allocated_pax, 4);
-  assert.deepEqual(discounted.approvals.map((a: Record<string, unknown>) => [a.over_capacity, a.discount, a.target_status]), [[false, 500, 'confirmed']]);
+  assert.deepEqual(discounted.approvals.map((a: Record<string, unknown>) => [a.over_capacity, a.discount, a.target_status, a.reason]), [[false, 500, 'confirmed', 'discount']]);
   assert.deepEqual((await history(discounted.id)).slice(-1), ['Waiting for approval · discount ฿500']);
   assert.equal((await book(date, 4, { price_discount: -500, intent: 'quote' })).status, 'quote', 'a quote is not weighed for its discount');
   assert.equal((await request('POST', `/v1/bookings/${discounted.id}/approve`)).json().status, 'confirmed');

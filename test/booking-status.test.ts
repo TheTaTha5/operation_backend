@@ -30,7 +30,7 @@ test('an unclassified status holds its seats rather than releasing them', () => 
 });
 
 const waiting = (over_capacity: boolean, status: BookingApproval['status'] = 'pending'): BookingApproval => ({
-  kind: 'approval', status, over_capacity, over_total: over_capacity ? 4 : null, discount: over_capacity ? null : 500, foc_count: null,
+  kind: 'approval', status, reason: over_capacity ? 'over_capacity' : 'discount', over_capacity, over_total: over_capacity ? 4 : null, discount: over_capacity ? null : 500, foc_count: null,
   target_status: 'confirmed', requested_by: null, requested_at: '2026-10-07T00:00:00.000Z', decided_by: null, decided_at: null, note: null, days: [],
 });
 

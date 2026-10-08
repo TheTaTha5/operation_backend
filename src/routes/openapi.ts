@@ -177,6 +177,10 @@ const booking = {
         properties: {
           kind: { type: 'string', enum: ['approval', 'foc'], description: '`approval`: over the allotment and/or a discount. `foc`: free passengers.' },
           status: { type: 'string', enum: ['pending', 'approved', 'rejected', 'replaced'], description: '`replaced`: a later edit asked again before this was decided.' },
+          reason: {
+            type: 'string', nullable: true,
+            description: 'Why it was asked: `over_capacity`, `discount` or `over_capacity+discount`; on one imported from legacy also `closed_day` or `b2c_hold`. `null` on an FOC approval (its reason is the booking\'s `foc_reason`).',
+          },
           over_capacity: { type: 'boolean', description: 'Over the allotment. While pending, the booking holds no seats.' },
           over_total: { type: 'integer', nullable: true }, discount: { type: 'number', nullable: true }, foc_count: { type: 'integer', nullable: true },
           target_status: { type: 'string', description: 'Where `/approve` moves the booking' },

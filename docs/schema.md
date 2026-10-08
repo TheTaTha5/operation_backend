@@ -215,6 +215,7 @@ erDiagram
     text booking_id FK
     text kind "approval or foc"
     text status "pending, approved, rejected, replaced"
+    text reason "over_capacity, discount, closed_day, b2c_hold…"
     boolean over_capacity "holds no seats while pending"
     integer over_total
     numeric discount

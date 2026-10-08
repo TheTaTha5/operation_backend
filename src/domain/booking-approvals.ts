@@ -29,6 +29,8 @@ export type ApprovalDay = { route_id: string; service_date: string; need: number
 
 export type BookingApproval = {
   kind: ApprovalKind; status: ApprovalStatus;
+  /** Why it was asked (`approvalReason`); legacy's imported labels too (`closed_day`, `b2c_hold`). `null` on an FOC approval. */
+  reason: string | null;
   over_capacity: boolean; over_total: number | null; discount: number | null; foc_count: number | null;
   target_status: BookingStatus;
   requested_by: string | null; requested_at: string; decided_by: string | null; decided_at: string | null; note: string | null;
@@ -36,6 +38,10 @@ export type BookingApproval = {
 };
 /** An approval about to be asked for. The store supplies `requested_at`; it starts `pending`. */
 export type NewApproval = Omit<BookingApproval, 'status' | 'requested_at' | 'decided_by' | 'decided_at' | 'note'>;
+
+/** Why an `approval` is asked for, in legacy's labels: `over_capacity`, `discount`, or both joined by `+`. */
+export const approvalReason = (overCapacity: boolean, discount: boolean): string | null =>
+  overCapacity && discount ? 'over_capacity+discount' : overCapacity ? 'over_capacity' : discount ? 'discount' : null;
 
 /** The approval of `kind` still waiting, if any. A booking has at most one per kind: asking again replaces it. */
 export const pendingApproval = (approvals: readonly BookingApproval[] | undefined, kind: ApprovalKind): BookingApproval | undefined =>
@@ -95,14 +101,14 @@ export function decideStatus(intent: Intent, facts: StatusFacts, by: string | un
   const asker = by ?? null;
 
   if (intent === 'confirm' && facts.focCount > 0) {
-    approvals.push({ kind: 'foc', over_capacity: false, over_total: null, discount: null, foc_count: facts.focCount, target_status: 'confirmed', requested_by: asker, days: [] });
+    approvals.push({ kind: 'foc', reason: null, over_capacity: false, over_total: null, discount: null, foc_count: facts.focCount, target_status: 'confirmed', requested_by: asker, days: [] });
   }
   const overCapacity = facts.overDays.length > 0;
   const discount = intent === 'confirm' && facts.discount > 0;
   if (overCapacity || discount) {
     const overTotal = facts.overDays.reduce((sum, day) => sum + day.over_by, 0);
     approvals.push({
-      kind: 'approval', over_capacity: overCapacity, over_total: overCapacity ? overTotal : null, discount: discount ? facts.discount : null,
+      kind: 'approval', reason: approvalReason(overCapacity, discount), over_capacity: overCapacity, over_total: overCapacity ? overTotal : null, discount: discount ? facts.discount : null,
       foc_count: null, target_status: base, requested_by: asker, days: facts.overDays.map((day) => ({ ...day })),
     });
     const why = [
@@ -142,7 +148,7 @@ export function reweigh(
     if (discount) {
       return {
         status: 'pending_approval',
-        request: { kind: 'approval', over_capacity: false, over_total: null, discount, foc_count: null, target_status: target, requested_by: asker, days: [] },
+        request: { kind: 'approval', reason: approvalReason(false, true), over_capacity: false, over_total: null, discount, foc_count: null, target_status: target, requested_by: asker, days: [] },
         history: [line(by, 'approval', 'Approval', `Fits the allotment now · still waiting for approval · discount ${baht(discount)}`)],
       };
     }
@@ -152,7 +158,7 @@ export function reweigh(
   return {
     status: 'pending_approval',
     request: {
-      kind: 'approval', over_capacity: true, over_total: overTotal, discount, foc_count: null, target_status: target, requested_by: asker,
+      kind: 'approval', reason: approvalReason(true, Boolean(discount)), over_capacity: true, over_total: overTotal, discount, foc_count: null, target_status: target, requested_by: asker,
       days: overDays.map((day) => ({ ...day })),
     },
     history: [line(by, 'approval', 'Approval', `Waiting for approval · over the allotment by ${overTotal} (${overDays.map((d) => `${d.route_id} ${d.service_date} +${d.over_by}`).join(', ')})`)],
@@ -164,7 +170,7 @@ export function decidedRecord(
   kind: ApprovalKind, status: 'approved' | 'rejected', target: BookingStatus, focCount: number, by: string | undefined, now: string, note: string | null,
 ): BookingApproval {
   return {
-    kind, status, over_capacity: false, over_total: null, discount: null, foc_count: kind === 'foc' ? focCount : null, target_status: target,
+    kind, status, reason: null, over_capacity: false, over_total: null, discount: null, foc_count: kind === 'foc' ? focCount : null, target_status: target,
     requested_by: null, requested_at: now, decided_by: by ?? null, decided_at: now, note, days: [],
   };
 }
