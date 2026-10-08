@@ -19,11 +19,15 @@ Key: ✅ exists today. Everything else is to build.
 
 ## Where it stands
 
-- **Done:** most of operations, bookings and seat locks (sections 3–5); read-only catalogue and
-  agents.
-- **Next:** catalogue writes (section 2). Every route's calendar expires, the first on 2027-01-01
-  (`route-season-calendars-expire.md`), and the fix is the season endpoints.
-- **Suggested order after that:** 4 (booking extras), 6 (sales), 8 (vans), 7 (money).
+*Updated 2026-10-08.* The order is `todo/authority-revision.md`'s: the server decides, bookings first.
+
+- **Done:** most of operations, bookings and seat locks (sections 3–5), with the status decided by
+  the server and changed through commands; the route calendar, its closed-day rule and its writes
+  (section 2); rate types and read-only agents (section 6).
+- **Next:** login and permissions (`todo/login-permissions-model.md`, waiting for approval). The
+  2027 calendars are now added through the season endpoints, once deployed.
+- **After that:** pricing (`POST /v1/quote`), booking extras (4), the rest of sales (6), vans (8),
+  money (7).
 
 ## 1. Identity and system
 
@@ -40,8 +44,10 @@ GET    /v1/routes                                    ✅
 POST   /v1/routes
 PATCH  /v1/routes/{id}
 PUT    /v1/routes/{id}/times          departure times
-PUT    /v1/routes/{id}/seasons        open/closed windows
-PUT    /v1/routes/{id}/overrides      one-off open/closed days
+POST   /v1/routes/{id}/seasons                       ✅  add an open/closed window
+DELETE /v1/routes/{id}/seasons/{season_id}           ✅
+PUT    /v1/routes/{id}/days/{date}                   ✅  one-off open/closed day
+DELETE /v1/routes/{id}/days/{date}                   ✅  (see route-calendar-rules-model.md)
 GET    /v1/boats                                     ✅
 POST   /v1/boats
 PATCH  /v1/boats/{id}
@@ -74,8 +80,10 @@ POST   /v1/bookings/{id}/cancel                      ✅  category, charge, reco
 POST   /v1/bookings/{id}/restore                     ✅
 POST   /v1/bookings/{id}/partial-cancel              ✅  by trip and pax key, refund split
 POST   /v1/bookings/{id}/reschedule                  ✅  from_date → to_date, reason, fee item
-POST   /v1/bookings/{id}/approve      over-capacity / FOC approval
-POST   /v1/bookings/{id}/reject
+POST   /v1/bookings/{id}/confirm                     ✅  the server decides confirmed, pending_foc or pending_approval
+POST   /v1/bookings/{id}/approve                     ✅  over-capacity / discount / FOC approval
+POST   /v1/bookings/{id}/reject                      ✅
+POST   /v1/bookings/{id}/cancel-weather              ✅
 GET    /v1/bookings/{id}/history                     ✅  every write appends; imported from sb_bookings__history
 addOns on POST/PATCH /v1/bookings, add_ons on reads ✅  (replaces PUT /add-ons, see addons-model.md)
 PUT    /v1/bookings/{id}/adjustments  price adjustments, upgrades (fee items are read-only on the booking, written by reschedule)
@@ -160,7 +168,9 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 
 - **Whole-state data routes:** `/api/load`, `/api/save`, `/api/v1/:resource` and
   `/api/v1/_batch`. The domain endpoints above take their place.
-- **Login and session routes:** `/api/login` and `/api/logout`. Authentik owns login.
+- **Login and session routes:** `/api/login` and `/api/logout` as legacy has them (cookie
+  sessions). ~~Authentik owns login.~~ **Corrected 2026-10-08:** login moves here instead: legacy's
+  users are imported and `POST /v1/login` issues Bearer tokens (`todo/login-permissions-model.md`).
 - **Browser-side state:** `_app_hooks` (app wiring), `nat_learn` (a nationality-guessing cache) and
   `agent_artifacts`.
 
@@ -174,7 +184,8 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 - **Live updates: a change feed or polling?** Legacy polls `/api/version` every 10s, deliberately,
   so that a broken B2C sync is still reported. Read the comment above that route before choosing.
 - **Permissions.** Legacy has per-area edit rights (`/api/users/perms`). `/v1/me` needs an
-  equivalent built from Authentik scopes.
+  equivalent, built from the imported users' areas rather than Authentik scopes: designed in
+  `todo/login-permissions-model.md`.
 - **Email images** (`/api/mailimg`, `/m/:id`) look like marketing, not operations. Confirm they can
   go.
 - **Resources mapped from field names only.** Check these with someone who uses the screens:

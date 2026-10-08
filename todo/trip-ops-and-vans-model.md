@@ -469,7 +469,9 @@ The questions as they were asked:
 
 ## Open
 
-1. **The boat catalogue is stale, like routes were before `sync:routes`.** Four legacy boats are
+1. ~~**The boat catalogue is stale, like routes were before `sync:routes`.**~~ **Closed
+   2026-10-08:** `npm run sync:boats` (merged in `c68001a`) copies legacy's boats; run it before the
+   import so no deployment is skipped. The original note: Four legacy boats are
    missing. That's 66 active boat assignments here, and **29 legacy deployments the import skips
    today** ("boat not in catalogue"), so those seats are missing from our availability now. It
    needs a `sync:boats` (or an extension of `sync:routes`) before the boat FK, and before any

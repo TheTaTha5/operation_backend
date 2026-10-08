@@ -9,11 +9,14 @@ Order follows the cutover decision: **bookings first**.
 
 ## 0. Housekeeping (docs only, no approval needed)
 
-- `README.md` ("Authentik OIDC authentication", "Temporary password login") and
-  `todo/frontend-authentication.md` still describe Authentik as the login. Login now moves here.
-- `docs/booking-columns.md` describes a `booking_trip_meal_requirements` table that never shipped
-  and says special meals are not columns (they are), and lacks the trip columns from 014–015.
-- `docs/schema.md` / `docs/schema.html` (uncommitted) stop at migration 021: no rate type tables.
+- ~~`README.md` ("Authentik OIDC authentication", "Temporary password login") and
+  `todo/frontend-authentication.md` still describe Authentik as the login.~~ **Done 2026-10-08**
+  (`docs/cleanup`, merged through `docs/tidy`): the README says login moves here, and the browser
+  login plan is marked superseded.
+- ~~`docs/booking-columns.md` describes a `booking_trip_meal_requirements` table that never shipped
+  …~~ **Done 2026-10-08**, same branch: corrected against the migrations.
+- ~~`docs/schema.md` / `docs/schema.html` stop at migration 021.~~ **Done 2026-10-08**, same branch:
+  committed, through migration 023.
 - `todo/legacy-replacement.md` lists data only. It needs a second checklist: each business rule in
   legacy's `allotment_v2/js` (wt-lk-inbox), and the endpoint that will own it.
 

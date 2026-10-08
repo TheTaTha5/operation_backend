@@ -48,40 +48,51 @@ Deploys migrate themselves. `railway.json` runs `node dist/migrate.js` as `preDe
 
 ## Authentik OIDC authentication
 
-Operational API routes are protected when all of these environment variables are configured:
+> **Planned:** login moves to this service. Legacy's users are imported here and `POST /v1/login`
+> becomes the real login. The design (users, permissions, approvals) is pending in
+> `todo/login-permissions-model.md`. Until it ships, the two sections below describe what the code
+> does today (`src/auth.ts`).
+
+Once authentication is on, every API route needs a Bearer token, except `POST /v1/login`,
+`/health` and `/docs`. It is on when `OIDC_ISSUER` and `OIDC_AUDIENCE` are both set, or when
+`AUTH_JWT_SECRET` is set (see the next section):
 
 ```text
 AUTH_REQUIRED=true
 OIDC_ISSUER=https://auth.example.com/application/o/operation-backend
 OIDC_AUDIENCE=operation-backend
-CORS_ORIGIN=https://app.example.com
 ```
 
-`OIDC_ISSUER` is the issuer URL displayed by the Authentik OAuth2/OIDC provider; do not substitute the Authentik root URL. The API obtains the provider's JWKS URL from OIDC discovery and validates Bearer access tokens for the configured issuer and audience.
+`OIDC_ISSUER` is the issuer URL displayed by the Authentik OAuth2/OIDC provider; do not substitute the Authentik root URL. The API obtains the provider's JWKS URL from OIDC discovery and validates Bearer access tokens for the configured issuer and audience. A token must have a `sub` claim.
 
-The frontend must use Authorization Code with PKCE and send `Authorization: Bearer <access token>`. Configure the Authentik provider to emit either scopes or group names matching these permissions:
+Send `Authorization: Bearer <access token>` on every request. A missing, invalid or expired token is `401`. Permissions come from the token's `scope` claim (space-separated) or its `groups` claim; either may carry these names:
 
 | API area | Read permission | Write permission |
 | --- | --- | --- |
-| Bookings, seat locks, agents, markets, salespeople | `booking:read` | `booking:write` |
-| Manifest, allotment, deployments | `operations:read` | `operations:write` |
+| Everything under `/v1/` except `/v1/manifest`: routes, boats, availability, bookings, seat locks, agents, markets, salespeople, rate types | `booking:read` | `booking:write` |
+| `/operations/…` (deployments, allotment) and `/v1/manifest` | `operations:read` | `operations:write` |
+
+A `GET` needs the read permission; any other method needs the write permission. A token without it is `403`.
 
 ## Temporary password login (testing only)
 
 `POST /v1/login` exchanges a username/password for a short-lived Bearer token this service will
-itself accept. It is a deliberate, narrow exception to the "validate tokens, do not issue them"
-boundary above, meant for testing before a frontend integration exists — not a replacement for
-OIDC, and not meant to stay configured indefinitely.
+itself accept. Today its users are a plain-text list in an environment variable, so it is for
+testing only and not meant to stay configured as it is. The plan (above) is to make it the real
+login, with users imported from legacy.
 
 ```text
 AUTH_JWT_SECRET=<random string, e.g. `openssl rand -base64 32`>
 AUTH_PASSWORD_USERS=[{"username":"ops","password":"...","groups":["admin"]}]
 ```
 
-`AUTH_PASSWORD_USERS` is a JSON array; `groups` follows the same permission table above (`admin`
-grants everything). Both variables can be set alongside `OIDC_ISSUER`/`OIDC_AUDIENCE` — a request's
-Bearer token is checked against whichever of the two are configured. `POST /v1/login` itself is
-always public.
+`AUTH_PASSWORD_USERS` is a JSON array of `{username, password, groups}`; a malformed value stops
+the service at startup. `groups` follows the same permission table above (`admin` grants
+everything). Setting `AUTH_JWT_SECRET` turns authentication on by itself, even without OIDC. Both
+variables can be set alongside `OIDC_ISSUER`/`OIDC_AUDIENCE` — a request's Bearer token is checked
+against whichever of the two are configured. `POST /v1/login` itself is always public. It answers
+`400` when `username` or `password` is missing, and `401` for a wrong pair or when
+`AUTH_JWT_SECRET` is not set.
 
 ```bash
 curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
@@ -90,11 +101,12 @@ curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
 ```
 
 The token is HS256, signed with `AUTH_JWT_SECRET`, expires after 12 hours, and is otherwise an
-ordinary Bearer token: `Authorization: Bearer <access_token>` on any request. Rotate
+ordinary Bearer token: `Authorization: Bearer <access_token>` on any request. Its `sub` and
+`preferred_username` are the username, and it carries the user's `groups`. Rotate
 `AUTH_JWT_SECRET` (which invalidates every outstanding token) and remove these two variables once
 testing is done.
 
-The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. The health endpoint remains public. Authentication is deliberately disabled only when OIDC configuration is absent, which supports local tests; set `AUTH_REQUIRED=true` in Railway so an incomplete configuration prevents startup.
+The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. The health endpoint remains public. Authentication is off only when neither complete OIDC configuration (`OIDC_ISSUER` and `OIDC_AUDIENCE`) nor `AUTH_JWT_SECRET` is set, which supports local tests; set `AUTH_REQUIRED=true` in Railway so that case stops the service at startup instead.
 
 ## API
 
@@ -248,8 +260,8 @@ Field notes:
   order: `market`, `sales`, `pay_type`, `rate_type`, `programs`, `contact`. This is legacy's
   `agIncompleteFields`. Any one of email, phone or contact counts as contact.
 - **`programs`** are the routes the agent may sell. `book_from`/`book_to` is the booking window sales
-  entered, and `null` means open. Travel dates are not stored: they come from the rate type, which
-  has no endpoint yet.
+  entered, and `null` means open. Travel dates are not stored: they come from the rate type (see
+  [Rate types](#rate-types)).
 - **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
 - **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). It
   is not validated yet. The foreign key is a migration that can only ship after the import has run
