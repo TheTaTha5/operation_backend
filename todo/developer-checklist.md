@@ -28,6 +28,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     `409 stale_version` as "someone changed this; reload".
   - the agent's season table reads and saves `GET/PUT /v1/agents/{id}/rate-seasons`, and prices can
     use `GET /v1/agents/{id}/rate-type?date=` instead of computing it.
+  - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`); it
+    will soon be the only price a booking saves.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
   amend and cancel.

@@ -1295,6 +1295,63 @@ A row that does not fit is `400` naming it (`adjustments[1].value must be a numb
 are client facts. What they add up to is still sent as `price_discount` and `price_extra` until the
 quote computes it (`todo/pricing-model.md`). The legacy import brings them with each booking.
 
+### Quote
+
+`POST /v1/quote` prices a booking the way legacy does, and saves nothing. Any login may ask (a login
+tied to an agent, for that agent only). The rule is `priceBooking` (`src/domain/pricing.ts`), proven
+on 4,352 of legacy's own bookings: each re-prices exactly as legacy stored it, seats, add-ons, FOC
+value, discount, extras, total and every trip's subtotal (`test/quote-legacy.test.ts`). Legacy's
+quirks are kept on purpose, marked "legacy:" in the code.
+
+The body is a booking's (`agent_id`, `booking_date`, `trips`, `add_ons`, `adjustments`, `price_mode`,
+`manual_total`, `staff_purpose`, `rate_type_ref`), plus:
+
+| Field | Meaning |
+|---|---|
+| `trips[].ovn_charge` (`ovnCharge`) | An overnight trip's charge, added to extras |
+| `trips[].charter_price_mode` (`charterPriceMode`), `charter_price_manual` | `manual` prices a charter by hand |
+| `booking_id` | This is an edit of that booking: a trip that is still the one it was sold as keeps its rate |
+| `rate` | `kept` (the default with `booking_id`) or `agent`: re-price at today's rate |
+
+```jsonc
+{ "price_mode": "rate", "seat": 7400, "add_on": 600, "foc_discount": -1700, "discount": -800, "extra": 500, "total": 7700,
+  "trips": [{ "subtotal": 7400, "rate_type_id": "rt003", "promo_id": null, "rate_source": "season" }],
+  "add_ons": [{ "amount": 600, "counted": true }],
+  "warnings": [{ "code": "not_offered", "trip": 1, "message": "trips[1]: r12 zone PK has no price: ฿0" }] }
+```
+
+How a price is reached, as legacy reaches it:
+
+- **The rate for a trip:** on an edit, the rate it was sold at; else the agent's rate season for the
+  travel date, else the agent's rate, else `rate_type_ref` (`rate_source` says which). An active
+  promo of the agent covering the route and date (and the booking date, when it has a book window)
+  is laid over it: highest `priority`, then the latest start.
+- **Seats:** foreign and Thai adult and child prices × the pax; infants are free. Both adult prices 0
+  means not offered (฿0, with a warning). A paid longtail bundle adds its price per adult and child.
+- **Charters:** the boat type's starter price, plus each passenger over the included number
+  (infants and FOC count), plus a paid bundle; or the charter's manual price.
+- **Add-ons:** from the first trip's rate (never a promo): longtail join and charter, private
+  transfers. An add-on type the rate has no price for is ฿0, with a warning. A longtail join is left
+  out of the total when a trip's route has a longtail bundle (`counted: false`).
+- **Total:** seats + add-ons − discounts (a percent of seats + add-ons, or an amount) + extras +
+  overnight charges, never below 0. `foc_discount` is the value given away free: shown, never
+  subtracted.
+- **Priced by hand** (`price_mode: manual`): the total is `manual_total`; adjustments and overnight
+  charges do not apply. Company bookings are always by hand, staff inspection by hand at 0, staff
+  welfare by rate, a walk-in either, every other agent by rate: a `price_mode` that contradicts this
+  is `400`.
+- **B2C bookings** (`booking_id` of one whose `external_id` starts `b2c_`): the price Love Kingdom
+  set, as stored (`"stored": true`); legacy never re-prices them.
+
+`400` for an unknown `agent_id`, a bad `rate`, a negative charge, or anything a booking create
+refuses; `404` for an unknown `booking_id`. Bookings still store the price the client sends; the
+server pricing them itself is the next step (`todo/pricing-model.md`).
+
+**Rebuilding the proof** after a deliberate pricing change: load a scratch database with
+`sync:routes`, `sync:boats`, `import-legacy.ts --commit` and `import:contracts --commit`, then
+`SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/build-quote-fixture.ts`. It lists what
+it could not reproduce and why.
+
 ### Agent seat locks
 
 - `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).
