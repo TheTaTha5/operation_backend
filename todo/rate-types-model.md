@@ -15,9 +15,8 @@ ALTER TABLE agents ADD CONSTRAINT agents_rate_type_fk FOREIGN KEY (rate_type_id)
 1. **Lost prices are re-entered by hand** (agreed 2026-10-07): RN prices, longtail charter rows,
    transfer prices outside r4/5/6/10/11/12, every bundle's `applies_to`. The data that does exist
    shows where to look: the 4 Ranong route rows, the 2 `paid` bundles.
-2. **Agent rate seasons live only in browsers** (`pricing-model.md`). Export
-   `localStorage['loveandaman_v2'].sb_agents_rate_bindings` from the machine that set them up, or
-   re-enter them.
+2. **Agent rate seasons live only in browsers.** Sales re-enter them once the endpoints exist
+   (`pricing-model.md`, step 2).
 3. **Custom add-ons:** keep (priced once a quote exists) or drop? Left out until decided.
 4. **`nationality_scope` does not restrict pricing in legacy** (spec Q2). Decided with the quote.
 
