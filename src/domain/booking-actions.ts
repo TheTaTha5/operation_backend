@@ -414,6 +414,14 @@ export function createHeader(header: BookingHeader, actor: string | undefined, n
 export const confirmationStamp = (actor: string | undefined, now: string): Pick<BookingHeader, 'confirmed_at' | 'confirmed_by'> =>
   (actor === undefined ? { confirmed_at: now } : { confirmed_at: now, confirmed_by: actor });
 
+/**
+ * A create whose `external_id` already names a booking: usually a retry after a timeout. Refused
+ * with the existing booking's id, so the caller can read it instead of creating a second one.
+ * `bookingId` is unknown only when a concurrent create won the race inside PostgreSQL.
+ */
+export const externalIdTaken = (externalId: string, bookingId?: string): never =>
+  refuse(`external_id ${externalId} is already ${bookingId ? `booking ${bookingId}` : 'used by another booking'}`, 409, 'duplicate_external_id');
+
 /** Statuses a booking can no longer be edited in (legacy `bkV2EditBooking`: "Cannot edit a … booking"). */
 const CLOSED: readonly BookingStatus[] = ['cancelled', 'completed', 'rejected', 'cancelled_weather'];
 export function assertEditable(status: BookingStatus): void {

@@ -166,10 +166,10 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 
 ## 7. Known gaps, read before going live
 
-- **Retrying a create is not safe yet.** If `POST /v1/bookings` times out and you resend the same
-  `external_id`, production answers `500`, not "already exists". There is no lookup by
-  `external_id` either. Until we fix it, after a timeout search
-  `GET /v1/bookings?agent_id=…&date=…` for your booking before you resend.
+- **Retrying a create.** If `POST /v1/bookings` times out, resend it with the same `external_id`.
+  If the first one was written, the retry answers `409` with `code: "duplicate_external_id"` and
+  the message `external_id LOV-… is already booking booking_…`: read that booking with
+  `GET /v1/bookings/{id}` instead of creating it again. Nothing is written twice.
 - **Thai/foreign split.** You store `paxThai` / `paxForeign` as totals, while we need them per
   category (`ad_th` vs `chd_th`). If you can't split them, send the untiered keys (`ad`, `chd`,
   `inf`, `foc`) and agree the rule with ops.

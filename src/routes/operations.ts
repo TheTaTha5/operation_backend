@@ -260,7 +260,8 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
   app.addHook('preHandler', async (request) => {
     const path = request.url.split('?')[0];
     if (path === '/v1/login') return;
-    const isWrite = request.method !== 'GET';
+    // GET, HEAD and OPTIONS change nothing, so they need only the read scope.
+    const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
     // A route's calendar is operations configuration, as deployments are, not a booking write.
     const isOperations = path.startsWith('/operations/') || path === '/v1/manifest' || (isWrite && path.startsWith('/v1/routes/'));
     const user = await authenticator.authenticate(request);
