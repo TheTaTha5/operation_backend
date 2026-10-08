@@ -161,6 +161,48 @@ export function samePickup(legacy: unknown, start: unknown, end: unknown, atPier
   return (want.endsWith('-') ? want.slice(0, -1) : want) === got;
 }
 
+/**
+ * The departures a legacy seat lock holds seats on, written from legacy's rules
+ * (`bkV2LockRange`, `bkV2LockDowOk`, `bkV2LockPendOn`, `releasedDates`; 08-app.js:2886-3270), not
+ * from the importer's: a day lock is its one date; a bulk lock every date `datefrom..dateto` on its
+ * weekdays (`dow`, empty = all); a month lock its whole months; each only on a day the route runs
+ * (`isOpen`). Seats are `qty` less that date's pending seats; a date released by hand, or a lock no
+ * longer active, holds nothing (`holding` false).
+ */
+export function legacyLockDays(lock: Row, isOpen: (date: string) => boolean): { date: string; pax: number; holding: boolean }[] {
+  const s = (v: unknown) => (v == null ? '' : String(v).trim());
+  const parse = (v: unknown): unknown => { try { return s(v) ? JSON.parse(s(v)) : undefined; } catch { return undefined; } };
+  const qty = Math.trunc(Number(lock.qty) || 0);
+  const active = s(lock.status) === 'active';
+  const scope = s(lock.scope);
+  if (scope !== 'bulk' && scope !== 'month') {
+    const pax = qty - Math.max(0, Math.trunc(Number(lock.pendqty) || 0));   // pending seats reserve nothing, day locks too
+    return /^\d{4}-\d{2}-\d{2}$/.test(s(lock.date)) ? [{ date: s(lock.date), pax, holding: active }] : [];
+  }
+  let from = s(lock.datefrom), to = s(lock.dateto) || from;
+  if (scope === 'month') {
+    const a = s(lock.monthfrom) || s(lock.month), b = s(lock.monthto) || a;
+    if (!/^\d{4}-\d{2}$/.test(a) || !/^\d{4}-\d{2}$/.test(b)) return [];
+    from = `${a}-01`;
+    to = `${b}-${String(new Date(Date.UTC(Number(b.slice(0, 4)), Number(b.slice(5, 7)), 0)).getUTCDate()).padStart(2, '0')}`;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return [];
+  const dowList = parse(lock.dow), dow = Array.isArray(dowList) && dowList.length ? new Set(dowList.map(Number)) : undefined;
+  const releasedValue = parse(lock.releaseddates);
+  const released = new Set(Array.isArray(releasedValue) ? releasedValue.map(String)
+    : releasedValue && typeof releasedValue === 'object' ? Object.keys(releasedValue).filter((k) => (releasedValue as Row)[k]) : []);
+  const pend = (parse(lock.pendby) ?? {}) as Row;
+  const out: { date: string; pax: number; holding: boolean }[] = [];
+  for (let d = new Date(`${from}T00:00:00Z`), n = 0; d <= new Date(`${to}T00:00:00Z`) && n < 800; d.setUTCDate(d.getUTCDate() + 1), n++) {
+    const date = d.toISOString().slice(0, 10);
+    if (dow && !dow.has(d.getUTCDay())) continue;
+    if (!isOpen(date)) continue;
+    const pax = qty - Math.max(0, Math.trunc(Number(pend[date]) || 0));
+    if (pax > 0) out.push({ date, pax, holding: active && !released.has(date) });
+  }
+  return out;
+}
+
 /** Ids in one set and not the other. */
 export function setDiff(legacy: Iterable<string>, here: Iterable<string>): { missing: string[]; extra: string[] } {
   const a = new Set(legacy), b = new Set(here);

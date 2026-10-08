@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
-  canonicalPickup, countDiff, legacyPax, legacyValue, same, samePickup, setDiff, targetPax, templateNames, unreadColumns,
+  canonicalPickup, countDiff, legacyLockDays, legacyPax, legacyValue, same, samePickup, setDiff, targetPax, templateNames, unreadColumns,
 } from '../src/tools/verify-legacy.js';
 
 test('values compare by meaning, not by spelling', () => {
@@ -76,4 +76,15 @@ test('names the import code builds count as read; messages and bare joins do not
     .map((column) => ({ table: 't', column, filled: 1 }));
   assert.deepEqual(unreadColumns(cols, source).map((c) => c.column), ['rn_adult_fr', 'travelfrom'],
     'pk_/kl_ seat columns are COMPOSED_READS; rn_ is not, so it is reported');
+});
+
+test('legacy locks become their departures, written from legacy\'s rules', () => {
+  const open = () => true;
+  assert.deepEqual(legacyLockDays({ scope: 'day', status: 'active', qty: 10, pendqty: 3, date: '2026-11-03' }, open), [{ date: '2026-11-03', pax: 7, holding: true }]);
+  // 2026-11-01 is a Sunday; [2,4] is Tuesday and Thursday; the 5th was released by hand.
+  const bulk = { scope: 'bulk', status: 'active', qty: 30, datefrom: '2026-11-01', dateto: '2026-11-08', dow: '[2,4]', releaseddates: '["2026-11-05"]' };
+  assert.deepEqual(legacyLockDays(bulk, open), [{ date: '2026-11-03', pax: 30, holding: true }, { date: '2026-11-05', pax: 30, holding: false }]);
+  assert.deepEqual(legacyLockDays(bulk, (d) => d !== '2026-11-03').map((d) => d.date), ['2026-11-05'], 'only days the route runs');
+  assert.equal(legacyLockDays({ scope: 'month', status: 'depleted', qty: 2, monthfrom: '2026-02', monthto: '2026-02' }, open).length, 28);
+  assert.deepEqual(legacyLockDays({ scope: 'bulk', status: 'released', qty: 0 }, open), []);
 });

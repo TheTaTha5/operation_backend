@@ -25,8 +25,9 @@
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from 'pg';
+import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import {
-  BOOKING_HEADER, countDiff, legacyPax, legacyValue, RELEASED, same, samePickup, setDiff, targetPax, unreadColumns, type Row,
+  BOOKING_HEADER, countDiff, legacyLockDays, legacyPax, legacyValue, RELEASED, same, samePickup, setDiff, targetPax, unreadColumns, type Row,
 } from './verify-legacy.js';
 
 const PREFIX = 'lg_';
@@ -64,7 +65,8 @@ async function main() {
     const lTrips = groupBy(await L('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx'), 'sb_bookings_id');
     const lPassengers = groupBy(await L('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx'), 'sb_bookings_id');
     const lHistory = new Map((await L('SELECT sb_bookings_id AS id, count(*)::int AS n FROM sb_bookings__history GROUP BY 1')).map((r) => [str(r.id), Number(r.n)]));
-    const lLocks = await L('SELECT id, routeid, date, qty, status, scope, parentid FROM sb_seat_locks');
+    const lLocks = await L(`SELECT id, routeid, date, qty, status, scope, parentid, pendqty, pendby, datefrom, dateto, dow,
+      month, monthfrom, monthto, releaseddates FROM sb_seat_locks`);
     const lBoatDays = await L('SELECT trips_id, key, value FROM trips__boat');
     const lOverrides = await L('SELECT key FROM boat_capovr');
 
@@ -112,18 +114,33 @@ async function main() {
     check(1, 'history lines per booking', both.length, historyDiff);
 
     // ── level 1 · locks, deployments, overrides, catalogues ──
+    // A lock here is one route on one date: a legacy lock spanning days is expected as one lock per
+    // departure (`lg_<id>_<date>`), on the days its route runs here (legacyLockDays).
+    const calendar = routeCalendar(
+      (await T('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons')) as RouteSeason[],
+      (await T('SELECT route_id, service_date::text, kind FROM route_day_overrides')) as RouteDayOverride[]);
     const parents = lLocks.filter((l) => !str(l.parentid));
-    const lockPresence = setDiff(parents.map((l) => PREFIX + str(l.id)), tLocks.map((l) => str(l.id)));
-    const lockById = new Map(parents.map((l) => [PREFIX + str(l.id), l]));
-    // Locks still holding seats first: a released or empty lock missing here costs nothing.
+    const spans = (l: Row) => ['bulk', 'month'].includes(str(l.scope));
+    const departures = new Map(parents.map((l) => [str(l.id), legacyLockDays(l, (date) => calendar.isOpen(str(l.routeid), date))]));
+    const expectedIds = new Map<string, Row>();   // imported id → its legacy lock
+    for (const l of parents) {
+      if (!spans(l)) { expectedIds.set(PREFIX + str(l.id), l); continue; }
+      for (const d of departures.get(str(l.id))!) expectedIds.set(`${PREFIX}${str(l.id)}_${d.date}`, l);
+    }
+    const lockPresence = setDiff(expectedIds.keys(), tLocks.map((l) => str(l.id)));
+    // One line per legacy lock, those still holding seats first: a released or empty one costs nothing.
     const holding = (l: Row) => str(l.status) === 'active' && Number(l.qty) > 0;
-    const missingLocks = lockPresence.missing.map((id) => lockById.get(id)!).sort((a, b) => Number(holding(b)) - Number(holding(a)));
+    const missingByLock = new Map<Row, number>();
+    for (const id of lockPresence.missing) { const l = expectedIds.get(id)!; missingByLock.set(l, (missingByLock.get(l) ?? 0) + 1); }
+    const missingLocks = [...missingByLock].sort((a, b) => Number(holding(b[0])) - Number(holding(a[0])));
     const lockKinds = new Map<string, number>();
-    for (const l of missingLocks) add(lockKinds, `scope ${str(l.scope) || 'day'}, ${str(l.status) || '(blank)'}${Number(l.qty) > 0 ? '' : ', 0 seats'}`, 1);
-    check(1, 'seat locks present (sub-locks fold into their parent)', parents.length,
-      missingLocks.map((l) => `${str(l.id)} missing (scope ${str(l.scope) || 'day'}, status ${str(l.status)}, ${str(l.routeid)} ${str(l.date) || 'no date'}, ${str(l.qty)} seat(s))`),
-      [...[...lockKinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${String(n).padStart(5)} missing: ${k}`),
-        ...(lockPresence.extra.length ? [`${lockPresence.extra.length} imported lock(s) no longer in legacy`] : [])]);
+    for (const [l] of missingLocks) add(lockKinds, `scope ${str(l.scope) || 'day'}, ${str(l.status) || '(blank)'}${Number(l.qty) > 0 ? '' : ', 0 seats'}`, 1);
+    const bulkDepartures = parents.filter(spans).reduce((n, l) => n + departures.get(str(l.id))!.length, 0);
+    check(1, 'seat locks present (sub-locks fold into their parent; bulk = one per departure)', expectedIds.size,
+      missingLocks.map(([l, n]) => `${str(l.id)} missing${spans(l) ? ` ${n} departure(s)` : ''} (scope ${str(l.scope) || 'day'}, status ${str(l.status)}, ${str(l.routeid)} ${str(l.date) || `${str(l.datefrom) || str(l.monthfrom) || str(l.month)}..`}, ${str(l.qty)} seat(s))`),
+      [`${parents.filter(spans).length} legacy lock(s) span days: ${bulkDepartures} departure(s) expected`,
+        ...[...lockKinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${String(n).padStart(5)} lock(s) missing: ${k}`),
+        ...(lockPresence.extra.length ? [`${lockPresence.extra.length} imported lock(s) legacy does not have`] : [])]);
 
     const legacyDeployments = new Map<string, string>(); // day::boat → route
     for (const bd of lBoatDays) {
@@ -187,6 +204,52 @@ async function main() {
       });
     }
     check(3, 'booking status', both.length, statusDiff);
+
+    // Approvals: legacy keeps one of each kind on the booking row (`approval_*`, `focapproval_*`).
+    const apCols = await tCols('booking_approvals');
+    if (apCols.size) {
+      const tApprovals = groupBy(await T(`SELECT ap.booking_id, ap.kind, ap.status, ${apCols.has('reason') ? 'ap.reason' : 'NULL::text AS reason'},
+          ap.over_capacity, ap.foc_count, ap.decided_by, (SELECT count(*) FROM booking_approval_days d WHERE d.approval_id = ap.id)::int AS days
+        FROM booking_approvals ap WHERE ap.booking_id LIKE '${PREFIX}%'`), 'booking_id');
+      const approvalDiff: string[] = [];
+      const kinds = new Map<string, number>();
+      let compared = 0;
+      for (const b of both) {
+        const id = str(b.id), rows = tApprovals.get(str(byExternal.get(id)!.id)) ?? [];
+        for (const [kind, prefix] of [['approval', 'approval_'], ['foc', 'focapproval_']] as const) {
+          const status = str(b[`${prefix}status`]);
+          const want = ['pending', 'approved', 'rejected'].includes(status);
+          const got = rows.filter((r) => str(r.kind) === kind);
+          if (!want && !got.length) continue;
+          compared++;
+          const d: string[] = [];
+          if (want && got.length !== 1) d.push(`${got.length} row(s), want 1`);
+          else if (!want) d.push(`legacy has none (status "${status}"), here ${got.length}`);
+          else {
+            const r = got[0]!;
+            if (status !== str(r.status)) d.push(`status ${status} → ${str(r.status)}`);
+            const decided = status !== 'pending';
+            if (decided && !same(b[`${prefix}approvedby`], r.decided_by, 'text')) d.push(`decided_by "${str(b[`${prefix}approvedby`])}" → "${str(r.decided_by)}"`);
+            if (kind === 'foc' && !same(b.focapproval_count, r.foc_count, 'number')) d.push(`foc_count ${str(b.focapproval_count)} → ${str(r.foc_count)}`);
+            if (kind === 'approval') {
+              let days = 0;
+              try {
+                const over = JSON.parse(str(b.approval_over) || '[]');
+                if (Array.isArray(over)) days = new Set(over.filter((o: Row) => str(o.routeId) && /^\d{4}-\d{2}-\d{2}$/.test(str(o.date)) && Number(o.need) > 0 && Number(o.overBy) > 0)
+                  .map((o: Row) => `${str(o.routeId)} ${str(o.date)}`)).size;
+              } catch { /* unreadable: no days */ }
+              if (apCols.has('reason') && !same(b.approval_reason, r.reason, 'text')) d.push(`reason "${str(b.approval_reason)}" → "${str(r.reason)}"`);
+              const over = /over_cap/.test(str(b.approval_reason)) || days > 0;
+              if (over !== (r.over_capacity === true)) d.push(`over_capacity ${over} → ${String(r.over_capacity)}`);
+              if (days !== Number(r.days)) d.push(`days ${days} → ${String(r.days)}`);
+            }
+          }
+          if (d.length) { approvalDiff.push(`${id} ${kind}: ${d.join('; ')}`); for (const x of d) add(kinds, `${kind} ${x.replace(/\s.*$/, '')}`, 1); }
+        }
+      }
+      check(3, 'approvals (over-allotment/discount and FOC)', compared, approvalDiff,
+        [...kinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${String(n).padStart(5)} differ in ${k}`));
+    }
     check(3, 'booking header fields', both.length, headerDiff,
       [...perField].sort((a, b) => b[1] - a[1]).map(([f, n]) => `${String(n).padStart(5)} booking(s) differ in ${f}`));
     // Grouped by what differs, so 4,000 trips with the same pickup problem read as one line.
@@ -225,9 +288,9 @@ async function main() {
     check(4, 'booking totals per month (THB, bookings that hold seats)', new Set([...lMoney.keys(), ...tMoney.keys()]).size, countDiff(lMoney, tMoney));
 
     const lLocked = new Map<string, number>(), tLocked = new Map<string, number>();
-    for (const l of parents) if (str(l.status) === 'active' && str(l.date)) add(lLocked, `${str(l.routeid)} ${str(l.date)}`, Math.trunc(Number(l.qty) || 0));
+    for (const l of parents) for (const d of departures.get(str(l.id))!) if (d.holding) add(lLocked, `${str(l.routeid)} ${d.date}`, d.pax);
     for (const l of tLocks) if (str(l.status) === 'active') add(tLocked, `${str(l.route_id)} ${str(l.day)}`, Number(l.pax) || 0);
-    check(4, 'active locked seats per route and day (dated locks)', new Set([...lLocked.keys(), ...tLocked.keys()]).size, countDiff(lLocked, tLocked));
+    check(4, 'locked seats per route and day (active locks, bulk ones per departure)', new Set([...lLocked.keys(), ...tLocked.keys()]).size, countDiff(lLocked, tLocked));
     const lBoats = new Map<string, number>(), tBoats = new Map<string, number>();
     for (const [k, r] of legacyDeployments) if (r) add(lBoats, `${r} ${k.split('::')[0]}`, 1);
     for (const [k, r] of targetDeployments) add(tBoats, `${r} ${k.split('::')[0]}`, 1);
