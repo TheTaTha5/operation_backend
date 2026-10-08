@@ -33,8 +33,8 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/operations
       LOG_LEVEL: info
-      # Off: a request with no token is let through, for curl and Swagger. A token that is sent is
-      # still checked. `/v1/login` issues them to the users below, which is how the legacy app logs in.
+      # With AUTH_JWT_SECRET set every request needs a Bearer token, which `/v1/login` issues to the
+      # users below: that is how the legacy app logs in. For curl, POST /v1/login as admin first.
       AUTH_REQUIRED: "false"
       AUTH_JWT_SECRET: local-development-only-not-a-real-secret
       AUTH_PASSWORD_USERS: '[{"username":"admin","password":"admin","groups":["admin"]}]'

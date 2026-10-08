@@ -54,8 +54,10 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
   compose file). A change to its files shows on reload; a change to its `server.js` needs
   `docker compose restart integration`.
 - **The API ignores `.env`.** Its `DATABASE_URL` is set in the compose file, so it can never write
-  to Railway. Authentication is off (`AUTH_REQUIRED=false`). `LOCAL_CORS_ORIGIN` in `.env`
-  changes the browser origin allowed to call it (default `http://localhost:5173`).
+  to Railway. Every request needs a Bearer token: get one with
+  `curl -X POST localhost:3000/v1/login -H 'content-type: application/json' -d '{"username":"admin","password":"admin"}'`.
+  `LOCAL_CORS_ORIGIN` in `.env` changes the browser origins allowed to call it (default
+  `http://localhost:8791,http://localhost:5173`).
 - **The sync tools and the import** run from the host against the local copies:
 
   ```bash
