@@ -41,12 +41,13 @@ import { bookingHeader } from '../domain/booking-header.js';
 import { holdsSeats, isBookingStatus } from '../domain/booking-status.js';
 import { parsePaxGrid, type PaxRow } from '../domain/pax.js';
 import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/operations.js';
-import { isIsoTime, routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { isIsoTime } from '../domain/calendar.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
 import { lockDays, spansDays } from './legacy-locks.js';
+import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
