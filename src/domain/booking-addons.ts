@@ -2,7 +2,7 @@
  * A booking's add-ons — longtail join/charter, private transfers, B2C extras.
  *
  * `addOns[]` is unbounded, so it is a table (`booking_addons`), not columns — see
- * `todo/addons-model.md`. The list replaces outright on an amendment, the way `passengers` does.
+ * `README.md`, "Add-ons". The list replaces outright on an amendment, the way `passengers` does.
  *
  * Nothing is filled in. A missing `qty` stays missing rather than becoming 1, and a missing join
  * count stays missing rather than becoming 0: for a longtail join, "not narrowed down" means

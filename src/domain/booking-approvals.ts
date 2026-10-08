@@ -4,8 +4,8 @@
  * Legacy decides the status in the browser when a booking is saved (`bkV2SubmitBooking`,
  * `bkV2CommitBooking`): the user presses "Save as quote" or "Confirm", and the save turns that into
  * `quote`, `confirmed`, `pending_foc` or `pending_approval` from the facts. Here the client sends
- * only which it was — the **intent** — and the server decides (todo/booking-authority-model.md,
- * phase 2). Pure, so both stores decide identically.
+ * only which it was — the **intent** — and the server decides (`README.md`, how the
+ * status is decided). Pure, so both stores decide identically.
  */
 import { holdsSeats, type BookingStatus } from './booking-status.js';
 import type { HistoryLine } from './booking-actions.js';
@@ -138,7 +138,7 @@ export function decideStatus(intent: Intent, facts: StatusFacts, by: string | un
  *
  * A discount on the waiting approval is carried over: an edit does not re-ask for it, and does not
  * clear it either. (Legacy re-asks on every "Confirm" save of a discounted booking; this service
- * weighs the discount when the booking is created or confirmed — todo/booking-authority-model.md.)
+ * weighs the discount when the booking is created or confirmed.)
  */
 export function reweigh(
   current: { status: BookingStatus; approvals?: readonly BookingApproval[] }, overDays: readonly ApprovalDay[], by: string | undefined,

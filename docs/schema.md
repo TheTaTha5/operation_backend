@@ -622,7 +622,7 @@ The `agents` box shows the structural columns. The rest describe the agent:
 
 The price lists agents are sold at (migration 022). A rate type is a header; every price hangs off
 one of its routes. The API reads and writes them, and the legacy import fills them with legacy's
-ids. Nothing prices a booking from them yet. The design is in `todo/rate-types-model.md`.
+ids. Nothing prices a booking from them yet. The API is in `README.md`, "Rate types"; pricing is `todo/pricing-model.md`.
 
 ```mermaid
 erDiagram
@@ -738,7 +738,7 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_partial_cancels.booking_trip_id` | `booking_trips` | Deliberate: the record must outlive a trip a later edit removes (020). |
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
-| `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings (`todo/rate-types-model.md`). |
+| `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer

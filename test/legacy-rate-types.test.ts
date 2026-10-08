@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { mapLegacyRateTypes, type LegacyRateTypeTables } from '../src/tools/legacy-rate-types.js';
 
 // Fixture rows in the shape of legacy's `operation_schemas.sb_rate_types*` tables, including the
-// cases the 2026-10-07 data check found on production (todo/rate-types-model.md, "Data check").
+// cases the 2026-10-07 data check found on production.
 const catalogue = new Map([['r4', { pier: 'tublamu' }], ['r5', { pier: 'panwa' }], ['r10', { pier: 'panwa' }], ['rn1', { pier: 'ranong' }]]);
 const sales = new Set(['s01']);
 

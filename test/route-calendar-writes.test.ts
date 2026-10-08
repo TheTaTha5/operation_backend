@@ -4,7 +4,7 @@ import type { InjectOptions } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { applyCalendarChange, assertCloseAllowed, routeCalendar, todayInThailand } from '../src/domain/calendar.js';
 
-// Settings → Programs as an API: `todo/route-calendar-rules-model.md`, section 4 and decision 7.
+// Settings → Programs as an API: `README.md`, "Editing the calendar".
 // Runs against whichever store DATABASE_URL picks. `test-calendar` has no seasons and is booked by no
 // other test file (`test/setup.ts`); the in-process app has no catalogue, so it accepts any route id.
 

@@ -5,7 +5,7 @@ import { assertRoutesOpen, isLegacyB2C, routeCalendar, type RouteSeason } from '
 import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type DayDemand } from '../src/domain/capacity.js';
 import { OperationsStore, tripsToCheckOpen, type BookingTripInput, type StoredTrip } from '../src/domain/operations.js';
 
-// Closed days, land routes and a marine day with no boat: `todo/route-calendar-rules-model.md`.
+// Closed days, land routes and a marine day with no boat: `README.md`, "Land routes and days with no boat".
 
 const refused = (work: () => unknown, statusCode: number, code: string | undefined, message?: RegExp): void => {
   assert.throws(work, (error: Error & { statusCode?: number; code?: string }) => {
