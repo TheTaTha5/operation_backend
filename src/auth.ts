@@ -113,6 +113,23 @@ export class OidcAuthenticator {
   }
 
   /**
+   * Love Kingdom's server reads availability with the `X-Api-Key` header it already sends legacy's
+   * `/api/b2c/availability`, matched against `B2C_API_KEY`. The key grants `availability:read` and
+   * nothing else, so it can never book. Undefined when the request carries no key: the Bearer token
+   * decides then. A key that is sent and wrong is `401`, never a silent fall-through to Bearer.
+   */
+  authenticateApiKey(request: FastifyRequest): AuthenticatedUser | undefined {
+    const sent = request.headers['x-api-key'];
+    if (sent === undefined) return undefined;
+    const key = process.env.B2C_API_KEY;
+    if (!key) unauthorized('X-Api-Key is not accepted: B2C_API_KEY is not set');
+    if (typeof sent !== 'string' || !safeEqual(sent, key)) unauthorized('Invalid X-Api-Key');
+    const user: AuthenticatedUser = { subject: 'love-kingdom', username: 'love-kingdom', scopes: ['availability:read'], groups: [] };
+    request.user = user;
+    return user;
+  }
+
+  /**
    * Temporary testing login: exchanges a username/password from `AUTH_PASSWORD_USERS` for a
    * short-lived HS256 token signed with `AUTH_JWT_SECRET`. This is a deliberate, scoped exception
    * to this service's normal "validate tokens, do not issue them" boundary — see CLAUDE.md.

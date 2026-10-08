@@ -272,8 +272,10 @@ export function registerOperationsRoutes(app: FastifyInstance, _options: object,
     const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(request.method);
     // A route's calendar is operations configuration, as deployments are, not a booking write.
     const isOperations = path.startsWith('/operations/') || path === '/v1/manifest' || (isWrite && path.startsWith('/v1/routes/'));
-    const user = await authenticator.authenticate(request);
-    requireAnyScope(user, [isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read')]);
+    const user = authenticator.authenticateApiKey(request) ?? await authenticator.authenticate(request);
+    const scope = isOperations ? (isWrite ? 'operations:write' : 'operations:read') : (isWrite ? 'booking:write' : 'booking:read');
+    // Love Kingdom's API key (`availability:read`) opens availability and nothing else.
+    requireAnyScope(user, !isWrite && path === '/v1/availability' ? [scope, 'availability:read'] : [scope]);
   });
 
   /**

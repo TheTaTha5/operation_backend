@@ -185,6 +185,14 @@ testing is done.
 
 The `admin` group grants every permission. `CORS_ORIGIN` must contain the frontend's exact HTTPS origin (multiple values can be comma-separated); those origins may use `GET`, `HEAD`, `POST`, `PUT`, `PATCH` and `DELETE`. The health endpoint remains public. Authentication is off only when neither complete OIDC configuration (`OIDC_ISSUER` and `OIDC_AUDIENCE`) nor `AUTH_JWT_SECRET` is set, which supports local tests; set `AUTH_REQUIRED=true` in Railway so that case stops the service at startup instead.
 
+### Love Kingdom's API key
+
+Love Kingdom's server may read `GET /v1/availability` with an `X-Api-Key` header instead of a Bearer
+token, as it does legacy's `/api/b2c/availability`. The key is `B2C_API_KEY`, the same value legacy
+uses. It grants **availability only**: any other route answers `403`, so the key can never book.
+A wrong key is `401` even when a valid Bearer token is also sent, and so is any key while
+`B2C_API_KEY` is unset. Booking still needs a Bearer token with `booking:write`.
+
 ## API
 
 Dates are ISO `YYYY-MM-DD`; passenger counts (`pax`) and deployment `capacity` are positive integers. All availability calculations are scoped to `route_id` plus service date. A booking or seat lock on a day the route does not run is refused (`409 route_closed`, see "Closed days"). A marine day with no boat deployed yet sells without a seat check, and a land route has no seat limit (see "Land routes and days with no boat").

@@ -33,6 +33,10 @@ and **`booking:write`**.
 - **Testing now:** `POST /v1/login` with a test username and password that we issue. It returns a
   12-hour token. It is temporary and will be removed.
 
+**Availability only:** `GET /v1/availability` also accepts your existing `X-Api-Key` header (the
+`B2C_API_KEY` you send legacy's `/api/b2c/availability`) instead of a token. The key opens nothing
+else: every other call answers `403` with it, so booking still needs the token.
+
 Never call us from the browser or ship the credentials to the public `book/` page. Our server does
 not allow your browser origin (CORS), and a token in the page would let anyone book.
 
