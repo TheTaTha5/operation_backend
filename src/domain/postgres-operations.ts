@@ -26,6 +26,7 @@ import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import { pickupFields } from './pickup.js';
 import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
+import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanPatch, type VanStatusRange, type VanStatusRangeInput } from './vans.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
@@ -301,6 +302,17 @@ const byDay = <T extends QueryResultRow>(rows: T[]): Map<string, T[]> => {
   }
   return days;
 };
+
+const VAN_SELECT = 'SELECT id, name, plate, type, capacity, ownership, partner_name, zone_base, color, driver, driver_phone, active FROM vans';
+const vanRow = (r: Record<string, unknown>): Van => ({
+  id: r.id as string, name: r.name as string, plate: (r.plate as string) ?? null, type: (r.type as string) ?? null, capacity: Number(r.capacity),
+  ownership: r.ownership as Van['ownership'], partner_name: (r.partner_name as string) ?? null, zone_base: (r.zone_base as Van['zone_base']) ?? null,
+  color: (r.color as string) ?? null, driver: (r.driver as string) ?? null, driver_phone: (r.driver_phone as string) ?? null, active: r.active === true,
+});
+const RANGE_SELECT = 'SELECT id, van_id, status, from_date::text AS from_date, to_date::text AS to_date, note FROM van_status_ranges';
+const rangeRow = (r: Record<string, unknown>): VanStatusRange => ({
+  id: Number(r.id), van_id: r.van_id as string, status: r.status as VanStatusRange['status'], from_date: r.from_date as string, to_date: (r.to_date as string) ?? null, note: (r.note as string) ?? null,
+});
 
 /** PostgreSQL repository. Advisory transaction locks serialize one route/day capacity pool across all API instances. */
 export class PostgresOperationsStore {
@@ -1123,6 +1135,69 @@ export class PostgresOperationsStore {
     for (const [idx, s] of d.boat_splits.entries()) {
       await this.client().query('INSERT INTO booking_trip_boat_splits (booking_trip_id, idx, boat_id, ad, chd, inf, foc) VALUES ($1,$2,$3,$4,$5,$6,$7)', [tripId, idx, s.boat_id, s.ad, s.chd, s.inf, s.foc]);
     }
+  }
+
+  // ── Vans and the month matrix (migration 016, slice A3) ──
+  async listVans(): Promise<Van[]> { return (await this.client().query(`${VAN_SELECT} ORDER BY id`)).rows.map(vanRow); }
+  async van(id: string): Promise<Van | undefined> { const { rows: [row] } = await this.client().query(`${VAN_SELECT} WHERE id = $1`, [id]); return row && vanRow(row); }
+  async createVan(input: VanInput): Promise<Van> {
+    // Ids are numbered like legacy's; the lock keeps two concurrent creates from taking the same one.
+    await this.client().query("SELECT pg_advisory_xact_lock(hashtext('vans'))");
+    const id = nextVanId((await this.client().query('SELECT id FROM vans')).rows.map((r) => r.id as string));
+    await this.writeVan({ id, ...input }, true);
+    return (await this.van(id))!;
+  }
+  async updateVan(id: string, patch: VanPatch): Promise<Van | undefined> {
+    const van = await this.van(id);
+    if (!van) return undefined;
+    await this.writeVan(applyVanPatch(van, patch), false);
+    return this.van(id);
+  }
+  private async writeVan(v: Van, insert: boolean): Promise<void> {
+    const values = [v.id, v.name, v.plate, v.type, v.capacity, v.ownership, v.partner_name, v.zone_base, v.color, v.driver, v.driver_phone, v.active];
+    await this.client().query(insert
+      ? 'INSERT INTO vans (id, name, plate, type, capacity, ownership, partner_name, zone_base, color, driver, driver_phone, active) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)'
+      : 'UPDATE vans SET name = $2, plate = $3, type = $4, capacity = $5, ownership = $6, partner_name = $7, zone_base = $8, color = $9, driver = $10, driver_phone = $11, active = $12 WHERE id = $1', values);
+  }
+  async vanStatusRanges(vanId?: string): Promise<VanStatusRange[]> {
+    return (await this.client().query(`${RANGE_SELECT} WHERE $1::text IS NULL OR van_id = $1 ORDER BY van_id, id`, [vanId ?? null])).rows.map(rangeRow);
+  }
+  async addStatusRange(vanId: string, input: VanStatusRangeInput): Promise<VanStatusRange> {
+    const { rows: [row] } = await this.client().query('INSERT INTO van_status_ranges (van_id, status, from_date, to_date, note) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+      [vanId, input.status, input.from_date, input.to_date, input.note]);
+    return { id: Number(row.id), van_id: vanId, ...input };
+  }
+  async putStatusRange(r: VanStatusRange): Promise<void> {
+    await this.client().query('UPDATE van_status_ranges SET status = $2, from_date = $3, to_date = $4, note = $5 WHERE id = $1', [r.id, r.status, r.from_date, r.to_date, r.note]);
+  }
+  async deleteStatusRange(vanId: string, id: number): Promise<boolean> {
+    return (await this.client().query('DELETE FROM van_status_ranges WHERE van_id = $1 AND id = $2', [vanId, id])).rowCount === 1;
+  }
+  async vanDays(from: string, to: string): Promise<StoredVanDay[]> { return this.readVanDays('service_date BETWEEN $1 AND $2', [from, to]); }
+  async vanDay(vanId: string, date: string): Promise<StoredVanDay | undefined> { return (await this.readVanDays('van_id = $1 AND service_date = $2', [vanId, date]))[0]; }
+  /** A cell is a van_days row and its van_day_routes; both are rewritten, and nothing is left for an empty cell. */
+  private async readVanDays(where: string, params: unknown[]): Promise<StoredVanDay[]> {
+    const { rows } = await this.client().query(`
+      SELECT van_id, service_date::text AS service_date,
+        COALESCE((SELECT array_agg(r.route_id ORDER BY r.route_id) FROM van_day_routes r WHERE r.van_id = c.van_id AND r.service_date = c.service_date), '{}') AS route_ids,
+        d.status, d.driver, d.driver_phone, d.plate, d.sent_at
+      FROM (SELECT van_id, service_date FROM van_days WHERE ${where} UNION SELECT van_id, service_date FROM van_day_routes WHERE ${where}) c
+      LEFT JOIN van_days d USING (van_id, service_date)
+      ORDER BY van_id, service_date`, params);
+    return rows.map((r) => ({
+      van_id: r.van_id, service_date: r.service_date, route_ids: r.route_ids, status: r.status ?? null, driver: r.driver ?? null,
+      driver_phone: r.driver_phone ?? null, plate: r.plate ?? null, sent_at: r.sent_at ? (r.sent_at as Date).toISOString() : null,
+    }));
+  }
+  async setVanDay(day: StoredVanDay): Promise<void> {
+    const key = [day.van_id, day.service_date];
+    await this.client().query('DELETE FROM van_day_routes WHERE van_id = $1 AND service_date = $2', key);
+    for (const routeId of day.route_ids) await this.client().query('INSERT INTO van_day_routes (van_id, service_date, route_id) VALUES ($1,$2,$3)', [...key, routeId]);
+    const { route_ids: _r, ...fields } = day;
+    if (isEmptyVanDay({ ...day, route_ids: [] })) { await this.client().query('DELETE FROM van_days WHERE van_id = $1 AND service_date = $2', key); return; }
+    await this.client().query(`INSERT INTO van_days (van_id, service_date, status, driver, driver_phone, plate, sent_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (van_id, service_date) DO UPDATE SET status = EXCLUDED.status, driver = EXCLUDED.driver, driver_phone = EXCLUDED.driver_phone,
+        plate = EXCLUDED.plate, sent_at = EXCLUDED.sent_at`, [...key, fields.status, fields.driver, fields.driver_phone, fields.plate, fields.sent_at]);
   }
 
   async listUsers(): Promise<StoredUser[]> { return (await this.client().query('SELECT * FROM users ORDER BY id')).rows.map(storedUser); }

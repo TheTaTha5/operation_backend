@@ -28,6 +28,7 @@ import {
 import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { clearedOnMove, dispatchView, type StoredDispatch, type TripDispatch } from './dispatch.js';
+import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanPatch, type VanStatusRange, type VanStatusRangeInput } from './vans.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
 
@@ -568,6 +569,49 @@ export class OperationsStore {
     return undefined;
   }
   setDispatch(tripId: string, dispatch: StoredDispatch): void { this.dispatch.set(tripId, { ...dispatch, boat_splits: dispatch.boat_splits.map((s) => ({ ...s })) }); }
+
+  // ── Vans and the month matrix (migration 016, slice A3) ──
+  private vans = new Map<string, Van>();
+  private vanRanges: VanStatusRange[] = [];
+  private vanRangeSeq = 0;
+  private vanDayRows = new Map<string, StoredVanDay>();
+  private copyDay = (d: StoredVanDay): StoredVanDay => ({ ...d, route_ids: [...d.route_ids] });
+
+  listVans(): Van[] { return sortVans([...this.vans.values()]).map((v) => ({ ...v })); }
+  van(id: string): Van | undefined { const v = this.vans.get(id); return v && { ...v }; }
+  createVan(input: VanInput): Van {
+    const van = { id: nextVanId([...this.vans.keys()]), ...input };
+    this.vans.set(van.id, van);
+    return { ...van };
+  }
+  updateVan(id: string, patch: VanPatch): Van | undefined {
+    const van = this.vans.get(id);
+    if (!van) return undefined;
+    const next = applyVanPatch(van, patch);
+    this.vans.set(id, next);
+    return { ...next };
+  }
+  vanStatusRanges(vanId?: string): VanStatusRange[] { return sortRanges(this.vanRanges.filter((r) => vanId === undefined || r.van_id === vanId)).map((r) => ({ ...r })); }
+  addStatusRange(vanId: string, input: VanStatusRangeInput): VanStatusRange {
+    const range = { id: ++this.vanRangeSeq, van_id: vanId, ...input };
+    this.vanRanges.push(range);
+    return { ...range };
+  }
+  /** Rewrites a range in place, keeping its id and so its place in the order. */
+  putStatusRange(range: VanStatusRange): void { this.vanRanges = this.vanRanges.map((r) => (r.id === range.id ? { ...range } : r)); }
+  deleteStatusRange(vanId: string, id: number): boolean {
+    const before = this.vanRanges.length;
+    this.vanRanges = this.vanRanges.filter((r) => !(r.van_id === vanId && r.id === id));
+    return this.vanRanges.length < before;
+  }
+  /** Stored cells between two dates, inclusive. */
+  vanDays(from: string, to: string): StoredVanDay[] { return [...this.vanDayRows.values()].filter((d) => d.service_date >= from && d.service_date <= to).map(this.copyDay); }
+  vanDay(vanId: string, date: string): StoredVanDay | undefined { const d = this.vanDayRows.get(`${vanId}|${date}`); return d && this.copyDay(d); }
+  /** A cell with nothing set is no row at all. */
+  setVanDay(day: StoredVanDay): void {
+    const key = `${day.van_id}|${day.service_date}`;
+    if (isEmptyVanDay(day)) this.vanDayRows.delete(key); else this.vanDayRows.set(key, this.copyDay(day));
+  }
 
   /** One route's day, with per-boat and per-lock detail. The rules are `dayCapacity`'s; this only gathers rows. */
   day(routeId: string, serviceDate: string, exclude: Exclusion = {}): DayState {

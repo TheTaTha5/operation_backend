@@ -1418,7 +1418,52 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 - A cancelled or rejected booking's dispatch cannot change (`409 cancelled`); an unknown trip is `404`.
 - The legacy import brings each active booking's boat, boat split, final pickup and pier note.
 
-Vans and van groups, reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+Van groups, reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+
+### Vans and the month matrix
+
+Legacy's Vans page: the fleet, which programmes each van serves on a date, its days off and its
+driver of the day. Writes need the `operations` edit area. Every field is the client's; the server
+checks shapes and works out what each day comes to.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /operations/vans` | — | `{ vans: [Van] }`, by id |
+| `GET /operations/vans/{id}` | — | the van and its `status_ranges` |
+| `POST /operations/vans` | `{name, capacity?, plate?, type?, ownership?, partner_name?, zone_base?, color?, driver?, driver_phone?, active?}` | `201` the van |
+| `PATCH /operations/vans/{id}` | any of the same | the van |
+| `POST /operations/vans/{id}/status-ranges` | `{status: "off"\|"maintenance", from_date, to_date?, note?}` | `201` the range |
+| `PATCH /operations/vans/{id}/status-ranges/{range_id}` | any of the same | the range |
+| `DELETE /operations/vans/{id}/status-ranges/{range_id}` | — | `204` |
+| `GET /operations/van-days?from=&to=` | — | the matrix, at most 93 days |
+| `PUT /operations/van-days/{date}/{van_id}` | `{route_ids?, status?, driver?, driver_phone?, plate?, sent_at?}` | the day |
+
+```jsonc
+// Van
+{ "id": "veh07", "name": "Van 7", "plate": "นข 1234", "type": "van", "capacity": 12, "ownership": "own",
+  "partner_name": null, "zone_base": "PK", "color": "#0f6e56", "driver": "Somchai", "driver_phone": "081…", "active": true }
+// GET /operations/van-days?from=2026-10-01&to=2026-10-31
+{ "from": "2026-10-01", "to": "2026-10-31", "vans": [ … ],
+  "days": [ { "van_id": "veh07", "service_date": "2026-10-01", "route_ids": ["r1", "r5"], "status": null,
+              "driver": null, "driver_phone": null, "plate": null, "sent_at": null,
+              "status_on": "maintenance", "usable": false } ],
+  "status_ranges": [ { "id": 3, "van_id": "veh07", "status": "maintenance", "from_date": "2026-09-28", "to_date": null, "note": "gearbox" } ] }
+```
+
+- **A new van** gets legacy's defaults (9 seats, a van, own, zone PK, active) and legacy's id: `veh`
+  and one more than the highest number in use. `name` is required (`400`, legacy's "Please enter a
+  vehicle name"). An `own` van has no `partner_name`. Legacy's spellings `partnerName`, `zoneBase`
+  and `driverPhone` are accepted.
+- **There is no delete:** a retired van is `active: false`. Legacy deletes; vans that groups point at
+  cannot be.
+- **`days`** has every van × every date, in van then date order. `status`, `driver`, `driver_phone`
+  and `plate` are that day's overrides (`null` = none). **`status_on`** (computed, legacy
+  `vehStatusOn`) is the day's own status if set, else the latest-added status range covering the
+  date, else `null`. **`usable`** (computed) is active and not `off` or `maintenance` that day: only
+  usable vans enter a route's van pool.
+- **`route_ids`** are the programmes the van serves that day, the only source of a route's van pool
+  (no zone fallback, as legacy). A `PUT` replaces the list; `[]` clears it; an unknown route is `400`.
+- `to_date: null` is open-ended. A range ending before it starts is `400`.
 
 ### Agent seat locks
 

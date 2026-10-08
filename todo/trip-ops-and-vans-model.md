@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Built: slice A1** (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import. Everything below the boat and pier note is still to build: van parts and groups (A2), the vans and month matrix (A3), reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
+Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A3, the vans and month matrix (`src/domain/vans.ts`). Still to build: van parts and groups (A2), reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -335,15 +335,8 @@ its index (`upgrades[1].sell_price must be a number ≥ 0`).
 - `POST /v1/bookings/{id}/upgrade/undo {trip_id}` reverses it, and drops the charge only if it
   isn't collected.
 
-**Vans and the month matrix** (`operations:*`):
-- `GET /operations/vans`, `POST /operations/vans`, `PATCH /operations/vans/{id}`. There is no
-  delete; set `active=false`.
-- `GET /operations/van-days?from=&to=` returns the matrix routes, status, driver override,
-  `sent_at`, and the status ranges.
-- `PUT /operations/van-days/{date}/{van_id}` with `{route_ids?, status?, driver?, driver_phone?,
-  plate?, sent_at?}`.
-- `POST /operations/vans/{id}/status-ranges` and
-  `DELETE /operations/vans/{id}/status-ranges/{range_id}`.
+**Vans and the month matrix:** built (`src/domain/vans.ts`, README → "Vans and the month matrix").
+Legacy keeps four things the 016 tables have no home for; see Open 8.
 
 ### What both stores need
 
@@ -451,6 +444,12 @@ The questions as they were asked:
    change on import.
 7. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
    stored.
+8. **Van fields legacy keeps that 016 cannot hold** (legacy, 2026-10-09):
+   - `ownership: "rented"` (เช่า), a third choice on legacy's form; 2 vans. 016's CHECK allows own/partner only, so the import reads them as own and the API refuses it.
+   - `note` on the van, 3 vans ("Khao Lak base", "รถร่วม").
+   - The van's change log (`sb_vehicles__log`, 1,967 lines: zone 1,379, status 379, edit 126, driver 47, created 36), shown on the Vans page.
+   - `dayZone`, a per-day zone override that feeds the return-van pool; 1 cell. `costperday` is never set.
+   - Legacy also deletes a van; here it is `active: false`.
 
 ## Follow-ups
 
@@ -463,7 +462,7 @@ The questions as they were asked:
 - The Vue port's contract is `operation_frontend/apps/web/docs/handoff/van-endpoints.md`; its §8
   checklist is the definition of done for the van board.
 - Apply 016 on the shared database and run the import there.
-- **A group can be left empty** when its last member's trip is removed or moved (legacy groups had
-  no rows, so they vanished by themselves): hide empty groups on read, or delete them on write?
+- **An emptied group stays and reads hide it** (decided 2026-10-09): when its last member's trip is
+  removed or moved, the row (and its van) is kept, and left out until a member is added again.
 - **Before `--commit` on production,** run a dry run and read the skipped bookings, the van group
   conflicts and the notes.

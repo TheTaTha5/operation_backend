@@ -21,6 +21,9 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import {
+  applyVanDayPatch, emptyVanDay, parseNewVan, parseStatusRange, parseVanDayPatch, parseVanDayRange, parseVanPatch, patchStatusRange, vanMatrix, vanStatusOn, usableOn,
+} from '../domain/vans.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
@@ -822,6 +825,69 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const next = applyDispatch(found.dispatch, patch, { pax: parsePaxGrid(found.trip.pax), deployedBoats: found.deployedBoats, now: new Date().toISOString(), by: actorOf(request.user) ?? null });
       await store.setDispatch(tripId, next);
       return { trip: (await store.tripForDispatch(tripId))!.trip, warnings: [] };
+    });
+  });
+
+  /**
+   * The van fleet and its month matrix (todo/trip-ops-and-vans-model.md, slice A3), legacy's Vans
+   * page. Every field is the client's; the server checks shapes and works out each day's status.
+   * There is no delete: a retired van is `active: false`.
+   */
+  const vanId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+  const vanNotFound = (id: string): never => notFound(`Van ${id} not found`);
+  const rangeId = (request: { params: unknown }): number => {
+    const id = Number((request.params as { range_id: string }).range_id);
+    return Number.isInteger(id) && id > 0 ? id : notFound('Status range not found');
+  };
+  app.get('/operations/vans', async () => ({ vans: await store.listVans() }));
+  app.get('/operations/vans/:id', async (request) => {
+    const van = (await store.van(vanId(request))) ?? vanNotFound(vanId(request));
+    return { ...van, status_ranges: await store.vanStatusRanges(van.id) };
+  });
+  app.post('/operations/vans', async (request, reply) => reply.code(201).send(await store.transaction(() => store.createVan(parseNewVan(record(request.body))))));
+  app.patch('/operations/vans/:id', async (request) => {
+    const patch = parseVanPatch(record(request.body));
+    return (await store.transaction(async () => store.updateVan(vanId(request), patch))) ?? vanNotFound(vanId(request));
+  });
+  app.post('/operations/vans/:id/status-ranges', async (request, reply) => {
+    const input = parseStatusRange(record(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      if (!(await store.van(vanId(request)))) vanNotFound(vanId(request));
+      return store.addStatusRange(vanId(request), input);
+    }));
+  });
+  app.patch('/operations/vans/:id/status-ranges/:range_id', async (request) => {
+    const body = record(request.body);
+    return store.transaction(async () => {
+      const range = (await store.vanStatusRanges(vanId(request))).find((r) => r.id === rangeId(request)) ?? notFound('Status range not found');
+      const next = patchStatusRange(range, body);
+      await store.putStatusRange(next);
+      return next;
+    });
+  });
+  app.delete('/operations/vans/:id/status-ranges/:range_id', async (request, reply) => {
+    if (!(await store.transaction(async () => store.deleteStatusRange(vanId(request), rangeId(request))))) notFound('Status range not found');
+    return reply.code(204).send();
+  });
+  /** Every van × every date in the range, with what each day comes to, and the ranges that touch it. */
+  app.get('/operations/van-days', async (request) => {
+    const { from, to } = parseVanDayRange(request.query as Record<string, unknown>);
+    const [vans, ranges, days] = [await store.listVans(), await store.vanStatusRanges(), await store.vanDays(from, to)];
+    return {
+      from, to, vans, days: vanMatrix(vans, ranges, days, [...eachDate(from, to)]),
+      status_ranges: ranges.filter((r) => r.from_date <= to && (r.to_date === null || r.to_date >= from)),
+    };
+  });
+  app.put('/operations/van-days/:service_date/:van_id', async (request) => {
+    const { service_date: date, van_id: id } = request.params as { service_date: string; van_id: string };
+    if (!isIsoDate(date)) badRequest('service_date must be YYYY-MM-DD');
+    const patch = parseVanDayPatch(record(request.body), new Set((await store.listRoutes()).map((route) => route.id)));
+    return store.transaction(async () => {
+      const van = (await store.van(id)) ?? vanNotFound(id);
+      const day = applyVanDayPatch((await store.vanDay(id, date)) ?? emptyVanDay(id, date), patch);
+      await store.setVanDay(day);
+      const status = vanStatusOn(await store.vanStatusRanges(id), day, date);
+      return { ...day, status_on: status, usable: usableOn(van, status) };
     });
   });
 
