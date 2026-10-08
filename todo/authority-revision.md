@@ -6,7 +6,7 @@ its own note:
 | Area | Note |
 |---|---|
 | Edit conflicts (`If-Match`) and retries (`Idempotency-Key`) on bookings | `booking-concurrency-model.md` |
-| Login, per-area permissions, who may approve | `login-permissions-model.md` |
+| Login: deploy steps and the legacy screens' changes | `login-permissions-model.md` |
 | Refusing deployment changes that strand sold seats; `license_pax` from the catalogue | `deployment-guards-model.md` |
 | Rate seasons, promo contracts, `POST /v1/quote`, adjustments | `pricing-model.md`, `rate-types-model.md` |
 | Agent writes | `agents.md` |
