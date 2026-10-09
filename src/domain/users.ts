@@ -122,6 +122,8 @@ export function writeNeed(path: string): WriteNeed {
   if (/^\/v1\/fleet\/(engines|gearboxes|propellers|incidents|jobs)(\/|$)/.test(path)) return { kind: 'area', areas: ['fleet'] };
   if (path === '/v1/boats' || path.startsWith('/v1/boats/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/route-families' || path.startsWith('/v1/route-families/')) return { kind: 'area', areas: ['config'] };
+  // A route's restaurant is set from legacy's costing menu (`mvRouteSet`), under Accounting & Finance.
+  if (/^\/v1\/routes\/[^/]+\/meal-venue$/.test(path)) return { kind: 'area', areas: ['accounting'] };
   if (path === '/v1/routes' || path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   // Sales editing (todo/sales-editing-model.md): templates, issued documents and the add-on catalogue
   // are sales'; salespeople and markets are the Team & Markets screen's, under `config` (decision 2);
@@ -142,6 +144,16 @@ export function writeNeed(path: string): WriteNeed {
   if (/^\/v1\/pier-handovers\/[^/]+\/accept$/.test(path)) return { kind: 'area', areas: ['accounting'] };
   if (path === '/v1/pier-handovers' || path.startsWith('/v1/pier-handovers/')) return { kind: 'area', areas: ['pier', 'operations'] };
   if (path === '/v1/commission-payouts' || path.startsWith('/v1/commission-payouts/')) return { kind: 'area', areas: ['accounting'] };
+  // The rest of Money (todo/money-model.md, "Design: the rest of Money"). Costing sits under
+  // Accounting & Finance in legacy (its writes had no guard); Trip P&L's close and "ran" are
+  // `laGuardEdit('accounting')`. The pier's meal order, its note and overnight choices are
+  // `laGuardEdit('operations')`; the day's restaurant is the pier job sheet's (`poGuard`: pier).
+  // Deposits and refund payouts are accounting's (`acctDeposit*`).
+  if (path.startsWith('/v1/costing/') || path === '/v1/meal-venues' || path.startsWith('/v1/meal-venues/')) return { kind: 'area', areas: ['accounting'] };
+  if (/^\/v1\/trip-actuals\/[^/]+\/[^/]+\/(close|reopen|ran|not-ran)$/.test(path)) return { kind: 'area', areas: ['accounting'] };
+  if (/^\/v1\/trip-actuals\/[^/]+\/[^/]+\/venue$/.test(path)) return { kind: 'area', areas: ['pier', 'operations'] };
+  if (/^\/v1\/trip-actuals\/[^/]+\/[^/]+\/(meal-order|meal-note|meal-overnight\/[^/]+)$/.test(path)) return { kind: 'area', areas: ['operations'] };
+  if (path === '/v1/deposits' || path.startsWith('/v1/deposits/') || /^\/v1\/refunds\/[^/]+\/payout$/.test(path)) return { kind: 'area', areas: ['accounting'] };
   return { kind: 'admin' };
 }
 

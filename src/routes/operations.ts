@@ -53,6 +53,9 @@ import { registerMoneyReportRoutes } from './money-reports.js';
 import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
 import { registerMoneyRoutes } from './money.js';
+import { registerCostingRoutes } from './costing.js';
+import { registerCreditRoutes } from './credit.js';
+import { payoutView } from '../domain/credit.js';
 import { cotDeductions } from '../domain/after-trip.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
@@ -1371,7 +1374,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   /** An agent's credit balance (legacy `acctAgentDepositAvail`): its credits less its `credit` payments. */
   const agentCredit = async (agentId: string): Promise<CreditBalance> => {
     const invoices = await store.listInvoices({ agentId });
-    return creditBalance(await store.listRefunds({ agentId }), await store.paymentsOf(invoices.map((i) => i.id)));
+    return creditBalance(await store.listRefunds({ agentId }), await store.paymentsOf(invoices.map((i) => i.id)), await store.moneyRepo.deposits({ agentId }));
   };
   const fullInvoice = async (invoice: StoredInvoice) => (await fullInvoices([invoice]))[0];
   /** A login tied to one agent sees that agent's invoices only; another's is not found. */
@@ -1541,10 +1544,16 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.get('/v1/refunds', async (request) => {
     const agent = request.user?.user?.agent_id;
     const q = { ...parseRefundListQuery(request.query as Record<string, unknown>), ...(agent ? { agent_id: agent } : {}) };
-    const refunds = (await store.listRefunds({ agentId: q.agent_id, bookingId: q.booking_id })).filter((r) => matchesRefundQuery(r, q));
+    const paidOut = (request.query as Record<string, unknown>).paid_out;
+    if (paidOut !== undefined && paidOut !== 'true' && paidOut !== 'false') refuseWith('paid_out must be true or false', 400);
+    // A refund's payout (todo/money-model.md, "Design: the rest of Money"); a credit is never paid out.
+    const payouts = new Map((await store.moneyRepo.payouts()).map((p) => [p.refund_id, p]));
+    const refunds = (await store.listRefunds({ agentId: q.agent_id, bookingId: q.booking_id })).filter((r) => matchesRefundQuery(r, q))
+      .filter((r) => paidOut === undefined || (r.kind === 'refund' && payouts.has(r.id) === (paidOut === 'true')));
     const numbers = new Map<string, string>();
     for (const id of new Set(refunds.map((r) => r.invoice_id))) numbers.set(id, (await store.invoice(id))?.number ?? id);
-    return { refunds: refunds.map((r) => ({ ...r, invoice_number: numbers.get(r.invoice_id)! })) };
+    const slips = await store.attachmentRefs([...new Set(refunds.flatMap((r) => payouts.get(r.id)?.slips ?? []))]);
+    return { refunds: refunds.map((r) => ({ ...r, invoice_number: numbers.get(r.invoice_id)!, payout: payoutView(payouts.get(r.id), slips) })) };
   });
 
   // ── Weather closures (todo/weather-closures-model.md; `weather.ts`) ──
@@ -1921,6 +1930,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   /** Fleet maintenance, part A: availability, engines/gearboxes/propellers, incidents, jobs (`fleet.ts`). */
   registerFleetRoutes(app, { store });
   registerMoneyRoutes(app, { store, assertBookingFresh });
+  /** The rest of Money (todo/money-model.md, "Design: the rest of Money"): the cost model and Trip P&L, deposits and refund payouts. */
+  registerCostingRoutes(app, { store });
+  registerCreditRoutes(app, { store });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an

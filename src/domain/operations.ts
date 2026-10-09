@@ -61,6 +61,7 @@ import { addonServiceView, sortAddonServices, type AddonService } from './addon-
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
 import { MemoryFleetRepo } from './fleet-store.js';
+import { MemoryMoneyRepo } from './money-store.js';
 import { copyBill, type StoredVanBill, type VanRate, type VanRateField } from './van-bills.js';
 import type { DailySettings } from './money-reports.js';
 import { copyAsset, matchesAsset, sortAssets, type AssetKind, type AssetOf, type AssetQuery, type Engine, type Gearbox, type Propeller } from './fleet-assets.js';
@@ -404,6 +405,8 @@ export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusio
 export class OperationsStore {
   /** Fleet part B (todo/fleet-maintenance-model.md): stock, memos, projects, the Daily Fleet Log, safety. */
   readonly fleetRepo = new MemoryFleetRepo();
+  /** The rest of Money (migrations 160–161): the cost model, trip actuals, deposits, refund payouts. */
+  readonly moneyRepo = new MemoryMoneyRepo();
   private deployments: Deployment[] = [];
   private bookings = new Map<string, StoredBooking>();
   private histories = new Map<string, HistoryEntry[]>();
@@ -722,7 +725,15 @@ export class OperationsStore {
   }
   updateRoute(id: string, fields: RouteFields): void {
     const index = this.catalogue.routes.findIndex((r) => r.id === id);
-    if (index >= 0) this.catalogue.routes[index] = compactRoute({ ...fields, id, sort: this.catalogue.routes[index].sort });
+    if (index < 0) return;
+    const venue = this.catalogue.routes[index].meal_venue_id;
+    this.catalogue.routes[index] = { ...compactRoute({ ...fields, id, sort: this.catalogue.routes[index].sort }), ...(venue ? { meal_venue_id: venue } : {}) };
+  }
+  /** The route's restaurant for costing (migration 160); null clears it. */
+  setRouteMealVenue(id: string, venueId: string | null): void {
+    const route = this.catalogue.routes.find((r) => r.id === id);
+    if (!route) return;
+    if (venueId) route.meal_venue_id = venueId; else delete route.meal_venue_id;
   }
   setRouteSorts(sorts: ReadonlyMap<string, number>): void {
     this.catalogue.routes = this.catalogue.routes.map((r) => (sorts.has(r.id) ? { ...r, sort: sorts.get(r.id) } : r));

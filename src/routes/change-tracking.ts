@@ -220,6 +220,15 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     const id = params(r).id ?? (result as { id?: string } | undefined)?.id;
     if (id) out.push({ kind, entity_id: id, action: path === prefix && r.method === 'POST' ? 'created' : 'updated', route_days: null, changed_by: by });
   }
+  // The rest of Money (todo/money-model.md, "Design: the rest of Money"): a boat's day, a deposit, a refund's payout.
+  if (path.startsWith('/v1/trip-actuals/:date/:boat_id/')) {
+    out.push({ kind: 'trip_actual', entity_id: `${params(r).date}:${params(r).boat_id}`, action: 'updated', route_days: null, changed_by: by });
+  }
+  if (path.startsWith('/v1/deposits')) {
+    const id = params(r).id ?? (result as { id?: string } | undefined)?.id;
+    if (id) out.push({ kind: 'deposit', entity_id: id, action: path === '/v1/deposits' && r.method === 'POST' ? 'created' : 'updated', route_days: null, changed_by: by });
+  }
+  if (path === '/v1/refunds/:id/payout') out.push({ kind: 'refund', entity_id: params(r).id, action: 'updated', route_days: null, changed_by: by });
   // The catalogue (todo/catalogue-editing-model.md).
   if (path === '/v1/routes' && r.method === 'POST') {
     const created = result as { created?: boolean; route?: { id: string } } | undefined;

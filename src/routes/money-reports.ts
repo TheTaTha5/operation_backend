@@ -20,6 +20,8 @@ import {
   applyPatch, billPeriod, billRows, billView, blankBill, overviewLine, parseBillAddress, parseBillPatch, parseMonthPeriod, parsePay, parseVanRate, partnersOf,
   partnerVans, pay, pullRates, send, sortOverview, unpay, unsend, vanRateGroups, VAN_RATE_DEFAULT, assertEditable, type BillAddress, type StoredVanBill,
 } from '../domain/van-bills.js';
+import { refundsToPay } from '../domain/credit.js';
+import { dailyLongtailFor } from './costing.js';
 import { accountingDashboard, agentStatement, dailyMoney, dailySettingsView, parseDailySettings, travelSummary, type DayMoneyInput } from '../domain/money-reports.js';
 
 type Request = FastifyRequest;
@@ -170,13 +172,16 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     for (const b of bookings) if (b.agent_id) byAgent.set(b.agent_id, [...(byAgent.get(b.agent_id) ?? []), b]);
     const refunds = await store.listRefunds();
     const agentOf = new Map(invoices.map((i) => [i.id, i.agent_id]));
+    const deposits = await store.moneyRepo.deposits();
     let exposure = 0, held = 0;
     for (const a of agents) {
       exposure += creditOf(a, byAgent.get(a.id) ?? []).used;
-      held += creditBalance(refunds.filter((r) => r.agent_id === a.id), payments.filter((p) => agentOf.get(p.invoice_id) === a.id)).available;
+      held += creditBalance(refunds.filter((r) => r.agent_id === a.id), payments.filter((p) => agentOf.get(p.invoice_id) === a.id), deposits.filter((d) => d.agent_id === a.id)).available;
     }
     const sales = await store.tourSales(bookings.map((b) => b.id));
-    return accountingDashboard({ invoices, payments, agents, credit_exposure: exposure, deposits_held: held, now: new Date(), sales });
+    const toPay = refundsToPay(refunds, new Map((await store.moneyRepo.payouts()).map((p) => [p.refund_id, p])), new Map(agents.map((a) => [a.id, a.name])),
+      new Map(invoices.map((i) => [i.id, i.number])));
+    return accountingDashboard({ invoices, payments, agents, credit_exposure: exposure, deposits_held: held, now: new Date(), sales, refunds_to_pay: toPay });
   });
   /** Legacy `acctStatementOpen`. A login tied to an agent reads its own; a salesperson their agents'. */
   app.get('/v1/agents/:id/statement', async (request) => {
@@ -189,7 +194,8 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     const invoices = await views(stored);
     const refunds = await store.listRefunds({ agentId: id });
     const bookings = await allBookings(id);
-    return agentStatement(agent, invoices, refunds, creditBalance(refunds, await store.paymentsOf(stored.map((i) => i.id))), creditOf(agent, bookings));
+    const deposits = await store.moneyRepo.deposits({ agentId: id });
+    return agentStatement(agent, invoices, refunds, creditBalance(refunds, await store.paymentsOf(stored.map((i) => i.id)), deposits), creditOf(agent, bookings), deposits);
   });
   app.get('/v1/reports/travel-summary', async (request) => {
     staffOnly(request);
@@ -201,11 +207,16 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     staffOnly(request);
     const date = dateParam(query(request).date ?? todayInThailand());
     const bookings = await store.bookingsOnDate(date);
+    const money = await dayMoney(bookings);
+    const daily = dailyMoney(date, bookings, money, {
+      agents: await store.agentRecords(), markets: await store.listMarkets(), routes: await store.listRoutes(), vans: await store.listVans(),
+      rates: await store.vanRates(), areas: await store.listPickupAreas(), settings: await store.dailyReportSettings(),
+    });
+    // Legacy `drPaneFi`: the costs known on the day (vans and longtails), and what is left before the boat and kitchen costs.
+    const longtail = await dailyLongtailFor(store, date, bookings);
+    const known = daily.van_cost.total + longtail.cost;
     return {
-      ...dailyMoney(date, bookings, await dayMoney(bookings), {
-        agents: await store.agentRecords(), markets: await store.listMarkets(), routes: await store.listRoutes(), vans: await store.listVans(),
-        rates: await store.vanRates(), areas: await store.listPickupAreas(), settings: await store.dailyReportSettings(),
-      }),
+      ...daily, longtail, known_cost: known, net_before_boat_costs: Math.round((daily.revenue - known + daily.extras) * 100) / 100,
       settings: dailySettingsView(await store.dailyReportSettings()),
     };
   });
