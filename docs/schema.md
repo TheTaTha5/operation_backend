@@ -56,6 +56,8 @@ flowchart LR
   weather -- "weather_cases.booking_id, refunds.booking_id" --> bookings
   weather -- "refunds.invoice_id" --> money
   weather -- "refunds.agent_id" --> sales
+  vanbills["Partner van bills and report settings<br/>van_bills, van_bill_route_rates,<br/>van_bill_row_overrides, van_bill_extra_lines,<br/>van_rates, daily_report_settings"]
+  vanbills -- "van_rates.route_id" --> catalogue
 ```
 
 ## 1. Catalogue and seat pool
@@ -1133,6 +1135,90 @@ erDiagram
   booking on the trip with no row reads `awaiting`.
 - **The agent's credit balance** is its `credit` rows less its live payments with `method = 'credit'`.
 - **`changes.kind`** also takes `weather_closure` (060).
+
+## 9. Partner van bills and report settings
+
+Legacy's partner van bill (`§vanBill`), Transfer Fleet's van rates and the daily report's settings
+(migration 120, `todo/money-model.md` slices 5 and 6). The rules are in `src/domain/van-bills.ts` and
+`src/domain/money-reports.ts`. **A bill's rows and amounts are not stored:** they are worked out on
+every read from the bookings' van parts and check-ins. Only what staff type is kept, plus the sent
+and paid state (new; legacy had none). The money reports store nothing.
+
+```mermaid
+erDiagram
+  van_bills {
+    text id PK "vb_…"
+    text partner "a van's partner_name, trimmed; unique with month and period"
+    text month "YYYY-MM"
+    smallint period "1 = days 1–10, 2 = 11–20, 3 = 21–end"
+    numeric per_pax "sale price per passenger"
+    numeric rate "the old single default rate per van"
+    text_array seen "row keys at the last save with mark_seen; NULL = never"
+    timestamptz updated_at
+    text updated_by
+    timestamptz sent_at "sent to the van owner"
+    text sent_by
+    numeric sent_bill "the total when sent"
+    timestamptz paid_at "needs sent_at"
+    text paid_by
+    date paid_on
+    text paid_via "transfer, cash or cheque"
+    text paid_ref
+    numeric paid_amount "the total when paid"
+  }
+  van_bill_route_rates {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text code PK "PP, PB, MT, SM, SR or —"
+    numeric rate
+  }
+  van_bill_row_overrides {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text row_key PK "date~route~van, ~R for a return-only run"
+    numeric rate "NULL = not set (0 is a rate)"
+    numeric ex
+    numeric cut
+    numeric per
+  }
+  van_bill_extra_lines {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text id PK
+    int seq "unique per bill"
+    date line_date
+    text note
+    int vans
+    int pax
+    numeric rate
+    numeric ex
+    numeric cut
+    numeric per_pax
+  }
+  van_rates {
+    text group_key "own, or p:<partner>"
+    text route_id FK "NULL = the group's base; ON DELETE CASCADE"
+    text field "base, PK or KL; a NULL route is base"
+    numeric rate
+    timestamptz updated_at
+    text updated_by
+  }
+  daily_report_settings {
+    boolean id PK "one row"
+    numeric van_cost "NULL = 1,200"
+    int van_quota "NULL = 6"
+    numeric target_per_pax "NULL = 130"
+    timestamptz updated_at
+    text updated_by
+  }
+  routes { text id PK }
+  van_bills ||--o{ van_bill_route_rates : "defaults"
+  van_bills ||--o{ van_bill_row_overrides : "typed on rows"
+  van_bills ||--o{ van_bill_extra_lines : "hand-typed lines"
+  routes |o--o{ van_rates : "priced on"
+```
+
+- **`van_rates` is unique on (group, route, field) with `NULLS NOT DISTINCT`**, so a group has one base.
+- **A bill names its partner by name, not by a key:** legacy's bill is per owner name, and vans carry
+  that name (`vans.partner_name`). Renaming a partner's vans leaves its old bills under the old name.
+- **Every amount is `NUMERIC(12,2)` and 0 or more**; a deduction (`cut`) is stored positive.
 
 ## Ids with no foreign key
 

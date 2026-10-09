@@ -39,6 +39,13 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    edited here. **Legacy must stop editing agents at the same moment** (the integration branch's
    §6.5): an agent made in legacy afterwards never arrives. `import:contracts` reruns would overwrite
    a main contract's rate and `doc_id` set here: stop rerunning it after this.
+1b6. **Van bills and the money reports (`feat/money-van-bills-and-reports`, migration 120):** re-run
+   `import-legacy` after deploying. It brings 26 of legacy's 31 van bills (the 5 with the older
+   four-part key are skipped), 65 van-rate cells and the daily report's settings; re-runs keep any
+   sent/paid state set here. Rehearsed 2026-10-09: 24 of the 26 bills match legacy's rows and totals
+   exactly; 2 (โกอู๊ด and สตอ, 2026-08 period 3) each miss one run, because the van-group import drops
+   the van of a legacy group whose members sat on different vans (see the import's "van group
+   conflicts"). Then decide the open points in `todo/money-model.md` "Flagged".
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
