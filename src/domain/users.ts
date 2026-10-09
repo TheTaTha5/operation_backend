@@ -142,6 +142,9 @@ export function writeNeed(path: string): WriteNeed {
   if (/^\/v1\/pier-handovers\/[^/]+\/accept$/.test(path)) return { kind: 'area', areas: ['accounting'] };
   if (path === '/v1/pier-handovers' || path.startsWith('/v1/pier-handovers/')) return { kind: 'area', areas: ['pier', 'operations'] };
   if (path === '/v1/commission-payouts' || path.startsWith('/v1/commission-payouts/')) return { kind: 'area', areas: ['accounting'] };
+  // The pier office (todo/pier-office-model.md): petty cash and the office lists, legacy's `poCanEdit`:
+  // the pier area, or operations for an account whose edit list predates pier (§pierEdit).
+  if (path.startsWith('/v1/pier-cash/') || path === '/v1/pier-office' || path.startsWith('/v1/pier-office/')) return { kind: 'area', areas: ['pier', 'operations'] };
   return { kind: 'admin' };
 }
 

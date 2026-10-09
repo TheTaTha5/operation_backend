@@ -220,6 +220,14 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     const id = params(r).id ?? (result as { id?: string } | undefined)?.id;
     if (id) out.push({ kind, entity_id: id, action: path === prefix && r.method === 'POST' ? 'created' : 'updated', route_days: null, changed_by: by });
   }
+  // The pier office (todo/pier-office-model.md): a pier's cash day (`<pier>:<date>`, or `settings`),
+  // and an office list by its name.
+  if (path.startsWith('/v1/pier-cash/')) {
+    const row = (result as { row?: { pier: string; date: string } } | undefined)?.row;
+    const entity = path === '/v1/pier-cash/settings' ? 'settings' : params(r).pier ? `${params(r).pier}:${params(r).date}` : row ? `${row.pier}:${row.date}` : undefined;
+    if (entity) out.push({ kind: 'pier_cash', entity_id: entity, action: 'updated', route_days: null, changed_by: by });
+  }
+  if (path.startsWith('/v1/pier-office/:list')) out.push({ kind: 'pier_office', entity_id: params(r).list, action: 'updated', route_days: null, changed_by: by });
   // The catalogue (todo/catalogue-editing-model.md).
   if (path === '/v1/routes' && r.method === 'POST') {
     const created = result as { created?: boolean; route?: { id: string } } | undefined;

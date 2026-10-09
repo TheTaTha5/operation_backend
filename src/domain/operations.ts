@@ -61,6 +61,7 @@ import { addonServiceView, sortAddonServices, type AddonService } from './addon-
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
 import { MemoryFleetRepo } from './fleet-store.js';
+import { MemoryPierOfficeRepo } from './pier-office-store.js';
 import { copyBill, type StoredVanBill, type VanRate, type VanRateField } from './van-bills.js';
 import type { DailySettings } from './money-reports.js';
 import { copyAsset, matchesAsset, sortAssets, type AssetKind, type AssetOf, type AssetQuery, type Engine, type Gearbox, type Propeller } from './fleet-assets.js';
@@ -404,6 +405,8 @@ export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusio
 export class OperationsStore {
   /** Fleet part B (todo/fleet-maintenance-model.md): stock, memos, projects, the Daily Fleet Log, safety. */
   readonly fleetRepo = new MemoryFleetRepo();
+  /** The pier office (todo/pier-office-model.md): petty cash and the office lists. */
+  readonly pierOfficeRepo = new MemoryPierOfficeRepo();
   private deployments: Deployment[] = [];
   private bookings = new Map<string, StoredBooking>();
   private histories = new Map<string, HistoryEntry[]>();
