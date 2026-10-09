@@ -2183,6 +2183,18 @@ lock has moved on. A `PATCH` changes `pax` and
 Every lock response carries `drawn_pax`: the seats bookings that hold seats have drawn from it. The
 lock itself holds `pax − drawn_pax`, and that is what a new draw may take.
 
+**Whole-boat holds** (legacy §bkLock, migration 047). A lock with a `boat_id` holds a whole boat for
+an agent who has not confirmed numbers; `pax` is the minimum seats promised. Ordinary locks read
+`boat_id: null`.
+- **On a boat deployed that day,** a hold counts exactly as a charter does:
+  - the boat's sellable and licensed seats leave the pool, whatever number was promised;
+  - the boat reads `chartered` in `/v1/availability`;
+  - a seat booking can't be put on it (`409 boat_chartered`), and neither can another charter;
+  - the hold holds nothing more, and nothing draws from it.
+- **On a boat not deployed that day,** it holds its `pax` as a plain lock.
+- **Who creates them:** only the legacy import, for now. Legacy creates holds, and turns them into a
+  charter, until seat locks move here (`todo/seat-lock-extras-model.md`).
+
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 
 `GET /api/health` remains available for service health checks. It returns `{ status: "ok", commit }`,

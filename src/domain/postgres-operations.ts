@@ -400,7 +400,7 @@ const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | n
   status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
   at: r.at ? jsonInstant(r.at) : null, by: (r.by as string) ?? null, sent_at: r.sent_at ? jsonInstant(r.sent_at) : null, sent_by: (r.sent_by as string) ?? null,
 };
-const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
+const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, boat_id: row.boat_id ?? null, drawn_pax: Number(row.drawn_pax ?? 0) });
 
 const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
 const num = (value: unknown): number | null => value === null || value === undefined ? null : Number(value);
@@ -592,7 +592,7 @@ export class PostgresOperationsStore {
          AND t.booking_id IS DISTINCT FROM $4
        GROUP BY t.route_id, t.service_date, t.booking_mode, t.charter_boat_id`, [ids, from, to, exclude.bookingId ?? null, releasing]);
     const { rows: locks } = await this.client().query(
-      `SELECT l.id, l.route_id, l.service_date::text AS service_date, l.pax,
+      `SELECT l.id, l.route_id, l.service_date::text AS service_date, l.pax, l.boat_id,
               COALESCE((SELECT SUM(d.qty) FROM booking_trip_lock_draws d
                         JOIN booking_trips t ON t.id = d.booking_trip_id
                         JOIN bookings b ON b.id = t.booking_id
@@ -613,7 +613,7 @@ export class PostgresOperationsStore {
           ...dayCapacity(
             (deployedByDay.get(key) ?? []).map((row): DayDeployment => ({ boat_id: String(row.boat_id), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), override_capacity: optionalInt(row.override_capacity) })),
             (tripsByDay.get(key) ?? []).map((row): HeldTrip => ({ booking_mode: String(row.booking_mode), pax: Number(row.pax), charter_boat_id: row.charter_boat_id ?? undefined })),
-            (locksByDay.get(key) ?? []).map((row): HeldLock => ({ id: String(row.id), pax: Number(row.pax), drawn: Number(row.drawn) })),
+            (locksByDay.get(key) ?? []).map((row): HeldLock => ({ id: String(row.id), pax: Number(row.pax), drawn: Number(row.drawn), ...(row.boat_id ? { boat_id: String(row.boat_id) } : {}) })),
             kindOf.get(routeId)),
         });
       }
@@ -1190,7 +1190,7 @@ export class PostgresOperationsStore {
     await this.lockPool(input.route_id, input.service_date);
     assertLockFits(await this.day(input.route_id, input.service_date), input.pax, 0);
     const id = `lock_${randomUUID()}`;
-    await this.client().query("INSERT INTO seat_locks (id,route_id,service_date,pax,agent_id,status) VALUES ($1,$2,$3,$4,$5,'active')", [id, input.route_id, input.service_date, input.pax, input.agent_id ?? null]);
+    await this.client().query("INSERT INTO seat_locks (id,route_id,service_date,pax,agent_id,boat_id,status) VALUES ($1,$2,$3,$4,$5,$6,'active')", [id, input.route_id, input.service_date, input.pax, input.agent_id ?? null, input.boat_id ?? null]);
     return (await this.readLocks({ id }))[0];
   }
   async listLocks(routeId?: string, date?: string): Promise<SeatLock[]> { return this.readLocks({ routeId, date }); }

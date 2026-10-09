@@ -227,6 +227,11 @@ export type SeatLock = {
   released_at?: string;
   /** Seats drawn from this lock by bookings that hold seats. The lock itself still holds `pax - drawn_pax`. */
   drawn_pax?: number;
+  /**
+   * A whole-boat hold (todo/boat-holds-model.md, migration 047): the boat it takes that day, as a
+   * charter does. `null` for an ordinary lock. Set by the legacy import only, for now.
+   */
+  boat_id?: string | null;
 };
 
 /**
@@ -904,7 +909,7 @@ export class OperationsStore {
     const drawn = drawnByLock(this.bookings.values(), exclude);
     const locks = [...this.locks.values()]
       .filter((l) => l.route_id === routeId && l.service_date === serviceDate && l.status === 'active' && l.id !== exclude.lockId)
-      .map((l) => ({ id: l.id, pax: l.pax, drawn: drawn.get(l.id) ?? 0 }));
+      .map((l) => ({ id: l.id, pax: l.pax, drawn: drawn.get(l.id) ?? 0, ...(l.boat_id ? { boat_id: l.boat_id } : {}) }));
     return dayCapacity(deployments, trips, locks, this.catalogue.routes.find((route) => route.id === routeId)?.kind);
   }
 
@@ -932,7 +937,7 @@ export class OperationsStore {
   }
 
   private lockView(lock: SeatLock): SeatLock {
-    return { ...lock, drawn_pax: drawnByLock(this.bookings.values()).get(lock.id) ?? 0 };
+    return { ...lock, boat_id: lock.boat_id ?? null, drawn_pax: drawnByLock(this.bookings.values()).get(lock.id) ?? 0 };
   }
 
   /**

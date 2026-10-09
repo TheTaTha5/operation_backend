@@ -167,7 +167,7 @@ export function checkBoatAssignment(input: {
   for (const [boatId, mine] of paxByBoat(input.next, trip.pax_total)) {
     const boat = input.boats.get(boatId);
     if (!boat) continue;
-    if (boat.chartered) refuse(`Boat ${boatId} is a charter on ${trip.service_date}: a seat booking can't go on it`, 409, 'boat_chartered');
+    if (boat.chartered) refuse(`Boat ${boatId} is chartered or held whole on ${trip.service_date}: a seat booking can't go on it`, 409, 'boat_chartered');
     const load = (input.others.get(boatId) ?? 0) + mine;
     if (load <= boat.sellable + BOAT_TOLERANCE) continue;
     const at = `Boat ${boatId} would carry ${load} on ${trip.service_date} (capacity ${boat.sellable}, at most ${boat.sellable + BOAT_TOLERANCE})`;
