@@ -61,7 +61,7 @@ const OWNED: Record<string, string> = {
   released_pax: 'use POST /v1/seat-locks/{id}/release or /release-departure',
   group_id: 'a bulk lock is made with POST /v1/seat-lock-groups',
   parent_id: 'a sub-group is made with POST /v1/seat-locks/{id}/sub-groups',
-  boat_id: 'whole-boat holds have their own design (todo/boat-holds-model.md)',
+  boat_id: 'whole-boat holds are made by the import only, for now',
   drawn_pax: 'it is worked out from the bookings that draw on the lock',
   remaining_pax: 'it is worked out by the server', held_pax: 'it is worked out by the server', allocated_pax: 'it is worked out by the server',
   sub_group_room: 'it is worked out by the server', holding: 'it is worked out by the server', state: 'it is worked out by the server',

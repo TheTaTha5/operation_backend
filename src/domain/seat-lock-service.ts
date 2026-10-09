@@ -42,7 +42,7 @@ export interface SeatLockIO {
 export type NewLockInput = {
   route_id: string; service_date: string; pax: number; holder_type: HolderType; agent_id: string | null;
   reason: string | null; expiry: string | null; pending?: PendingChoice;
-  /** A whole-boat hold: set by the import and tests only (its own design, todo/boat-holds-model.md). */
+  /** A whole-boat hold: set by the import and tests only (creating them is their own design, not written yet). */
   boat_id?: string | null;
 };
 export type LockChanges = {
@@ -157,7 +157,7 @@ export class SeatLockService {
   private stamp(row: LockRow): LockRow { return { ...row, version: row.version + 1, updated_at: this.clock().toISOString() }; }
   private event(by: string | undefined, line: Parameters<typeof eventAt>[2]): NewLockEvent { return eventAt(this.clock(), by, line); }
   private noBoat(row: LockRow): void {
-    if (row.boat_id) refuseLock('A whole-boat hold takes its boat; only a full release applies to it here (todo/boat-holds-model.md)', 400, 'boat_hold');
+    if (row.boat_id) refuseLock('A whole-boat hold takes its boat; only a full release applies to it here', 400, 'boat_hold');
   }
 
   // ── One lock ───────────────────────────────────────────────────────────────────────────────────

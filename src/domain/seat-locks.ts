@@ -44,7 +44,7 @@ export type LockRow = {
   /** Set on a sub-group: the lock its seats are carved from. */
   parent_id: string | null;
   sub_name: string | null;
-  /** A whole-boat hold (todo/boat-holds-model.md, migration 047): it takes this boat, as a charter does. */
+  /** A whole-boat hold (migration 047): it takes this boat, as a charter does. */
   boat_id: string | null;
   created_at: string;
   created_by: string | null;
