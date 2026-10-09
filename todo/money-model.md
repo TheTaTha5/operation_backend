@@ -70,18 +70,11 @@ Built 2026-10-09 (branch `feat/money-van-bills-and-reports`, migration 120): REA
 bills" and "Money reports", `src/domain/van-bills.ts`, `src/domain/money-reports.ts`,
 `src/domain/aboard.ts`, `src/routes/money-reports.ts`, `src/tools/legacy-van-bills.ts`. Still open:
 
-1. **Add the Money slices 3–4 sources to the reports once they are on `main`:**
-   - Travel Summary: pier payments by method (and their fees, slips, "waiting for slip"), on-tour sales
-     (`SB_EXTRAS`: by method, fee, commission, still to collect), the no-show charge decisions
-     (pending count, charged total), the COT decisions (deduct, payout, not collected) and so
-     `due = to_collect − pier paid` and `tsNoCollect`'s "paid > 0" exception.
-   - Daily Report: `due`, `got`, `noSlip`, extras, and the per-agent `due` (`pckMoney`).
-   - Accounting dashboard: "Extras · cash · month" (`acctExtrasMonthTotal`).
-2. **Trip P&L with close/freeze, the longtail cost and the cost model** wait for Fleet (fuel, meals,
+1. **Trip P&L with close/freeze, the longtail cost and the cost model** wait for Fleet (fuel, meals,
    `cost_plans`, `trip_actuals`). The Daily Report's `ltCost` and its "net before boat costs" line are
    left out until then.
-3. **Operations and Fleet reports** (`px*` beyond money) are not in Money.
-4. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
+2. **Operations and Fleet reports** (`px*` beyond money) are not in Money.
+3. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
    updates; append to `changes_kind_check` as migration 100 does.
 
 ## Flagged
@@ -130,7 +123,11 @@ defaults to legacy unless it says otherwise.
 - Credit `used` counts an unpaid booking whole, even when its invoice is part-paid (`agCreditState`).
 - Travel Summary's `no_show` (events) and `travelled` (last count) are two different measures, as in
   legacy, so they need not add up.
-- B2C `paymentSnapshot.balance` is not stored here, so it is 0 in `to_collect`.
+- Travel Summary's `to_collect` leaves out on-tour sales still to collect (legacy `tsMoneyOf`: they are
+  in `sales_due`), while the Daily Report's `due` counts them (legacy `pckMoney`), so the two differ.
+- "Extras · cash · month" (`extras_this_month`) counts every on-tour sale, whatever its method, as
+  legacy's `acctExtrasMonthTotal` does despite its label. It uses the Bangkok month of `sold_at`
+  (legacy: the UTC month of the record time), as the collections do.
 
 **Import**
 - 26 of legacy's 31 `van_bill` rows; the 5 with the older four-part key are skipped (the outline's

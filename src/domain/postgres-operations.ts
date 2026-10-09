@@ -117,6 +117,12 @@ const season = (row: QueryResultRow): RouteSeason => ({ id: String(row.id), rout
 const dayOverride = (row: QueryResultRow): RouteDayOverride => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] });
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
 const TRANSACTION_ATTEMPTS = 8;
+/**
+ * The transaction gate's advisory key (`transaction`): every transaction holds it shared, a retry holds
+ * it alone. Two int4 keys, so it can never collide with the `hashtext(...)` keys of the route-day,
+ * `vans` and `changes` locks, which are single bigint keys.
+ */
+const TX_GATE = '1330861636, 1';
 const isRetryable = (error: unknown): boolean => error instanceof Error && ['40001', '40P01'].includes((error as Error & { code?: string }).code ?? '');
 const asIso = (value: unknown): string => value instanceof Date ? value.toISOString() : String(value);
 const isoOrNull = (value: unknown): string | null => (value === null || value === undefined ? null : asIso(value));
@@ -628,24 +634,41 @@ export class PostgresOperationsStore {
    *
    * Retrying is safe because a rolled-back attempt leaves nothing behind and every handler re-reads
    * what it needs. Deadlocks (`40P01`) are retried on the same grounds.
+   *
+   * **A retry runs alone.** Retrying alone did not guarantee progress: a long write (a booking edit
+   * reads the booking, its day, its invoices, and the change feed's before and after) could lose to a
+   * stream of short ones until it ran out of attempts, a 500. Most of those conflicts are coarse, not
+   * real: a small table is read by a sequential scan, which locks the whole table, so any write to it
+   * elsewhere counts. The route-day advisory locks cannot prevent them either: a serializable
+   * transaction's snapshot is taken by its first statement, before any lock it then waits for, so the
+   * second writer of a day reads the day as it was and is cancelled once. So every transaction holds
+   * the gate (`TX_GATE`) shared, taken before `BEGIN`; a retry takes it exclusive, waits for the
+   * transactions in flight to finish, and runs with no other serializable transaction beside it: its
+   * snapshot comes after theirs committed, and nothing concurrent is left to cancel it. A first attempt
+   * never waits for another, so writes stay concurrent until two of them collide.
    */
   async transaction<T>(work: () => T | Promise<T>): Promise<T> {
     if (this.context.getStore()) return await work();
     for (let attempt = 1; ; attempt++) {
       const client = await this.pool.connect();
+      const alone = attempt > 1;
+      let broken: Error | undefined;
       try {
-        await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-        const result = await this.context.run(client, work);
-        await client.query('COMMIT');
-        return result;
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        if (attempt >= TRANSACTION_ATTEMPTS || !isRetryable(error)) throw error;
-      } finally { client.release(); }
-      // Contended pools are already serialized by the advisory lock, so a jittered pause is enough to
-      // let the winner commit rather than have both sides collide again immediately. It doubles each
-      // time: a write now also touches its history and action records, which every booking read
-      // scans, so several writers can keep colliding for longer than a fixed step outlasts.
+        await client.query(`SELECT ${alone ? 'pg_advisory_lock' : 'pg_advisory_lock_shared'}(${TX_GATE})`);
+        try {
+          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+          const result = await this.context.run(client, work);
+          await client.query('COMMIT');
+          return result;
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          if (attempt >= TRANSACTION_ATTEMPTS || !isRetryable(error)) throw error;
+        } finally {
+          // A session lock outlives the transaction: a connection that cannot give it back is closed, not pooled.
+          await client.query(`SELECT ${alone ? 'pg_advisory_unlock' : 'pg_advisory_unlock_shared'}(${TX_GATE})`).catch((error: Error) => { broken = error; });
+        }
+      } finally { client.release(broken); }
+      // A short jittered pause, then the retry queues for the gate.
       await new Promise((resolve) => setTimeout(resolve, 2 ** attempt * 5 * (1 + Math.random())));
     }
   }

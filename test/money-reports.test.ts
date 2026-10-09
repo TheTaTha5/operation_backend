@@ -6,7 +6,7 @@ process.env.AUTH_JWT_SECRET = 'money-reports-test-secret';
 const { buildApp } = await import('../src/app.js');
 const { OperationsStore } = await import('../src/domain/operations.js');
 const { blankAgent, seedUser, testStore, tokenFor } = await import('./users-helper.js');
-const { accountingDashboard, lastMonths, tripAmount } = await import('../src/domain/money-reports.js');
+const { accountingDashboard, lastMonths, noCollect, saleList, tripAmount } = await import('../src/domain/money-reports.js');
 
 // The money reports (todo/money-model.md slice 6), on whichever store DATABASE_URL selects. Other files
 // write invoices in parallel on PostgreSQL, so whole-database figures are checked by what this file
@@ -116,9 +116,76 @@ test('Travel Summary: who travelled, upgrade money, cash on tour, what is left t
   await ok('PUT', `/operations/trip-ops/${c.trips[0].id}/checkins/van/0`, { expected: 1, actual_pax: 0, checked_in_at: '2062-01-05T00:00:00Z', events: [{ type: 'cxl', pax: 1, ad: 1 }] });
   const ts = await ok('GET', `/v1/reports/travel-summary?date=${date}`);
   assert.deepEqual([ts.bookings, ts.booked, ts.travelled, ts.no_show, ts.cxl], [3, 7, 5, 1, 1]);
-  assert.deepEqual(ts.money, { cash: 500, transfer: 0, card: 1000, fees: 30, sales: 1900, sales_due: 400, sales_count: 3, commission: 200,
-    cash_on_tour: 1000, to_collect: 1400, to_collect_bookings: 2 });
+  assert.deepEqual(ts.money, { cash: 500, transfer: 0, card: 1000, received: 1500, fees: 30, pier: { cash: 0, transfer: 0, card: 0, total: 0, fees: 0, no_slip: 0 },
+    sales: 1900, sales_due: 400, sales_count: 3, commission: 200, sales_fees: 30, sales_by: { cash: 500, transfer: 0, card: 1000 }, sales_no_slip: 1, no_slip: 1,
+    cash_on_tour: 1000, to_collect: 1400, to_collect_bookings: 2, due: 1400, net: 1500 });
+  assert.deepEqual(ts.cot, { total: 1000, deduct: 0, payout: 0, not_collected: 0, not_collected_bookings: 0, undecided_bookings: 1 });
+  assert.deepEqual(ts.noshow, { cases: 2, pending: 2, decided: 0, postponed: 0, charged: 0 }, 'a no-show on a and a cancel on c wait for a decision');
+  assert.deepEqual(ts.collect_rows.map((r: { booking_id: string; target: number; due: number }) => [r.booking_id, r.target, r.due]), [[a.id, 1000, 1000], [b.id, 400, 400]].sort((x, y) => (x[0] < y[0] ? -1 : 1)));
   assert.equal((await send('GET', '/v1/reports/travel-summary?date=2062-1-5')).statusCode, 400);
+});
+
+test('Travel Summary and the Daily Report read the pier money and the decisions after the trip', async () => {
+  const date = '2062-01-06';
+  const a = await book(date, 3000, { agent_id: 'mr_a2', cash_on_tour_amount: 1000 }, { ad: 3 });
+  const b = await book(date, 2000, {}, { ad: 2 });
+  const c = await book(date, 1000, {}, { ad: 1 });
+  await ok('PATCH', `/v1/bookings/${b.id}`, { upgrades: [{ label: 'Snorkel', sell_price: 400, collected: false, method: 'cash' }] });
+  // a paid part of its cash on tour at the pier, one transfer still without its slip.
+  await ok('POST', `/v1/bookings/${a.id}/pier-payments`, { service_date: date, lines: [{ method: 'transfer', amount: 600 }, { method: 'cash', amount: 100 }] });
+  const wrong = await ok('POST', `/v1/bookings/${a.id}/pier-payments`, { service_date: date, lines: [{ method: 'card', amount: 50, fee: 5 }] });
+  await ok('DELETE', `/v1/bookings/${a.id}/pier-payments/${wrong.payments.find((p: { method: string }) => p.method === 'card').id}?reason=typo`);
+  // b bought on tour: one paid by card (2%, no slip), one left to collect on the travel day.
+  await ok('POST', `/v1/bookings/${b.id}/tour-sales`, { service: 'Kayak', qty: 2, unit_price: 250, to_company: 300, method: 'card', fee_pct: 2, seller: 'Nok' });
+  await ok('POST', `/v1/bookings/${b.id}/tour-sales`, { service: 'Photos', qty: 1, unit_price: 300, method: 'cot' });
+  // c did not come, but paid 200 at the pier: §paid, it counts.
+  await ok('PUT', `/operations/trip-ops/${c.trips[0].id}/checkins/van/0`, { expected: 1, actual_pax: 0, checked_in_at: '2062-01-06T00:00:00Z', events: [{ type: 'no_show', pax: 1, ad: 1 }] });
+  await ok('POST', `/v1/bookings/${c.id}/pier-payments`, { service_date: date, lines: [{ method: 'cash', amount: 200 }], overpay_anyway: true });
+  await ok('PUT', `/v1/bookings/${a.id}/cot-decisions/${date}`, { mode: 'part', deduct: 400, payout: 600 });
+  await ok('PUT', `/v1/bookings/${c.id}/noshow-charges/${date}`, { decision: 'full' });
+  // A wrong value is refused, not counted: a full charge is the trip's price, the server's.
+  assert.equal((await send('PUT', `/v1/bookings/${c.id}/noshow-charges/${date}`, { decision: 'full', amount: 1 })).statusCode, 400);
+
+  let ts = await ok('GET', `/v1/reports/travel-summary?date=${date}`);
+  assert.deepEqual(ts.money, { cash: 300, transfer: 600, card: 500, received: 1400, fees: 10, pier: { cash: 300, transfer: 600, card: 0, total: 900, fees: 0, no_slip: 1 },
+    sales: 1200, sales_due: 700, sales_count: 3, commission: 200, sales_fees: 10, sales_by: { cash: 0, transfer: 0, card: 500 }, sales_no_slip: 1, no_slip: 2,
+    cash_on_tour: 1000, to_collect: 1400, to_collect_bookings: 3, due: 700, net: 800 }, 'net is received less the cash-on-tour payout; a deleted payment counts nowhere');
+  assert.deepEqual(ts.cot, { total: 1000, deduct: 400, payout: 600, not_collected: 0, not_collected_bookings: 0, undecided_bookings: 0 });
+  assert.deepEqual(ts.noshow, { cases: 1, pending: 0, decided: 1, postponed: 0, charged: 1000 }, 'c is charged its trip\'s price');
+  const row = (id: string) => ts.collect_rows.find((r: { booking_id: string }) => r.booking_id === id);
+  assert.deepEqual([row(a.id).target, row(a.id).paid, row(a.id).due, row(a.id).no_slip], [1000, 700, 300, 1]);
+  assert.deepEqual([row(c.id).target, row(c.id).paid, row(c.id).not_counted], [0, 200, null], 'paid before cancelling: a refund matter, still counted');
+
+  // More than the cash on tour decided is not settled (legacy): it counts as undecided.
+  await ok('PUT', `/v1/bookings/${a.id}/cot-decisions/${date}`, { mode: 'part', deduct: 900, payout: 600 });
+  await ok('PUT', `/v1/bookings/${c.id}/noshow-charges/${date}`, { decision: 'postpone' });
+  ts = await ok('GET', `/v1/reports/travel-summary?date=${date}`);
+  assert.deepEqual([ts.cot.deduct, ts.cot.payout, ts.cot.undecided_bookings, ts.money.net], [0, 0, 1, 1400]);
+  assert.deepEqual(ts.noshow, { cases: 1, pending: 0, decided: 1, postponed: 1, charged: 0 });
+  await ok('PUT', `/v1/bookings/${a.id}/cot-decisions/${date}`, { mode: 'nocol', ref: 'did not pay' });
+  ts = await ok('GET', `/v1/reports/travel-summary?date=${date}`);
+  assert.deepEqual([ts.cot.not_collected, ts.cot.not_collected_bookings, ts.cot.undecided_bookings], [1000, 1, 0]);
+
+  const dr = await ok('GET', `/v1/reports/daily?date=${date}`);
+  assert.deepEqual([dr.due, dr.got, dr.no_slip, dr.extras, dr.upgrades.due], [1000, 900, 1, 800, 400], 'legacy pckMoney: the pier still owes 300 + 400 + 300');
+  assert.deepEqual(dr.by_agent.map((x: { key: string; due: number }) => [x.key, x.due]).sort(), [['_walk-in', 700], ['mr_a2', 300]]);
+  assert.equal((await send('GET', '/v1/reports/daily?date=2062-1-6')).statusCode, 400);
+
+  const dash = await ok('GET', '/v1/reports/accounting');
+  assert.ok(dash.extras_this_month >= 800, 'the two sales above were sold this month (whatever their trip day), the cot one too');
+});
+
+test('the report rules: tsSaleList by day, tsNoCollect\'s paid exception, extras by Bangkok month', () => {
+  const sale = (trip_date: string | null, method: string, qty = 1, unit_price = 100, slips: string[] = []) =>
+    ({ booking_id: 'b', trip_date, method, qty, unit_price, to_company: 0, fee: method === 'card' ? 3 : 0, slips }) as never;
+  const S = saleList({ upgrades: [] }, '2062-05-01', [sale('2062-05-01', 'cash'), sale('2062-05-02', 'cash'), sale(null, 'transfer'), sale('2062-05-01', 'cot', 2), sale('2062-05-01', 'card', 1, 100, ['f1'])]);
+  assert.deepEqual([S.got, S.due, S.n, S.by, S.fee, S.comm, S.no_slip], [300, 200, 4, { cash: 100, transfer: 100, card: 100 }, 3, 300, 1],
+    'another day\'s sale is not this day\'s; one with no day counts; a cot sale is still due; a transfer with no slip waits for one');
+  const nobody = { travelled: 0, cxl: 0, ns: 1, no_show: 1 };
+  assert.deepEqual([noCollect(nobody, 0), noCollect(nobody, 50), noCollect({ ...nobody, travelled: 1 }, 0)], [true, false, false]);
+  const d = accountingDashboard({ invoices: [], payments: [], agents: [], credit_exposure: 0, deposits_held: 0, now: new Date('2062-03-15T05:00:00Z'),
+    sales: [{ sold_at: '2062-02-28T18:00:00Z', qty: 2, unit_price: 150 }, { sold_at: '2062-02-28T16:00:00Z', qty: 1, unit_price: 999 }, { sold_at: '2062-03-31T16:59:00Z', qty: 1, unit_price: 50 }] });
+  assert.equal(d.extras_this_month, 350, 'Bangkok\'s month: 1 March 01:00 counts, 28 February 23:00 does not');
 });
 
 test('Daily Report money: revenue by route, market and channel; van cost from the van rates', async () => {
@@ -136,7 +203,7 @@ test('Daily Report money: revenue by route, market and channel; van cost from th
   assert.deepEqual(dr.by_route.map((r: { route_id: string; pax: number; revenue: number }) => [r.route_id, r.pax, r.revenue]), [['r10', 4, 8000], ['r12', 1, 1500]]);
   assert.deepEqual(dr.by_market.map((m: { id: string; pax: number }) => [m.id, m.pax]), [['_none', 3], ['walkin', 2]]);
   assert.deepEqual(dr.by_channel, { invoice: 6000, proforma: 0, cot: 0, transfer: 0, other: 3500 });
-  assert.deepEqual(dr.by_agent[0], { key: 'mr_a1', agent_id: 'mr_a1', name: 'mr_a1', market_id: '_none', pay_type: 'invoice', bookings: 1, ad: 3, chd: 0, inf: 0, foc: 0, pax: 3, revenue: 6000, docs: { nofiles: 1 } });
+  assert.deepEqual(dr.by_agent[0], { key: 'mr_a1', agent_id: 'mr_a1', name: 'mr_a1', market_id: '_none', pay_type: 'invoice', bookings: 1, ad: 3, chd: 0, inf: 0, foc: 0, pax: 3, revenue: 6000, due: 0, docs: { nofiles: 1 } });
   assert.deepEqual([dr.van_cost.total, dr.van_cost.estimated, dr.van_cost.vans, dr.van_cost.default_rate_vans], [1800, false, 1, 1], 'no rate set: the partner default');
 
   await ok('PUT', '/v1/van-rates', { group: `p:${partner}`, route_id: 'r10', field: 'PK', rate: 1650 });
