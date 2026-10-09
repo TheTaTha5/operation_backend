@@ -64,6 +64,24 @@ Not in Money:
 - **Settlement (slice 5):** van bills sent and paid (slice 3's commission payouts and pier hand-over
   are built).
 
+## Decided (2026-10-10)
+
+- **A reschedule fee on a booking already invoiced tops up that invoice** (corrected). The 2026-10-09
+  build issued a separate VAT-free fee invoice and added no fee item, on the belief that legacy left
+  the fee unbilled. That was wrong: legacy `bkV2RescheduleBooking` adds the fee item and, when the
+  booking has a live invoice (`acctBookingInvoice`), adds a line `Reschedule fee · <from> → <to> ·
+  <reason>` to it and raises its subtotal, net and total by the fee. Decided: copy legacy, with VAT
+  worked out again by the invoice's own VAT mode (`invoices.ts withFeeLine`, as a discount does),
+  since legacy's flat raise left VAT wrong on an `include` or `exclude` invoice. A paid invoice takes
+  the fee and reads partial.
+  - **The fee item is kept even when the invoice is topped up,** as legacy. The brief said to keep it
+    only when the booking is not invoiced; kept here instead because nothing can bill it twice (the
+    booking cannot go on a second invoice while the topped-up one is live, `409
+    booking_already_invoiced`), and without it a void and re-issue, or a restore after a cancel, would
+    drop the fee, and the `full` charge and credit `used` would leave it out. Test:
+    `test/invoices.test.ts` "a reschedule fee is billed once". Say if the fee item should go.
+  - Fee invoices remain for cancellation charges only; `fee_type: "reschedule"` comes from the import.
+
 ## Slices 5 and 6: what is left
 
 Built 2026-10-09 (branch `feat/money-van-bills-and-reports`, migration 120): README "Partner van

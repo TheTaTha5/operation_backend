@@ -983,7 +983,7 @@ erDiagram
     text number UK "INV-YYMM-NNNN"
     text agent_id FK
     text kind "booking, prepay or fee"
-    text fee_type "cancellation or reschedule; only on a fee"
+    text fee_type "cancellation, or reschedule (imported only); only on a fee"
     text vat_mode "copied from the agent at issue"
     numeric vat_rate
     numeric subtotal "the lines less their discounts"

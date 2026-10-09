@@ -159,7 +159,7 @@ export type PaymentState = 'none' | 'invoiced' | 'partial' | 'paid';
 /**
  * The booking's invoice (`acctBookingInvoice`): its live booking or prepay invoice, else its newest
  * live fee invoice (a cancelled booking's cancellation fee). `payment_state` counts every live
- * invoice, a reschedule fee's too: `paid` once all are paid, `partial` once anything is. It replaces
+ * invoice: `paid` once all are paid, `partial` once anything is. It replaces
  * legacy's stored `paymentStatus`, a copy that went wrong whenever a fee invoice was involved.
  */
 export function bookingInvoice(briefs: readonly InvoiceBrief[]): { invoice: BookingInvoice | null; payment_state: PaymentState } {
@@ -364,6 +364,30 @@ export function withDiscounts(invoice: StoredInvoice, payments: readonly StoredP
     line.discount = d === null || d === 0 ? null : cents(d as number);
   });
   const lines = [...next.values()].sort((a, b) => a.seq - b.seq);
+  return { ...invoice, lines, ...invoiceAmounts(lines, invoice.vat_mode, invoice.vat_rate) };
+}
+
+/**
+ * The booking's live booking or prepay invoice (legacy `acctBookingInvoice`, fee invoices left out):
+ * the newest that carries the booking on a line still on it. Undefined when there is none.
+ */
+export function liveBookingInvoiceOf(bookingId: string, invoices: readonly StoredInvoice[]): StoredInvoice | undefined {
+  return invoices.filter((i) => !i.voided && i.kind !== 'fee' && i.lines.some((l) => l.booking_id === bookingId && !l.removed_at && !l.cot_date))
+    .sort((a, b) => (a.issued_at < b.issued_at ? 1 : -1))[0];
+}
+
+/**
+ * A reschedule fee on a booking already invoiced (legacy `bkV2RescheduleBooking`: "top up that same
+ * invoice"): one more line for the booking, then the totals and VAT worked out again with the
+ * invoice's own VAT mode, as a discount does. Legacy added the fee to subtotal, net and total alike,
+ * so its VAT went wrong (decided 2026-10-10: copy legacy, VAT done right). A paid invoice takes it
+ * too and then reads partial.
+ */
+export function withFeeLine(invoice: StoredInvoice, bookingId: string, label: string, amount: number): StoredInvoice {
+  if (invoice.voided) refuse(`Invoice ${invoice.number} is void`, 409, 'invoice_void');
+  if (!(amount > 0)) badRequest('A fee line must be more than 0');
+  const lines: InvoiceLine[] = [...invoice.lines.map((l) => ({ ...l })),
+    { seq: Math.max(-1, ...invoice.lines.map((l) => l.seq)) + 1, booking_id: bookingId, label, amount: cents(amount), discount: null, ...NOT_REMOVED }];
   return { ...invoice, lines, ...invoiceAmounts(lines, invoice.vat_mode, invoice.vat_rate) };
 }
 

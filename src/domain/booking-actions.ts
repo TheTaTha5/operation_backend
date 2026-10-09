@@ -298,8 +298,8 @@ export type BookingReschedule = {
 export type RescheduleRequest =
   | { kind: 'move'; route_id: string; service_date: string; pax?: number }
   | { kind: 'record'; from_date: string; to_date: string; reason: string; charge_type: ChargeType; charge_amount?: number; collect: 'invoice' | 'separate';
-      /** Set by the route, never the client: the booking is already on a live invoice, so the fee gets one of its own. */
-      invoiced?: boolean };
+      /** Set by the route, never the client: the number of the booking's live invoice, which the fee tops up. */
+      invoice_number?: string };
 
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const isoDay = (value: unknown, name: string): string =>
@@ -322,12 +322,20 @@ export function parseRescheduleRequest(body: Record<string, unknown>): Reschedul
   return { kind: 'record', from_date, to_date, reason, ...charge(body), collect: collect as 'invoice' | 'separate' };
 }
 
+/** The fee's label, on the fee item and on the invoice line alike (legacy `bkV2RescheduleBooking`). */
+export const rescheduleFeeLabel = (from: string, to: string, reason: string | null): string =>
+  `Reschedule fee · ${from} → ${to}${reason ? ` · ${reason}` : ''}`;
+
 /**
  * The reschedule record, the fee item it adds, and its history line. The trip's price stands; a
- * charge is extra (`booking.js:13643`). Collected on the invoice it becomes a fee item, billed by the
- * booking's next invoice; collected separately it is kept on the record only. With no charge there
- * is nothing to collect. A booking already invoiced bills the charge by a fee invoice of its own
- * (decided 2026-10-09; legacy left it unbilled), so it is not a fee item too, or it would be billed twice.
+ * charge is extra (`booking.js:13643`). Collected on the invoice it becomes a fee item, as legacy
+ * (`bkV2RescheduleBooking`); collected separately it is kept on the record only. With no charge there
+ * is nothing to collect.
+ *
+ * A booking already on a live invoice also has that invoice topped up with the fee (the route does
+ * it, `invoices.ts withFeeLine`), and the history names it. The fee item stays all the same, as in
+ * legacy: the booking cannot be invoiced again while that invoice is live, and an invoice issued after
+ * it is voided must bill the fee again.
  */
 export function planRescheduleRecord(
   booking: { total?: number; fee_items: readonly { amount: number }[] },
@@ -336,12 +344,12 @@ export function planRescheduleRecord(
   const amount = chargeAmount(request, amountOwed(booking));
   const collect: Collect = amount > 0 ? request.collect : 'none';
   const route = `${request.from_date} → ${request.to_date}`;
-  const ownInvoice = collect === 'invoice' && request.invoiced === true;
-  const collected = ownInvoice ? ' · on a fee invoice' : collect === 'invoice' ? ' · on booking invoice' : collect === 'separate' ? ' · paid separately' : '';
+  const collected = collect === 'invoice' ? (request.invoice_number ? ` · on invoice ${request.invoice_number}` : ' · on booking invoice')
+    : collect === 'separate' ? ' · paid separately' : '';
   const locks = locksReturned > 0 ? ` · ${locksReturned} lock seat${locksReturned === 1 ? '' : 's'} returned` : '';
   return {
     record: { from_date: request.from_date, to_date: request.to_date, reason: request.reason, charge_type: request.charge_type, charge_amount: amount, collect, by: by ?? null },
-    ...(collect === 'invoice' && !ownInvoice ? { fee_item: { type: 'reschedule', label: `Reschedule fee · ${route} · ${request.reason}`, amount } } : {}),
+    ...(collect === 'invoice' ? { fee_item: { type: 'reschedule', label: rescheduleFeeLabel(request.from_date, request.to_date, request.reason), amount } } : {}),
     history: line(by, 'reschedule', 'Reschedule', `Rescheduled ${route} · ${chargeLabel(request.charge_type, amount)}${collected}${locks} · ${request.reason}`),
   };
 }

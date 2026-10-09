@@ -1514,8 +1514,9 @@ this works on multi-trip bookings.
   one-trip-per-route-per-day rule are checked too (`400`).
 - **The price stands; a charge is extra.** `collect` is `invoice` (default) or `separate`. With
   `invoice` and a charge above 0, a fee item `{ type: "reschedule", label: "Reschedule fee · <from> →
-  <to> · <reason>", amount }` is added. With `separate`, the charge is kept on the reschedule record
-  only. The recorded `collect` is `none` whenever the charge is 0.
+  <to> · <reason>", amount }` is added, and a booking already on a live invoice has that invoice
+  topped up with the same line (see "Invoices and payments"). With `separate`, the charge is kept on
+  the reschedule record only. The recorded `collect` is `none` whenever the charge is 0.
 
 The older body `{ route_id, service_date, pax? }` still works. It moves a single-trip booking
 anywhere and writes no reschedule record (it does write a history line).
@@ -2302,10 +2303,18 @@ refused with `400`; an unchanged echo is accepted.
   - no VAT, due now, whole baht;
   - only when the booking's agent is in the catalogue.
 - **Restore** voids that fee invoice.
-- **A reschedule fee** collected on the invoice (`collect: "invoice"`):
-  - booking not invoiced yet: a fee item, billed by its next invoice;
-  - booking already on a live invoice: a fee invoice of its own (`fee_type: "reschedule"`, no VAT, due
-    now), and no fee item, so it is never billed twice. Legacy left this fee unbilled.
+- **A reschedule fee** collected on the invoice (`collect: "invoice"`) is always a fee item on the
+  booking, as legacy (`bkV2RescheduleBooking`):
+  - booking not invoiced yet: the fee item is billed by its next invoice;
+  - booking already on a live booking or prepay invoice: **that invoice is topped up**, as legacy does.
+    It gets a line `Reschedule fee · <from> → <to> · <reason>` for the booking, and its subtotal, net,
+    VAT and total are worked out again with the invoice's own VAT mode (as a discount is). Legacy
+    added the fee to subtotal, net and total alike, which left its VAT wrong; this does not. A paid
+    invoice takes the fee too and then reads `partial`. The history line says `on invoice <number>`.
+  - **Billed once:** while that invoice is live the booking cannot go on another
+    (`409 booking_already_invoiced`); once it is voided, the next invoice bills the fee item once.
+  - No separate fee invoice is issued for a reschedule; `fee_type: "reschedule"` comes only from
+    legacy's import.
 
 **The agent's credit** (legacy `agCreditState`):
 - **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`. (Its

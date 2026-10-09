@@ -198,24 +198,70 @@ test('an invoice write is in the change feed, with its booking', async () => {
   assert.equal(changes.filter((c) => c.entity_id === b.id && c.kind === 'booking').length, 2);
 });
 
-test('a reschedule charged on an invoiced booking gets a fee invoice of its own, and no fee item', async () => {
-  const b = await booking('inv_a1', 3000, '2056-03-01');
-  await send('POST', '/operations/deployments', { boat_id: 'inv-boat-2056-03-02', route_id: 'r1', service_date: '2056-03-02', capacity: 40 });
-  const inv = (await issue('inv_a1', [b.id])).json();
-  const moved = await send('POST', `/v1/bookings/${b.id}/reschedule`, { from_date: '2056-03-01', to_date: '2056-03-02', reason: 'weather', charge_type: 'partial', charge_amount: 500 });
-  assert.equal(moved.statusCode, 200, moved.body);
-  assert.deepEqual(moved.json().fee_items, [], 'billed by its own invoice, so not on the next one too');
-  assert.equal(moved.json().invoice.id, inv.id, 'the booking\'s invoice is still its main one');
-  assert.equal(moved.json().payment_state, 'invoiced');
-  const fee = (await send('GET', `/v1/invoices?booking_id=${b.id}`)).json().invoices.find((i: { kind: string }) => i.kind === 'fee');
-  assert.deepEqual([fee.fee_type, fee.total, fee.vat_amount, fee.lines[0].label], ['reschedule', 500, 0, 'Reschedule fee · 2056-03-01 → 2056-03-02 · weather']);
+const deploy = (date: string) => send('POST', '/operations/deployments', { boat_id: `inv-boat-${date}`, route_id: 'r1', service_date: date, capacity: 40 });
+const reschedule = (id: string, from: string, to: string, extra: object) =>
+  send('POST', `/v1/bookings/${id}/reschedule`, { from_date: from, to_date: to, reason: 'weather', charge_type: 'partial', ...extra });
+const amounts = (i: { subtotal: number; net_amount: number; vat_amount: number; total: number }) => [i.subtotal, i.net_amount, i.vat_amount, i.total];
 
+test('a reschedule charged on an invoiced booking tops up that invoice (VAT included), and a paid one reads partial', async () => {
+  const b = await booking('inv_a1', 3000, '2056-03-01');
+  await deploy('2056-03-02');
+  const inv = (await issue('inv_a1', [b.id])).json();
   await send('POST', `/v1/invoices/${inv.id}/payments`, { amount: 3000, method: 'cash' }, acct);
-  assert.equal((await send('GET', `/v1/bookings/${b.id}`)).json().payment_state, 'partial', 'paid only once the fee is paid too');
-  await send('POST', `/v1/invoices/${fee.id}/payments`, { amount: 500, method: 'cash' }, acct);
   assert.equal((await send('GET', `/v1/bookings/${b.id}`)).json().payment_state, 'paid');
 
-  const notYet = await booking('inv_a1', 1000, '2056-03-01');
-  const later = (await send('POST', `/v1/bookings/${notYet.id}/reschedule`, { from_date: '2056-03-01', to_date: '2056-03-02', reason: 'x', charge_type: 'partial', charge_amount: 200 })).json();
+  // The client may not say which invoice: a number it sends is overridden by the booking's own.
+  const moved = await reschedule(b.id, '2056-03-01', '2056-03-02', { charge_amount: 535, invoice_number: 'INV-0000-0001', invoiced: false });
+  assert.equal(moved.statusCode, 200, moved.body);
+  assert.deepEqual([moved.json().invoice.id, moved.json().invoice.status, moved.json().invoice.balance, moved.json().payment_state], [inv.id, 'partial', 535, 'partial']);
+  const after = (await send('GET', `/v1/invoices/${inv.id}`)).json();
+  assert.deepEqual(after.lines.map((l: { booking_id: string; label: string; amount: number }) => [l.booking_id, l.amount]), [[b.id, 3000], [b.id, 535]]);
+  assert.equal(after.lines[1].label, 'Reschedule fee · 2056-03-01 → 2056-03-02 · weather', 'as legacy labels it');
+  assert.deepEqual(amounts(after), [3535, 3304, 231, 3535], 'VAT worked out again, included in the price');
+  assert.deepEqual([after.status, after.paid, after.balance], ['partial', 3000, 535]);
+  const all = (await send('GET', `/v1/invoices?booking_id=${b.id}`)).json().invoices;
+  assert.deepEqual(all.map((i: { id: string }) => i.id), [inv.id], 'no fee invoice of its own');
+  assert.deepEqual(moved.json().fee_items.map((f: { type: string; amount: number }) => [f.type, f.amount]), [['reschedule', 535]], 'a fee item, as legacy');
+  const history = (await send('GET', `/v1/bookings/${b.id}/history`)).json().history;
+  assert.ok(history.some((h: { text: string }) => h.text === `Rescheduled 2056-03-01 → 2056-03-02 · Charge ฿535 · on invoice ${inv.number} · weather`), JSON.stringify(history.map((h: { text: string }) => h.text)));
+});
+
+test('a reschedule fee on an invoice that adds VAT on top gets VAT too; paid separately or free tops up nothing', async () => {
+  const b = await booking('inv_a2', 1000, '2056-03-03');
+  await deploy('2056-03-04');
+  await deploy('2056-03-05');
+  await deploy('2056-03-06');
+  const inv = (await issue('inv_a2', [b.id])).json();
+  assert.deepEqual(amounts(inv), [1000, 1000, 70, 1070]);
+  assert.equal((await reschedule(b.id, '2056-03-03', '2056-03-04', { charge_amount: 500 })).statusCode, 200);
+  assert.deepEqual(amounts((await send('GET', `/v1/invoices/${inv.id}`)).json()), [1500, 1500, 105, 1605]);
+
+  const separate = await reschedule(b.id, '2056-03-04', '2056-03-05', { charge_amount: 300, collect: 'separate' });
+  assert.equal(separate.statusCode, 200, separate.body);
+  const free = await reschedule(b.id, '2056-03-05', '2056-03-06', { charge_type: 'none', charge_amount: 900 });
+  assert.equal(free.statusCode, 200, free.body);
+  const read = (await send('GET', `/v1/invoices/${inv.id}`)).json();
+  assert.equal(read.lines.length, 2, 'only the fee collected on the invoice');
+  assert.deepEqual(free.json().fee_items.map((f: { amount: number }) => f.amount), [500]);
+});
+
+test('a reschedule fee is billed once: never by a second invoice, once by the one issued after a void', async () => {
+  const b = await booking('inv_a3', 2000, '2056-03-07');
+  await deploy('2056-03-08');
+  const inv = (await issue('inv_a3', [b.id])).json();
+  assert.equal((await reschedule(b.id, '2056-03-07', '2056-03-08', { charge_amount: 400 })).statusCode, 200);
+  assert.deepEqual(amounts((await send('GET', `/v1/invoices/${inv.id}`)).json()), [2400, 2400, 0, 2400], 'no VAT for a none agent');
+
+  const again = await issue('inv_a3', [b.id]);
+  assert.deepEqual([again.statusCode, again.json().code], [409, 'booking_already_invoiced'], 'the fee is on the live invoice already');
+  assert.equal((await send('POST', `/v1/invoices/${inv.id}/void`, { reason: 'reissue' }, acct)).statusCode, 200);
+  const reissued = (await issue('inv_a3', [b.id])).json();
+  assert.deepEqual(reissued.lines.map((l: { amount: number }) => l.amount), [2000, 400], 'the fee item bills it once');
+  assert.equal(reissued.total, 2400);
+
+  const notYet = await booking('inv_a3', 1000, '2056-03-07');
+  const later = (await reschedule(notYet.id, '2056-03-07', '2056-03-08', { reason: 'x', charge_amount: 200 })).json();
   assert.deepEqual(later.fee_items.map((f: { amount: number }) => f.amount), [200], 'not invoiced yet: a fee item for its next invoice, as legacy');
+  assert.deepEqual((await send('GET', `/v1/invoices?booking_id=${notYet.id}`)).json().invoices, [], 'and no invoice');
+  assert.deepEqual((await issue('inv_a3', [notYet.id])).json().lines.map((l: { amount: number }) => l.amount), [1000, 200]);
 });

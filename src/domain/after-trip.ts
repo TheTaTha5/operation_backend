@@ -14,7 +14,7 @@
  * totals and VAT are worked out again as a discount's are.
  */
 import { refuse, type HistoryLine } from './booking-actions.js';
-import { cotLineLabel, invoiceAmounts, NOT_REMOVED, type StoredInvoice } from './invoices.js';
+import { cotLineLabel, invoiceAmounts, liveBookingInvoiceOf, NOT_REMOVED, type StoredInvoice } from './invoices.js';
 import type { AttachmentRef } from './attachments.js';
 import { assertOnTrip, slipIdsOf, type MoneyBooking } from './pier-money.js';
 
@@ -98,8 +98,7 @@ export const cotDeductions = (decisions: readonly Pick<StoredCotDecision, 'servi
  */
 export function syncCotLines(bookingId: string, invoices: readonly StoredInvoice[], decisions: readonly Pick<StoredCotDecision, 'service_date' | 'deduct'>[], now: string, by: string | null):
   { invoice: StoredInvoice; before: StoredInvoice } | undefined {
-  const inv = invoices.filter((i) => !i.voided && i.kind !== 'fee' && i.lines.some((l) => l.booking_id === bookingId && !l.removed_at && !l.cot_date))
-    .sort((a, b) => (a.issued_at < b.issued_at ? 1 : -1))[0];
+  const inv = liveBookingInvoiceOf(bookingId, invoices);
   if (!inv) return undefined;
   const want = new Map(cotDeductions(decisions).map((d) => [d.service_date, d.deduct]));
   const lines = inv.lines.map((l) => ({ ...l }));
