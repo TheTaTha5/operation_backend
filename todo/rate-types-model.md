@@ -1,10 +1,13 @@
 # Rate types: what is still open
 
-Rate types exist: migration 022, the endpoints and the importer (`README.md`, "Rate types").
+Rate types exist: migration 022, the endpoints and the importer (`README.md`, "Rate types"). **This
+API is their master since 2026-10-09:** the legacy import leaves them alone unless run with
+`--rate-types`, which seeds a database that has none.
 
 ## To do
 
-Run the import in production, then add the foreign key (it cannot ship before):
+If production has no rate types yet, run the import once with `--rate-types`; then add the foreign
+key (it cannot ship before):
 
 ```sql
 ALTER TABLE agents ADD CONSTRAINT agents_rate_type_fk FOREIGN KEY (rate_type_id) REFERENCES rate_types (id);

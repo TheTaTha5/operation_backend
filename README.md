@@ -460,14 +460,12 @@ A rate type is a price list: what an agent pays per seat on each route and picku
 boat, and per add-on. Reads are open to any login; writes need the `sales` edit area. Nothing
 prices a booking from them yet; that is the quote, a later slice (`todo/pricing-model.md`).
 
-Rate types arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids
-(`rt003`, `rt_staff`, …), which are the ids `agents.rate_type_id` and `bookings.rate_type_ref`
-already hold. Until cutover legacy is the master, and each import run replaces only what legacy's
-tables can hold: seat prices in zones PK, KL and NoTransfer, speedboat and catamaran charters, the
-longtail add-on, and transfers on r4, r5, r6, r10, r11 and r12. Legacy dropped everything else on
-save, so it can only be entered here, and the import keeps it: RN prices, longtail charters,
-transfers on other routes, a bundle's `applies_to`. A legacy price changed here is put back by the
-next import run, so change those in legacy until cutover.
+**This API is the master for rate types** (moved 2026-10-09): edit them here, not in legacy. The
+legacy import leaves them alone. `import-legacy.ts --rate-types` imports them once, to seed a database
+that has none, with legacy's ids (`rt003`, `rt_staff`, …), the ids `agents.rate_type_id` and
+`bookings.rate_type_ref` already hold. Legacy dropped some prices on save, so they were never there
+to import and are entered here: RN prices, longtail charters, transfers outside r4, r5, r6, r10, r11
+and r12, a bundle's `applies_to`.
 
 - `GET /v1/rate-types?active=&q=`: summary rows, A–Z by name (case-insensitive), then id.
   - `active` is `true` (the default), `false`, or `all`.

@@ -1,7 +1,7 @@
 /**
  * Backfills this service's database from the legacy monolith's (`operation_schemas`).
  *
- *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…]
+ *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…] [--rate-types]
  *
  * Without `--commit` it is a dry run: every write happens inside one transaction on the target, the
  * report is printed, and the transaction is rolled back. The source is opened read-only either way.
@@ -17,7 +17,9 @@
  * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
  * bookings named in `--remove`.
  *
- * Rate types keep legacy's ids and are upserted (mapping: `legacy-rate-types.ts`). Under each one,
+ * Rate types moved here on 2026-10-09: this API is their master, and a run leaves them alone. Only
+ * `--rate-types` imports them, to seed a database that has none yet. Then they keep legacy's ids and
+ * are upserted (mapping: `legacy-rate-types.ts`). Under each one,
  * only what legacy's tables can hold is replaced: seat prices in zones PK, KL and NoTransfer,
  * speedboat and catamaran charters, the longtail add-on, and transfers on the routes legacy has a
  * table for. Everything else was entered here by hand, because legacy drops it on save — RN prices,
@@ -60,6 +62,8 @@ type Row = Record<string, unknown>;
 
 const commit = process.argv.includes('--commit');
 const remove = (process.argv.find((arg) => arg.startsWith('--remove='))?.slice('--remove='.length) ?? '').split(',').filter(Boolean);
+/** Rate types are this API's since 2026-10-09: imported only to seed an empty database. */
+const withRateTypes = process.argv.includes('--rate-types');
 const sourceUrl = process.env.SOURCE_DATABASE_URL;
 const targetUrl = process.env.TARGET_DATABASE_URL;
 if (!sourceUrl || !targetUrl) throw new Error('Set SOURCE_DATABASE_URL and TARGET_DATABASE_URL');
@@ -1027,8 +1031,13 @@ async function main() {
     }
     const keepRate = (row: Row) => !clashes.has(String(row.rate_type_id ?? row.id));
     for (const key of ['rateTypes', 'routes', 'seat', 'charter', 'longtail', 'transfer'] as const) rateTypes[key] = rateTypes[key].filter(keepRate);
+    // Moved here (2026-10-09): without --rate-types nothing below writes a rate type.
+    if (!withRateTypes) {
+      for (const key of ['rateTypes', 'routes', 'seat', 'charter', 'longtail', 'transfer', 'issues'] as const) rateTypes[key] = [];
+      rateTypes.notes = new Map();
+    }
     const rateIds = rateTypes.rateTypes.map((r) => String(r.id));
-    const rateTypesOnlyHere = (await target.query('SELECT id FROM rate_types WHERE id <> ALL($1::text[]) ORDER BY id', [legacyRateTypes.rates.map((r) => str(r.id))])).rows.map((r) => String(r.id));
+    const rateTypesOnlyHere = !withRateTypes ? [] : (await target.query('SELECT id FROM rate_types WHERE id <> ALL($1::text[]) ORDER BY id', [legacyRateTypes.rates.map((r) => str(r.id))])).rows.map((r) => String(r.id));
 
     // ── Invoices and payments (migration 045, `legacy-invoices.ts`): after the bookings and agents they name ──
     const routeNames = new Map((await target.query('SELECT id, name FROM routes')).rows.map((r) => [String(r.id), String(r.name)]));
@@ -1192,7 +1201,8 @@ async function main() {
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
-    console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
+    if (!withRateTypes) console.log('rate types: not imported (this API is their master since 2026-10-09; --rate-types seeds an empty database)');
+    else console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
       + `${rateTypes.charter.length} charter rows, ${rateTypes.longtail.length} longtail rows, ${rateTypes.transfer.length} transfer prices `
       + `(transfer tables: ${legacyRateTypes.transfers.map((t) => t.routeId).join(', ')})`);
     console.log('target now holds:', after);

@@ -11,6 +11,9 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
    the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas,
    and (with 045) the invoices and payments with their slips.
+1b2. **Rate types are this API's now** (`feat/rate-types-cutover`): the import no longer touches
+   them. If Railway has none yet (`SELECT count(*) FROM rate_types`), run the import once with
+   `--rate-types`. From then on prices are edited here, not in legacy.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
