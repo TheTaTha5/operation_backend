@@ -15,6 +15,8 @@
  * - Status: only `active` holds. `expired` keeps its expiry, so it reads expired here, which is the
  *   same thing worked out on read; `depleted`, `released`, `converted` become `released`. A bulk
  *   departure legacy released by hand (`releaseddates`) comes in released.
+ * - A whole-boat hold (migration 180): `converted` stays `converted`, with the booking its `convert`
+ *   line names (`lg_` + legacy's id); its deal is `any` when legacy's `subname` says so, else `fixed`.
  * - The log comes over line by line, `imported`: a bulk lock's onto its group, and onto the departure
  *   when the line names one (`tripdate`).
  */
@@ -155,7 +157,7 @@ export function mapLegacyLocks(src: { locks: readonly Row[]; log: readonly Row[]
     const days = new Map<string, string>();
     const lockRow = (row: Partial<Row>): Row => ({
       pending_pax: 0, released_pax: 0, expiry: null, reason: null, group_id: null, parent_id: null, sub_name: null, boat_id: null,
-      released_at: null, version: 1, ...holder, ...created(l), updated_at: created(l).created_at, ...row,
+      boat_deal: null, converted_booking_id: null, released_at: null, version: 1, ...holder, ...created(l), updated_at: created(l).created_at, ...row,
     });
 
     if (spansDays(l)) {
@@ -186,13 +188,21 @@ export function mapLegacyLocks(src: { locks: readonly Row[]; log: readonly Row[]
       if (!day) { report.skip('seat lock', id, str(l.date) ? `bad date ${str(l.date)}` : 'undated lock has no date'); continue; }
       const boatId = scope === 'boat' ? str(l.boatid) || null : null;
       const expiry = isoDay(l.expiry);
-      // A whole-boat hold never expires by itself (legacy skips it in the sweep).
-      const status = boatId ? (str(l.status) === 'active' ? 'active' : 'released') : statusOf(str(l.status), expiry, ctx.today, report, scope === 'boat' ? 'whole-boat holds' : 'locks');
+      // A whole-boat hold never expires by itself (legacy skips it in the sweep). A converted one names
+      // its booking only in its `convert` log line (legacy's `convertedTo` is not stored).
+      const convertedTo = boatId && str(l.status) === 'converted'
+        ? [...(logOf.get(id) ?? [])].reverse().find((e) => str(e.type) === 'convert' && str(e.bookingid)) : undefined;
+      if (boatId && str(l.status) === 'converted' && !convertedTo) report.note('converted holds naming no booking → released');
+      const status = boatId ? (str(l.status) === 'active' ? 'active' : convertedTo ? 'converted' : 'released')
+        : statusOf(str(l.status), expiry, ctx.today, report, scope === 'boat' ? 'whole-boat holds' : 'locks');
       if (scope === 'boat') report.note(boatId ? 'whole-boat holds imported with their boat' : 'whole-boat holds with no boat (a plain lock)');
       const lockId = ctx.prefix + id;
       out.locks.push(lockRow({
         id: lockId, route_id: routeId, service_date: day, pax, released_pax: Math.min(released, pax), boat_id: boatId, expiry, reason,
         pending_pax: status === 'active' && !boatId ? Math.min(Math.max(0, int(l.pendqty)), qty) : 0, status,
+        // Legacy's reused `subName`: `any` is any boat that big; anything else, or nothing, the boat itself.
+        boat_deal: boatId ? (str(l.subname) === 'any' ? 'any' : 'fixed') : null,
+        converted_booking_id: convertedTo ? ctx.prefix + str(convertedTo.bookingid) : null,
       }));
       days.set(day, lockId);
       logTarget.set(id, { lock: lockId });

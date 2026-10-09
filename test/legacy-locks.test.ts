@@ -97,6 +97,32 @@ test('status: expired keeps its expiry (it reads expired here), depleted is rele
   ], 'a whole-boat hold never expires by itself; its fixed/any is not a sub-group name');
 });
 
+test('a whole-boat hold keeps its deal, and a converted one the booking its convert line names', () => {
+  const r = report();
+  const hold = (id: string, extra: Record<string, unknown>) => day(id, { scope: 'boat', boatid: 'b13', qty: 38, expiry: '2026-10-31', ...extra });
+  const out = mapLegacyLocks({
+    locks: [
+      hold('lk6', { subname: 'fixed', status: 'converted' }),
+      hold('lk7', { subname: 'any', status: 'active' }),
+      hold('lk8', { subname: '', status: 'converted' }),
+      hold('lk9', { subname: 'fixed', status: 'released' }),
+    ],
+    log: [
+      { sb_seat_locks_id: 'lk6', idx: 0, date: '2026-10-01', type: 'create', qty: 38 },
+      { sb_seat_locks_id: 'lk6', idx: 1, date: '2026-10-01', type: 'convert', bookingid: 'BK-26100035-N13I', note: 'เหมาลำ Oceanus' },
+    ],
+  }, ctx, r);
+  assert.deepEqual(out.locks.map((l) => [l.id, l.status, l.boat_deal, l.converted_booking_id]), [
+    ['lg_lk6', 'converted', 'fixed', 'lg_BK-26100035-N13I'],
+    ['lg_lk7', 'active', 'any', null],
+    ['lg_lk8', 'released', 'fixed', null],
+    ['lg_lk9', 'released', 'fixed', null],
+  ], 'legacy\'s missing subName means fixed; a converted hold with no convert line has no booking to name');
+  assert.ok(r.notes.includes('converted holds naming no booking → released'));
+  const plain = mapLegacyLocks({ locks: [day('lk10')], log: [] }, ctx, report()).locks[0];
+  assert.deepEqual([plain.boat_deal, plain.converted_booking_id], [null, null]);
+});
+
 test('a bulk lock is a group with one lock per departure; its log goes to the group, and to the departure a line names', () => {
   const r = report();
   const bulk = { id: 'lkB', scope: 'bulk', routeid: 'r5', datefrom: '2026-11-01', dateto: '2026-11-08', dow: '[2,4]', qty: 28, status: 'active', holdertype: 'agent', holderid: 'a10',
