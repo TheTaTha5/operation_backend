@@ -224,7 +224,9 @@ const COMMAND_DOCS: Record<string, { summary: string; description: string }> = {
   'cancel-weather': {
     summary: 'Cancel a booking because the trip was called off for weather',
     description: 'From any status that holds seats. Becomes `cancelled_weather`, `cancellation_reason` `weather`, and gives its seats back. '
-      + 'Undo with `/restore`. Refunds and credits are not handled here yet.',
+      + 'Body `{ note, outcome }`: `outcome` is `cancel` (default, no refund), `refund` or `credit`. Only this booking\'s lines come off its invoice; '
+      + 'what it had paid beyond what the invoice still asks is refunded or kept as the agent\'s credit, listed in `refunds`. Resolves its weather follow-ups. '
+      + 'Undo with `/restore`.',
   },
 };
 

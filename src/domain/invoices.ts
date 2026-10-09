@@ -22,11 +22,20 @@ export const VAT_MODES = ['none', 'include', 'exclude'] as const;
 export type VatMode = typeof VAT_MODES[number];
 export type InvoiceKind = 'booking' | 'prepay' | 'fee';
 export type FeeType = 'cancellation' | 'reschedule';
-export const PAYMENT_METHODS = ['transfer', 'cash', 'card'] as const;
+/** `credit` spends the agent's credit balance (`refunds.ts`); the others are money received. */
+export const PAYMENT_METHODS = ['transfer', 'cash', 'card', 'credit'] as const;
 export type PaymentMethod = typeof PAYMENT_METHODS[number];
 export type InvoiceStatus = 'issued' | 'partial' | 'paid' | 'void';
 
-export type InvoiceLine = { seq: number; booking_id: string | null; label: string; amount: number; discount: number | null };
+/**
+ * `removed_*`: a line taken off a live invoice (a weather cancel takes only its booking's lines off,
+ * migration 061). It stays on the document and leaves every total.
+ */
+export type InvoiceLine = {
+  seq: number; booking_id: string | null; label: string; amount: number; discount: number | null;
+  removed_at: string | null; removed_by: string | null; removed_reason: string | null;
+};
+export const NOT_REMOVED = { removed_at: null, removed_by: null, removed_reason: null } as const;
 /** The document's header text: legacy's editor wrote it and lost it on every save. */
 export const HEADER_FIELDS = ['note', 'ref', 'dear', 'accept_at', 'remark'] as const;
 type HeaderField = typeof HEADER_FIELDS[number];
@@ -49,6 +58,16 @@ export type StoredPayment = {
   slips: string[];
 };
 
+/**
+ * Money taken back from an invoice for one booking (migration 061): owed back to the agent (`refund`)
+ * or kept as the agent's credit (`credit`), spent later as a payment with method `credit`.
+ */
+export type RefundKind = 'refund' | 'credit';
+export type StoredRefund = {
+  id: string; kind: RefundKind; invoice_id: string; booking_id: string | null; agent_id: string | null;
+  amount: number; reason: string; created_by: string | null; created_at: string;
+};
+
 export const copyInvoice = (i: StoredInvoice): StoredInvoice => ({ ...i, lines: i.lines.map((l) => ({ ...l })) });
 
 /** Money to the satang, so sums of NUMERIC(12,2) values don't drift. */
@@ -61,8 +80,9 @@ const sum = (values: readonly number[]): number => cents(values.reduce((s, v) =>
  * `acctInvRecalc` (and `acctCreateInvoice`, which is the same with no discount): the discounts come
  * off the amount issued, never more than all of it, then VAT in whole baht by the VAT mode.
  */
-export function invoiceAmounts(lines: readonly Pick<InvoiceLine, 'amount' | 'discount'>[], vatMode: VatMode | null, vatRate: number | null):
+export function invoiceAmounts(all: readonly (Pick<InvoiceLine, 'amount' | 'discount'> & { removed_at?: string | null })[], vatMode: VatMode | null, vatRate: number | null):
   Pick<StoredInvoice, 'subtotal' | 'net_amount' | 'vat_amount' | 'total'> {
+  const lines = all.filter((l) => !l.removed_at);
   const gross = sum(lines.map((l) => l.amount));
   const discount = Math.min(sum(lines.map((l) => l.discount ?? 0)), gross);
   const subtotal = cents(Math.max(0, gross - discount));
@@ -75,6 +95,8 @@ export function invoiceAmounts(lines: readonly Pick<InvoiceLine, 'amount' | 'dis
 /** Payments that count: a deleted one stays on record but out of every total. */
 export const livePayments = (payments: readonly StoredPayment[]): StoredPayment[] => payments.filter((p) => !p.deleted_at);
 export const paidOf = (payments: readonly StoredPayment[]): number => sum(livePayments(payments).map((p) => p.amount));
+/** What refunds and credits took back from an invoice. */
+export const returnedOf = (refunds: readonly Pick<StoredRefund, 'amount'>[]): number => sum(refunds.map((r) => r.amount));
 
 /**
  * `acctInvoiceState`: void; paid once the payments reach the total (WHT does not count, decided
@@ -88,7 +110,9 @@ export function invoiceState(invoice: { voided: boolean; total: number }, paid: 
 
 export type PaymentView = Omit<StoredPayment, 'slips'> & { slips: AttachmentRef[] };
 export type InvoiceView = StoredInvoice & {
-  status: InvoiceStatus; paid: number; balance: number;
+  /** `paid` is every live payment; `status` and `balance` count it less `refunded` and `credited`. */
+  status: InvoiceStatus; paid: number; balance: number; refunded: number; credited: number;
+  refunds: StoredRefund[];
   /** What the document asks to be paid: the total less withholding tax (legacy's "Payment Amount"). */
   payment_amount: number;
   booking_ids: string[];
@@ -100,10 +124,13 @@ const fileRef = (files: ReadonlyMap<string, AttachmentRef>, id: string): Attachm
 export const bookingIdsOf = (invoice: Pick<StoredInvoice, 'lines'>): string[] =>
   [...new Set(invoice.lines.map((l) => l.booking_id).filter((id): id is string => !!id))];
 
-export function invoiceView(invoice: StoredInvoice, payments: readonly StoredPayment[], files: ReadonlyMap<string, AttachmentRef> = new Map()): InvoiceView {
+export function invoiceView(invoice: StoredInvoice, payments: readonly StoredPayment[], files: ReadonlyMap<string, AttachmentRef> = new Map(),
+  refunds: readonly StoredRefund[] = []): InvoiceView {
   const paid = paidOf(payments);
+  const refunded = returnedOf(refunds.filter((r) => r.kind === 'refund')), credited = returnedOf(refunds.filter((r) => r.kind === 'credit'));
   return {
-    ...invoice, lines: invoice.lines.map((l) => ({ ...l })), ...invoiceState(invoice, paid), paid,
+    ...invoice, lines: invoice.lines.map((l) => ({ ...l })), ...invoiceState(invoice, cents(paid - refunded - credited)), paid, refunded, credited,
+    refunds: refunds.map((r) => ({ ...r })),
     payment_amount: cents(invoice.total - (invoice.wht_amount ?? 0)), booking_ids: bookingIdsOf(invoice),
     payments: payments.map((p) => ({ ...p, slips: p.slips.map((id) => fileRef(files, id)) })),
   };
@@ -111,8 +138,11 @@ export function invoiceView(invoice: StoredInvoice, payments: readonly StoredPay
 
 // ── A booking's invoice and payment state ────────────────────────────────────────────────────────
 
-/** What a booking read needs of each invoice that names it. */
-export type InvoiceBrief = { id: string; number: string; kind: InvoiceKind; fee_type: FeeType | null; total: number; issued_at: string; voided: boolean; paid: number[] };
+/**
+ * What a booking read needs of each invoice that names it on a live line (a line a weather cancel
+ * took off does not count). `returned` is what refunds and credits took back from it.
+ */
+export type InvoiceBrief = { id: string; number: string; kind: InvoiceKind; fee_type: FeeType | null; total: number; issued_at: string; voided: boolean; paid: number[]; returned: number };
 export type BookingInvoice = { id: string; number: string; kind: InvoiceKind; fee_type: FeeType | null; status: InvoiceStatus; total: number; paid: number; balance: number };
 export type PaymentState = 'none' | 'invoiced' | 'partial' | 'paid';
 
@@ -125,11 +155,11 @@ export type PaymentState = 'none' | 'invoiced' | 'partial' | 'paid';
 export function bookingInvoice(briefs: readonly InvoiceBrief[]): { invoice: BookingInvoice | null; payment_state: PaymentState } {
   const live = briefs.filter((b) => !b.voided).sort((a, b) => (a.issued_at === b.issued_at ? (a.id < b.id ? -1 : 1) : a.issued_at < b.issued_at ? -1 : 1));
   if (!live.length) return { invoice: null, payment_state: 'none' };
-  const states = live.map((b) => ({ b, paid: sum(b.paid), ...invoiceState({ voided: false, total: b.total }, sum(b.paid)) }));
+  const states = live.map((b) => ({ b, paid: sum(b.paid), ...invoiceState({ voided: false, total: b.total }, cents(sum(b.paid) - b.returned)) }));
   const main = [...states].reverse().find((s) => s.b.kind !== 'fee') ?? states[states.length - 1];
   return {
     invoice: { id: main.b.id, number: main.b.number, kind: main.b.kind, fee_type: main.b.fee_type, status: main.status, total: main.b.total, paid: main.paid, balance: main.balance },
-    payment_state: states.every((s) => s.status === 'paid') ? 'paid' : states.some((s) => s.paid > 0) ? 'partial' : 'invoiced',
+    payment_state: states.every((s) => s.status === 'paid') ? 'paid' : states.some((s) => s.paid - s.b.returned > 0) ? 'partial' : 'invoiced',
   };
 }
 
@@ -230,8 +260,8 @@ export function invoiceLines(agentId: string, bookings: readonly IssuableBooking
     if (b.agent_id !== agentId) refuse(`Booking ${b.id} is not agent ${agentId}'s`, 400, 'booking_not_agents');
     if (RELEASED.includes(b.status)) refuse(`Booking ${b.id} is ${b.status}`, 409, 'booking_cancelled');
     if (b.invoice) refuse(`Booking ${b.id} is already on invoice ${b.invoice.number}`, 409, 'booking_already_invoiced');
-    lines.push({ seq: lines.length, booking_id: b.id, label: [b.voucher_ref ?? b.id, routeName(b.route_id) ?? b.route_id, b.service_date].filter(Boolean).join(' · '), amount: b.total ?? 0, discount: null });
-    for (const f of b.fee_items) lines.push({ seq: lines.length, booking_id: b.id, label: f.label || 'Fee', amount: f.amount, discount: null });
+    lines.push({ seq: lines.length, booking_id: b.id, label: [b.voucher_ref ?? b.id, routeName(b.route_id) ?? b.route_id, b.service_date].filter(Boolean).join(' · '), amount: b.total ?? 0, discount: null, ...NOT_REMOVED });
+    for (const f of b.fee_items) lines.push({ seq: lines.length, booking_id: b.id, label: f.label || 'Fee', amount: f.amount, discount: null, ...NOT_REMOVED });
   }
   return lines;
 }
@@ -258,7 +288,7 @@ export function feeInvoice(input: { id: string; number: string; agent_id: string
     subtotal: amount, net_amount: amount, vat_amount: 0, total: amount, wht_amount: null, issued_at: input.now, due_at: input.now,
     note: input.label, ref: null, dear: null, accept_at: null, remark: null,
     voided: false, voided_at: null, voided_by: null, void_reason: null, created_by: input.by,
-    lines: [{ seq: 0, booking_id: input.booking_id, label: input.label, amount, discount: null }],
+    lines: [{ seq: 0, booking_id: input.booking_id, label: input.label, amount, discount: null, ...NOT_REMOVED }],
   };
 }
 
@@ -274,7 +304,8 @@ const OWNED: Record<string, string> = {
   lines: 'use PUT /v1/invoices/{id}/discounts for a discount', subtotal: 'it is worked out from the lines', net_amount: 'it is worked out from the lines',
   vat_amount: 'it is worked out from the lines', total: 'it is worked out from the lines', vat_mode: 'it is the agent\'s, copied at issue', vat_rate: 'it is the agent\'s, copied at issue',
   status: 'use POST /v1/invoices/{id}/void, or record a payment', paid: 'record a payment', balance: 'record a payment', payment_amount: 'it is the total less WHT',
-  payments: 'use POST /v1/invoices/{id}/payments or /payment-corrections', issued_at: 'it is the time the invoice was issued', due_at: 'it follows from the agent\'s credit days',
+  payments: 'use POST /v1/invoices/{id}/payments or /payment-corrections', refunded: 'a weather cancel records it (POST /v1/bookings/{id}/cancel-weather)',
+  credited: 'a weather cancel records it (POST /v1/bookings/{id}/cancel-weather)', refunds: 'a weather cancel records them (POST /v1/bookings/{id}/cancel-weather)', issued_at: 'it is the time the invoice was issued', due_at: 'it follows from the agent\'s credit days',
   voided: 'use POST /v1/invoices/{id}/void', voided_at: 'use POST /v1/invoices/{id}/void', voided_by: 'use POST /v1/invoices/{id}/void', void_reason: 'use POST /v1/invoices/{id}/void',
   created_by: 'it is the user who issued the invoice',
 };
@@ -360,11 +391,15 @@ const assertNotOverpaid = (invoice: StoredInvoice, paid: number, anyway: boolean
   }
 };
 
-/** `acctRecordPayment`: on a live invoice; more than it owes needs `overpay_anyway` (legacy's "Save anyway?"). */
-export function recordPayment(invoice: StoredInvoice, payments: readonly StoredPayment[], p: NewPayment, id: string, now: string, by: string | null):
+/**
+ * `acctRecordPayment`: on a live invoice; more than it owes needs `overpay_anyway` (legacy's "Save
+ * anyway?"). `returned` is what refunds and credits took back from it, so it no longer counts as paid.
+ * A `credit` payment is checked against the agent's balance by the caller (`assertCreditCovers`).
+ */
+export function recordPayment(invoice: StoredInvoice, payments: readonly StoredPayment[], p: NewPayment, id: string, now: string, by: string | null, returned = 0):
   { payment: StoredPayment; history: HistoryLine } {
   if (invoice.voided) refuse(`Invoice ${invoice.number} is void: record the payment on its live invoice`, 409, 'invoice_void');
-  const paid = cents(paidOf(payments) + p.amount);
+  const paid = cents(paidOf(payments) - returned + p.amount);
   assertNotOverpaid(invoice, paid, p.overpay_anyway);
   const full = invoiceState(invoice, paid).status === 'paid';
   return {
@@ -378,7 +413,7 @@ export function recordPayment(invoice: StoredInvoice, payments: readonly StoredP
  * `pfmEditSubmit`: several payments changed or deleted at once, with one reason and one history line.
  * A deleted payment stays on record (decided 2026-10-09). Nothing changed is not a write.
  */
-export function correctPayments(invoice: StoredInvoice, payments: readonly StoredPayment[], body: Record<string, unknown>, now: string, by: string | null):
+export function correctPayments(invoice: StoredInvoice, payments: readonly StoredPayment[], body: Record<string, unknown>, now: string, by: string | null, returned = 0):
   { changed: StoredPayment[]; history?: HistoryLine } {
   const raw = body.payments;
   if (!Array.isArray(raw) || raw.length === 0) badRequest('payments must list at least one { id, … }');
@@ -401,6 +436,10 @@ export function correctPayments(invoice: StoredInvoice, payments: readonly Store
     }
     const amount = r.amount === undefined ? p.amount : amountOf(r.amount, `payments[${i}].amount`);
     const method = r.method === undefined ? p.method : methodOf(r.method, `payments[${i}].method`);
+    // The balance a credit payment spent was checked when it was recorded: deleting it gives it back, editing it would skip the check.
+    if ((p.method === 'credit' || method === 'credit') && (amount !== p.amount || method !== p.method)) {
+      refuse(`Payment ${p.id}: a credit payment cannot be edited, and a payment cannot become one: delete it and record it again`, 409, 'credit_payment');
+    }
     const paidOn = r.paid_on === undefined && r.date === undefined ? p.paid_on : isoDay(r.paid_on ?? r.date, `payments[${i}].paid_on`) ?? p.paid_on;
     const ch: string[] = [];
     if (amount !== p.amount) ch.push(`${thb(p.amount)} -> ${thb(amount)}`);
@@ -410,7 +449,7 @@ export function correctPayments(invoice: StoredInvoice, payments: readonly Store
   });
   if (!changed.length) return { changed };
   const after = payments.map((p) => changed.find((c) => c.id === p.id) ?? p);
-  if (!invoice.voided) assertNotOverpaid(invoice, paidOf(after), flag(body.overpay_anyway, 'overpay_anyway'));
+  if (!invoice.voided) assertNotOverpaid(invoice, cents(paidOf(after) - returned), flag(body.overpay_anyway, 'overpay_anyway'));
   return { changed, history: { by, kind: 'payment', tag: 'Payment', text: `Payment correction · ${log.join(' · ')}${reason ? ` · reason: ${reason}` : ''}` } };
 }
 

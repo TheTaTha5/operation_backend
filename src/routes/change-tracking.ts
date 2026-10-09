@@ -12,8 +12,19 @@ import { bookingDays, mergeChanges, type ChangeInput } from '../domain/changes.j
 import type { Booking } from '../domain/operations.js';
 import type { Store } from './operations.js';
 
-type Context = { request: FastifyRequest; depth: number };
+/** `closures`: weather closures a booking command resolved a row of (`noteWeatherClosure`). */
+type Context = { request: FastifyRequest; depth: number; closures?: Set<string> };
 export const changeContext = new AsyncLocalStorage<Context>();
+
+/**
+ * A booking command that resolves a weather follow-up says so here, rather than every booking write
+ * reading the follow-up rows before and after: in a serializable transaction each extra read is
+ * another chance to collide with an unrelated write.
+ */
+export const noteWeatherClosure = (id: string): void => {
+  const ctx = changeContext.getStore();
+  if (ctx) (ctx.closures ??= new Set()).add(id);
+};
 
 type Snapshot = {
   bookings: Map<string, Booking | undefined>;
@@ -59,7 +70,10 @@ async function vanDayOf(store: Store, r: FastifyRequest): Promise<{ date: string
   return typeof date === 'string' && typeof b.route_id === 'string' ? { date, routeId: b.route_id } : undefined;
 }
 
-/** Each invoice of these bookings, as one comparable string: the invoice and its payments. */
+/**
+ * Each invoice of these bookings, as one comparable string: the invoice and its payments. A refund or
+ * credit is only ever made with its invoice's lines taken off (`refunds.ts`), so it changes this too.
+ */
 async function invoicePrints(store: Store, bookingIds: readonly string[]): Promise<Map<string, string>> {
   if (!bookingIds.length) return new Map();
   const invoices = await store.invoicesOfBookings(bookingIds);
@@ -117,6 +131,18 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     if (was !== print) out.push({ kind: 'invoice', entity_id: id, action: was === undefined ? 'created' : 'updated', route_days: null, changed_by: by });
   }
   if (path.startsWith('/v1/routes/:id/')) out.push({ kind: 'route', entity_id: params(r).id, action: 'updated', route_days: null, changed_by: by });
+  // A weather closure: by its own endpoints, or a booking command that resolved one of its rows.
+  const closures = new Set(changeContext.getStore()?.closures ?? []);
+  if (path.startsWith('/v1/weather-closures')) {
+    const id = params(r).id ?? (result as { id?: string } | undefined)?.id;
+    if (id) closures.add(id);
+  }
+  for (const id of closures) {
+    const closure = await store.weatherClosure(id);
+    if (!closure) continue;
+    out.push({ kind: 'weather_closure', entity_id: id, action: path === '/v1/weather-closures' && r.method === 'POST' ? 'created' : 'updated',
+      route_days: [{ route_id: closure.route_id, service_date: closure.service_date }], changed_by: by });
+  }
   return mergeChanges(out);
 }
 

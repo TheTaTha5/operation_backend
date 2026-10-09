@@ -12,6 +12,7 @@ import { holdsSeats, type BookingStatus } from './booking-status.js';
 import { formatPaxGrid, parsePaxGrid, paxTotal, type PaxGrid, type PaxRow } from './pax.js';
 import type { BookingChanges } from './operations.js';
 import type { BookingHeader, BookingHeaderPatch } from './booking-header.js';
+import type { WeatherCancelOutcome } from './refunds.js';
 import {
   decideStatus, discountOf, focCountOf, pendingApproval, type ApprovalKind, type BookingApproval, type NewApproval,
 } from './booking-approvals.js';
@@ -447,7 +448,11 @@ export function assertEditable(status: BookingStatus): void {
  */
 export const STATUS_COMMANDS = ['confirm', 'approve', 'reject', 'cancel-weather'] as const;
 export type StatusCommand = typeof STATUS_COMMANDS[number];
-export type StatusCommandRequest = { note?: string };
+/**
+ * `weather` is `/cancel-weather`'s money (`refunds.ts`): what was done with what the booking had paid,
+ * and how much. The route works it out before the command runs; absent reads as "No refund".
+ */
+export type StatusCommandRequest = { note?: string; weather?: { outcome: WeatherCancelOutcome; amount: number } };
 
 export function parseStatusCommandRequest(body: Record<string, unknown>): StatusCommandRequest {
   const note = optionalText(body.note, 'note');
@@ -520,7 +525,11 @@ export function planStatusCommand(
       decide: { kind, status: 'rejected', note: request.note ?? null }, request: [], claims: false,
     };
   }
-  return { status: 'cancelled_weather', confirms: false, cancellation_reason: 'weather', history: [line(by, 'weather', 'Weather', `Cancelled for weather${note}`)], request: [], claims: false };
+  // Legacy `bkV2WeatherResolveOne`'s line and tags: `No refund` (Cancel), `Refund ฿x`, `Kept as credit ฿x`.
+  const { outcome, amount } = request.weather ?? { outcome: 'cancel', amount: 0 };
+  const money = outcome === 'refund' ? `Refund ${baht(amount)}` : outcome === 'credit' ? `Kept as credit ${baht(amount)}` : 'No refund';
+  const moneyTag = outcome === 'refund' ? 'Refund' : outcome === 'credit' ? 'Credit' : 'Cancel';
+  return { status: 'cancelled_weather', confirms: false, cancellation_reason: 'weather', history: [line(by, 'weather', moneyTag, `Cancelled for weather · ${money}${note}`)], request: [], claims: false };
 }
 
 // ── Shared parsing ───────────────────────────────────────────────────────────────────────────────

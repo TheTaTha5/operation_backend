@@ -79,6 +79,9 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/attachments' || path.startsWith('/v1/attachments/')) return { kind: 'area', areas: ['operations', 'pier', 'accounting'] };
   // Legacy's "Pickup time setup" (psuPersist guards operations).
   if (path.startsWith('/v1/pickup-areas') || path.startsWith('/v1/pickup-time-profiles')) return { kind: 'area', areas: ['operations'] };
+  // Weather closures: legacy saves them only with operations (`sbWeatherPersist`, decision 10). Their
+  // refund and credit are made by `/cancel-weather`, under the bookings above.
+  if (path === '/v1/weather-closures' || path.startsWith('/v1/weather-closures/')) return { kind: 'area', areas: ['operations'] };
   // Legacy's Re-confirm page sends the agent's list.
   if (path === '/v1/reconfirm/sent') return { kind: 'area', areas: ['operations'] };
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).
