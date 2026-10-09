@@ -23,6 +23,8 @@
  * contract templates and issued documents are edited here, and a run leaves them alone. Only `--sales`
  * imports them, to seed a database that has none: legacy's ids kept and upserted; an agent's programmes,
  * activity and renewal archive and a market's sub-markets replaced; a document already here kept.
+ * Staff and their 2026 quota, and the Sales Board's targets and follow-up marks, come with `--sales` too
+ * (2026-10-10; a quota for another year, set here, is kept).
  * Legacy's custom nationalities and its insurance ages and review ticks follow the bookings, on every run.
  *
  * Routes and boats are this API's since 2026-10-09 (`seed:routes`, `seed:boats`): the import reads
@@ -74,7 +76,7 @@ import { b2cSkipReason, parseB2CMode } from './legacy-b2c.js';
 import { mapLegacyWeather } from './legacy-weather.js';
 import { mapLegacyPierMoney } from './legacy-pier-money.js';
 import { HOUSE_AGENT_IDS } from '../domain/agent-writes.js';
-import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales } from './legacy-sales.js';
+import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales, mapLegacyStaffAndBoard } from './legacy-sales.js';
 import { mapLegacyDailySettings, mapLegacyVanBills, mapLegacyVanRates } from './legacy-van-bills.js';
 
 const PREFIX = 'lg_';
@@ -241,6 +243,7 @@ async function main() {
     const legacyMarkets = await read('SELECT * FROM sb_markets');
     const legacyMarketSubs = await read('SELECT sb_markets_id, idx, value FROM sb_markets__subs ORDER BY sb_markets_id, idx');
     const legacySales = await read('SELECT * FROM sb_sales');
+    const legacyStaff = await read('SELECT * FROM sb_staff ORDER BY id');
     const legacyAgents = await read('SELECT * FROM sb_agents');
     const legacyAgentPrograms = await read('SELECT sb_agents_id, idx, value FROM sb_agents__programs ORDER BY sb_agents_id, idx');
     const legacyAgentPeriods = await read('SELECT * FROM sb_agents__programperiods ORDER BY sb_agents_id, idx');
@@ -1056,6 +1059,8 @@ async function main() {
     // Templates, issued documents and the renewal archive (`legacy-sales.ts`), with --sales only.
     const contractsHere = new Set((await target.query('SELECT id FROM contracts')).rows.map((r) => String(r.id)));
     const sales = mapLegacySales({ templates: legacyTemplates, artifacts: legacyArtifacts, history: legacyContractHistory, agentIds, contractIds: contractsHere });
+    // Staff and their quotas, and the Sales Board's targets and follow-up marks, with --sales only.
+    const staffBoard = mapLegacyStaffAndBoard({ staff: legacyStaff, sales: legacySales, salesIds, agentIds, at: new Date().toISOString() });
     // A code is what this import matches rate types on. If one already belongs to a different rate
     // type here (one created through the API), the unique index would abort the whole run: that rate
     // type is left out and listed instead, for someone to rename one of the two.
@@ -1160,6 +1165,12 @@ async function main() {
       await insert('contract_templates', sales.templates, upsert(sales.templates, 'updated_at = now()'));
       // An issued document is frozen: one already here is left as it is.
       await insert('contract_documents', sales.documents, 'ON CONFLICT (id) DO NOTHING');
+      // Staff upserted; legacy's one quota year (2026) replaced, a year set here kept.
+      await insert('staff', staffBoard.staff, 'ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, dept = EXCLUDED.dept, active = EXCLUDED.active, updated_at = now()');
+      await target.query('DELETE FROM staff_quotas WHERE year = 2026 AND staff_id = ANY($1::text[])', [staffBoard.staff.map((s) => String(s.id))]);
+      await insert('staff_quotas', staffBoard.quotas);
+      await insert('sales_targets', staffBoard.targets, 'ON CONFLICT (sales_id, month) DO UPDATE SET pax = EXCLUDED.pax, set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by');
+      await insert('sales_followups', staffBoard.followups, 'ON CONFLICT DO NOTHING');
     }
     // Legacy's custom nationalities, on every run while bookings are legacy's; never deleted, never a built-in.
     await insert('nationalities', customNationalities.nationalities, 'ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name WHERE NOT nationalities.builtin');
@@ -1344,10 +1355,11 @@ async function main() {
     console.log(`van job orders: ${jobSends.length} of ${vanSent.length} sent marks (${jobSends.filter((s) => !s.group_id).length} return-only), `
       + `${bookings.filter((b) => b.job_note !== null).length} special requests (${bookings.filter((b) => b.job_note === '').length} blanked), `
       + `${pickupNames.length} of ${vanPickupTh.length} Thai pickup names, ${order.size} groups ordered`);
-    if (!withSales) console.log('agents, markets, salespeople, templates, documents: not imported (this API is their master since 2026-10-09; --sales seeds an empty database)');
+    if (!withSales) console.log('agents, markets, salespeople, templates, documents, staff, targets: not imported (this API is their master since 2026-10-09; --sales seeds an empty database)');
     else {
       console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
       console.log(`sales: ${sales.templates.length} contract templates, ${sales.documents.length} issued documents, ${sales.history.length} archived contracts`);
+      console.log(`staff: ${staffBoard.staff.length} staff, ${staffBoard.quotas.length} quotas; sales board: ${staffBoard.targets.length} targets, ${staffBoard.followups.length} follow-up marks`);
     }
     console.log(`nationalities: ${customNationalities.nationalities.length} custom of ${legacyNationalities.length}; insurance: ${insuranceApplied} of ${legacyInsurance.length} rows on imported bookings`);
     if (!withRateTypes) console.log('rate types: not imported (this API is their master since 2026-10-09; --rate-types seeds an empty database)');
@@ -1364,7 +1376,7 @@ async function main() {
     for (const id of staleVans) console.log(`  van ${id}`);
     console.log(`\nplaceholders created (${placeholders.length}):`);
     for (const p of placeholders) console.log(`  ${p}`);
-    const salesIssues = [...(withSales ? sales.issues : []), ...customNationalities.issues];
+    const salesIssues = [...(withSales ? [...sales.issues, ...staffBoard.issues] : []), ...customNationalities.issues];
     console.log(`\nsales data to check (${salesIssues.length}):`);
     for (const i of salesIssues) console.log(`  ${i}`);
     console.log(`\nagent data to check (${agentData.length}):`);

@@ -153,3 +153,48 @@ export function applyLegacyInsurance(rows: Row[], ctx: {
   }
   return applied;
 }
+
+const MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+export type StaffBoardImport = { staff: Row[]; quotas: Row[]; targets: Row[]; followups: Row[]; issues: string[] };
+
+/**
+ * Staff and their 2026 quota (`sb_staff`, `quota_2026`), and the Sales Board's targets and follow-up
+ * marks (`sb_sales.targets` `{"2026-07": 120}`, `sb_sales.followup` `{"2026-07::a56": true,
+ * "foc:2026-07::a56": true}`), for `--sales`. Legacy never recorded when a target or mark was set:
+ * `at` (the import's time) stands in. What does not parse is listed and skipped.
+ */
+export function mapLegacyStaffAndBoard(input: { staff: Row[]; sales: Row[]; salesIds: ReadonlySet<string>; agentIds: ReadonlySet<string>; at: string }): StaffBoardImport {
+  const issues: string[] = [];
+  const staff: Row[] = [], quotas: Row[] = [], targets: Row[] = [], followups: Row[] = [];
+  for (const s of input.staff) {
+    const id = str(s.id);
+    if (!id) { issues.push('a staff row skipped: no id'); continue; }
+    staff.push({ id, code: str(s.code) || null, name: str(s.name), dept: str(s.dept) || null, active: s.active !== false });
+    if (s.quota_2026 == null || str(s.quota_2026) === '') continue;
+    const n = Number(s.quota_2026);
+    if (!Number.isInteger(n) || n < 0) { issues.push(`staff ${id}: 2026 quota ${str(s.quota_2026)} is not a whole number, 0 or more: skipped`); continue; }
+    quotas.push({ staff_id: id, year: 2026, free_seats: n });
+  }
+  for (const s of input.sales) {
+    const salesId = str(s.id);
+    if (!input.salesIds.has(salesId)) continue;
+    const t = json(s.targets);
+    if (s.targets != null && str(s.targets) !== '' && !isObject(t)) issues.push(`salesperson ${salesId}: targets are not readable, skipped`);
+    for (const [month, raw] of Object.entries(isObject(t) ? t : {})) {
+      const pax = Number(raw);
+      // Legacy deletes a 0 target; one that is still there is skipped the same way.
+      if (!MONTH.test(month) || !Number.isInteger(pax) || pax <= 0) { issues.push(`salesperson ${salesId}: target ${month} = ${String(raw)} skipped (not a month, or not a whole number above 0)`); continue; }
+      targets.push({ sales_id: salesId, month, pax, set_at: input.at, set_by: null });
+    }
+    const f = json(s.followup);
+    if (s.followup != null && str(s.followup) !== '' && !isObject(f)) issues.push(`salesperson ${salesId}: follow-up marks are not readable, skipped`);
+    for (const [key, raw] of Object.entries(isObject(f) ? f : {})) {
+      if (!raw) continue;
+      const m = /^(?:(foc):)?(\d{4}-\d{2})::(.+)$/.exec(key);
+      if (!m || !MONTH.test(m[2])) { issues.push(`salesperson ${salesId}: follow-up mark ${key} skipped (not legacy's "[foc:]YYYY-MM::agent")`); continue; }
+      if (!input.agentIds.has(m[3])) { issues.push(`salesperson ${salesId}: follow-up mark ${key} skipped: agent ${m[3]} is not here`); continue; }
+      followups.push({ sales_id: salesId, month: m[2], agent_id: m[3], kind: m[1] === 'foc' ? 'foc' : 'agent', marked_at: input.at, marked_by: null });
+    }
+  }
+  return { staff, quotas, targets, followups, issues };
+}

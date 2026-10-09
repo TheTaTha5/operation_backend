@@ -16,6 +16,7 @@ import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserP
 import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind, type Route, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, holdsSeats, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
+import { checkStaffBooking, isStaffAgent } from '../domain/staff.js';
 import { capacityNumbers } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
@@ -99,6 +100,10 @@ const notFound = (message: string): never => { const error = new Error(message);
 const unauthorized = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 401; throw error; };
 const forbidden = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number; code: string }).statusCode = 403; (error as Error & { code: string }).code = 'forbidden'; throw error; };
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+/** FOC (free) seats in a trip's passengers, parsed rows or the stored grid (legacy `bkV2PaxTot(pax, 'foc')`). */
+const focCount = (pax: readonly PaxRow[] | Record<string, number>): number => (Array.isArray(pax)
+  ? (pax as readonly PaxRow[]).filter((r) => r.category === 'foc').reduce((n, r) => n + r.count, 0)
+  : Object.entries(pax).filter(([key]) => key === 'foc' || key.startsWith('foc_')).reduce((n, [, v]) => n + v, 0));
 /** A command's body without `version`, which is the write's precondition, not part of the command. */
 const withoutVersion = (body: unknown, required = false): Record<string, unknown> => {
   const { version: _version, ...rest } = record(body ?? (required ? body : {}));
@@ -933,6 +938,22 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const outcome = await holdOnBadInput(request, 'create', () => createBooking(request));
     return 'held' in outcome ? reply.code(202).send(outcome.held) : reply.code(201).send(outcome.done);
   });
+  /**
+   * Legacy `bkV2Save`'s staff guard (todo/sales-editing-model.md, "Design — extras", `staff.ts`): a
+   * staff booking names a staff member, and a welfare one's free seats fit the year's quota unless the
+   * body says `quota_anyway: true` (`409 over_quota`).
+   */
+  async function assertStaffRules(body: unknown, p: {
+    bookingId?: string; agentId?: string; staffId: string | null; staffIdSent: boolean; staffPurpose: string | null; purpose: string | null;
+    trips: { service_date: string; foc: number }[];
+  }): Promise<void> {
+    const anyway = anywayFlag(isRecord(body) ? body.quota_anyway : undefined, 'quota_anyway');
+    const agent = p.agentId ? await store.agent(p.agentId) : undefined;
+    const staffAgent = isStaffAgent(agent && { id: agent.id, code: agent.code ?? null });
+    if (!staffAgent && !(p.staffIdSent && p.staffId)) return;
+    const member = p.staffId ? await store.staffMember(p.staffId) : undefined;
+    checkStaffBooking({ ...p, staffAgent }, member, staffAgent && member ? await store.staffBookings() : [], anyway);
+  }
   async function createBooking(request: FastifyRequest) {
     const plan = await planBooking(request, request.body);
     const created = await store.transaction(() => writeBooking(request, request.body, plan));
@@ -956,6 +977,11 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     if (viaStatus) request.log.warn({ status: (body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
     // A deactivated agent takes no new bookings (todo/sales-editing-model.md, decision 1).
     if (input.agent_id) assertAgentBookable(await store.agent(input.agent_id));
+    await assertStaffRules(request.body, {
+      agentId: input.agent_id, staffId: input.header?.staff_id ?? null, staffIdSent: input.header?.staff_id !== undefined,
+      staffPurpose: input.header?.staff_purpose ?? null, purpose: input.header?.purpose ?? null,
+      trips: input.trips.map((t) => ({ service_date: t.service_date, foc: focCount(t.pax) })),
+    });
     // The server prices the booking (README "Prices"); a B2C booking keeps the price sent.
     await fillPickups(input.header?.pickup_area_id, input.header?.dropoff_area_id, input.trips);
     const priced = isB2C(input) ? undefined : await priceFor({ agentId: input.agent_id, header: input.header ?? {}, trips: input.trips,
@@ -1053,6 +1079,18 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return store.transaction(async () => {
       await assertBookingFresh(request);
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+      // The staff guard reads the trips' FOC seats, the staff member and the purpose: checked when one changes.
+      const staffHeader = (['staff_id', 'staff_purpose', 'purpose'] as const).filter((key) => changes.header?.[key] !== undefined);
+      if (!isB2C(stored) && !(SEAT_RELEASING_STATUSES as readonly string[]).includes(stored.status)
+        && (staffHeader.length || ['trips', 'route_id', 'service_date', 'pax'].some((key) => body[key] !== undefined))) {
+        const pick = <K extends 'staff_id' | 'staff_purpose' | 'purpose'>(key: K) => (changes.header?.[key] !== undefined ? changes.header[key] ?? null : stored[key] ?? null);
+        await assertStaffRules(body, {
+          bookingId: stored.id, agentId: stored.agent_id, staffId: pick('staff_id'), staffIdSent: changes.header?.staff_id !== undefined,
+          staffPurpose: pick('staff_purpose'), purpose: pick('purpose'),
+          trips: changes.trips ? changes.trips.map((t) => ({ service_date: t.service_date, foc: focCount(t.pax) }))
+            : stored.trips.map((t) => ({ service_date: changes.service_date && stored.trips.length === 1 ? changes.service_date : t.service_date, foc: focCount(t.pax) })),
+        });
+      }
       assertReconfirmEcho(body.reconfirm, stored.reconfirm);
       assertDocCheckEcho(body.doc_check, stored.doc_check);
       assertInsuranceEcho(body.passengers, stored.passengers);

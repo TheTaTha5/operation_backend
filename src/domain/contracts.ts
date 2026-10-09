@@ -1,7 +1,7 @@
 /**
  * An agent's contracts: one `main` and time-boxed `promo` overlays (todo/contracts-model.md,
- * migration 029). Read-only for now; the quote will price from them. Pure, so both stores list and
- * order them identically.
+ * migration 029). The quote prices from them; promos are written by `contract-writes.ts`. Pure, so
+ * both stores list and order them identically.
  */
 import { refuse } from './booking-actions.js';
 
@@ -19,6 +19,8 @@ export type Contract = {
   discount: { mode: 'pct' | 'amt'; value: number } | null;
   bonus: { buy: number; free: number; basis: string | null } | null;
   book_window: boolean; created_date: string | null; created_by: string | null; note: string | null; doc_id: string | null;
+  /** When and by whom a promo was voided (`POST /v1/contracts/{id}/void`); null otherwise, and on legacy's two. */
+  voided_at: string | null; voided_by: string | null;
   /** In legacy's order. */
   program_periods: ContractPeriod[];
   /** An own-price promo's prices; empty otherwise. */
@@ -49,6 +51,7 @@ const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 /** A contract as both stores hand it out: copied, so a caller cannot change the stored one. */
 export const contractView = (c: Contract): Contract => ({
   ...c, discount: c.discount && { ...c.discount }, bonus: c.bonus && { ...c.bonus },
+  voided_at: c.voided_at ?? null, voided_by: c.voided_by ?? null,
   program_periods: c.program_periods.map((p) => ({ ...p })),
   seat_prices: c.seat_prices.map((p) => ({ ...p }))
     .sort((a, b) => cmp(a.route_id, b.route_id) || cmp(a.zone, b.zone) || cmp(a.category, b.category) || cmp(a.residency, b.residency)),

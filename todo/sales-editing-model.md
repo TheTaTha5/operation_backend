@@ -6,24 +6,26 @@ templates and issued documents; salespeople and markets; the add-on catalogue; n
 passengers' insurance age and review; the import's cutover. Migrations 090–093; README "Agents" to
 "Nationalities" and "Insurance"; `src/routes/sales-editing.ts` and the `src/domain/` modules it names.
 
+**Built** on `feat/sales-extras` (2026-10-10, same legacy read): promo contracts
+(`contracts-model.md`), `import:contracts` seed-only, the Sales Board's targets and follow-up marks
+(`sales-board.ts`), staff and their welfare quotas with the booking form's staff guard (`staff.ts`).
+Migrations 200–202; README "Contracts", "Sales Board", "Staff and welfare quotas".
+
 ## Open
 
-1. **Staff and welfare quotas** (decision 13): later, with the staff-welfare pricing. Legacy keeps a
-   quota for 2026 only (`sb_staff.quota_2026`, bug 14); keep one per year when it comes. 24 staff.
-2. **Sales targets and follow-up marks** (Sales Board, `sbEditTarget`, `salesSetTarget`): stored on
-   the salesperson in legacy (`sb_sales.targets`, `followup`), not modelled here and not decided.
-   Legacy keeps them until the Sales Board moves.
-3. **Promo contracts** (add, edit, void): with the quote (`contracts-model.md`).
-4. **Merge the custom nationalities** (decision 11): 66 in legacy today (four Nigerias, ISO-3 copies
+1. **Merge the custom nationalities** (decision 11): 66 in legacy today (four Nigerias, ISO-3 copies
    of built-ins, lower-case junk); merging rewrites the bookings that use them.
-5. **The add-on catalogue's contents** come from sales (checklist). Not modelled: per-agent add-on
+2. **The add-on catalogue's contents** come from sales (checklist). Not modelled: per-agent add-on
    prices (`a.addonServices`) and custom add-on kinds (`SB_ADDON_TYPES`); legacy never saved either.
-6. **Agent codes:** add the unique constraint once sales renames the 21 shared ones (`agents.md`).
-7. **`import:contracts`** still mirrors legacy's contracts and would overwrite a main contract's
-   `rate_type_id` and `doc_id`, now set here: make it seed-only like the agents import.
-8. **Scoping beyond agents** was not decided: a sales-bound login still lists and books for any
+3. **Agent codes:** add the unique constraint once sales renames the 21 shared ones (`agents.md`).
+4. **Scoping beyond agents** was not decided: a sales-bound login still lists and books for any
    agent through `/v1/bookings`, and sees every rate type (legacy hid other salespeople's rate types
    too, `_rtInScope`).
+5. **A company booking's reason** (`companyPurpose`, legacy `bkV2Save`, beside the staff guard): legacy
+   refuses a booking on `a_company` without one. Not built: the booking has no such field here yet
+   (`purpose` holds the staff ones), so it needs its own small design.
+6. **The Sales Board reads bookings on every request** (two months, more when targets run back):
+   fine at legacy's volume (about 5,000 bookings); a summary table if it gets slow.
 
 ## Flagged
 
@@ -78,6 +80,35 @@ legacy had a rule):
   `contract_template_effective_id` on the agent detail (`test/agents.test.ts` changed for them).
 - **Routes** live in `src/routes/sales-editing.ts`, registered from `operations.ts`; the agent,
   contract, salesperson and market reads moved there too.
+
+Extras (`feat/sales-extras`, 2026-10-10; promos are flagged in `contracts-model.md`):
+
+- **Staff quotas were built now**, not "later" (decision 13): staff pricing already exists
+  (`enforcedPriceMode`: welfare at the staff rate, FOC free, inspection 0), so only the registry, the
+  quota and the guard were missing. One quota per year (legacy: 2026 only, bug 14).
+- **The over-quota guard** counts what was used without inspection bookings, as legacy's roster does
+  (`staffWelfareUsed`); legacy's save guard counted inspections too. One rule here. Like legacy, a
+  year already over its quota asks even when the booking adds no free seat.
+- **The guard runs** on create, and on a `PATCH` only when trips, pax, `staff_id`, `staff_purpose` or
+  `purpose` change (legacy asked on every save); not on a cancelled booking. "Save anyway" is
+  `quota_anyway: true`.
+- **A `staff_id` sent must be a staff member** on any booking (`400`; legacy's picker only offered
+  them). `bookings.staff_id` has no foreign key: imported bookings mirror legacy, which deletes staff.
+- **Deleting a staff member** is refused while a booking names them (`409 in_use`; legacy deleted
+  and left the bookings naming nobody).
+- **A new staff member's quota** is for this year (legacy: the year on screen). Ids and codes are
+  legacy's (`st` and `EMP-` + the highest number + 1); codes are not unique (legacy has 3 clashes).
+- **Targets:** a pax that is not a whole number ≥ 0 is `400` (legacy read it as 0, which cleared the
+  target); a sales-bound login cannot set one (`403`; legacy hid the button). `set_at`/`set_by` are
+  new; imported targets carry the import's time.
+- **Follow-up marks** are set or cleared as sent (legacy toggled, so a retry undid it); the agent must
+  be the salesperson's (`400`; legacy only listed their own). Imported marks carry the import's time.
+- **The Sales Board is computed here** (`GET /v1/sales-board`), legacy's numbers: ties in rank by
+  salesperson id (legacy's load order).
+- **Import:** `--sales` also seeds staff (legacy's 2026 quota replaced, a year set here kept),
+  targets and follow-up marks. Rehearsed 2026-10-10 on a throwaway import: 24 staff, 24 quotas
+  (58 seats), 0 targets, 1 follow-up mark; a rerun without `--sales` kept a rename, a 2027 quota and
+  a target set here.
 
 Import (`import-legacy.ts`):
 

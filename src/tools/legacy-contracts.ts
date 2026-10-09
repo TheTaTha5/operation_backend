@@ -11,6 +11,32 @@
 import type { Contract, ContractPeriod, ContractSeatPrice } from '../domain/contracts.js';
 
 type Row = Record<string, unknown>;
+
+/**
+ * `import:contracts`'s flags. Contracts are this API's since promos are written here (2026-10-10):
+ * without `--seed` the import writes nothing; `--seed` upserts legacy's, to seed a database that has none.
+ */
+export function contractImportArgs(argv: readonly string[]): { commit: boolean; seed: boolean } {
+  const known = new Set(['--commit', '--seed']);
+  const unknown = argv.filter((a) => a.startsWith('--') && !known.has(a));
+  if (unknown.length) throw new Error(`Unknown flag ${unknown.join(', ')}: import:contracts takes --seed and --commit`);
+  return { commit: argv.includes('--commit'), seed: argv.includes('--seed') };
+}
+
+/**
+ * The seed's upsert: legacy wins for every contract it has, except a void made here, which keeps its
+ * stamp only while legacy's row is void too (`voided_at` is only for a void contract).
+ */
+export const CONTRACT_SEED_UPSERT = `INSERT INTO contracts (id, agent_id, kind, status, rate_type_id, active_from, active_to, priority, version, price_mode, discount_mode, discount_value,
+    bonus_buy, bonus_free, bonus_basis, book_window, created_date, created_by, note, doc_id)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+  ON CONFLICT (id) DO UPDATE SET agent_id = EXCLUDED.agent_id, kind = EXCLUDED.kind, status = EXCLUDED.status, rate_type_id = EXCLUDED.rate_type_id,
+    active_from = EXCLUDED.active_from, active_to = EXCLUDED.active_to, priority = EXCLUDED.priority, version = EXCLUDED.version,
+    price_mode = EXCLUDED.price_mode, discount_mode = EXCLUDED.discount_mode, discount_value = EXCLUDED.discount_value,
+    bonus_buy = EXCLUDED.bonus_buy, bonus_free = EXCLUDED.bonus_free, bonus_basis = EXCLUDED.bonus_basis, book_window = EXCLUDED.book_window,
+    created_date = EXCLUDED.created_date, created_by = EXCLUDED.created_by, note = EXCLUDED.note, doc_id = EXCLUDED.doc_id,
+    voided_at = CASE WHEN EXCLUDED.status = 'void' THEN contracts.voided_at END, voided_by = CASE WHEN EXCLUDED.status = 'void' THEN contracts.voided_by END`;
+
 export type ContractCatalogue = { agentIds: ReadonlySet<string>; rateTypeIds: ReadonlySet<string>; routeIds: ReadonlySet<string> };
 
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -94,7 +120,7 @@ export function contractFromLegacy(row: Row, periodRows: readonly Row[], catalog
       id, agent_id: agentId, kind, status, rate_type_id: rateTypeId, active_from: activeFrom, active_to: activeTo,
       priority: Number(row.priority) || 0, version: str(row.version), price_mode: mode as Contract['price_mode'], discount, bonus,
       book_window: Boolean(Number(row.bookwin)), created_date: day(row.createddate, 'created_date'), created_by: str(row.createdby),
-      note: str(row.note), doc_id: str(row.docid), program_periods: periods, seat_prices: seatPrices,
+      note: str(row.note), doc_id: str(row.docid), voided_at: null, voided_by: null, program_periods: periods, seat_prices: seatPrices,
     },
     notes,
   };

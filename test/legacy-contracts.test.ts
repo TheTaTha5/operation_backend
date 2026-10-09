@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { contractFromLegacy } from '../src/tools/legacy-contracts.js';
+import { CONTRACT_SEED_UPSERT, contractFromLegacy, contractImportArgs } from '../src/tools/legacy-contracts.js';
 
 // Fixture rows in the shape of legacy's sb_contracts and __programperiods (production, 2026-10-09).
 const catalogue = { agentIds: new Set(['a06', 'a13']), rateTypeIds: new Set(['rt1', 'rt2']), routeIds: new Set(['r4', 'r10']) };
@@ -19,7 +19,7 @@ test('a main contract keeps its fields, and its periods in legacy\'s order', () 
   assert.deepEqual(rest, {
     id: 'ct_main_a13', agent_id: 'a13', kind: 'main', status: 'active', rate_type_id: 'rt1', active_from: '2025-10-01', active_to: '2026-09-30',
     priority: 0, version: 'v2025-1', price_mode: null, discount: null, bonus: null, book_window: false, created_date: '2025-10-01',
-    created_by: 'migration', note: null, doc_id: null, seat_prices: [],
+    created_by: 'migration', note: null, doc_id: null, voided_at: null, voided_by: null, seat_prices: [],
   });
   assert.deepEqual(program_periods.map((p) => p.route_id), ['r4', 'r10']);
 });
@@ -60,4 +60,12 @@ test('what the schema cannot hold is skipped, set to none or dropped, and noted'
   assert.equal(mapped.contract.rate_type_id, null);
   assert.deepEqual(mapped.contract.program_periods.map((p) => [p.travel_from, p.travel_to]), [[null, null]], 'the backwards one is gone; an open travel window stays');
   assert.equal(mapped.notes.length, 2);
+});
+
+test('import:contracts seeds only when told: without --seed it writes nothing', () => {
+  assert.deepEqual(contractImportArgs([]), { commit: false, seed: false });
+  assert.deepEqual(contractImportArgs(['--seed', '--commit']), { commit: true, seed: true });
+  assert.throws(() => contractImportArgs(['--comit']), /Unknown flag --comit/);
+  // A void made here keeps its stamp only while legacy's row is void too.
+  assert.match(CONTRACT_SEED_UPSERT, /voided_at = CASE WHEN EXCLUDED\.status = 'void' THEN contracts\.voided_at END/);
 });

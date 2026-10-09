@@ -57,6 +57,8 @@ import { sortHeld, type HeldOrder, type HeldStatus } from './b2c.js';
 import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
 import type { StoredSalesPerson, SalesPersonSummary } from './team.js';
 import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
+import type { SalesFollowup, SalesTarget } from './sales-board.js';
+import type { StaffMember } from './staff.js';
 import { sortAddonServices, type AddonService } from './addon-services.js';
 import type { StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
@@ -1764,6 +1766,59 @@ export class PostgresOperationsStore {
   }
   async deleteSalesPerson(id: string): Promise<void> { await this.client().query('DELETE FROM sales_people WHERE id = $1', [id]); }
 
+  /** Staff and their welfare quotas (migration 202). */
+  private async readStaff(id?: string): Promise<StaffMember[]> {
+    const { rows } = await this.client().query(`SELECT s.id, s.code, s.name, s.dept, s.active, s.created_at, s.updated_at,
+        COALESCE((SELECT jsonb_object_agg(q.year::text, q.free_seats) FROM staff_quotas q WHERE q.staff_id = s.id), '{}'::jsonb) AS quotas
+      FROM staff s WHERE ($1::text IS NULL OR s.id = $1) ORDER BY s.id`, [id ?? null]);
+    return rows.map((r) => ({
+      id: r.id, code: r.code ?? null, name: r.name, dept: r.dept ?? null, active: r.active === true,
+      quotas: Object.fromEntries(Object.entries(r.quotas as Record<string, number>).sort(([a], [b]) => (a < b ? -1 : 1)).map(([y, n]) => [y, Number(n)])),
+      created_at: asIso(r.created_at), updated_at: asIso(r.updated_at),
+    }));
+  }
+  async listStaff(): Promise<StaffMember[]> { return this.readStaff(); }
+  async staffMember(id: string): Promise<StaffMember | undefined> { return (await this.readStaff(id))[0]; }
+  async saveStaff(s: StaffMember): Promise<void> {
+    await this.client().query(`INSERT INTO staff (id, code, name, dept, active, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, dept = EXCLUDED.dept, active = EXCLUDED.active, updated_at = EXCLUDED.updated_at`,
+    [s.id, s.code, s.name, s.dept, s.active, s.created_at, s.updated_at]);
+    await this.client().query('DELETE FROM staff_quotas WHERE staff_id = $1', [s.id]);
+    for (const [year, n] of Object.entries(s.quotas)) await this.client().query('INSERT INTO staff_quotas (staff_id, year, free_seats) VALUES ($1,$2,$3)', [s.id, Number(year), n]);
+  }
+  async deleteStaff(id: string): Promise<void> { await this.client().query('DELETE FROM staff WHERE id = $1', [id]); }
+  /** Bookings that name a staff member or a staff purpose: what quotas and the staff trips read. */
+  async staffBookings(): Promise<Booking[]> {
+    const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.staff_id IS NOT NULL OR b.purpose IN ('staff_welfare', 'staff_inspection') ORDER BY b.id`);
+    return rows.map(booking);
+  }
+
+  /** The Sales Board's targets and follow-up marks (migration 201). */
+  async listSalesTargets(salesId?: string): Promise<SalesTarget[]> {
+    const { rows } = await this.client().query('SELECT sales_id, month, pax, set_at, set_by FROM sales_targets WHERE ($1::text IS NULL OR sales_id = $1) ORDER BY sales_id, month', [salesId ?? null]);
+    return rows.map((r) => ({ sales_id: r.sales_id, month: r.month, pax: Number(r.pax), set_at: asIso(r.set_at), set_by: r.set_by ?? null }));
+  }
+  /** `null` clears the month's target. */
+  async setSalesTarget(salesId: string, month: string, target: SalesTarget | null): Promise<void> {
+    if (!target) { await this.client().query('DELETE FROM sales_targets WHERE sales_id = $1 AND month = $2', [salesId, month]); return; }
+    await this.client().query(`INSERT INTO sales_targets (sales_id, month, pax, set_at, set_by) VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (sales_id, month) DO UPDATE SET pax = EXCLUDED.pax, set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by`,
+    [target.sales_id, target.month, target.pax, target.set_at, target.set_by]);
+  }
+  async listSalesFollowups(month?: string): Promise<SalesFollowup[]> {
+    const { rows } = await this.client().query('SELECT sales_id, month, agent_id, kind, marked_at, marked_by FROM sales_followups WHERE ($1::text IS NULL OR month = $1)', [month ?? null]);
+    return rows.map((r) => ({ sales_id: r.sales_id, month: r.month, agent_id: r.agent_id, kind: r.kind, marked_at: asIso(r.marked_at), marked_by: r.marked_by ?? null }));
+  }
+  /** `marked` false clears it; marking one already marked keeps its first stamp. */
+  async setSalesFollowup(row: SalesFollowup, marked: boolean): Promise<void> {
+    if (!marked) {
+      await this.client().query('DELETE FROM sales_followups WHERE sales_id = $1 AND month = $2 AND agent_id = $3 AND kind = $4', [row.sales_id, row.month, row.agent_id, row.kind]);
+      return;
+    }
+    await this.client().query(`INSERT INTO sales_followups (sales_id, month, agent_id, kind, marked_at, marked_by) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT DO NOTHING`, [row.sales_id, row.month, row.agent_id, row.kind, row.marked_at, row.marked_by]);
+  }
+
   async listTemplates(): Promise<ContractTemplate[]> {
     const { rows } = await this.client().query(`SELECT id, code, name, active, is_default, created_date::text, note, form, accent, accent_hex, font, sections, text, created_at, updated_at
       FROM contract_templates`);
@@ -1910,7 +1965,7 @@ export class PostgresOperationsStore {
   private async readContracts(filter: ContractListQuery & { id?: string }): Promise<Contract[]> {
     const { rows } = await this.client().query(
       `SELECT id, agent_id, kind, status, rate_type_id, active_from::text, active_to::text, priority, version, price_mode, discount_mode,
-              discount_value, bonus_buy, bonus_free, bonus_basis, book_window, created_date::text, created_by, note, doc_id
+              discount_value, bonus_buy, bonus_free, bonus_basis, book_window, created_date::text, created_by, note, doc_id, voided_at, voided_by
        FROM contracts WHERE ($1::text IS NULL OR id = $1) AND ($2::text IS NULL OR agent_id = $2) AND ($3::text IS NULL OR kind = $3) AND ($4::text IS NULL OR status = $4)`,
       [filter.id ?? null, filter.agentId ?? null, filter.kind ?? null, filter.status ?? null]);
     if (rows.length === 0) return [];
@@ -1934,9 +1989,41 @@ export class PostgresOperationsStore {
       discount: row.discount_mode === null ? null : { mode: row.discount_mode, value: Number(row.discount_value) },
       bonus: row.bonus_buy === null ? null : { buy: Number(row.bonus_buy), free: Number(row.bonus_free), basis: row.bonus_basis ?? null },
       book_window: row.book_window === true, created_date: row.created_date ?? null, created_by: row.created_by ?? null,
-      note: row.note ?? null, doc_id: row.doc_id ?? null,
+      note: row.note ?? null, doc_id: row.doc_id ?? null, voided_at: isoOrNull(row.voided_at), voided_by: row.voided_by ?? null,
       program_periods: periods.get(row.id) ?? [], seat_prices: prices.get(row.id) ?? [],
     }));
+  }
+  /** A promo written here (`contract-writes.ts`): the whole contract, its periods and prices replaced. */
+  async saveContract(c: Contract): Promise<void> {
+    const db = this.client();
+    await db.query(
+      `INSERT INTO contracts (id, agent_id, kind, status, rate_type_id, active_from, active_to, priority, version, price_mode, discount_mode, discount_value,
+         bonus_buy, bonus_free, bonus_basis, book_window, created_date, created_by, note, doc_id, voided_at, voided_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+       ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, rate_type_id = EXCLUDED.rate_type_id, active_from = EXCLUDED.active_from,
+         active_to = EXCLUDED.active_to, priority = EXCLUDED.priority, price_mode = EXCLUDED.price_mode, discount_mode = EXCLUDED.discount_mode,
+         discount_value = EXCLUDED.discount_value, bonus_buy = EXCLUDED.bonus_buy, bonus_free = EXCLUDED.bonus_free, bonus_basis = EXCLUDED.bonus_basis,
+         book_window = EXCLUDED.book_window, note = EXCLUDED.note, voided_at = EXCLUDED.voided_at, voided_by = EXCLUDED.voided_by`,
+      [c.id, c.agent_id, c.kind, c.status, c.rate_type_id, c.active_from, c.active_to, c.priority, c.version, c.price_mode,
+        c.discount?.mode ?? null, c.discount?.value ?? null, c.bonus?.buy ?? null, c.bonus?.free ?? null, c.bonus?.basis ?? null,
+        c.book_window, c.created_date, c.created_by, c.note, c.doc_id, c.voided_at, c.voided_by]);
+    await db.query('DELETE FROM contract_program_periods WHERE contract_id = $1', [c.id]);
+    await db.query('DELETE FROM contract_seat_prices WHERE contract_id = $1', [c.id]);
+    for (const [seq, p] of c.program_periods.entries()) {
+      await db.query('INSERT INTO contract_program_periods (contract_id, seq, route_id, book_from, book_to, travel_from, travel_to, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+        [c.id, seq, p.route_id, p.book_from, p.book_to, p.travel_from, p.travel_to, p.note]);
+    }
+    for (const p of c.seat_prices) {
+      await db.query('INSERT INTO contract_seat_prices (contract_id, route_id, zone, category, residency, price) VALUES ($1,$2,$3,$4,$5,$6)',
+        [c.id, p.route_id, p.zone, p.category, p.residency, p.price]);
+    }
+  }
+  /** Trips priced with this promo (`promo_id`) on bookings that still hold their seats: legacy's "already sold" count. */
+  async promoSoldTrips(id: string): Promise<number> {
+    const { rows: [row] } = await this.client().query(
+      `SELECT count(*)::int AS n FROM booking_trips t JOIN bookings b ON b.id = t.booking_id WHERE t.promo_id = $1 AND NOT (b.status::text = ANY($2::text[]))`,
+      [id, [...SEAT_RELEASING_STATUSES]]);
+    return row.n;
   }
 
   /** The trip, its booking and its dispatch as stored, for a dispatch write; undefined for an unknown trip. */
