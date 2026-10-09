@@ -8,6 +8,7 @@ import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import type { AltPickup } from './alt-pickups.js';
 import { allergyCount, type Allergy } from './allergies.js';
+import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
 import {
@@ -153,6 +154,9 @@ export type Booking = BookingHeader & {
   upgrades: Upgrade[];
   /** The booking's documents: the agent's voucher, passports (migration 040). */
   attachments: BookingDocument[];
+  /** The document check (`doc-check.ts`), or null; `doc_check_status` is legacy's `docCheckStatus`, computed. */
+  doc_check: DocCheckView | null;
+  doc_check_status: string;
   allergy_list: Allergy[];
   /** The kitchen's count (legacy `bkV2AllergyCount`): the list's people, or 1 for free text alone. Computed. */
   allergy_count: number;
@@ -253,7 +257,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
 export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
-export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'doc_check' | 'doc_check_status'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
 
 /**
  * The wire shape of a stored booking.
@@ -274,7 +278,7 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 
 /** `dispatch` gives each trip's dispatch as a read shows it; without it, every trip's is empty. */
 export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch, reconfirm: StoredReconfirm | null = null,
-  files: ReadonlyMap<string, AttachmentRef> = new Map()): Booking {
+  files: ReadonlyMap<string, AttachmentRef> = new Map(), docCheck: DocCheck | null = null): Booking {
   const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
     ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
     ...ovnOfIndex(stored.trips, ovn_of), operations: dispatch({ ovn_of, ...trip }),
@@ -286,6 +290,7 @@ export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) 
   const approvals = (stored.approvals ?? []).map((approval) => ({ ...approval, days: approval.days.map((day) => ({ ...day })) }));
   return {
     ...stored, approvals, trips, alt_pickups: (stored.alt_pickups ?? []).map((a) => ({ ...a })), upgrades: (stored.upgrades ?? []).map((u) => upgradeView(u, files)),
+    doc_check: docCheckView(docCheck), doc_check_status: docCheckStatus(docCheck, (stored.attachments ?? []).length),
     allergy_list: (stored.allergy_list ?? []).map((a) => ({ ...a })), allergy_count: allergyCount(stored.allergy_list ?? [], stored.special_meals_allergies),
     attachments: (stored.attachments ?? []).map((d) => ({ ...(files.get(d.attachment_id) ?? { id: d.attachment_id, name: d.attachment_id, mime: 'application/octet-stream', size: 0 }), kind: d.kind, by: d.by, at: d.at })), route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
     allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm),
@@ -578,7 +583,7 @@ export class OperationsStore {
   private view(stored: StoredBooking): Booking {
     return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
       vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups), checkinsView(this.checkins.get(trip.id) ?? []),
-      activeUpgrade(this.tripUpgrades.filter((u) => u.booking_trip_id === trip.id))), this.reconfirms.get(stored.id) ?? null, this.fileRefs());
+      activeUpgrade(this.tripUpgrades.filter((u) => u.booking_trip_id === trip.id))), this.reconfirms.get(stored.id) ?? null, this.fileRefs(), this.docChecks.get(stored.id) ?? null);
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
@@ -597,6 +602,10 @@ export class OperationsStore {
     this.checkins.set(tripId, after);
     return after.length < before.length;
   }
+
+  /** Each booking's document check (migration 042). */
+  private docChecks = new Map<string, DocCheck>();
+  setDocCheck(bookingId: string, d: DocCheck): void { this.docChecks.set(bookingId, copyDocCheck(d)); }
 
   /** The pier's meal editor: who changed the meals there, and when (migration 041). */
   stampPierMeals(id: string, at: string, by: string | null): void {
