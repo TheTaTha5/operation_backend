@@ -72,6 +72,7 @@ import { mapLegacyMoney } from './legacy-invoices.js';
 import { groupOrders, jobNotes, sentMarks, thaiNames, type ImportedGroup } from './legacy-van-jobs.js';
 import { b2cSkipReason, parseB2CMode } from './legacy-b2c.js';
 import { mapLegacyWeather } from './legacy-weather.js';
+import { mapLegacyPierMoney } from './legacy-pier-money.js';
 import { HOUSE_AGENT_IDS } from '../domain/agent-writes.js';
 import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales } from './legacy-sales.js';
 
@@ -218,6 +219,10 @@ async function main() {
       lineItems: await read('SELECT * FROM sb_invoices__lineitems'), payments: await read('SELECT * FROM sb_payments'),
     };
     const legacyWeather = await read('SELECT * FROM sb_weather');
+    // Pier money and the after-trip decisions (migrations 110–112, `legacy-pier-money.ts`).
+    const legacyExtras = await read('SELECT * FROM sb_extras ORDER BY id');
+    const legacyTsCot = await read('SELECT * FROM ts_cot ORDER BY key');
+    const legacyTravelSum = await read('SELECT * FROM travel_sum ORDER BY key');
     const legacyVans = await read('SELECT * FROM sb_vehicles');
     const vanDayRoutes = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__dayroute');
     const vanDayStatus = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__daystatus');
@@ -1078,6 +1083,9 @@ async function main() {
     }, report);
     // ── Weather closures and their follow-ups (migration 060, `legacy-weather.ts`): after the bookings they name ──
     const weather = mapLegacyWeather({ closures: legacyWeather, bookings: legacyBookings }, { prefix: PREFIX, routes, bookings: new Set(bookings.map((b) => String(b.id))) }, report);
+    // ── Pier money and the after-trip decisions (migrations 110–112, `legacy-pier-money.ts`): after the bookings they hang off ──
+    const pierMoney = mapLegacyPierMoney({ bookings: legacyBookings, extras: legacyExtras, tsCot: legacyTsCot, travelSum: legacyTravelSum, history: legacyHistory },
+      { prefix: PREFIX, bookings: new Set(bookings.map((b) => String(b.id))), files: filesHere }, report);
 
     // ── Write, in one transaction ──
     await target.query('BEGIN');
@@ -1222,6 +1230,18 @@ async function main() {
     await insert('payment_slips', money.slips);
     await insert('weather_closures', weather.closures);
     await insert('weather_cases', weather.cases);
+    // Hang off the bookings above: the earlier run's went with them (ON DELETE CASCADE).
+    await insert('booking_pier_payments', pierMoney.pierPayments);
+    await insert('booking_pier_payment_slips', pierMoney.pierSlips);
+    await insert('booking_tour_sales', pierMoney.tourSales);
+    await insert('booking_tour_sale_slips', pierMoney.saleSlips);
+    await insert('booking_cot_decisions', pierMoney.cotDecisions);
+    await insert('booking_cot_decision_slips', pierMoney.cotSlips);
+    await insert('booking_noshow_charges', pierMoney.noshow);
+    // In legacy's order, so the serial id keeps two events at the same instant in sequence.
+    await target.query(`INSERT INTO booking_pfm_events (booking_id, kind, approver, by, at)
+      SELECT e.booking_id, e.kind, e.approver, e.by, e.at FROM jsonb_populate_recordset(NULL::booking_pfm_events, $1::jsonb) WITH ORDINALITY AS e ORDER BY e.ordinality`,
+    [JSON.stringify(pierMoney.pfmEvents)]);
     await insert('booking_approvals', approvals);
     // Each imported booking has at most one approval of each kind, so (booking, kind) finds its id.
     if (approvalDays.length) {
@@ -1271,6 +1291,21 @@ async function main() {
     if (replacedRefunds) console.log(`  replaced ${replacedRefunds} refunds and credits made here on those invoices`);
     const byStatus = (s: string) => weather.cases.filter((c) => c.status === s).length;
     console.log(`weather: ${weather.closures.length} closures, ${weather.cases.length} follow-ups (${byStatus('awaiting')} awaiting, ${byStatus('notified')} notified, ${byStatus('resolved')} resolved); replaced ${replacedClosures} closures`);
+    {
+      const sum = (rows: Row[], f: (r: Row) => number) => rows.reduce((s, r) => s + f(r), 0).toLocaleString('en-US');
+      const byMethod = (m: string) => pierMoney.pierPayments.filter((p) => p.method === m);
+      console.log(`pier money: ${pierMoney.pierPayments.length} pier payments on ${new Set(pierMoney.pierPayments.map((p) => p.booking_id)).size} bookings `
+        + `(cash ${byMethod('cash').length} ฿${sum(byMethod('cash'), (p) => Number(p.amount))}; card ${byMethod('card').length} ฿${sum(byMethod('card'), (p) => Number(p.amount))} + fees ฿${sum(byMethod('card'), (p) => Number(p.fee))}; `
+        + `transfer ${byMethod('transfer').length} ฿${sum(byMethod('transfer'), (p) => Number(p.amount))}), ${pierMoney.pierSlips.length} slips`);
+      console.log(`on-tour sales: ${pierMoney.tourSales.length} (฿${sum(pierMoney.tourSales, (s) => Number(s.qty) * Number(s.unit_price))}, commission ฿${sum(pierMoney.tourSales, (s) => Number(s.qty) * Number(s.unit_price) - Number(s.to_company))}), ${pierMoney.saleSlips.length} slips`);
+      const deducting = pierMoney.cotDecisions.filter((d) => Number(d.deduct) > 0);
+      const invoiced = new Set(money.lines.map((l) => String(l.booking_id)));
+      console.log(`after the trip: ${pierMoney.cotDecisions.length} COT decisions (deduct ฿${sum(pierMoney.cotDecisions, (d) => Number(d.deduct))}, payout ฿${sum(pierMoney.cotDecisions, (d) => Number(d.payout))}), `
+        + `${pierMoney.cotSlips.length} slips; ${pierMoney.noshow.length} no-show decisions (฿${sum(pierMoney.noshow, (c) => Number(c.amount))}); ${pierMoney.pfmEvents.length} PFM events`);
+      const kept = deducting.filter((d) => invoiced.has(String(d.booking_id)));
+      console.log(`  invoiced bookings with a COT deduction, their invoices kept at legacy's amounts (no minus line): ${kept.length}`);
+      for (const d of kept) console.log(`    ${d.booking_id} ${d.service_date} deduct ฿${Number(d.deduct).toLocaleString('en-US')}`);
+    }
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
