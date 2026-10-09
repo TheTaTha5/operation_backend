@@ -1334,7 +1334,8 @@ export class OperationsStore {
       if (booking.id === exclude.bookingId || !bookingHoldsSeats(booking)) continue;
       for (const trip of booking.trips) {
         if (trip.route_id !== routeId || trip.service_date !== serviceDate) continue;
-        trips.push({ booking_mode: trip.booking_mode, pax: paxTotal(trip.pax), charter_boat_id: trip.charter_boat_id });
+        trips.push({ booking_mode: trip.booking_mode, pax: paxTotal(trip.pax), charter_boat_id: trip.charter_boat_id,
+          split_boat_ids: (this.dispatch.get(trip.id)?.boat_splits ?? []).map((s) => s.boat_id) });
       }
     }
     const drawn = drawnByLock(this.bookings.values(), exclude);

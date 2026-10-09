@@ -702,13 +702,14 @@ export class PostgresOperationsStore {
        LEFT JOIN boat_capacity_overrides o ON o.boat_id = d.boat_id AND o.service_date = d.service_date
        WHERE d.route_id = ANY($1::text[]) AND d.service_date BETWEEN $2 AND $3`, [ids, from, to]);
     const { rows: trips } = await this.client().query(
-      `SELECT t.route_id, t.service_date::text AS service_date, t.booking_mode, t.charter_boat_id, SUM(p.count)::int AS pax
+      `SELECT t.route_id, t.service_date::text AS service_date, t.booking_mode, t.charter_boat_id, SUM(p.count)::int AS pax,
+              ARRAY(SELECT s.boat_id FROM booking_trip_boat_splits s WHERE s.booking_trip_id = t.id ORDER BY s.idx) AS split_boat_ids
        FROM booking_trips t
        JOIN bookings b ON b.id = t.booking_id
        JOIN booking_trip_pax p ON p.booking_trip_id = t.id
        WHERE t.route_id = ANY($1::text[]) AND t.service_date BETWEEN $2 AND $3 AND b.status <> ALL($5::text[]) AND NOT ${WAITING_FOR_SEATS}
          AND t.booking_id IS DISTINCT FROM $4
-       GROUP BY t.route_id, t.service_date, t.booking_mode, t.charter_boat_id`, [ids, from, to, exclude.bookingId ?? null, releasing]);
+       GROUP BY t.id`, [ids, from, to, exclude.bookingId ?? null, releasing]);
     // Every lock on those days that can count: the active ones, and every sub-group (a released one
     // still counts its draws against its parent). `poolLocks` picks what holds.
     const { rows: locks } = await this.client().query(
@@ -733,7 +734,8 @@ export class PostgresOperationsStore {
           route_id: routeId, service_date: date,
           ...dayCapacity(
             (deployedByDay.get(key) ?? []).map((row): DayDeployment => ({ boat_id: String(row.boat_id), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), override_capacity: optionalInt(row.override_capacity) })),
-            (tripsByDay.get(key) ?? []).map((row): HeldTrip => ({ booking_mode: String(row.booking_mode), pax: Number(row.pax), charter_boat_id: row.charter_boat_id ?? undefined })),
+            (tripsByDay.get(key) ?? []).map((row): HeldTrip => ({ booking_mode: String(row.booking_mode), pax: Number(row.pax), charter_boat_id: row.charter_boat_id ?? undefined,
+              split_boat_ids: (row.split_boat_ids as string[]).map(String) })),
             (() => { const rows = locksByDay.get(key) ?? []; return poolLocks(rows.map(lockRow), new Map(rows.map((row) => [String(row.id), Number(row.drawn)])), today, exclude.lockId); })(),
             kindOf.get(routeId)),
         });

@@ -933,7 +933,10 @@ available_seats = sellable seats on boats not chartered
 ```
 
 - **A charter takes its whole boat.** The chartered boat's sellable seats leave the pool, however
-  few passengers the charter carries; `deployments[].chartered` marks it. `charter_pax` is reported
+  few passengers the charter carries; `deployments[].chartered` marks it. A charter trip split over
+  several boats (its dispatch `boat_splits`) takes every one of them, as legacy (`baCharterBoatMap`):
+  each leaves the sellable and the licensed seats, and takes no seat booking (`409 boat_chartered`)
+  or other charter. `charter_pax` is reported
   for information and is not subtracted again. A charter recorded before boats were tracked, on a
   day with more than one boat, cannot say which boat it took, so its passengers come out of the
   pool instead — the last line above.
