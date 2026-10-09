@@ -39,6 +39,13 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
      stock equals legacy's.
    - Legacy must stop editing assets, incidents, jobs, stock, memos, projects and the Daily Log at
      the same moment.
+6b. **Pier office:** `npm run import:pier-office -- --commit`, after step 4 (the sheets name boats).
+   - Rehearsal (2026-10-10, on a fresh import): petty cash Panwa 38 in ฿169,828 and 114 out
+     ฿159,728, Tub Lamu 1 out ฿1,800; 54 longtail cells ฿190,000; 61 park cells ฿661,280 + ฿10,500
+     dock fees; the company name; 6 kinds, 41 items, 13 codes, 5 groups, 72 staff, 2 licence types,
+     4 classes; nothing skipped. Panwa's balance on 2026-10-09 reads ฿10,100, as legacy's. A re-run
+     left every count the same.
+   - Legacy must stop writing petty cash and the seven lists at the same moment (§6.8 of the handoff).
 7. **Validate the booking area keys:**
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 8. **Check:** `npm run verify:import`. Expected differences:
@@ -52,7 +59,8 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    what was recorded here on legacy's records for:
    - pier payments, on-tour sales and the cash-on-tour and no-show decisions;
    - the fleet records;
-   - van rates and the daily report settings.
+   - van rates and the daily report settings;
+   - the pier office (step 6b): its lists whole, legacy's petty cash rows and every sheet cell.
 
    So decide when legacy stops writing each of these (`money-model.md`, `fleet-maintenance-model.md`).
 10. **Railway variables:**
@@ -113,7 +121,9 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
     - the catalogue (§3.14: Programs, the boat form, Boat Status and day seats; `409 seats_sold`,
       resend with `capacity_anyway`);
     - sales (§6.5–6.6: agents, templates, Team & Markets, add-ons, insurance);
-    - fleet (§3.13, §3.15, §6.7).
+    - fleet (§3.13, §3.15, §6.7);
+    - the pier office: petty cash, its sheets and certificate, and the office lists (§6.8; a deleted
+      petty cash row is kept, out of the totals; `n` and a code's `bg` are the server's).
 
     Each screen stops writing legacy's blob for its area.
   - **Legacy sync per area** (decided): keep saving to legacy only the areas that have not moved.
@@ -165,6 +175,9 @@ So, in this order:
 - **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
   pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
   invoice left overpaid by a cash-on-tour deduction.
+- **Pier office** (`pier-office-model.md`): which part of the rest comes next: the sheets' booked side
+  (expected park fees need the cost plans), the roster and pay, stock moves and sign-out sheets, or
+  licences.
 - **Fleet stock:** 18 duplicate items to merge (`POST /v1/fleet/stock-items/{id}/merge`), and 7
   stock lines whose history did not add up (item i25 most of all: 44 between Tub Lamu and Panwa),
   from the `import:fleet-stock` report. Legacy's 7 cancelled memos have no reason (it was never kept).

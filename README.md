@@ -84,6 +84,7 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:boats [-- --commit]` | Seed the boat catalogue the same way: every field of the boat form, its documents and status log. Dry run unless `--commit`; adds what is missing, refreshes a boat never edited here, never touches one edited here, never deletes. Legacy's `totalcap` becomes `registered_persons`, never a selling limit. Run the import afterwards so deployments on a new boat are imported. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet-stock [-- --commit] [--all]` | Import legacy's fleet stock, memos, projects, Daily Fleet Log and safety equipment (see "Fleet maintenance"). Dry run unless `--commit`; rerunnable; run after `seed:boats` and `import:attachments`. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:pier-office [-- --commit] [--all]` | Import legacy's pier petty cash (ledger rows, the longtail and park sheets, the company name) and the Pier Office lists (see "Pier office"). Dry run unless `--commit`; prints counts and baht totals beside legacy's. Until the pier area cuts over a rerun mirrors legacy: lists replaced whole, rows with legacy's ids and every sheet cell replaced, rows made here (`pc_…`) kept. Run after `seed:boats`. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]` | Seed fleet maintenance (engines, gearboxes, propellers and their histories, incidents, maintenance jobs) from legacy. Dry run unless `--commit`. A seed: run it once, after `seed:boats` and before anyone edits fleet here. Legacy's ids are upserted with their lists replaced; records created here are untouched. Lists what it skipped and legacy's oddities (duplicate numbers, a job link to a deleted job, `inprogress`/`high`). |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
 
@@ -179,12 +180,12 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 
 | Area | Writes |
 |---|---|
-| `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities, the daily report's settings; the Daily Fleet Log's water meters, issued and extra items and outside requests (as `fleet` does) |
+| `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities, the daily report's settings; the Daily Fleet Log's water meters, issued and extra items and outside requests (as `fleet` does); the pier office (as `pier` does) |
 | `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat; van rates; engines, gearboxes, propellers, incidents and maintenance jobs; stock, consumables, purchase memos, projects, the Daily Fleet Log, safety equipment (`/v1/fleet/…`); uploading files |
 | `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
 | `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
 | `accounting` | invoices, their discounts and payments; accepting the pier's hand-over; commission payouts; also the Daily PFM decisions, pier payments and collecting an upgrade (legacy saves bookings for accounting too); partner van bills; van rates; the daily report's settings |
-| `pier` | pier payments (`/v1/bookings/{id}/pier-payments`), handing the pier's cash over, check-ins |
+| `pier` | pier payments (`/v1/bookings/{id}/pier-payments`), handing the pier's cash over, check-ins; the pier office: petty cash and its sheets, the office lists (`/v1/pier-cash/…`, `/v1/pier-office/…`, as `operations` does, legacy's `poCanEdit`) |
 
 - `role: admin` may do everything, including the user screens.
 - **Edit areas follow legacy's `editInfo`:** a list in `edit_areas` decides, and `can_edit` is read
@@ -2744,6 +2745,103 @@ upgrades it names. `amount` is computed. Refused: an item of another seller or w
 **Change feed:** a booking command here is a `booking` change; kinds `pier_handover` and
 `commission_payout` announce hand-overs and payouts (`route_days: null`).
 
+### Pier office: petty cash
+
+Legacy's "เงินสดย่อย" (§poCash; todo/pier-office-model.md, migration 170): a cash box per pier
+(`tublamu`, `panwa`, `ranong`) whose balance carries from day to day, and two month sheets the pier
+keys: longtail boats paid, and national-park and dock fees. Writes need `pier` or `operations`
+(legacy `poCanEdit`); any staff login reads, an agent's login gets `403`. Petty cash is not linked to
+pier payments or the hand-over, as in legacy.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /v1/pier-cash/{pier}/days/{date}[?deleted=true]` | — | the ledger day (below) |
+| `POST /v1/pier-cash/{pier}/days/{date}/rows` | `{ kind: "in"\|"out", amount, description?, time? }` | `201`, `{ row, day }` |
+| `DELETE /v1/pier-cash/rows/{id}?reason=` | — | `{ row, day }` |
+| `POST /v1/pier-cash/{pier}/days/{date}/pull` | — | `201`, `{ rows, day }` |
+| `GET /v1/pier-cash/{pier}/days/{date}/certificate[?ids=a,b]` | — | the receipt-substitute certificate |
+| `GET /v1/pier-cash/{pier}/months/{yyyy-mm}` | — | the month table |
+| `GET /v1/pier-cash/{pier}/months/{yyyy-mm}/longtail[?date=]` | — | the longtail sheet |
+| `GET /v1/pier-cash/{pier}/months/{yyyy-mm}/park[?date=]` | — | the park-fee sheet |
+| `PATCH /v1/pier-cash/{pier}/days/{date}/longtail/{boat_id}` | `{ join_boats?, charter_boats?, amount?, note? }` | `{ pier, date, boat_id, cell }` |
+| `PATCH /v1/pier-cash/{pier}/days/{date}/park/{boat_id}` | `{ ad_th?, chd_th?, inf_th?, foc_th?, ad_fr?, chd_fr?, inf_fr?, foc_fr?, amount?, dock?, filled_from? }` | same |
+| `GET /v1/pier-cash/settings`, `PUT /v1/pier-cash/settings` | `{ company_name }` | `{ company_name, updated_at, updated_by }` |
+
+```jsonc
+// GET /v1/pier-cash/panwa/days/2026-10-09
+{ "pier": "panwa", "date": "2026-10-09", "opening": 12350, "in": 0, "out": 2250, "net": -2250, "closing": 10100, "negative": false,
+  "reference": { "longtail": 0, "park": 20940, "dock": 300, "total": 21240 }, "pulled": 0, "waiting": 21240,
+  "rows": [ { "id": "pc1791506960246odh", "pier": "panwa", "date": "2026-10-09", "kind": "out", "description": "Guide (PP1500)", "amount": 1500,
+              "time": "07:48", "source": null, "created_at": "…", "created_by": "GSA.PK01", "deleted_at": null, "deleted_by": null,
+              "delete_reason": null, "balance": 10850 } ] }
+```
+
+- **The ledger** (legacy `pcSheetMain`): `opening` is every earlier day's in − out at that pier;
+  `closing` = opening + in − out. Rows run by `time` (`HH:MM`; untimed last; at one time, in before
+  out), each with the `balance` after it. `negative` is legacy's "⚠ ติดลบ" warning: a balance below
+  0 is never refused.
+- **A row:** `amount` above 0 (to the satang; "ใส่จำนวนเงินก่อนครับ" in legacy), `kind`,
+  `description` and `time` are the client's; `id`, `source`, `created_*` the server's. There is no
+  edit, as in legacy. **Delete** keeps the row with `deleted_*` and out of every total (legacy removed
+  it); `?deleted=true` lists them under `deleted`; a second delete is `409 row_deleted`.
+- **The sheets' figures** (`reference`: longtail paid, park fees, dock fees) count in the ledger only
+  once **pulled**: pull adds an out row per category with a total above 0 and no live pulled row
+  that day (`source` `longtail`/`park`/`dock`, "ค่าเรือหางยาว (ดึงจากชีท)" …). Nothing new is `409
+  nothing_to_pull`. `waiting` = reference − pulled: a cell changed after its pull shows there, and
+  pulls again only after its pulled row is deleted (legacy pulls a category once a day). `source`
+  sent on a row is `400`.
+- **The month table** (`pcMonthTable`): `{ pier, month, opening, closing, days, totals }`, one day per
+  date with rows, sheet cells or a boat deployed on a route of the pier, each with its own opening,
+  in, out, closing, `reference`, `pulled`, `waiting`.
+- **The sheets** (`pcSheetLT`, `pcSheetPK`): `{ days: [{ date, boats: [{ boat_id, boat_name,
+  route_id, route_name, route_color, cell }], totals }], totals }`, for the boats deployed from the
+  pier that day plus any boat with a cell. A longtail `cell` adds `used_boats` (= join + charter,
+  legacy `n`); a park `cell` adds `heads` (the 8 counts). Both are the server's: a different value
+  sent is `400`. A cell left with nothing is removed (`cell: null`), as legacy deletes it. A boat
+  not in the catalogue is `404`. **Not here yet:** the booked side legacy shows beside them (join
+  heads and charter boats from bookings, heads by nationality after check-in, the expected park fee
+  from the cost plan).
+- **The certificate** ("ใบรับรองแทนใบเสร็จรับเงิน", `pcPrintCert`): the day's out rows in ledger order,
+  or only `ids` (`400` "No rows selected." when none is), with `company_name`, `date_th`
+  (`09/10/2569`), `total` and `total_text_th` ("เจ็ดพันหกร้อยห้าสิบบาทถ้วน"; satang as "…สตางค์").
+  Without a company name it is `409 company_name_missing` (legacy opens its dialog first).
+
+### Pier office lists
+
+The lists the Pier Office pages edit (todo/pier-office-model.md, migration 171). Writes need `pier`
+or `operations`; any staff login reads.
+
+| List (`{list}`) | Row | Legacy |
+|---|---|---|
+| `item-kinds` | `{ id, name, name_en, unit, color, sort, active }` (texts up to 40) | `pier_kinds`, the loan equipment kinds |
+| `items` | `{ id, pier, kind_id, label, total, active, note }` | `pier_items`, each pier's equipment lines |
+| `attendance-codes` | `{ id, code, label, color, bg, kind: work\|off\|leave\|none\|night, sort, active }` | `pier_codes`, the roster codes |
+| `sections` | `{ id, pier, name, sort }` | `pier_sect`, the roster groups |
+| `staff` | `{ id, pier, nick, name, role, phone, active, default_code, section_id, note, sort }` | `pier_staff` |
+| `license-types` | `{ id, side: deck\|eng, short, formal, per_boat, active }` | `pier_lic_types` |
+| `license-classes` | `{ id, type_id, name, max_gt, max_bhp, sort }` (null = no limit) | `pier_lic_classes` |
+
+| Method + path | Answers |
+|---|---|
+| `GET /v1/pier-office[?pier=]` | `{ item_kinds, items, attendance_codes, sections, staff, license_types, license_classes }`, items, groups and staff narrowed to `pier` |
+| `POST /v1/pier-office/{list}` | `201`, the row (not `license-types`: `405`) |
+| `PATCH /v1/pier-office/{list}/{id}` | the row |
+| `DELETE /v1/pier-office/{list}/{id}` | `{ deleted, unassigned }`: `item-kinds`, `attendance-codes`, `sections`, `license-classes` only; the others are switched off with `{ "active": false }` (`405`) |
+| `POST /v1/pier-office/{list}/order` | `{ ids }` (`item-kinds`, `attendance-codes`), `{ pier, ids }` (`sections`, `staff`): every row once, in the order shown |
+
+- A fresh system starts from legacy's seeds: kinds fin, mask, towel; 11 roster codes; the deck and
+  eng licence types with two classes each.
+- **The server's:** `id`, `sort` (the order command's; a new row goes last), a code's `bg` (legacy
+  `paTint` of `color`), a licence type's `side`, a class's `type_id`. Sent with another value they are
+  `400` naming what to use.
+- **Refused:** an item with no label or an unknown kind (`400`; `409 no_kinds` when there are none);
+  a negative total; deleting a kind that items use (`409 kind_in_use`); a code already used, any
+  case (`409 code_taken`); a person with neither nick nor name (the missing one copies the other);
+  a group of another pier; deleting a group with people unless `?unassign_anyway=true` (`409
+  section_in_use`; they become unassigned).
+- A person moved into another group, or to another pier, goes last (legacy `paStaffSect`); moved to
+  another pier without a group named, they leave theirs. `default_code` is upper-cased.
+
 ### After the trip: cash on tour and no-show decisions
 
 Legacy's Travel Summary decisions, per booking and trip date (todo/money-model.md slice 4, migration
@@ -3310,7 +3408,10 @@ the last number it saw and refetches only the records named.
     its follow-ups (`route_days` is its trip);
   - `boat`: created or edited, its status timeline, retire and restore, and a day's seats. Its
     `route_days` are the days whose seats moved: the deployments a capacity change rewrote, and the
-    day of a day's seats (when the boat is deployed); `null` when none did.
+    day of a day's seats (when the boat is deployed); `null` when none did;
+  - `pier_cash`: a pier's petty cash day, `entity_id` `<pier>:<date>` (a row added or deleted, a
+    pull, a sheet cell), or `settings`; `pier_office`: an office list, `entity_id` its name
+    (`staff`, `sections`, …). See [Pier office](#pier-office-petty-cash). `route_days` is `null`.
 
   `action` is `created`, `updated` or `deleted`.
 - **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking
