@@ -275,3 +275,19 @@ old bookings).
 10. **Reason and expiry on sub-groups:** keep them per sub-group as legacy does? *Recommend: reason
     yes; expiry inherited from the parent unless ops need it separate.*
 11. **Seed locks `lk001`–`lk004`:** *Recommend: skip them on import.*
+
+## Decided (2026-10-09)
+
+1. **Bulk locks:** reuse `feat/bulk-seat-locks`'s shape (a group + one lock per departure), with an
+   `overdue` warning and a manual release per departure instead of its automatic release.
+2. **Day-lock expiry:** copy legacy: an expired lock stops holding seats, worked out on read (no job).
+3. **Pending seats:** modelled (`pending_pax`, the short answer with split/all, a confirm command).
+4. **Sub-groups:** modelled, one level; a booking draws from a sub-group, the pool counts the parent;
+   reason per sub-group, expiry from the parent (Q10).
+5. **Whole-boat holds:** their own design (the pool side is built, 047).
+6. **Lock log:** server-written `seat_lock_events`, `GET /v1/seat-locks/{id}/log`, legacy's lines imported.
+7. **Release** keeps the asked `pax` and records released seats separately.
+8–9. **Holders:** `holder_type` agent/office/global; an agent lock needs a real agent (`400`) and only
+   its bookings draw from it; office/global any. Legacy's 9 free-text holders import as `office`
+   with the name kept in the reason.
+11. **Demo locks `lk001`–`lk004`:** imported like any other lock.

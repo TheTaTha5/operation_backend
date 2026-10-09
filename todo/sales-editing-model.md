@@ -361,3 +361,29 @@ Read-only, legacy production, 2026-10-09.
 14. **`a_company` as a house account?** The import marks only three. *Recommend:* add it.
 15. **`nat_learn`:** *Recommend:* leave it out (a client-side guess cache), as `legacy-replacement.md`
     says. `agent_artifacts` is not browser state, though; it should move off that list.
+
+## Decided (2026-10-09)
+
+1. **Agents are deactivated, not deleted:** deactivate/activate (`sales`); delete only with no booking
+   or contract; a booking for an inactive agent is refused (new).
+2. **Salespeople and markets** are edited under `config`.
+3. **Sales scoping is the server's:** a login with `sales_id` lists and opens only its own agents,
+   editing another's is `403`, a new agent gets the caller's salesperson.
+4. **Agent codes:** new and changed codes must be unique (`409 code_taken`); the 21 legacy duplicates
+   stay until sales cleans them, then the constraint is added.
+5. **Rate type** changes through `PUT /v1/agents/{id}/rate-type` (refills programmes, syncs the main
+   contract, `drop_unpriced`); `PATCH` refuses `rate_type_id`; programmes through their own `PUT`.
+6. **Renewal: copy legacy:** renew edits the agent's contract fields; no contract row is created.
+7. **Activity:** the server writes a line for every agent change from every path, with the login.
+8. **Credit on non-invoice agents: copy legacy** (allowed; billing ignores it).
+9. **Templates and issued documents** are stored: templates (one default, unique code, `sales`) and
+   frozen issued documents linked to their contract.
+10. **Add-on catalogue: build one** (add-on services with prices). Needs its own design: legacy never
+    saved one, so there is nothing to copy; ask sales what it lists.
+11. **Nationalities:** the server owns the list (`GET`/`POST`, legacy's clean-and-match rule,
+    `operations`); merging the 65 custom ones later (it rewrites 218 bookings).
+12. **Insurance:** `age` and `insurance_reviewed` (who/when) on booking passengers, a small command
+    under `operations`; fractional ages allowed.
+13. **Staff welfare quotas:** later, with staff pricing.
+14. **`a_company`** becomes a house account.
+15. **`nat_learn`** stays out (a browser guess cache); `agent_artifacts` is real data (item 9).

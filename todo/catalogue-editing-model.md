@@ -289,3 +289,26 @@ Read 2026-10-09 from the legacy database.
 13. **Retire boats here?** Legacy cannot actually retire one. *Recommend a `retired` flag set by a
     command (`POST /v1/boats/{id}/retire`, `/restore`), refused while the boat has future
     deployments.*
+
+## Decided (2026-10-09)
+
+1. **Routes and boats move together;** `sync:routes` and `sync:boats` retire once the edit endpoints exist.
+2. **Boat edits need `config`** (all fields), as legacy.
+3. **The whole boat form moves now,** all ~35 fields: selling, registration, the status log and
+   documents with their rules (`fleet-maintenance-model.md` covers the rules).
+4. **Capacity above the licence: copy legacy,** so it is accepted. This drops the schema check
+   `capacity <= license_pax` (migration 005); sales stay capped at the licence by `deploymentSeats`.
+5. **A capacity change** updates the boat's future deployments, and asks first (`*_anyway`) when a day
+   would carry more passengers than the new seats.
+6. **Route delete** is refused while anything uses it (`409` naming what).
+11. **Capacity + 2 and the charter refusal on trip-ops:** built (README "Dispatch").
+7. **Route fields:** none now; `meal_venue_id` and the venues list move with costing (Money reports);
+   `daily_cap` when a land limit is wanted; `code` never.
+8. **Families:** an editable table (ops add families).
+9. **Love Kingdom creates routes** through `POST /v1/routes`: same `ext_id` → the same route; its
+   login may call it.
+10. **A boat's seats for one day:** `PUT/DELETE /v1/boats/{id}/capacity-overrides/{date}`, `operations`,
+    raising above normal needs `act-capunlock`, a reason, who/when stored, over the licence `400`, no
+    past days.
+12. **The stand-in boat:** ask ops what limit they want on no-boat days first (in the checklist).
+13. **Retire:** `POST /v1/boats/{id}/retire` and `/restore`; refused while the boat has future deployments.

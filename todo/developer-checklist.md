@@ -68,15 +68,22 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.
 
-## Ask sales
-
-- **Re-enter the agents' rate seasons** once the season screen saves to this API: legacy kept them
-  only in browsers, so none came across.
-
 ## Ask ops
 
 - **The 2027 route calendars.** Five Panwa routes close to bookings on 2027-01-01
   (`route-season-calendars-expire.md`).
+- **A sea route with no boat yet:** what limit do they want on such days? Legacy uses a fake boat
+  ("Boat for Allotment Set") for it (`catalogue-editing-model.md` 12).
+- **B2C orphans:** cancel the 6 bookings of deleted Love Kingdom orders (2 in the future hold seats)
+  and the 3 test bookings in legacy (`b2c-sync-model.md` 7).
+- **Fleet projects PRJ-001…007:** copies or real? (`fleet-maintenance-model.md` 10)
+
+## Ask sales
+
+- **Re-enter the agents' rate seasons** once the season screen saves to this API: legacy kept them
+  only in browsers, so none came across.
+- **The add-on catalogue** you asked for: what should it list, and with which prices? Legacy never
+  saved one (`sales-editing-model.md` 10).
 
 ## Housekeeping
 

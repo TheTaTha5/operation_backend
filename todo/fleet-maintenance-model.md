@@ -512,3 +512,22 @@ The Fleet Deployment planning board can stay a client draft unless shared plans 
     Boat Operation.
 13. **Uploading project documents** needs `operations`, `pier` or `accounting` here.
     *Recommendation:* add `fleet` to `/v1/attachments` when slice 7 is built.
+
+## Decided (2026-10-09)
+
+1. **In this API and database,** after bookings and money; slice 1 (boat availability) first.
+2. **A boat under repair:** check legacy's `bop2AssignBoat` and copy it; if legacy only shows N/A, a
+   warning and `deploy_anyway: true`.
+3. **Memos: copy legacy:** any `fleet` editor approves with a typed approver; "paid" as legacy.
+4. **Numbers: copy legacy** (no server numbering; duplicates possible, as today).
+5. **Fields legacy loses** are stored here.
+6. **Stock bugs are fixed:** movements are append-only, a cancel after receipt reverses the stock, a
+   hand edit is an `adjust` movement.
+7. **Negative stock:** copy legacy (consumables only, after a confirm).
+8. **The Daily Log lock is enforced** (`409`; unlocking is a command).
+9. **Daily Log extras are kept** (no 120-day deletion).
+10. **Import:** the 8 warehouse spellings map to the 3 warehouses; the rest imports as is and is
+    listed; ops are asked about the PRJ-001…007 copies.
+11. **Safety equipment and consumables are built** with the rest.
+12. **The Fleet Deployment planning board stays out** (browser-only drafts).
+13. **`fleet` may upload files** once projects are built.

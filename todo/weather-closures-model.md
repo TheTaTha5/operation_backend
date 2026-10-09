@@ -228,3 +228,20 @@ it is only tagged when someone opens the panel.
     refund and credit later under `accounting`.*
 11. **Past dates:** legacy hides the button for past dates. *Recommend: refuse closing a past
     date (`400`).*
+
+## Decided (2026-10-09)
+
+1. **Sales onto a closed trip:** copy legacy, so nothing is refused; the closure only shows.
+2–3. **Storage:** `weather_closures` (route, date, note, who, when) plus one follow-up row per booking
+   per closure (awaiting → notified → resolved, outcome).
+4. **Which bookings:** every booking on the closed trip, worked out on read (later sales included).
+5. **Resolve** reuses `/reschedule` and `/cancel-weather`: a full new day is refused, lock seats are
+   given back (legacy skipped both).
+6. **Refund and credit: now**, with weather closures. This pulls part of Money forward: where a refund
+   is recorded against the invoice (only this booking's share, not the whole invoice) and where an
+   agent's credit balance lives and is spent (`money-model.md` open 1).
+7. **Charters** are followed up too.
+8. **Undo** keeps resolved bookings as they are and asks first when some exist (`undo_anyway`).
+9. **The 3 stale `awaiting` cases** import as they are.
+10. **Permission:** `operations` for everything, refund and credit included.
+11. **Past dates:** allowed (staff may record a closure after the day).

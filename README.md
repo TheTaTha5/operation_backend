@@ -178,7 +178,7 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 | Area | Writes |
 |---|---|
 | `operations` | bookings and their commands, seat locks, deployments |
-| `fleet` | deployments (legacy's Fleet Deployment) |
+| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys) |
 | `sales` | rate types, agents |
 | `config` | the route calendar |
 | `accounting` | invoices, their discounts and payments |

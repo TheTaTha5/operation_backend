@@ -200,3 +200,19 @@ Other `/api/b2c/*` routes are Love Kingdom calling legacy with `X-Api-Key`: `ava
 7. **The 6 confirmed rows of deleted orders and the 3 test bookings:** *Recommend: list them for
    ops to cancel in legacy now (a legacy data fix, not ours), and skip `b2c_BK-` on import.*
 8. **`POST /api/b2c/reset`:** *Recommend: no equivalent here.*
+
+## Decided (2026-10-09)
+
+1. **Push, not pull:** Love Kingdom books through `POST /v1/bookings`; the pull is not ported.
+2. **Love Kingdom pushes now,** writing to legacy and to this API during the transition.
+   - **Duplicates:** the legacy import stops copying legacy's `b2c_` bookings, so Love Kingdom's push
+     is the only source here.
+3. **Health:** Love Kingdom alerts on its own failed calls; this API adds a reconciliation read
+   (B2C bookings changed since a time).
+4. **Bad data:** accepted and listed, as legacy's issues panel does, not refused. *Design note:* a
+   booking on an unknown route can't be stored today (the trip's route is a foreign key), so the
+   design needs a holding place for what can't become a booking (an issues list of raw orders).
+6. **Edit clashes:** the version decides; Love Kingdom sends the version it read, a clash is `409`.
+7. **Orphans:** ops cancels the 6 deleted-order bookings and the 3 test ones in legacy; the import
+   skips `b2c_BK-` test ids.
+8. **`/reset`:** no equivalent here.

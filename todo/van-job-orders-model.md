@@ -192,3 +192,16 @@ The groups, vans, pickup times and sequence the sheet is built from are booking 
    login.*
 9. **Change feed:** vans and van stops are not in the feed yet. *Recommend: add `van_job` (or reuse
    `booking`/`van_group`) so two staff on the board see each other's ticks.*
+
+## Decided (2026-10-09)
+
+1. **The sheet is built by the server:** `GET /operations/van-jobs?date=` (the day's job list) and one
+   sheet's rows in print order, from a pure `src/domain/van-jobs.ts`.
+2. **"Sent" is per job** (van + route + group, keyed by the van group's id), off `van_days`.
+3. **A change after sending** keeps the tick and is flagged `changed_since_sent` (new vs legacy).
+4. **Special request:** a booking field `job_note` (empty = use the notes), read by check-in and pier too.
+5. **Thai names:** a `pickup_name_th` table keyed by the trimmed, case-folded pickup text; 762 imported.
+6. **Group order:** stored here (`PUT /operations/van-groups/order`), and job orders follow it.
+7. **Template and row highlights:** the client's; `vanjob_th_flag` dropped.
+8. **Permissions:** `operations` for writes, as legacy.
+9. **Change feed:** not now (vans and van jobs stay out of the feed).
