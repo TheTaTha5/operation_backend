@@ -505,6 +505,37 @@ to these:
 - **Writes need the `operations` area** (the refund and credit too); spending credit is an invoice
   payment and needs `accounting`.
 
+### 2.9 Partner van bills, van rates and the money reports
+
+**The server works out every van bill row and amount, and every report figure** (README "Partner van
+bills" and "Money reports"). `VAN_BILL`, `van_rates` and `dr_cfg` move to these:
+
+| Legacy | API |
+|---|---|
+| `vbAgg`, `vbRenderOv` (ภาพรวม) | `GET /v1/van-bills?month=&period=` → `partners[]` |
+| `vbRows`, `vbState`, the per-partner screen | `GET /v1/van-bills/{partner}/{month}/{period}?van_id=` → `rows`, `extra_lines`, `totals`, `by_code`, `codes`, `new_rows` |
+| `vbSet('perPax')`, `vbSetRateC`, `vbSetRow`, `vbAddExtra`/`vbSetExtra`/`vbDelExtra` | `PATCH …` with `per_pax`, `route_rates`, `row_overrides`, `extra_lines` (each replaces that whole field) |
+| `vbSave` (§vbSeen) | `PATCH …` with `mark_seen: true` (with the inputs, or alone) |
+| `vbPullRates` | `POST …/pull-rates` → the bill and `pulled: { got, none }` (a `generic: true` code is legacy's `*`) |
+| (new) sent / paid | `POST …/send`, `…/unsend`, `…/pay` `{ via, ref, paid_on }`, `…/unpay` |
+| `vanRates`, `vanRateSet` (Transfer Fleet "ราคาจริง") | `GET /v1/van-rates`, `PUT /v1/van-rates` `{ group, route_id, field, rate }` (`rate: null` clears) |
+| `renderAccounting` KPIs, `acctDashboardHtml` | `GET /v1/reports/accounting` |
+| `acctStatementOpen` | `GET /v1/agents/{id}/statement` |
+| `renderTravelSum` totals | `GET /v1/reports/travel-summary?date=` |
+| `drData` money, `drPaneFi`, `drVanReal` | `GET /v1/reports/daily?date=` |
+| `drCfg`, `drCfgSet` | `GET`/`PUT /v1/reports/daily/settings` |
+
+- **Delete client-side:** `vbPersist`, `vbStamp`, the edit snapshot (`_vb.snap`) and every amount the
+  screen adds up; keep the edit mode and the "fill an empty field at once" behaviour as UI only, and
+  send the field with `PATCH`.
+- **Refusals to show as they are:** `409 bill_paid` (undo the payment first), `409 bill_not_sent`,
+  `409 bill_not_paid`, `409 no_van_rates` (legacy's alert, in Thai), `400` naming a field.
+- **Writes:** van bills need `accounting`; van rates `accounting` or `fleet`; the daily report's
+  settings `operations` or `accounting`. A login tied to an agent gets `403` on the reports and reads
+  only its own statement.
+- **Not in the reports yet** (their sources are Money slices 3–4): pier payments, on-tour sales
+  (`SB_EXTRAS`), cash-on-tour and no-show decisions. Keep reading those from legacy until they move.
+
 ## 3. Day-of-operations
 
 **Change: every trip's `operations` is the truth for boats, vans, pickups and check-ins. Read it into
@@ -923,6 +954,7 @@ dialog resends with `remove_anyway`.**
 | `409 seats_sold` ("N booking(s) (P pax) on it") | removing a boat, moving it to another route, or shrinking it below the passengers placed on it | legacy's confirm (`bop2UnassignBoat`, `bop2AssignBoat`) with the server's message; on yes resend with `remove_anyway: true` (`?remove_anyway=true` on `DELETE`) |
 | `409 charter_boat` ("Cancel the charter booking first") | a boat a charter holds | show it |
 | `409 past_date` | a date before today (Asia/Bangkok), unless the login is an admin | show it |
+| `409 boat_not_ready` ("… is not ready on …: fixing, held by MJ-058") | putting a boat that is fixing/unavailable that day (its log or a started job), or a charter boat not chartered that day, on a route or another route | single assign: the pool already hides such a boat; if it still happens, confirm with the message and resend with `deploy_anyway: true`. Range and weekly forms: skip that day as `statusBlocked` does. Copy week/day, templates: resend with `deploy_anyway: true` to keep legacy's behaviour |
 | `400` | a `license_pax` that differs from the boat catalogue's | show it |
 
 - With `remove_anyway`, the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id,
@@ -955,7 +987,11 @@ the endpoints below; `save('config')` and `boatCapPersist` stop writing the cata
   from `GET /v1/boats` (`cap` ← `capacity`, `licensePax` ← `license_pax`, `totalcap` ←
   `registered_persons`, `log` ← `status_log` with `s` ← `status`, `from`/`to` ← `from_date`/`to_date`,
   `docs` ← `documents` with `exp` ← `expires_on`). Use `status_today` instead of `getStoredStatus`
-  for today.
+  for today, and `status_effective`/`blocked_by` (or `GET /v1/fleet/availability` for other days)
+  instead of `getCurStatus`/`boatEffStatus`/`boatJobBlock`.
+- **Planned ahead** (`saveStatus`'s "ยังมีใบงานที่ไม่ถูกปิด" confirm): an `available` entry over open
+  work answers `409 open_work`; on yes resend with `plan_ahead: true`. The server adds the
+  `LA_PLAN_MARK` text to the note and returns `planned_over` (`ovrJobs`); stop writing the mark.
 - **Refusals to show as they are:** `400` (the message names the field: a blank name, a marine route
   with no pier, an unknown family, over the licence on the day-seats dialog, a missing reason),
   `403` (the area, or "unlock boat capacity" on a raise), `409 route_in_use`, `409 family_in_use`,
@@ -970,6 +1006,40 @@ the endpoints below; `save('config')` and `boatCapPersist` stop writing the cata
   kept (`400` for a value).
 - **Delete:** `boatCapPersist`, the `BOAT_CAP_OVR` local copy, `ROUTE_COLORS` picking and route/boat
   id making (`'r'+Date.now()`, `LA_UID('b')`): the server does them.
+
+### 3.15 Fleet: assets, incidents, maintenance jobs (part A)
+
+**Change: engines, gearboxes, propellers, incidents and maintenance jobs are this API's
+(2026-10-09). Their screens call the endpoints below; `flSave` stops writing `FL_ENGINES`,
+`FL_GEARBOXES`, `FL_PROPELLERS`, `FL_INCIDENTS`, `FL_MAINT`.** README "Fleet maintenance" is the field
+reference. Seed once with `npm run import:fleet -- --commit`.
+
+| Screen (legacy function) | Call |
+|---|---|
+| Asset forms (`flSaveEngine`, `flSaveGearbox`, `flSavePropeller`, `flSaveAddSpare`) | `POST /v1/fleet/{engines,gearboxes,propellers}`; edit `PATCH …/{id}` with the form's fields only |
+| Status change (`flChangeEngStatus`, the forms' status pick) | `POST …/{id}/status {status}` |
+| Install / remove / swap (form selects, `flEquipRemove`, `flEquipSwapDo`) | `POST …/{id}/install`, `…/remove`, `…/swap {with_id}` |
+| Move a spare (`flConfirmMove`) | `POST /v1/fleet/{gearboxes,propellers}/{id}/move` |
+| Mark service (`flEngMarkService`, `flGbMarkService`) | `POST …/{id}/service {hours}` (the `prompt()` answer) |
+| Incident add / edit / delete / log (`flSaveIncident`, `flDeleteIncident`, `flAddIncLog`) | `POST /v1/fleet/incidents`, `PATCH …/{id}`, `DELETE …/{id}`, `POST …/{id}/log` |
+| Quick swap (`flConfirmSwap`, `flConfirmPropCascade`) | `POST /v1/fleet/incidents/{id}/swap` with the cascade choices in one call |
+| Create job (`flSaveCreateJob`, `flChooseJobMode`) | `POST /v1/fleet/jobs`; the open-job confirm resends `create_anyway: true`; the one-or-per-asset choice is `per_asset` (+ `nos`) |
+| Start (`flMaintStart`, `flStartGear*`) | `POST /v1/fleet/jobs/{id}/start {gear}`; the swap's replacement engine: `POST /v1/fleet/engines/{id}/install {boat_id, pos, job_id}` |
+| Close (`flMaintClose`, `flMaintServiceReset` confirm) | `POST …/{id}/close {outcome, note, awaiting_invoice}`; on `409 reset_service_choice` ask legacy's question, resend with `reset_service` |
+| Edit boat status (`flSaveEditBoatStatus`) | `POST …/{id}/boat-status` |
+| Job assets, log, split, pin (`flMaintAddAsset`, `flMaintAddLog`, `flSplitExistingJob`, `flEngSplitIntoJobs`, `flMaintTogglePin`) | `POST/DELETE …/assets`, `POST …/log`, `POST …/split {by, nos}`, `PATCH {pinned}` |
+| Job board (`flBoardSaveCard`, `flBoardDrop`, `flBoardPark`, `flBoardSub*`) | `PATCH …/{id} {owner, due_date, board_lane, parked}`, `POST …/log`, `…/steps…` |
+
+- **Numbers stay the client's** (decided): send `no` (and `nos`) computed as today
+  (`next_no` in the list answers says it); `409 number_taken` means pick the next one.
+- **Read, don't compute:** `hours`/`service` (`flEngHours`, `flEngServiceState`, `flGbServiceState`),
+  `severity`, `shown_status` (`effStatus`), `cost` (`flMaintCalcCost`), `lane`/`silent_days`
+  (`flBoardLane`, `flBoardSilent`), labels of damaged assets.
+- **Behaviour changes:** see todo/fleet-maintenance-model.md "Flagged" (closing a job run alongside
+  the boat no longer cuts the boat's status entry; the per-asset choice really makes one job per
+  asset; the board fields, engine `retired` and gearbox service hours are kept).
+- **Not yet (part B):** parts from stock (`flMaintAddPart`, `flMaintRemovePart`), memos, Daily Fleet
+  Log meters (so `hours` is `base_hours` until then), projects.
 
 ---
 
@@ -1236,7 +1306,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
-| Fleet maintenance, part A (boat availability, engines and other assets, incidents, jobs); fleet reports beyond memo spend; the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `todo/fleet-maintenance-model.md` (part B is built: §6.7) |
+| Fleet reports beyond memo spend (cost analytics, upkeep, fuel intelligence, dashboard); the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `fleet-maintenance-model.md` (part A: §3.15; part B: §6.7) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
@@ -1336,7 +1406,8 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Pier meal editor | `PUT /v1/bookings/{id}/meals` | To do |
 | Documents and slips | `POST/GET/DELETE /v1/attachments…` | To do |
 | Doc Check page | `PUT /v1/bookings/{id}/doc-check/…` | To do |
-| Boat Operation | `POST /operations/deployments`, `DELETE …` | Partial (`remove_anyway`, `past_date`) |
+| Boat Operation | `POST /operations/deployments`, `DELETE …` | Partial (`remove_anyway`, `past_date`; `deploy_anyway` to do) |
+| Fleet: assets, incidents, jobs, job board | `/v1/fleet/{engines,gearboxes,propellers,incidents,jobs}…`, `GET /v1/fleet/availability` | To do (§3.15) |
 | Settings → Programs calendar | `/v1/routes/{id}/seasons…`, `/days/{date}` | Done |
 | Settings → Programs: add, edit, delete, drag; families | `/v1/routes`, `/v1/routes/{id}`, `/v1/routes/order`, `/v1/route-families` | To do |
 | Boat form, Boat Status timeline, restore | `/v1/boats`, `/v1/boats/{id}`, `…/status-log`, `…/retire`, `…/restore` | To do |

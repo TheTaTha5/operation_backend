@@ -56,6 +56,10 @@ flowchart LR
   weather -- "weather_cases.booking_id, refunds.booking_id" --> bookings
   weather -- "refunds.invoice_id" --> money
   weather -- "refunds.agent_id" --> sales
+  vanbills["Partner van bills and report settings<br/>van_bills, van_bill_route_rates,<br/>van_bill_row_overrides, van_bill_extra_lines,<br/>van_rates, daily_report_settings"]
+  vanbills -- "van_rates.route_id" --> catalogue
+  fleet["Fleet maintenance<br/>fleet_engines, fleet_gearboxes, fleet_propellers,<br/>fleet_*_log, fleet_incidents, fleet_incident_assets,<br/>fleet_incident_log, fleet_jobs, fleet_job_assets,<br/>fleet_job_parts, fleet_job_log, fleet_job_steps"]
+  fleet -- "boat_id" --> catalogue
 ```
 
 ## 1. Catalogue and seat pool
@@ -136,6 +140,7 @@ erDiagram
     date to_date "null = open-ended"
     text loc
     text reason
+    text_array planned_over "work a person planned ahead of (130)"
   }
   boat_capacity_overrides {
     text boat_id PK, FK
@@ -237,7 +242,9 @@ erDiagram
   `seed:routes` and `seed:boats` never overwrite. `routes.ext_id` is unique (Love Kingdom's create
   is idempotent on it). `route_families` replaces legacy's hard-coded family list.
 - **A boat's status** is `boat_status_log`, legacy's date ranges; the status on a date is the latest
-  range covering it (`storedStatus` in `src/domain/catalogue.ts`).
+  range covering it (`storedStatus` in `src/domain/catalogue.ts`). Whether it can sail adds the open
+  work holding it (section 9, `availability` in `src/domain/fleet-availability.ts`), less the work an
+  entry's `planned_over` names.
 - **Seats left on a route-day are computed, not stored.** Each read sums what is deployed and
   subtracts what bookings and active locks hold. There is no counter column to fall out of step.
 - **Whether a route runs on a date** is decided from `route_seasons` and `route_day_overrides` by
@@ -1134,7 +1141,166 @@ erDiagram
 - **The agent's credit balance** is its `credit` rows less its live payments with `method = 'credit'`.
 - **`changes.kind`** also takes `weather_closure` (060).
 
-## 9. Fleet maintenance, part B: stock, memos, projects, Daily Fleet Log, safety
+## 9. Partner van bills and report settings
+
+Legacy's partner van bill (`§vanBill`), Transfer Fleet's van rates and the daily report's settings
+(migration 120, `todo/money-model.md` slices 5 and 6). The rules are in `src/domain/van-bills.ts` and
+`src/domain/money-reports.ts`. **A bill's rows and amounts are not stored:** they are worked out on
+every read from the bookings' van parts and check-ins. Only what staff type is kept, plus the sent
+and paid state (new; legacy had none). The money reports store nothing.
+
+```mermaid
+erDiagram
+  van_bills {
+    text id PK "vb_…"
+    text partner "a van's partner_name, trimmed; unique with month and period"
+    text month "YYYY-MM"
+    smallint period "1 = days 1–10, 2 = 11–20, 3 = 21–end"
+    numeric per_pax "sale price per passenger"
+    numeric rate "the old single default rate per van"
+    text_array seen "row keys at the last save with mark_seen; NULL = never"
+    timestamptz updated_at
+    text updated_by
+    timestamptz sent_at "sent to the van owner"
+    text sent_by
+    numeric sent_bill "the total when sent"
+    timestamptz paid_at "needs sent_at"
+    text paid_by
+    date paid_on
+    text paid_via "transfer, cash or cheque"
+    text paid_ref
+    numeric paid_amount "the total when paid"
+  }
+  van_bill_route_rates {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text code PK "PP, PB, MT, SM, SR or —"
+    numeric rate
+  }
+  van_bill_row_overrides {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text row_key PK "date~route~van, ~R for a return-only run"
+    numeric rate "NULL = not set (0 is a rate)"
+    numeric ex
+    numeric cut
+    numeric per
+  }
+  van_bill_extra_lines {
+    text bill_id PK, FK "ON DELETE CASCADE"
+    text id PK
+    int seq "unique per bill"
+    date line_date
+    text note
+    int vans
+    int pax
+    numeric rate
+    numeric ex
+    numeric cut
+    numeric per_pax
+  }
+  van_rates {
+    text group_key "own, or p:<partner>"
+    text route_id FK "NULL = the group's base; ON DELETE CASCADE"
+    text field "base, PK or KL; a NULL route is base"
+    numeric rate
+    timestamptz updated_at
+    text updated_by
+  }
+  daily_report_settings {
+    boolean id PK "one row"
+    numeric van_cost "NULL = 1,200"
+    int van_quota "NULL = 6"
+    numeric target_per_pax "NULL = 130"
+    timestamptz updated_at
+    text updated_by
+  }
+  routes { text id PK }
+  van_bills ||--o{ van_bill_route_rates : "defaults"
+  van_bills ||--o{ van_bill_row_overrides : "typed on rows"
+  van_bills ||--o{ van_bill_extra_lines : "hand-typed lines"
+  routes |o--o{ van_rates : "priced on"
+```
+
+- **`van_rates` is unique on (group, route, field) with `NULLS NOT DISTINCT`**, so a group has one base.
+- **A bill names its partner by name, not by a key:** legacy's bill is per owner name, and vans carry
+  that name (`vans.partner_name`). Renaming a partner's vans leaves its old bills under the old name.
+- **Every amount is `NUMERIC(12,2)` and 0 or more**; a deduction (`cut`) is stored positive.
+
+## 10. Fleet maintenance, part A: assets, incidents, jobs
+
+Legacy's Fleet screens, part A (migration 130, `todo/fleet-maintenance-model.md`). The rules are in
+`src/domain/fleet-availability.ts`, `fleet-assets.ts` and `fleet-jobs.ts`. Each record is written
+whole: its row upserted, its lists (`*_log`, assets, parts, steps) replaced in order (`seq`/`idx`).
+
+```mermaid
+erDiagram
+  fleet_engines {
+    text id PK "legacy's (e1…); e<base36 ms> new"
+    text boat_id FK "null: off a boat"
+    text pos "Port, Std, C.Port…"
+    text status "ready, fixing, broken, spare, limited"
+    float base_hours "hours brought in; the Daily Fleet Log meter adds"
+    integer service_interval
+    float last_service_hours
+    boolean retired "a job closed as decommission"
+  }
+  fleet_gearboxes {
+    text id PK
+    text boat_id FK
+    text engine_id FK "at most one per engine (form rule)"
+    text on_boat_id FK "left on the boat waiting for an engine"
+    text status "ready, fixing, broken, spare, limited"
+    float base_hours "the engine's hours at fitting"
+  }
+  fleet_propellers {
+    text id PK
+    text boat_id FK
+    text gearbox_id FK "legacy has twin props on 6 gearboxes"
+    text status "active, fixing, broken, spare, damaged, limited"
+  }
+  fleet_incidents {
+    text id PK
+    text no "INC-…; not unique (legacy duplicates)"
+    text boat_id FK
+    date date
+    integer priority "1-5"
+    text severity "computed from priority; legacy high kept"
+    text status "open, resolved, closed, inprogress (legacy)"
+    text job_id "no key: legacy keeps one dangling"
+    text_array related_job_ids
+  }
+  fleet_jobs {
+    text id PK
+    text no "MJ-…; not unique"
+    text boat_id FK
+    text type "corrective, preventive, scheduled"
+    text status "pending, inprogress, done"
+    date start_date "holds the boat from here once started"
+    text boat_status "available, fixing, unavailable; null = fixing"
+    boolean set_fixing "false: runs alongside the boat"
+    text outcome "success, limited, rework, decommission, cancelled"
+    text incident_id "no key"
+    numeric legacy_cost "legacy's stored cost, read-only"
+    text board_lane "decide, wait, doing, close"
+  }
+  boats { text id PK }
+  boats |o--o{ fleet_engines : "carries"
+  fleet_engines |o--o| fleet_gearboxes : "drives"
+  fleet_gearboxes |o--o{ fleet_propellers : "turns"
+  boats ||--o{ fleet_incidents : "reported on"
+  boats ||--o{ fleet_jobs : "repaired by"
+```
+
+- **Child tables** (each `ON DELETE CASCADE`): `fleet_engine_log`, `fleet_gearbox_log`,
+  `fleet_propeller_log` (the same columns: `date, type, description, detail, text, hours,
+  engine_hours, used_hours, from_loc, to_loc, incident_id, outcome, cost, by`);
+  `fleet_incident_assets`, `fleet_incident_log`; `fleet_job_assets`, `fleet_job_parts`,
+  `fleet_job_log`, `fleet_job_steps`.
+- **Numbers are the client's** (decided 2026-10-09): a new one already used is refused by the API,
+  but legacy's duplicates are kept, so `no` has an index, not a unique one.
+- **A job holds its boat** while `inprogress`, from `start_date`, unless `set_fixing` is false or
+  `boat_status` is `available`. Nothing stores the effective status; it is computed on read.
+
+## 11. Fleet maintenance, part B: stock, memos, projects, Daily Fleet Log, safety
 
 Migrations 140–143 (`todo/fleet-maintenance-model.md`, "Design — part B"). The rules are in
 `src/domain/fleet-*.ts`; both stores reach these tables through `store.fleetRepo` (`fleet-store.ts`,
@@ -1216,7 +1382,6 @@ erDiagram
 - **`fleet_daily_locks`:** a row means the pier's day is locked; every Daily Log write to it is
   refused (`409 day_locked`).
 - **A project's boat entries** are rows of the boat's status log with `project_id` set.
-
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration
@@ -1235,9 +1400,11 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
 | `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
-| `fleet_memos.job_id`, `fleet_stock_movements.job_id` | part A's maintenance jobs | Built on a separate branch (140); to gain a key when the two are merged. Legacy names one deleted job (`mjmtsfprvltstem`). |
+| `fleet_memos.job_id`, `fleet_stock_movements.job_id` | part A's maintenance jobs | Built in parallel with `fleet_jobs` (140); legacy's are imported as they are. Legacy names one deleted job (`mjmtsfprvltstem`). |
 | `fleet_daily_meters.engine_id`, `fleet_consumables.engine_id` | part A's engines | Same. |
 | `fleet_fuel_prices.key`, `fleet_daily_locks.pier`, `fleet_daily_requests.pier` | piers or `boats` | A price key is a pier or a boat; piers have no table. |
+| `fleet_incidents.job_id`, `fleet_jobs.incident_id` | `fleet_jobs`, `fleet_incidents` | Legacy keeps an incident linked to a deleted job, and deleting an incident leaves its job's link (130). |
+| `fleet_jobs.parent_project_id` | `fleet_projects` | The two were built in parallel (130, 141); legacy's are imported as they are. |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer

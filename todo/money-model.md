@@ -1,7 +1,8 @@
 # Money, modelled
 
 **Status:** slice 1 (invoices and payments) is built: README → "Invoices and payments", migration 045,
-`src/domain/invoices.ts`. Slices 2–6 are outlined below; each gets its own detail pass and approval.
+`src/domain/invoices.ts`. Slices 5 and 6 are built except what waits for slices 3–4 and Fleet (see
+"Slices 5 and 6: what is left"). Slices 2–4 are outlined below; each gets its own detail pass.
 
 - **Source:** wt-lk-inbox `allotment_v2/js/08-app.js`, read on 2026-10-09:
   - accounting block `acctCreateInvoice`, `acctRecordPayment`, `acctInvoiceState`, `acctVoidInvoice` and
@@ -22,7 +23,7 @@
   - `npm run import:attachments`, which already copies the slips of `sb_payments`, `pierpayments`,
     `paymentslips`, `sb_extras` and `ts_cot`.
 - **Not here yet:** pier payments, on-tour sales, cash-on-tour decisions, no-show charge decisions,
-  proforma decisions, van bills, money reports.
+  proforma decisions, Trip P&L.
 
 ## What legacy does, in short (slices 2–6)
 
@@ -67,24 +68,9 @@
 - Data: full 68 (฿335,400), postpone 5, none 2, partial 1.
 - It never creates an invoice. Postpone opens the reschedule screen.
 
-**Partner van bill (`VAN_BILL`)**
-- **One bill:** per partner, per month, per ten-day period (1–10, 11–20, 21–end).
-- **Rows** are computed from the bookings' van parts and check-ins: one row per day + route + van, and out
-  and back count as one run.
-- **Staff save:** `perPax`, a default `rate`, rates per route code, per-row `rate/ex/cut` overrides,
-  extra lines, and `seen`.
-- **Amounts:** `bill = rate + ex − cut`, `sale = pax × perPax` and `pl = sale − bill`.
-- **Status:** none. There is no sent or paid state.
-- **Data:** 26 bills from 5 partners, Aug–Oct. 6 use an older key that today's code never reads.
-
-**Reports**
+**Reports not built yet**
 - Trip P&L with close/freeze (`trip_actuals.closed`, none closed yet).
-- Daily Report.
-- Travel Summary totals.
-- Accounting dashboard: outstanding, aging, credit exposure, top debtors.
-- Agent statement.
 - Operations and Fleet reports.
-- All are computed in the browser.
 
 **Not money, and corrections to `todo/legacy-replacement.md`**
 - `sb_market_stats` and `sb_market_monthly` are imported Phuket arrival figures, not "computed from
@@ -101,8 +87,8 @@
 | 2 | **Proforma** | who is in scope, the deadline, the travel/hold decision and who may make it |
 | 3 | **Pier money** | pier payments, on-tour sales, the amount owed at the pier, fees, commission |
 | 4 | **After the trip** | cash-on-tour decisions, no-show charge decisions, the invoice's COT deduction |
-| 5 | **Partner van bills** | the rows, the amounts and the overview |
-| 6 | **Reports** | the accounting dashboard, agent statement, Travel Summary totals, Daily Report and Trip P&L, as computed `GET`s |
+| 5 | **Partner van bills** (built) | the rows, the amounts and the overview |
+| 6 | **Reports** (built but Trip P&L and the slice 3–4 parts) | the accounting dashboard, agent statement, Travel Summary totals, Daily Report and Trip P&L, as computed `GET`s |
 
 Not in Money:
 - **Pier petty cash** (`po_cash_*`): a cash box per pier, so it belongs with pier operations.
@@ -111,7 +97,7 @@ Not in Money:
 - **Market stats:** these are data, not money.
 
 
-## Slices 2–6, outlined
+## Slices 2–4, outlined
 
 **2. Proforma**
 - `GET /v1/pfm?date=` lists the bookings in scope. For each it gives the deadline, the payment state and
@@ -143,20 +129,6 @@ Not in Money:
   `note`.
 - **Invoice:** Open 1 decides whether the invoice subtracts the COT `deduct`.
 
-**5. Partner van bills**
-- `GET /v1/van-bills?partner=&month=&period=` computes the rows from van parts and check-ins.
-- `PUT` saves the staff inputs: `per_pax`, `rate`, route rates, row overrides, extra lines and `seen`.
-- `GET /v1/van-bills/overview?month=&period=` gives the overview.
-- Tables: `van_bills`, `van_bill_route_rates`, `van_bill_row_overrides` and `van_bill_extra_lines`.
-- The 6 old-key bills are not imported: legacy's own code no longer reads them.
-
-**6. Reports**
-- Computed `GET`s:
-  - `/v1/reports/accounting`: outstanding, aging, credit exposure and top debtors;
-  - `/v1/agents/{id}/statement`;
-  - `/v1/reports/travel-summary?date=`;
-  - `/v1/reports/daily?date=`.
-- Trip P&L needs the cost model and fleet actuals, so it waits for Fleet.
 
 
 ## Decided (2026-10-09)
@@ -169,6 +141,90 @@ Not in Money:
 - **Settlement (slices 3 and 5):** build it with the slices: commission payouts, the pier cash
   hand-over at day close, and van bills sent and paid.
 
+## Slices 5 and 6: what is left
+
+Built 2026-10-09 (branch `feat/money-van-bills-and-reports`, migration 120): README "Partner van
+bills" and "Money reports", `src/domain/van-bills.ts`, `src/domain/money-reports.ts`,
+`src/domain/aboard.ts`, `src/routes/money-reports.ts`, `src/tools/legacy-van-bills.ts`. Still open:
+
+1. **Add the Money slices 3–4 sources to the reports once they are on `main`:**
+   - Travel Summary: pier payments by method (and their fees, slips, "waiting for slip"), on-tour sales
+     (`SB_EXTRAS`: by method, fee, commission, still to collect), the no-show charge decisions
+     (pending count, charged total), the COT decisions (deduct, payout, not collected) and so
+     `due = to_collect − pier paid` and `tsNoCollect`'s "paid > 0" exception.
+   - Daily Report: `due`, `got`, `noSlip`, extras, and the per-agent `due` (`pckMoney`).
+   - Accounting dashboard: "Extras · cash · month" (`acctExtrasMonthTotal`).
+2. **Trip P&L with close/freeze, the longtail cost and the cost model** wait for Fleet (fuel, meals,
+   `cost_plans`, `trip_actuals`). The Daily Report's `ltCost` and its "net before boat costs" line are
+   left out until then.
+3. **Operations and Fleet reports** (`px*` beyond money) are not in Money.
+4. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
+   updates; append to `changes_kind_check` as migration 100 does.
+
+## Flagged
+
+Decisions made here without asking, behaviour that differs from legacy, and side effects. Each
+defaults to legacy unless it says otherwise.
+
+**New behaviour**
+- **Sent and paid on van bills** (decided 2026-10-09, details mine): draft → sent → paid; paying needs
+  the bill sent (`409 bill_not_sent`); `paid_via` is `transfer`, `cash` or `cheque`; the total is frozen
+  into `sent.bill` and `paid.amount`; `changed_since_sent` compares totals only. **A paid bill is
+  locked** (`409 bill_paid` on edit, pull-rates, send, unsend) until `unpay`. Legacy had no state.
+- **Reports refuse a login tied to an agent** (`403`); its own statement is allowed, another agent's
+  is `404`; a salesperson sees only their agents' statements (as `GET /v1/agents/{id}`).
+- **Permissions legacy did not have:** van rates (legacy `ctWrite`, no guard) need `accounting` or
+  `fleet`; the daily report's settings (no guard) need `operations` or `accounting`. Van bills need
+  `accounting`, as legacy.
+- **The API addresses a bill by path** `/v1/van-bills/{partner}/{month}/{period}` (the outline had
+  query parameters), and its inputs are a `PATCH` where a field sent replaces that whole field.
+
+**Behaviour that differs from legacy**
+- **Check-ins count on every slot** (van part), not only the trip's main record, for "aboard" (van
+  bills) and "travelled" (Travel Summary). Same result for a trip that is not split; legacy missed the
+  no-shows of split bookings.
+- **`mark_seen` records every row of the period**; legacy's Save with a van filter recorded only that
+  van's rows, so the others kept warning.
+- **Collections and "paid this month" use Bangkok months and `paid_on`**; legacy sliced the record
+  time in UTC and labelled each month one month early.
+- **Statement `paid` is net** of what refunds and weather credits took back from an invoice, so
+  `invoiced − paid = outstanding`.
+- **Daily van cost uses every van part**, each with its own passengers, and **the trip's route**;
+  legacy used the booking's main van only and the boat's deployment route (a trip with no boat yet
+  fell to the group base rate).
+- **Van rates are keyed to routes in the catalogue**: legacy cells for unknown routes are dropped at
+  import (none today). A van's `costPerDay` is not modelled: every legacy van has it empty.
+- **Amounts are refused when negative** (`400`); legacy's inputs stripped the sign. A client sends a
+  deduction positive, as legacy stores it.
+
+**Kept from legacy, probably bugs (not fixed)**
+- A split booking's return leg adds the **whole booking's** passengers to `return_pax` once per part
+  (display only; the sale is on the way out).
+- A split booking's passengers on a van bill are all shown as **adults**.
+- Travel Summary counts a booking's **upgrades on every date** it has a trip (they are booking-level).
+- `pullRates` almost always "finds" a rate: with nothing set the partner default (฿1,800) is used and
+  marked `generic`, so `409 no_van_rates` only fires when rates are explicitly 0.
+- Credit `used` counts an unpaid booking whole, even when its invoice is part-paid (`agCreditState`).
+- Travel Summary's `no_show` (events) and `travelled` (last count) are two different measures, as in
+  legacy, so they need not add up.
+- B2C `paymentSnapshot.balance` is not stored here, so it is 0 in `to_collect`.
+
+**Import**
+- 26 of legacy's 31 `van_bill` rows; the 5 with the older four-part key are skipped (the outline's
+  "6 of 26" was an older count). Blank bills (no inputs) are imported too.
+- Bills are upserted on partner, month and period: legacy's inputs replace ours, **sent and paid
+  survive a re-import**; a bill made here that legacy lacks is left alone. Van rates and `dr_cfg` are
+  replaced whole on every run (legacy is master until Money moves): **a rate edited here is lost on
+  the next import** until then.
+- Rehearsal 2026-10-09, replaying legacy's `vbRows` and bill maths on legacy's own data: 24 of 26
+  bills identical (rows, passengers, return passengers, bookings, bill, sale). The 2 others
+  (โกอู๊ด and สตอ, 2026-08 period 3) each miss one r12 run on 2026-08-22: legacy's group 1 there had
+  members on veh12 and veh17, and the van-group import leaves such a group with no van.
+
+**Side effects:** `OperationsStore` and `PostgresOperationsStore` gain van bill, van rate and daily
+settings methods; `users.ts` `writeNeed` gains three paths; `routes/operations.ts` registers
+`money-reports.ts`. No existing endpoint changes.
+
 ## Open
 
 1. **Deposits and refunds.** The weather outcomes are built (migration 061, README "Weather closures,
@@ -176,5 +232,4 @@ Not in Money:
    balance, spent as a payment with method `credit`). Still open:
    - legacy's manual deposit ("รับมัดจำ", `acctDepositSubmit`): money received with no invoice. It fits
      as a `credit` with no invoice, which `refunds.invoice_id NOT NULL` does not allow yet;
-   - paying a refund out (method, date, slip): legacy had no step either;
-   - the agent statement's "Deposit held" (slice 6) reads `credit_balance`.
+   - paying a refund out (method, date, slip): legacy had no step either.

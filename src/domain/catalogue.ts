@@ -333,6 +333,8 @@ export type BoatDocument = { name: string; expires_on: string | null; renew_stat
 export type StatusEntry = {
   id: string; status: BoatStatus; from_date: string; to_date: string | null; loc: string | null; province: string | null;
   loc_type: string | null; detail: string | null; note: string | null; reason: string | null; project_id: string | null;
+  /** The open work a person planned the boat ahead of (fleet's `plan_ahead`, legacy `ovrJobs`); null: none. */
+  planned_over: string[] | null;
 };
 /** Free-text fields of the boat form. */
 export const BOAT_TEXT_FIELDS = ['name_th', 'brand', 'model', 'vessel_use', 'material', 'reg', 'callsign', 'imo', 'build_year', 'homeport_city', 'homeport', 'owner', 'owner_addr', 'note'] as const;
@@ -353,7 +355,9 @@ export type BoatRecord = { [K in TextField]: string | null } & { [K in Measure]:
 };
 export type BoatFields = Omit<BoatRecord, 'id' | 'retired' | 'retired_on' | 'retired_reason' | 'unretired_on' | 'documents' | 'status_log' | 'updated_at'>;
 
-export const copyBoat = (b: BoatRecord): BoatRecord => ({ ...b, documents: b.documents.map((d) => ({ ...d })), status_log: b.status_log.map((e) => ({ ...e })) });
+export const copyBoat = (b: BoatRecord): BoatRecord => ({
+  ...b, documents: b.documents.map((d) => ({ ...d })), status_log: b.status_log.map((e) => ({ ...e, planned_over: e.planned_over ? [...e.planned_over] : null })),
+});
 /** The selling fields the rest of the service reads (`Boat`), with nothing for a field not set. */
 export const boatOf = (b: BoatRecord): Boat => ({
   id: b.id, name: b.name, capacity: b.capacity,
@@ -519,12 +523,15 @@ export function withFormStatus(log: readonly StatusEntry[], ownership: 'own' | '
 }
 
 const entry = (e: Partial<StatusEntry> & Pick<StatusEntry, 'id' | 'status' | 'from_date'>): StatusEntry => ({
-  to_date: null, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null, ...e,
+  to_date: null, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null, planned_over: null, ...e,
 });
 
 /** An entry's fields from `POST`/`PATCH /v1/boats/{id}/status-log`; an absent field is unchanged. */
 export function parseStatusEntry(body: Record<string, unknown>): Partial<StatusEntry> {
-  refuseOwned(body, { id: 'an entry id is assigned by the server', project_id: 'it is set by fleet maintenance' });
+  refuseOwned(body, {
+    id: 'an entry id is assigned by the server', project_id: 'it is set by fleet maintenance',
+    planned_over: 'send plan_ahead: true and the server names the open work the boat is planned ahead of',
+  });
   const e: Partial<StatusEntry> = {};
   if (body.status !== undefined) e.status = pickable(body.status);
   if (body.from_date !== undefined) e.from_date = realDate(body.from_date, 'from_date');

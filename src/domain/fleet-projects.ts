@@ -142,8 +142,8 @@ export function planProjectPatch(p: Project, raw: Record<string, unknown>, ctx: 
 
 // ── The boat log a project writes (legacy pushes these entries itself, with `projectId`) ──
 
-const entry = (id: string, e: Partial<StatusEntry> & Pick<StatusEntry, 'status' | 'from_date'>): StatusEntry => ({
-  id, to_date: null, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null, ...e,
+const entry = (id: string, e: Omit<Partial<StatusEntry>, 'planned_over'> & Pick<StatusEntry, 'status' | 'from_date'>): StatusEntry => ({
+  id, to_date: null, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null, planned_over: null, ...e,
 });
 const nowMs = (ctx: Ctx) => Date.parse(ctx.now);
 function boatUnavailable(boat: BoatRecord, p: Project, ctx: Ctx): BoatRecord {

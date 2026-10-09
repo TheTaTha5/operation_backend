@@ -21,6 +21,7 @@
     "import:contracts": "tsx src/tools/import-contracts.ts",
     "import:attachments": "tsx src/tools/import-attachments.ts",
     "import:fleet-stock": "tsx src/tools/import-fleet-stock.ts",
+    "import:fleet": "tsx src/tools/import-fleet.ts",
     "verify:import": "tsx src/tools/verify-import.ts"
   },
   "dependencies": {

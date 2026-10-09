@@ -58,6 +58,12 @@ import { addonServiceView, sortAddonServices, type AddonService } from './addon-
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
 import { MemoryFleetRepo } from './fleet-store.js';
+import { copyBill, type StoredVanBill, type VanRate, type VanRateField } from './van-bills.js';
+import type { DailySettings } from './money-reports.js';
+import { copyAsset, matchesAsset, sortAssets, type AssetKind, type AssetOf, type AssetQuery, type Engine, type Gearbox, type Propeller } from './fleet-assets.js';
+import {
+  copyIncident, copyJob, matchesIncident, matchesJob, sortIncidents, sortJobs, type Incident, type IncidentQuery, type Job, type JobQuery,
+} from './fleet-jobs.js';
 
 export type Deployment = {
   boat_id: string;
@@ -808,6 +814,28 @@ export class OperationsStore {
   }
   newSeasonId(): string { return this.id('season'); }
 
+  // ── Fleet, part A (todo/fleet-maintenance-model.md; migration 130): the rules are `fleet-*.ts`'s ──
+  private fleet = {
+    engine: new Map<string, Engine>(), gearbox: new Map<string, Gearbox>(), propeller: new Map<string, Propeller>(),
+    incidents: new Map<string, Incident>(), jobs: new Map<string, Job>(),
+  };
+  private fleetMap<K extends AssetKind>(kind: K): Map<string, AssetOf[K]> { return this.fleet[kind] as unknown as Map<string, AssetOf[K]>; }
+  fleetAssets<K extends AssetKind>(kind: K, q: AssetQuery = {}): AssetOf[K][] {
+    return sortAssets([...this.fleetMap(kind).values()].filter((a) => matchesAsset(a, q))).map((a) => copyAsset(a));
+  }
+  fleetAsset<K extends AssetKind>(kind: K, id: string): AssetOf[K] | undefined { const a = this.fleetMap(kind).get(id); return a && copyAsset(a); }
+  putFleetAsset<K extends AssetKind>(kind: K, asset: AssetOf[K]): void { this.fleetMap(kind).set(asset.id, copyAsset(asset)); }
+  fleetIncidents(q: IncidentQuery = {}): Incident[] { return sortIncidents([...this.fleet.incidents.values()].filter((i) => matchesIncident(i, q))).map(copyIncident); }
+  fleetIncident(id: string): Incident | undefined { const i = this.fleet.incidents.get(id); return i && copyIncident(i); }
+  putFleetIncident(incident: Incident): void { this.fleet.incidents.set(incident.id, copyIncident(incident)); }
+  deleteFleetIncident(id: string): boolean { return this.fleet.incidents.delete(id); }
+  fleetJobs(q: JobQuery = {}): Job[] { return sortJobs([...this.fleet.jobs.values()].filter((j) => matchesJob(j, q))).map(copyJob); }
+  fleetJob(id: string): Job | undefined { const j = this.fleet.jobs.get(id); return j && copyJob(j); }
+  putFleetJob(job: Job): void { this.fleet.jobs.set(job.id, copyJob(job)); }
+  deleteFleetJob(id: string): boolean { return this.fleet.jobs.delete(id); }
+  /** Every number in use, to refuse a duplicate and to answer the next one. */
+  fleetNumbers(table: 'incidents' | 'jobs'): { id: string; no: string }[] { return [...this.fleet[table].values()].map((x) => ({ id: x.id, no: x.no })); }
+
   async transaction<T>(work: () => T | Promise<T>): Promise<T> {
     const prior = this.tail;
     let release!: () => void;
@@ -1093,6 +1121,32 @@ export class OperationsStore {
   pickupNamesTh(): PickupNameTh[] { return [...this.pickupNameRows.values()].sort((a, b) => (a.name_key < b.name_key ? -1 : a.name_key > b.name_key ? 1 : 0)).map((n) => ({ ...n })); }
   putPickupNameTh(n: PickupNameTh): void { this.pickupNameRows.set(n.name_key, { ...n }); }
   deletePickupNameTh(nameKey: string): boolean { return this.pickupNameRows.delete(nameKey); }
+
+  // ── Partner van bills, van rates, the daily report's settings (migration 120) ──
+  private vanBillRows = new Map<string, StoredVanBill>();
+  private vanRateRows: VanRate[] = [];
+  private dailySettings: DailySettings | undefined;
+  vanBill(partner: string, month: string, period: number): StoredVanBill | undefined {
+    const b = [...this.vanBillRows.values()].find((x) => x.partner === partner && x.month === month && x.period === period);
+    return b && copyBill(b);
+  }
+  vanBillsOf(month: string, period: number): StoredVanBill[] {
+    return [...this.vanBillRows.values()].filter((x) => x.month === month && x.period === period).sort((a, b) => (a.partner < b.partner ? -1 : 1)).map(copyBill);
+  }
+  putVanBill(bill: StoredVanBill): void { this.vanBillRows.set(bill.id, copyBill(bill)); }
+  /** By group, then route (a group's base first), then field: as PostgreSQL orders them (`COLLATE "C"`). */
+  vanRates(): VanRate[] {
+    const key = (r: VanRate) => `${r.group_key}\u0000${r.route_id ?? ''}\u0000${r.field}`;
+    return [...this.vanRateRows].sort((a, b) => (key(a) < key(b) ? -1 : 1)).map((r) => ({ ...r }));
+  }
+  putVanRate(rate: VanRate): void { this.deleteVanRate(rate.group_key, rate.route_id, rate.field); this.vanRateRows.push({ ...rate }); }
+  deleteVanRate(groupKey: string, routeId: string | null, field: VanRateField): boolean {
+    const before = this.vanRateRows.length;
+    this.vanRateRows = this.vanRateRows.filter((r) => !(r.group_key === groupKey && r.route_id === routeId && r.field === field));
+    return this.vanRateRows.length < before;
+  }
+  dailyReportSettings(): DailySettings | undefined { return this.dailySettings && { ...this.dailySettings }; }
+  putDailyReportSettings(s: DailySettings): void { this.dailySettings = { ...s }; }
 
   // ── Van stops (migration 034) ──
   private vanStops = new Map<string, VanStop>();

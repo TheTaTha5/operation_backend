@@ -1,0 +1,155 @@
+import assert from 'node:assert/strict';
+import { after, test } from 'node:test';
+import type { InjectOptions } from 'fastify';
+
+process.env.AUTH_JWT_SECRET = 'money-reports-test-secret';
+const { buildApp } = await import('../src/app.js');
+const { OperationsStore } = await import('../src/domain/operations.js');
+const { blankAgent, seedUser, testStore, tokenFor } = await import('./users-helper.js');
+const { accountingDashboard, lastMonths, tripAmount } = await import('../src/domain/money-reports.js');
+
+// The money reports (todo/money-model.md slice 6), on whichever store DATABASE_URL selects. Other files
+// write invoices in parallel on PostgreSQL, so whole-database figures are checked by what this file
+// adds; days are in 2062 and agents named mr_.
+const store = testStore();
+const agents = {
+  mr_a1: { pay_type: 'invoice', vat_mode: 'none', credit_days: 15, credit_limit: 50_000_000 },
+  mr_a2: { pay_type: 'cot', vat_mode: 'none', credit_days: null, credit_limit: null },
+} as const;
+if (store instanceof OperationsStore) {
+  store.seedCatalogue({ routes: [{ id: 'r10', name: 'Phi Phi Bamboo by Speedboat', pier: 'panwa' }, { id: 'r12', name: 'Whale', pier: 'panwa' }] });
+  store.seedAgents({ agents: Object.entries(agents).map(([id, fields]) => ({ ...blankAgent(id, null), ...fields })) });
+} else {
+  const { Pool } = await import('pg');
+  const db = new Pool({ connectionString: process.env.DATABASE_URL });
+  for (const [id, f] of Object.entries(agents)) {
+    await db.query(`INSERT INTO agents (id, name, pay_type, vat_mode, credit_days, credit_limit) VALUES ($1, $1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO UPDATE SET pay_type = $2, vat_mode = $3, credit_days = $4, credit_limit = $5`, [id, f.pay_type, f.vat_mode, f.credit_days, f.credit_limit]);
+  }
+  await db.end();
+}
+const app = buildApp({ store });
+after(async () => app.close());
+await seedUser(store, { username: 'mr-admin', role: 'admin' });
+await seedUser(store, { username: 'mr-agent', agent_id: 'mr_a1' });
+await seedUser(store, { username: 'mr-ops', edit_areas: ['operations'] });
+await seedUser(store, { username: 'mr-sales', edit_areas: ['sales'] });
+const admin = await tokenFor(app, 'mr-admin');
+const agentLogin = await tokenFor(app, 'mr-agent');
+const ops = await tokenFor(app, 'mr-ops');
+const salesLogin = await tokenFor(app, 'mr-sales');
+const send = async (method: InjectOptions['method'], url: string, payload?: object, headers: Record<string, string> = admin) => {
+  const booking = method !== 'GET' && /^\/v1\/bookings\/[^/]+/.exec(url);
+  const version = booking ? (await app.inject({ method: 'GET', url: booking[0], headers: admin })).json().version : undefined;
+  return app.inject({ method, url, headers, ...(payload || version ? { payload: { ...payload, ...(version ? { version } : {}) } } : {}) });
+};
+const ok = async (method: InjectOptions['method'], url: string, payload?: object, headers?: Record<string, string>) => {
+  const res = await send(method, url, payload, headers);
+  assert.ok(res.statusCode < 300, `${method} ${url}: ${res.statusCode} ${res.body}`);
+  return res.json();
+};
+const run = Date.now().toString(36);
+let n = 0;
+/** A booking at the price sent: a B2C id keeps it (CLAUDE.md, "Temporary exceptions"). */
+async function book(date: string, total: number, extra: object = {}, pax: Record<string, number> = { ad: 2 }, route = 'r10') {
+  await ok('POST', '/operations/deployments', { boat_id: `mr-boat-${date}-${route}`, route_id: route, service_date: date, capacity: 80 });
+  return ok('POST', '/v1/bookings', { external_id: `b2c_mr_${run}_${++n}`, total, trips: [{ route_id: route, date, pax, zone: 'PK' }], ...extra }) as Promise<{ id: string; trips: { id: string }[] }>;
+}
+
+test('aging, collections and top debtors are worked out as legacy does', () => {
+  const now = new Date('2062-03-15T05:00:00Z');
+  assert.deepEqual(lastMonths(now, 3), ['2062-01', '2062-02', '2062-03']);
+  assert.deepEqual(lastMonths(new Date('2062-02-28T18:00:00Z'), 1), ['2062-03'], 'Bangkok\'s month, not UTC\'s');
+  const inv = (id: string, agent: string, balance: number, due: string, status = 'issued') => ({ id, agent_id: agent, balance, due_at: due, status }) as never;
+  const pay = (amount: number, paid_on: string, method = 'transfer', deleted_at: string | null = null) => ({ amount, paid_on, method, deleted_at }) as never;
+  const d = accountingDashboard({
+    invoices: [inv('i1', 'a', 100, '2062-03-20T00:00:00Z'), inv('i2', 'a', 200, '2062-03-01T00:00:00Z'), inv('i3', 'b', 300, '2062-01-20T00:00:00Z'),
+      inv('i4', 'b', 400, '2061-12-01T00:00:00Z'), inv('i5', 'c', 999, '2061-01-01T00:00:00Z', 'void'), inv('i6', 'c', 0, '2061-01-01T00:00:00Z', 'paid')],
+    payments: [pay(50, '2062-03-02'), pay(70, '2062-03-03', 'credit'), pay(80, '2062-02-10'), pay(90, '2062-03-04', 'cash', '2062-03-05')],
+    agents: [{ id: 'a', name: 'Alpha' }, { id: 'b', name: 'Beta' }], credit_exposure: 10, deposits_held: 20, now,
+  });
+  assert.deepEqual(d.aging, { not_due: 100, days_1_30: 200, days_31_60: 300, days_60_plus: 400 });
+  assert.deepEqual([d.outstanding, d.overdue_invoices, d.paid_this_month], [1000, 3, 50], 'credit spent and deleted payments are not money received');
+  assert.deepEqual(d.collections.slice(-2), [{ month: '2062-02', amount: 80 }, { month: '2062-03', amount: 50 }]);
+  assert.deepEqual(d.top_outstanding, [{ agent_id: 'b', name: 'Beta', balance: 700 }, { agent_id: 'a', name: 'Alpha', balance: 300 }]);
+  assert.equal(tripAmount({ trips: [{}, {}] as never, total: 900 }, { ovn_leg: false, subtotal: 400 }), 400, 'a multi-trip booking: the trip\'s own price');
+  assert.equal(tripAmount({ trips: [{}] as never, total: 900 }, { ovn_leg: false, subtotal: 400 }), 900);
+  assert.equal(tripAmount({ trips: [{}, {}] as never, total: 900 }, { ovn_leg: true, subtotal: 400 }), 0, 'an overnight return leg was paid on the way out');
+});
+
+test('the accounting dashboard and the agent statement', async () => {
+  const b1 = await book('2062-01-10', 9_000_000, { agent_id: 'mr_a1' });
+  const b2 = await book('2062-01-10', 4000, { agent_id: 'mr_a1' });
+  const inv = await ok('POST', '/v1/invoices', { agent_id: 'mr_a1', booking_ids: [b1.id] });
+  await ok('POST', `/v1/invoices/${inv.id}/payments`, { amount: 1_000_000, method: 'transfer' });
+  const inv2 = await ok('POST', '/v1/invoices', { agent_id: 'mr_a1', booking_ids: [b2.id] });
+  await ok('POST', `/v1/invoices/${inv2.id}/void`, { reason: 'test' });
+
+  const dash = await ok('GET', '/v1/reports/accounting');
+  assert.deepEqual(dash.top_outstanding[0], { agent_id: 'mr_a1', name: 'mr_a1', balance: 8_000_000 }, 'the biggest debtor here');
+  assert.ok(dash.outstanding >= 8_000_000 && dash.aging.not_due >= 8_000_000, 'due in 15 days: not due yet');
+  assert.ok(dash.paid_this_month >= 1_000_000 && dash.collections.length === 6);
+  assert.ok(dash.credit_exposure >= 8_000_000 + 4000, 'unpaid bookings of invoice agents, the voided one\'s too');
+  assert.equal((await send('GET', '/v1/reports/accounting', undefined, agentLogin)).statusCode, 403, 'a staff report');
+
+  const st = await ok('GET', '/v1/agents/mr_a1/statement');
+  assert.deepEqual([st.invoiced, st.paid, st.outstanding, st.pay_type], [9_000_000, 1_000_000, 8_000_000, 'invoice']);
+  assert.deepEqual(st.invoices.map((i: { number: string; status: string }) => [i.number, i.status]), [[inv.number, 'partial']], 'live invoices only');
+  assert.deepEqual([st.credit.used, st.credit.limit, st.credit_balance.available, st.credits], [9_004_000, 50_000_000, 0, []], "legacy agCreditState: an unpaid booking counts whole, part-paid or not");
+  assert.equal((await send('GET', '/v1/agents/mr_a1/statement', undefined, agentLogin)).statusCode, 200, 'an agent reads its own');
+  assert.equal((await send('GET', '/v1/agents/mr_a2/statement', undefined, agentLogin)).statusCode, 404, 'not another\'s');
+  assert.equal((await send('GET', '/v1/agents/nobody_mr/statement')).statusCode, 404);
+});
+
+test('Travel Summary: who travelled, upgrade money, cash on tour, what is left to collect', async () => {
+  const date = '2062-01-05';
+  const a = await book(date, 3000, { agent_id: 'mr_a2', cash_on_tour_amount: 1000 }, { ad: 3 });
+  const b = await book(date, 2000, {}, { ad: 2, chd: 1 });
+  const c = await book(date, 1000, {}, { ad: 1 });
+  await ok('PATCH', `/v1/bookings/${b.id}`, { upgrades: [
+    { label: 'Longtail charter', sell_price: 500, to_company: 300, collected: true, method: 'cash' },
+    { label: 'Snorkel', sell_price: 400, collected: false, method: 'cash' },
+    { label: 'Kayak', sell_price: 1000, to_company: 1000, collected: true, method: 'card', fee_pct: 3 },
+  ] });
+  // One of a's three did not come; c did not come at all, and owes nothing.
+  await ok('PUT', `/operations/trip-ops/${a.trips[0].id}/checkins/pier/0`, { expected: 3, actual_pax: 2, checked_in_at: '2062-01-05T01:00:00Z', events: [{ type: 'no_show', pax: 1, ad: 1 }] });
+  await ok('PUT', `/operations/trip-ops/${c.trips[0].id}/checkins/van/0`, { expected: 1, actual_pax: 0, checked_in_at: '2062-01-05T00:00:00Z', events: [{ type: 'cxl', pax: 1, ad: 1 }] });
+  const ts = await ok('GET', `/v1/reports/travel-summary?date=${date}`);
+  assert.deepEqual([ts.bookings, ts.booked, ts.travelled, ts.no_show, ts.cxl], [3, 7, 5, 1, 1]);
+  assert.deepEqual(ts.money, { cash: 500, transfer: 0, card: 1000, fees: 30, sales: 1900, sales_due: 400, sales_count: 3, commission: 200,
+    cash_on_tour: 1000, to_collect: 1400, to_collect_bookings: 2 });
+  assert.equal((await send('GET', '/v1/reports/travel-summary?date=2062-1-5')).statusCode, 400);
+});
+
+test('Daily Report money: revenue by route, market and channel; van cost from the van rates', async () => {
+  const date = '2062-02-07';
+  const partner = `MR van ${run}`;
+  const v = await ok('POST', '/operations/vans', { name: 'MR-1', capacity: 12, ownership: 'partner', partner_name: partner });
+  await ok('PUT', `/operations/van-days/${date}/${v.id}`, { route_ids: ['r10'] });
+  const a = await book(date, 6000, { agent_id: 'mr_a1' }, { ad: 3 });
+  const b = await book(date, 2000, {}, { ad: 1 });
+  await book(date, 1500, {}, { ad: 1 }, 'r12');
+  await ok('POST', '/operations/van-groups', { service_date: date, route_id: 'r10', zone: 'PK', members: [{ trip_id: a.trips[0].id }, { trip_id: b.trips[0].id }], van_id: v.id });
+
+  let dr = await ok('GET', `/v1/reports/daily?date=${date}`);
+  assert.deepEqual([dr.bookings, dr.pax.total, dr.paying_pax, dr.revenue, dr.revenue_per_pax], [3, 5, 5, 9500, 1900]);
+  assert.deepEqual(dr.by_route.map((r: { route_id: string; pax: number; revenue: number }) => [r.route_id, r.pax, r.revenue]), [['r10', 4, 8000], ['r12', 1, 1500]]);
+  assert.deepEqual(dr.by_market.map((m: { id: string; pax: number }) => [m.id, m.pax]), [['_none', 3], ['walkin', 2]]);
+  assert.deepEqual(dr.by_channel, { invoice: 6000, proforma: 0, cot: 0, transfer: 0, other: 3500 });
+  assert.deepEqual(dr.by_agent[0], { key: 'mr_a1', agent_id: 'mr_a1', name: 'mr_a1', market_id: '_none', pay_type: 'invoice', bookings: 1, ad: 3, chd: 0, inf: 0, foc: 0, pax: 3, revenue: 6000, docs: { nofiles: 1 } });
+  assert.deepEqual([dr.van_cost.total, dr.van_cost.estimated, dr.van_cost.vans, dr.van_cost.default_rate_vans], [1800, false, 1, 1], 'no rate set: the partner default');
+
+  await ok('PUT', '/v1/van-rates', { group: `p:${partner}`, route_id: 'r10', field: 'PK', rate: 1650 });
+  dr = await ok('GET', `/v1/reports/daily?date=${date}`);
+  assert.deepEqual([dr.van_cost.total, dr.van_cost.default_rate_vans, dr.van_cost.by_van[v.id]], [1650, 0, 1650]);
+
+  assert.equal((await send('PUT', '/v1/reports/daily/settings', { van_cost: 1700 }, salesLogin)).statusCode, 403);
+  let s = await ok('PUT', '/v1/reports/daily/settings', { van_cost: 1700, van_quota: 0 }, ops);
+  assert.deepEqual([s.van_cost, s.van_quota, s.target_per_pax, s.set.van_cost, s.set.van_quota, s.updated_by], [1700, 6, 130, 1700, null, 'mr-ops'], '0 goes back to the default');
+  assert.equal((await send('PUT', '/v1/reports/daily/settings', { van_cost: -1 })).statusCode, 400);
+  assert.equal((await send('PUT', '/v1/reports/daily/settings', { vanCost: 1 })).statusCode, 400);
+  s = await ok('GET', '/v1/reports/daily/settings');
+  assert.equal(s.van_cost, 1700);
+  const empty = await ok('GET', '/v1/reports/daily?date=2062-02-08');
+  assert.deepEqual([empty.bookings, empty.revenue, empty.van_cost.total, empty.van_cost.estimated], [0, 0, 0, true]);
+});

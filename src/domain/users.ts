@@ -111,6 +111,9 @@ export function writeNeed(path: string): WriteNeed {
   // on routes, families and boats its `config` (`save('config')`, decision 2).
   if (/^\/v1\/boats\/[^/]+\/capacity-overrides(\/|$)/.test(path)) return { kind: 'area', areas: ['operations'] };
   if (/^\/v1\/boats\/[^/]+\/(retire|restore)$/.test(path)) return { kind: 'area', areas: ['fleet'] };
+  // Fleet maintenance, part A (todo/fleet-maintenance-model.md): assets, incidents and jobs are legacy's
+  // `fleet` (`flSave`), job starts and closes included though they write the boat's status log.
+  if (/^\/v1\/fleet\/(engines|gearboxes|propellers|incidents|jobs)(\/|$)/.test(path)) return { kind: 'area', areas: ['fleet'] };
   if (path === '/v1/boats' || path.startsWith('/v1/boats/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/route-families' || path.startsWith('/v1/route-families/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/routes' || path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
@@ -122,6 +125,11 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/nationalities') return { kind: 'area', areas: ['operations'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
   if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
+  // Partner van bills (legacy `laGuardEdit('accounting')`). Van rates and the daily report's settings
+  // had no guard in legacy (`ctWrite`): given to those who pay the vans or run them (todo/money-model.md).
+  if (path.startsWith('/v1/van-bills/')) return { kind: 'area', areas: ['accounting'] };
+  if (path === '/v1/van-rates') return { kind: 'area', areas: ['accounting', 'fleet'] };
+  if (path === '/v1/reports/daily/settings') return { kind: 'area', areas: ['operations', 'accounting'] };
   return { kind: 'admin' };
 }
 
