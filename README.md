@@ -2497,6 +2497,15 @@ the PFM history lines and the B2C payment state (`legacy-pier-money.ts`), `lg_`-
 off the imported bookings, so they are replaced with them on every run; what was made here on an
 imported booking goes with it, as invoices' payments do. Imported invoices get no minus lines, so
 their totals stay legacy's; the run lists the invoiced bookings that carry a deduction.
+Rehearsal of 2026-10-09 (after `import:attachments`), every total equal to legacy's:
+- 158 pier payments on 156 bookings: cash 122 ฿325,000, card 27 ฿63,323 + ฿2,698 fees, transfer 9
+  ฿13,990; all 34 slips linked;
+- 160 on-tour sales, ฿256,000, commission ฿80,500; 49 slips;
+- 143 COT decisions (deduct ฿203,450, payout ฿20,750; 8 slips); 76 no-show decisions (฿349,000);
+- 71 PFM events (69 reminders, 2 extensions);
+- 56 bookings owing a B2C balance (฿417,079; legacy's other 2 are bookings the import skips, a test
+  order among them);
+- 11 invoiced bookings carry a deduction their invoice does not show.
 
 ### Upgrades
 
