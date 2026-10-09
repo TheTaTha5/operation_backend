@@ -399,8 +399,8 @@ list when sent, and are left alone when absent.
 - `409 stale_version` → show the message ("…reload and try again"), refetch the booking, redraw.
   Nothing was written.
 - A malformed `If-Match`, or a header and body `version` that disagree, is `400`.
-- **Today it is optional** (no header = last write wins). It becomes required once this client and
-  Love Kingdom send it, so this is not optional for the client.
+- **Required** (since 2026-10-09): a write without it is `428 version_required` and changes nothing.
+  Seat-lock `PATCH` and `release` need it too.
 - Reconfirm writes do not change `version`; for the other day-of-operations writes see "Questions".
 
 ### 2.6 Status commands, approvals, cancel, restore, partial cancel, reschedule, history

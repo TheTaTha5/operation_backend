@@ -61,8 +61,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
     legacy's "Save anyway?" and resend with `overpay_anyway: true`.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
-  `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
-  amend and cancel.
+  `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
+  and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.
 
 ## Ask sales
 

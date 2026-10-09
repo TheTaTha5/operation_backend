@@ -35,8 +35,12 @@ await seedUser(store, { username: 'inv-ops', edit_areas: ['operations'] });
 const admin = await tokenFor(app, 'inv-admin');
 const acct = await tokenFor(app, 'inv-acct');
 const ops = await tokenFor(app, 'inv-ops');
-const send = (method: InjectOptions['method'], url: string, payload?: object, headers: Record<string, string> = admin) =>
-  app.inject({ method, url, headers, ...(payload ? { payload } : {}) });
+/** A write to a booking sends the version it read (If-Match is required of a login). */
+const send = async (method: InjectOptions['method'], url: string, payload?: object, headers: Record<string, string> = admin) => {
+  const booking = method !== 'GET' && /^\/v1\/bookings\/[^/]+/.exec(url);
+  const version = booking ? (await app.inject({ method: 'GET', url: booking[0], headers: admin })).json().version : undefined;
+  return app.inject({ method, url, headers, ...(payload || version ? { payload: { ...payload, ...(version ? { version } : {}) } } : {}) });
+};
 
 let n = 0;
 const run = Date.now().toString(36);

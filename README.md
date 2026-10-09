@@ -1141,9 +1141,10 @@ moved on, the write is refused and nothing changes:
   "message": "Booking BK-1 has changed since you read it (you have version 1, it is now 2); reload and try again" }
 ```
 
-**Optional for now:** a write without either goes through, last write wins, as legacy does. It
-becomes required once the legacy integration client and Love Kingdom send it. A malformed
-`If-Match`, or a header and a body `version` that disagree, is `400`.
+**Required of a login** (decided 2026-10-09): a `PATCH`, command or `PUT …/meals` that sends neither
+is `428 version_required`, and nothing changes. Creating needs none. With authentication off (local
+development) it is not checked, as permissions are not. A malformed `If-Match`, or a header and a
+body `version` that disagree, is `400`.
 
 Retries need nothing extra: a retried create with the same `external_id` is `409
 duplicate_external_id` naming the booking already made.
@@ -2150,8 +2151,9 @@ the last number it saw and refetches only the records named.
 - `POST /v1/seat-locks/{id}/release` — idempotently releases a lock. Seats already drawn from it stay
   with their bookings; only the undrawn remainder goes back to the pool.
 
-A lock carries a `version` and an `ETag` as a booking does; `PATCH` and `release` accept `If-Match` (or
-`version`) and answer `409 stale_version` when the lock has moved on. A `PATCH` changes `pax` and
+A lock carries a `version` and an `ETag` as a booking does; `PATCH` and `release` need `If-Match` (or
+`version`) from a login (`428 version_required` without), and answer `409 stale_version` when the
+lock has moved on. A `PATCH` changes `pax` and
 `agent_id` only; any other field in its body is ignored.
 
 Every lock response carries `drawn_pax`: the seats bookings that hold seats have drawn from it. The

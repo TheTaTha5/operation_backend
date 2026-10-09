@@ -20,7 +20,11 @@ async function waiting(date: string, payload: object): Promise<string> {
   assert.equal(created.statusCode, 201, created.body);
   return created.json().id;
 }
-const decide = async (headers: { authorization: string }, id: string, command = 'approve') => app.inject({ method: 'POST', url: `/v1/bookings/${id}/${command}`, headers, payload: {} });
+/** A command sends the version it read (If-Match is required of a login). */
+const decide = async (headers: { authorization: string }, id: string, command = 'approve') => {
+  const version = (await app.inject({ method: 'GET', url: `/v1/bookings/${id}`, headers: admin })).json().version;
+  return app.inject({ method: 'POST', url: `/v1/bookings/${id}/${command}`, headers, payload: { version } });
+};
 
 test('over the allotment: act-approve or an admin, not any editor', async () => {
   const over = await waiting('2041-02-01', { trips: [{ routeId: 'r3', date: '2041-02-01', pax: { ad: 22 } }] });
