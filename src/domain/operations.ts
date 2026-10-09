@@ -7,6 +7,7 @@ import { withSeq, type BookingPassenger, type BookingPassengerInput } from './bo
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import type { AltPickup } from './alt-pickups.js';
+import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
   confirmationStamp, externalIdTaken, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
@@ -114,6 +115,8 @@ export type BookingInput = {
   adjustments?: BookingAdjustmentInput[];
   /** Extra pickup or drop-off points (`alt-pickups.ts`). Defaults to none. */
   alt_pickups?: AltPickup[];
+  /** On-tour upgrades sold (`upgrades.ts`). Defaults to none. */
+  upgrades?: UpgradeInput[];
   /**
    * Original booking payload retained for operations, reconciliation, and audit import.
    *
@@ -141,6 +144,7 @@ export type Booking = BookingHeader & {
   add_ons: BookingAddOn[];
   adjustments: BookingAdjustment[];
   alt_pickups: AltPickup[];
+  upgrades: Upgrade[];
   /** Every approval the booking waited for, oldest first. The last `pending` one of a kind is the one waiting. */
   approvals: BookingApproval[];
   /** The current cancellation's category and charge. Absent unless the booking was cancelled with one. */
@@ -180,6 +184,8 @@ export type BookingChanges = {
   adjustments?: BookingAdjustmentInput[];
   /** Same rule again. */
   alt_pickups?: AltPickup[];
+  /** Same rule again. */
+  upgrades?: UpgradeInput[];
 };
 
 export type SeatLock = {
@@ -232,7 +238,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
 export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
-export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm'> & { trips: StoredTrip[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[] };
 
 /**
  * The wire shape of a stored booking.
@@ -263,7 +269,7 @@ export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) 
   // Approvals are copied: the store decides them in place, and a view already handed out must not change.
   const approvals = (stored.approvals ?? []).map((approval) => ({ ...approval, days: approval.days.map((day) => ({ ...day })) }));
   return {
-    ...stored, approvals, trips, alt_pickups: (stored.alt_pickups ?? []).map((a) => ({ ...a })), route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
+    ...stored, approvals, trips, alt_pickups: (stored.alt_pickups ?? []).map((a) => ({ ...a })), upgrades: (stored.upgrades ?? []).map(upgradeView), route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
     allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm),
   };
 }
@@ -553,7 +559,8 @@ export class OperationsStore {
 
   private view(stored: StoredBooking): Booking {
     return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
-      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups), checkinsView(this.checkins.get(trip.id) ?? [])), this.reconfirms.get(stored.id) ?? null);
+      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups), checkinsView(this.checkins.get(trip.id) ?? []),
+      activeUpgrade(this.tripUpgrades.filter((u) => u.booking_trip_id === trip.id))), this.reconfirms.get(stored.id) ?? null);
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
@@ -571,6 +578,29 @@ export class OperationsStore {
     const after = before.filter((r) => !(r.kind === kind && r.slot === slot));
     this.checkins.set(tripId, after);
     return after.length < before.length;
+  }
+
+  /** Route upgrades (migration 038), kept after an undo. */
+  private tripUpgrades: TripUpgrade[] = [];
+  private tripUpgradeSeq = 0;
+  /** Moves one trip to another route through the ordinary edit, which checks the route's calendar and seats. */
+  upgradeRoute(id: string, tripId: string, routeId: string, actor: string | undefined, entry: HistoryLine): Booking | undefined {
+    const booking = this.bookings.get(id);
+    return booking && this.amendBooking(id, { trips: retargetTrip(booking.trips, tripId, routeId) }, actor, entry);
+  }
+  /** Replaces the upgrades list as given, writing no history (a route upgrade's charge). */
+  setUpgrades(bookingId: string, upgrades: readonly StoredUpgrade[]): void {
+    const booking = this.bookings.get(bookingId);
+    if (booking) booking.upgrades = upgrades.map((u) => ({ ...u }));
+  }
+  tripUpgradesOf(tripId: string): TripUpgrade[] { return this.tripUpgrades.filter((u) => u.booking_trip_id === tripId).map((u) => ({ ...u })); }
+  addTripUpgrade(row: Omit<TripUpgrade, 'id'>): TripUpgrade {
+    const saved = { ...row, id: ++this.tripUpgradeSeq };
+    this.tripUpgrades.push(saved);
+    return { ...saved };
+  }
+  undoTripUpgrade(id: number, at: string, by: string | null): void {
+    this.tripUpgrades = this.tripUpgrades.map((u) => (u.id === id ? { ...u, undone_at: at, undone_by: by } : u));
   }
 
   /** Each booking's reconfirmation (migration 035), by booking id. */
@@ -830,19 +860,21 @@ export class OperationsStore {
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, passengers, add_ons, adjustments, alt_pickups, intent: _intent, ...rest } = input;
+    const { trips, header, passengers, add_ons, adjustments, alt_pickups, upgrades, intent: _intent, ...rest } = input;
     // `booking_data` is what PostgreSQL's create writes: the input's blob if it carries one, otherwise
     // the column's `{}`. Nothing sends one since the blob stopped being written (2026-09-22), so both
     // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
       ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}),
       booking_data: rest.booking_data ?? {}, id, status, version: 1, created_at: now, updated_at: now, trips: planned,
-      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), adjustments: withSeq(adjustments ?? []), alt_pickups: (alt_pickups ?? []).map((a) => ({ ...a })), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
+      passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), adjustments: withSeq(adjustments ?? []), alt_pickups: (alt_pickups ?? []).map((a) => ({ ...a })),
+      upgrades: storedUpgrades(upgrades ?? [], [], now, actor ?? null).upgrades, reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
     };
     this.bookings.set(id, booking);
     this.requestApprovals(booking, decision.approvals);
     this.log(id, createdLine(actor));
     for (const line of decision.history) this.log(id, line);
+    for (const line of storedUpgrades(upgrades ?? [], [], now, actor ?? null).history) this.log(id, line);
     return this.view(booking);
   }
 
@@ -954,9 +986,13 @@ export class OperationsStore {
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     if (changes.adjustments) booking.adjustments = withSeq(changes.adjustments);
     if (changes.alt_pickups) booking.alt_pickups = changes.alt_pickups.map((a) => ({ ...a }));
+    // As PostgreSQL logs them: the edit, the sales, then what the reweigh decided.
+    const sold = changes.upgrades && storedUpgrades(changes.upgrades, booking.upgrades, this.now(), actor ?? null);
+    if (sold) booking.upgrades = sold.upgrades;
     booking.updated_at = this.now();
     booking.version += 1;
     this.log(id, line);
+    for (const extra of sold ? sold.history : []) this.log(id, extra);
     for (const extra of reweighed?.history ?? []) this.log(id, extra);
     return this.view(booking);
   }
@@ -1125,6 +1161,10 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
 }
 
 /** The input a stored trip would have come from, id included, so an edit derived from it stays that trip. */
+/** The itinerary with one trip on another route, everything else as it is: a route upgrade. */
+export const retargetTrip = (current: readonly StoredTrip[], tripId: string, routeId: string): BookingTripInput[] =>
+  current.map((trip) => ({ ...asInput(trip, current), ...(trip.id === tripId ? { route_id: routeId } : {}) }));
+
 const asInput = (trip: StoredTrip, all: readonly StoredTrip[]): BookingTripInput => {
   const { id, route_id, service_date, booking_mode, charter_boat_id, lock_draws: _draws, pax: _pax, seq: _seq, ovn_of, ...details } = trip;
   return {

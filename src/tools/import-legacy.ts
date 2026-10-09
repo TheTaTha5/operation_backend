@@ -167,6 +167,7 @@ async function main() {
     const legacyTrips = await read('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx');
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
     const legacyAdjustments = await read('SELECT * FROM sb_bookings__adjustments ORDER BY sb_bookings_id, idx');
+    const legacyUpgrades = await read('SELECT * FROM sb_bookings__upgrades ORDER BY sb_bookings_id, idx');
     const legacyAddOns = await read('SELECT sb_bookings_id, type FROM sb_bookings__addons');
     const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
     const legacyFeeItems = await read('SELECT * FROM sb_bookings__feeitems ORDER BY sb_bookings_id, idx');
@@ -389,6 +390,7 @@ async function main() {
     };
     const partialCancelsOf = childrenOf(legacyPartialCancels), feeItemsOf = childrenOf(legacyFeeItems), historyOf = childrenOf(legacyHistory);
     const adjustmentsOf = childrenOf(legacyAdjustments);
+    const upgradesOf = childrenOf(legacyUpgrades);
     const addOnsOf = new Map<string, string[]>();
     for (const a of legacyAddOns) { const k = str(a.sb_bookings_id); (addOnsOf.get(k) ?? addOnsOf.set(k, []).get(k)!).push(str(a.type)); }
 
@@ -534,7 +536,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -691,6 +693,23 @@ async function main() {
         adjustments.push({ booking_id: id, seq: adjustmentSeq++, kind, mode, value, label: str(a.label) || null, note: str(a.note) || null });
       }
       // Alternate pickups (migration 037), read by the API's own parser so legacy's spellings and old `qty` entries map the same way.
+      // On-tour upgrades (migration 038), with legacy's own fee and amount paid. Payment slips are
+      // attachments, which have no home here yet: they are counted, not kept.
+      let upgradeSeq = 0;
+      for (const u of upgradesOf.get(legacyId) ?? []) {
+        const sell = Number(u.sellprice);
+        if (!str(u.id) || !(sell >= 0)) { note('upgrades dropped: no id or no price'); continue; }
+        const slips = jsonValue(u.slips);
+        if (Array.isArray(slips) && slips.length) note('upgrade payment slips not kept: attachments have no home yet');
+        const num = (v: unknown) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+        const settle = str(u.settle);
+        upgrades.push({
+          booking_id: id, seq: upgradeSeq++, id: str(u.id), label: str(u.label) || 'Upgrade', sell_price: sell, to_company: num(u.tocompany),
+          seller: str(u.seller) || null, note: str(u.note) || null, collected: typeof u.collected === 'boolean' ? u.collected : null,
+          settle: settle === 'pending' || settle === 'done' ? settle : null, method: str(u.method) || null,
+          fee_pct: num(u.feepct), fee: num(u.fee), customer_paid: num(u.customerpaid), at: instant(u.at) ?? null,
+        });
+      }
       // Reconfirmation (migration 035). A record saved before legacy split out `sent` (§rcSplit) has no
       // such key; legacy reads a "done" one as sent, at the time and by the person who confirmed it.
       const rc = jsonValue(b.ops_reconfirm) as Row | null;
@@ -980,6 +999,7 @@ async function main() {
     await insert('booking_adjustments', adjustments);
     await insert('booking_reconfirmations', reconfirms);
     await insert('booking_alt_pickups', altPickups);
+    await insert('booking_upgrades', upgrades);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);
     await insert('booking_trip_checkin_event_tries', checkinTries);

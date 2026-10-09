@@ -1531,6 +1531,73 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
 
+### Upgrades
+
+**On-tour sales.** An upsell sold to the customer on the day ("Longtail · Join → เหมา (Charter)"):
+`upgrades` is a booking field, accepted on `POST /v1/bookings` and `PATCH /v1/bookings/{id}` and
+returned on every read. The list replaces outright (absent = unchanged, `[]` = clear). Legacy's
+spellings (`sellPrice`, `toCompany`, `feePct`) are accepted.
+
+```jsonc
+"upgrades": [ { "id": "up_1789029877535", "label": "Longtail · Join → เหมา (Charter)", "sell_price": 1100, "to_company": 770,
+                "commission": 330, "seller": "BEST", "note": null, "collected": true, "settle": "pending",
+                "method": "card", "fee_pct": 5, "fee": 55, "customer_paid": 1155, "at": "2026-09-10T08:44:37.535Z" } ]
+```
+
+- **Computed:**
+  - `commission` = `sell_price − to_company`;
+  - `fee` = `sell_price × fee_pct / 100` for a `card` payment, 0 otherwise;
+  - `customer_paid` = `sell_price + fee`;
+  - `at` is when the sale was first saved; it doesn't change on an edit.
+
+  Values sent for them are replaced. A sale with no `method` (legacy's older ones) has no `fee` or
+  `customer_paid`.
+- **Refused (`400`, naming the index):**
+  - no `sell_price` above 0 (legacy's "ใส่ราคาขาย");
+  - `fee_pct` above 100;
+  - an `id` twice;
+  - `settle` other than `pending` / `done`;
+  - **non-empty `slips`**: payment-slip attachments have no home here yet.
+
+  `id` is the client's (`up_<ms>`), made by the server if absent. `settle` starts `pending`.
+- **History**, in legacy's words: "Upgrade · <label> · ขาย ฿2,000 · บริษัท ฿1,300 · คอม ฿700 ·
+  <seller>" for a new sale; "Edited upgrade · …" for a changed one. Removing a sale isn't logged.
+
+**Route upgrade.** One trip moves to another programme that sails that day (legacy's
+"⤴ Upgrade"):
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `POST /v1/bookings/{id}/upgrade` | `{trip_id, to_route_id, reason, charge?}` | the booking |
+| `POST /v1/bookings/{id}/upgrade/undo` | `{trip_id}` | the booking |
+
+- **The trip moves at the price it was booked at.** As any move, it loses its boat, vans and
+  check-ins (pier note kept); the route's calendar is checked as for an edit.
+- **A `charge` above 0** adds an on-tour sale "Upgrade > <programme>": cash, not collected,
+  all of it owed to the company.
+- **History:** "Upgrade route · <from> > <to> · <reason> · +THB 1,500" (or "· no charge").
+- The trip's `operations.upgrade` shows the upgrade in force:
+  `{id, from_route_id, to_route_id, reason, charge, upgrade_id, at, by}`, or `null`.
+- **Refused:**
+  - `400`:
+    - no `reason` (legacy's "Enter a reason.");
+    - `to_route_id` the trip is already on;
+    - a trip not on the booking;
+    - `charge` below 0;
+  - `409`:
+    - `charter`: a charter trip;
+    - `overnight`: an overnight trip ("Edit the booking instead");
+    - `lock_draw`: a trip drawing on a seat lock ("Release the lock draw first");
+    - `already_upgraded`;
+    - `route_not_sailing`: no boat on the target that day;
+    - `not_enough_seats`: "Needs 2, free 1".
+- **Undo** moves the trip back, under the same seat checks (`409 not_upgraded` if there's no
+  upgrade). It drops the charge unless it was collected, logs "Upgrade undone · back to <from>",
+  and keeps the upgrade's record.
+
+The import brings every legacy sale, with its own fee and amount paid. Its payment slips are not
+kept (7 sales): attachments have no home yet.
+
 ### Reconfirm
 
 Did the customer confirm their pickup, and was the agent's re-confirm list sent: legacy's Re-confirm
