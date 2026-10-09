@@ -21,7 +21,7 @@ import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
-import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { applyDispatch, charterSynced, checkBoatAssignment, parseDispatchPatch, parseRaise, paxByBoat } from '../domain/dispatch.js';
 import { changeContext, trackChanges } from './change-tracking.js';
 import { parseSince } from '../domain/changes.js';
 import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
@@ -1445,13 +1445,37 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const tripId = (request.params as { trip_id: string }).trip_id;
     const body = record(request.body);
     const patch = parseDispatchPatch(body);
+    const raise = parseRaise(body.raise_capacity);
     const vanParts = body.van_parts === undefined ? undefined : parseVanParts(body.van_parts);
     return store.transaction(async () => {
       const found = (await store.tripForDispatch(tripId)) ?? notFound('Trip not found');
       if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(found.booking.status)) {
         refuseWith(`Booking ${found.booking.id} is ${found.booking.status}: its dispatch cannot change`, 409, 'cancelled');
       }
-      const next = applyDispatch(found.dispatch, patch, { pax: parsePaxGrid(found.trip.pax), deployedBoats: found.deployedBoats, now: new Date().toISOString(), by: actorOf(request.user) ?? null });
+      const now = new Date().toISOString(), by = actorOf(request.user) ?? null;
+      const next = applyDispatch(found.dispatch, patch, { pax: parsePaxGrid(found.trip.pax), deployedBoats: found.deployedBoats, now, by });
+      // Boat assignment rules (todo/boat-assignment-model.md): charter boat, chartered boats, capacity + 2.
+      const { route_id: routeId, service_date: date } = found.trip;
+      const day = (await store.dayRange([routeId], date, date))[0];
+      const others = new Map<string, number>();
+      for (const b of await store.bookingsOn(date, routeId)) {
+        if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(b.status)) continue;
+        for (const t of b.trips) {
+          if (t.id === tripId || t.route_id !== routeId || t.service_date !== date) continue;
+          for (const [boat, n] of paxByBoat(t.operations, t.pax_total)) others.set(boat, (others.get(boat) ?? 0) + n);
+        }
+      }
+      const user = request.user?.user;
+      const raises = checkBoatAssignment({
+        patch, next, trip: found.trip, others, raise,
+        boats: new Map((day?.boats ?? []).map((b) => [b.boat_id, { ...b, chartered: b.chartered && !(found.trip.booking_mode === 'charter') }])),
+        mayRaise: !user || user.role === 'admin' || user.actions.includes('act-capunlock'),
+      });
+      if (raises.length) {
+        const catalogue = new Set((await store.listBoats()).map((b) => b.id));
+        for (const r of raises) if (!catalogue.has(r.boat_id)) refuseWith(`Boat ${r.boat_id} is not in the boat catalogue: its capacity for a day can't be raised`, 409, 'boat_not_catalogued');
+      }
+      for (const r of raises) await store.putBoatCapacityOverride({ ...r, service_date: date, set_by: by, set_at: now });
       await store.setDispatch(tripId, next);
       let warnings: string[] = [];
       if (vanParts) {
@@ -1468,11 +1492,19 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     });
   });
 
-  /** Rebuilds the van parts a booking's alternate pickups call for (`altPartsPlan`); true when it changed them. */
+  /**
+   * Rebuilds the van parts a booking's alternate pickups call for (`altPartsPlan`), and puts each charter
+   * trip on its charter boat (`charterSynced`, legacy `§chOpsSync`); true when it changed anything.
+   */
   async function syncAltParts(booking: Booking): Promise<boolean> {
     const plans = altPartsPlan(booking);
     for (const plan of plans) await store.setVanParts(plan.tripId, plan.parts);
-    return plans.length > 0;
+    let charters = 0;
+    for (const trip of booking.trips) {
+      const synced = charterSynced(trip, (await store.tripForDispatch(trip.id))?.dispatch);
+      if (synced) { await store.setDispatch(trip.id, synced); charters += 1; }
+    }
+    return plans.length > 0 || charters > 0;
   }
 
   /**

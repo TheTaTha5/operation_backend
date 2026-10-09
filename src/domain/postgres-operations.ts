@@ -1694,6 +1694,13 @@ export class PostgresOperationsStore {
     }));
   }
 
+  /** A boat's capacity for one day (migration 046 records who and when): the trip-ops raise. */
+  async putBoatCapacityOverride(o: { boat_id: string; service_date: string; capacity: number; reason: string; set_by: string | null; set_at: string }): Promise<void> {
+    await this.client().query(`INSERT INTO boat_capacity_overrides (boat_id, service_date, capacity, reason, set_by, set_at) VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason, set_by = EXCLUDED.set_by, set_at = EXCLUDED.set_at`,
+    [o.boat_id, o.service_date, o.capacity, o.reason, o.set_by, o.set_at]);
+  }
+
   async putAttachment(f: StoredFile): Promise<void> {
     await this.client().query('INSERT INTO attachments (id, filename, mime, size, data, uploaded_by, uploaded_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
       [f.id, f.name, f.mime, f.size, f.data, f.uploaded_by, f.uploaded_at]);
