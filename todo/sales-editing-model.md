@@ -25,6 +25,157 @@ passengers' insurance age and review; the import's cutover. Migrations 090–093
    agent through `/v1/bookings`, and sees every rate type (legacy hid other salespeople's rate types
    too, `_rtInScope`).
 
+## Design — extras (feat/sales-extras, 2026-10-10)
+
+The developer said build, copying legacy (wt-lk-inbox@658298d). Promo contracts are designed in
+`contracts-model.md` ("Design — promo writes"). This covers open items 1, 2 and 7. Item 6 waits.
+
+### Sales targets and follow-up marks (open item 2)
+
+Legacy (`04-data-core.js` `salesSetTarget`, `salesToggleFollow`, `salesPaxAgg`, `salesStreak`;
+`08-app.js` `sbEditTarget`, `renderSalesBoard`): a target is pax per salesperson per month, kept on
+the salesperson (`sb_sales.targets = {"2026-07": 120}`; 0 deletes it). A follow-up mark is a tick per
+salesperson, month and agent, two kinds (followed; FOC feedback collected), kept as
+`sb_sales.followup = {"2026-07::a56": true, "foc:2026-07::a56": true}`. Persist guards `sales`; the
+target's edit shows only to a login not bound to a salesperson; a bound login sees only its own
+board. Legacy data: 0 targets, 1 follow-up mark.
+
+The Sales Board counts **pax by trip month** (a trip counts in its own month, every passenger
+including infants and FOC), cancelled/rejected/weather-cancelled bookings out, by the agent's
+*current* salesperson. Trend per agent against last month: no pax last month → `new`; none this
+month → `gone`; last month < 5 → `flat` with the difference; else +25 % or more `up`, −20 % or less
+`down`, between `flat`. Streak: months in a row, back from this one (24 at most), with a target met.
+
+| Field | Authority |
+|---|---|
+| target `pax` | client fact (whole number ≥ 0; 0 clears) |
+| follow-up mark | client fact (set or cleared) |
+| `set_at`/`set_by`, `marked_at`/`marked_by` | computed (the write's time and login) |
+| board: pax, FOC, bookings, `target_pct`, `reached`, `streak`, `rank`, `previous_rank`, agent `trend` | computed |
+
+```sql
+-- 201_sales_targets.sql
+CREATE TABLE sales_targets (
+  sales_id TEXT NOT NULL REFERENCES sales_people (id) ON DELETE CASCADE,
+  month    TEXT NOT NULL CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
+  pax      INTEGER NOT NULL CHECK (pax > 0),
+  set_at   TIMESTAMPTZ NOT NULL,
+  set_by   TEXT,
+  PRIMARY KEY (sales_id, month)
+);
+CREATE TABLE sales_followups (
+  sales_id  TEXT NOT NULL REFERENCES sales_people (id) ON DELETE CASCADE,
+  month     TEXT NOT NULL CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
+  agent_id  TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
+  kind      TEXT NOT NULL CHECK (kind IN ('agent', 'foc')),
+  marked_at TIMESTAMPTZ NOT NULL,
+  marked_by TEXT,
+  PRIMARY KEY (sales_id, month, agent_id, kind)
+);
+```
+
+Contract (area `sales`; a sales-bound login: no target writes, follow-ups on its own board only):
+
+- `PUT /v1/sales/{id}/targets/{month}` `{ "pax": 120 }` → `{ "sales_id": "s01", "month": "2026-10", "pax": 120 }`.
+  `0` or `null` clears (`pax: 0` answered). `400` for a month not `YYYY-MM` or pax not a whole number
+  ≥ 0; `403` for a sales-bound login; `404` unknown salesperson.
+- `PUT /v1/sales/{id}/followups` `{ "month": "2026-10", "agent_id": "a56", "kind": "agent" | "foc", "marked": true }`
+  → `{ …, "marked": true }`. Legacy toggles; here the mark is set or cleared as sent, so a retry
+  cannot undo it. `400` for an agent that is not this salesperson's; `403` for another
+  salesperson's board.
+- `GET /v1/sales-board?month=YYYY-MM` (default this month, Thailand), any login:
+
+```jsonc
+{ "month": "2026-10", "previous_month": "2026-09", "total_pax": 1234,
+  "sales": [ { "sales_id": "s01", "name": "IRIS", "code": "IR", "color": "#0F6E56", "pax": 412, "foc": 6,
+               "target": 400, "target_pct": 103, "reached": true, "streak": 2, "rank": 1, "previous_rank": 2,
+               "bookings": 97, "agents": 140, "agents_with_sales": 38 } ],
+  "agents": [ { "agent_id": "a56", "name": "…", "sales_id": "s01", "pax": 40, "previous_pax": 25, "foc": 2,
+                "trend": { "category": "up", "pct": 60, "change": 15 }, "followed": true, "feedback_collected": false } ] }
+```
+
+`sales` is every active salesperson, most pax first (ties in id order, legacy's load order); a
+sales-bound login sees the whole leaderboard (legacy did) but only its own `agents`.
+
+### Staff and welfare quotas (open item 1): built
+
+It can be built without designing staff pricing anew: the price is already the server's
+(`enforcedPriceMode` — welfare at the staff rate, inspection free; FOC seats are free in
+`priceBooking`). What was missing is the registry, the quota and the booking-form guard.
+
+Legacy (`08-app.js` `SB_STAFF`, `staffAdd`, `staffSetField`, `staffSetQuota`, `staffDelete`,
+`staffWelfareUsed`, `staffTripsFor`, the guard in `bkV2Save`): staff `{id st01…, code EMP-001…, name,
+dept, active, quota: {"2026": 3}}`; persist guards `sales`. Used = FOC passengers (`foc`, `foc_fr`,
+`foc_th`) on trips in that year, of the staff member's bookings that are not cancelled/rejected/
+weather-cancelled and not an inspection. Remaining = quota − used. Saving a staff booking needs a
+staff member; a welfare one whose FOC seats exceed what is left asks "Free welfare seats exceed the
+quota … Save anyway?". Legacy data: 24 staff (3 code clashes: EMP-010, EMP-020, EMP-021), quotas for
+2026 only, 41 bookings naming one, none unknown.
+
+| Field | Authority |
+|---|---|
+| `code`, `name`, `dept`, `active` | client fact |
+| a year's `free_seats` | client fact (whole number ≥ 0) |
+| `id` | computed (`st` + next number, legacy) |
+| `used`, `remaining` | computed |
+| booking `staff_id` | validated: required on a staff booking, must be a staff member when set |
+| booking FOC over the quota | validated: `409 over_quota` until `quota_anyway: true` |
+
+```sql
+-- 202_staff.sql
+CREATE TABLE staff (
+  id         TEXT PRIMARY KEY,
+  code       TEXT,                         -- not unique: legacy's own 24 have 3 clashes
+  name       TEXT NOT NULL DEFAULT '',     -- legacy adds a blank row and names it in place
+  dept       TEXT,
+  active     BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE staff_quotas (
+  staff_id   TEXT NOT NULL REFERENCES staff (id) ON DELETE CASCADE,
+  year       INTEGER NOT NULL CHECK (year BETWEEN 2000 AND 2100),
+  free_seats INTEGER NOT NULL CHECK (free_seats >= 0),
+  PRIMARY KEY (staff_id, year)
+);
+```
+
+`bookings.staff_id` gets no foreign key: the import mirrors legacy's bookings, and legacy deletes
+staff freely. The write path checks it instead.
+
+Contract (writes area `sales`, reads any login):
+
+- `GET /v1/staff?year=2026` (default this year) → `{ "year": 2026, "staff": [{ id, code, name, dept,
+  active, quotas: {"2026": 3}, quota, used, remaining }], "totals": { active, all, quota, used } }` in
+  id order.
+- `GET /v1/staff/trips?year=2026` → `{ "trips": [{ booking_id, staff_id, service_date, route_id,
+  purpose: "welfare" | "inspection", foc, head, paid }] }` by date (legacy's "trips" tab).
+- `POST /v1/staff` → `201`: `name`, `code`, `dept`, `active` optional; defaults legacy's `staffAdd`:
+  id `st<n+1>`, code `EMP-<n+1>`, name `""`, a quota of 3 for this year.
+- `PATCH /v1/staff/{id}`: `name`, `code`, `dept`, `active`. Unknown fields `400`.
+- `PUT /v1/staff/{id}/quotas/{year}` `{ "free_seats": 3 }` → the staff row.
+- `DELETE /v1/staff/{id}` → `204`; `409 in_use` while a booking names them (make them inactive).
+- Bookings (`POST /v1/bookings`, `PATCH /v1/bookings/{id}` when trips, pax, `staff_id` or
+  `staff_purpose` change): on the staff agent (`a_staff`/`STAFF`) `staff_id` is required (`400`);
+  any `staff_id` sent must be a staff member (`400`); a welfare booking whose FOC seats in a year
+  exceed that year's remaining (this booking excluded) is `409 over_quota` until `"quota_anyway": true`:
+
+```json
+{ "statusCode": 409, "code": "over_quota", "error": "Conflict",
+  "message": "Free welfare seats exceed the quota: 2026: 1 free seat left, 3 requested, over by 2. The over-quota people should be Adult (charged at the staff rate), not FOC. Send quota_anyway: true to save anyway." }
+```
+
+### `import:contracts` seed-only (open item 7)
+
+`npm run import:contracts` writes nothing without `--seed` (it says so); `--seed` upserts legacy's
+contracts as today (legacy wins for each id it has; one only here is left). Run it once, to seed.
+
+### Import (`import-legacy.ts --sales`)
+
+Seeds staff (`sb_staff`, `quota_2026` → year 2026), targets (`sb_sales.targets`, months that are not
+`YYYY-MM` or pax ≤ 0 listed and skipped) and follow-up marks (`sb_sales.followup`; a key that does
+not parse, or an agent not here, listed and skipped). Upsert by key; without `--sales` none of them.
+
 ## Flagged
 
 Behaviour changes against legacy, and decisions made while building (each defaults to legacy where
