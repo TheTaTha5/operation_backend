@@ -32,7 +32,7 @@ export async function tokenFor(app: FastifyInstance, username: string, password 
   return { authorization: `Bearer ${login.json().access_token}` };
 }
 
-const blankAgent = (id: string, sales_id: string | null): StoredAgent => ({
+export const blankAgent = (id: string, sales_id: string | null): StoredAgent => ({
   id, code: null, name: id, market_id: null, sub_market: null, sales_id, color: null, pay_type: null, vat_mode: 'none', credit_days: null, credit_limit: null,
   contact: null, email: null, phone: null, note: null, rate_type_id: null, contract_template_id: null, contract_status: null, contract_version: null,
   contract_start: null, contract_end: null, legal_name: null, tax_id: null, tat_license: null, address: null, company_tel: null, hotline: null, fax: null,

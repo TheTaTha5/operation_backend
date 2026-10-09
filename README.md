@@ -181,6 +181,7 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 | `fleet` | deployments (legacy's Fleet Deployment) |
 | `sales` | rate types, agents |
 | `config` | the route calendar |
+| `accounting` | invoices, their discounts and payments |
 
 - `role: admin` may do everything, including the user screens.
 - **Edit areas follow legacy's `editInfo`:** a list in `edit_areas` decides, and `can_edit` is read
@@ -366,6 +367,7 @@ it here needs the caller's salesperson id in the token, and that has not been de
   - `signatory`: `{ name, designation, tel, signed_date }`
   - `booking_channel`: `{ method, cutoff, cancel_policy, email, phone }`
   - `programs`: `[{ route_id, book_from, book_to, note }]` in the agent's order
+  - `credit`: `{ limit, used, available, pct, over }`, worked out (see "Invoices and payments")
 - `GET /v1/agents/{id}/activity?limit=`: the audit log, newest first:
   `{ activity: [{ at, by, kind, text }] }`. `limit` defaults to 50 and may be 1–200. `404` if the
   agent is unknown.
@@ -999,7 +1001,8 @@ sent. Weather is not on the list: a weather cancel is its own status, `cancelled
 
 **Charges.** `charge_type` is `none` (default), `full` or `partial`. `partial` needs
 `charge_amount > 0`. `full` is computed: `total` plus the existing fee items. `none` ignores any
-amount. The charge is recorded, not billed: invoices belong to accounting.
+amount. Cancelling voids the booking's live invoice, and a charge becomes a fee invoice of its own
+(see "Invoices and payments"); restoring voids that fee invoice.
 
 **A closed booking is refused.** Cancel, partial cancel and reschedule answer `409` on a booking
 that is `cancelled`, `cancelled_weather`, `rejected` or `completed`.
@@ -1664,6 +1667,161 @@ keeps them (`attachments`, migration 040).
   (5,887 of 6,342; batches, re-runnable). Run it before the main import, which then links each
   booking's documents and upgrade slips to them.
 
+### Invoices and payments
+
+Legacy's Accounting screen and Daily PFM payments (todo/money-model.md slice 1, migration 045). The
+server works out every amount, the invoice number, the due date and the status. A client sends who
+is billed and what was paid. Writes need the `accounting` area; any login may read.
+
+| Method + path | Does |
+|---|---|
+| `GET /v1/invoices?agent_id=&booking_id=&status=&from=&to=` | List the invoices, oldest first. `status` takes one or more, comma-separated; `from` and `to` are the issue date (Bangkok) |
+| `GET /v1/invoices/{id}` | One invoice |
+| `POST /v1/invoices` | Issue one; answers `201` and the invoice |
+| `PATCH /v1/invoices/{id}` | The document's header text and the withholding tax |
+| `PUT /v1/invoices/{id}/discounts` | Line discounts |
+| `POST /v1/invoices/{id}/void` | Void it |
+| `POST /v1/invoices/{id}/payments` | Record a payment; answers `201` and the invoice |
+| `POST /v1/invoices/{id}/payment-corrections` | Change or delete payments; answers the invoice |
+| `GET /v1/payments?agent_id=&from=&to=&method=&deleted=` | Payments across invoices, oldest first |
+
+```jsonc
+// An invoice, as every endpoint above answers it
+{ "id": "inv_…", "number": "INV-2610-0012", "agent_id": "a12", "kind": "booking", "fee_type": null,
+  "lines": [ { "seq": 0, "booking_id": "BK-…", "label": "V-881 · Phi Phi Premium · 2026-10-12", "amount": 5600, "discount": null } ],
+  "vat_mode": "include", "vat_rate": 0.07, "subtotal": 5600, "net_amount": 5234, "vat_amount": 366, "total": 5600,
+  "wht_amount": null, "payment_amount": 5600,
+  "issued_at": "2026-10-09T03:12:44.000Z", "due_at": "2026-10-24T03:12:44.000Z",
+  "status": "partial", "paid": 3000, "balance": 2600, "booking_ids": ["BK-…"],
+  "note": null, "ref": "PO-77", "dear": null, "accept_at": null, "remark": null,
+  "voided": false, "voided_at": null, "voided_by": null, "void_reason": null, "created_by": "acc1",
+  "payments": [ { "id": "pay_…", "invoice_id": "inv_…", "amount": 3000, "method": "transfer", "paid_on": "2026-10-09", "ref": null,
+    "recorded_by": "acc1", "recorded_at": "…", "deleted_at": null, "deleted_by": null, "delete_reason": null,
+    "slips": [ { "id": "att_…", "name": "slip.jpg", "mime": "image/jpeg", "size": 120331 } ] } ] }
+```
+
+**Issuing** (legacy `acctCreateInvoice`):
+- **Request:** `{ "agent_id": "a12", "booking_ids": ["BK-…"], "kind": "booking", "ref": "PO-77" }`.
+  - `kind` is `booking` (the default) or `prepay`. A prepay invoice is a credit agent paying one
+    booking early.
+  - The header fields `note`, `ref`, `dear`, `accept_at` (`YYYY-MM-DD`) and `remark` may come too.
+  - `lines`, totals, `number` and `due_at` are the server's; anything sent for them is ignored.
+- **Refused:**
+  - a booking of another agent: `400 booking_not_agents`;
+  - a cancelled, rejected or weather-cancelled booking: `409 booking_cancelled`;
+  - a booking already on a live invoice: `409 booking_already_invoiced`, naming the invoice.
+- **Lines:** one per booking at today's price (`total`), then one per fee item. From then on each
+  line keeps the amount it was issued for: a later price change does not move the invoice.
+- **VAT** is the agent's `vat_mode`, copied at issue, at 7% in whole baht:
+  - `include`: the total is the subtotal, and `net = round(subtotal / 1.07)`;
+  - `exclude`: VAT is added on top;
+  - `none`: no VAT.
+- **Number:** `INV-YYMM-NNNN` for the Bangkok month, from a server counter, so two invoices never
+  share a number.
+- **Due date:** a `proforma` agent's, or a prepay invoice, is due when issued. Otherwise it is due
+  after the agent's `credit_days`, or 30 days for an `invoice` agent without them.
+- **Several bookings** may share an invoice, as on legacy's screen.
+- Each booking's history gets `Invoice INV-… issued · ฿5,600 (incl. VAT)`.
+
+**Status** is worked out, never stored:
+- `void` once voided;
+- `paid` once the payments reach `total`;
+- `partial` once something is paid;
+- `issued` otherwise.
+
+`balance` is what is still owed; a void invoice owes nothing. Withholding tax does not count towards
+paid, as in legacy: an agent that pays `total − wht_amount` leaves the invoice `partial`.
+
+**`PATCH`** changes `note`, `ref`, `dear`, `accept_at`, `remark` and `wht_amount` (0 or `null`
+clears it). `payment_amount` is `total − wht_amount`, what the document asks to be paid. A field the
+server works out is refused with `400` naming what to use instead (`total cannot be changed: it is
+worked out from the lines`). An unchanged echo of it is accepted.
+
+**Discounts** (legacy `acctInvDisc`):
+- **Request:** `PUT …/discounts` with `{ "lines": [ { "seq": 0, "discount": 600 } ] }`.
+  - Lines not named keep their discount; 0 or `null` clears one.
+- **Effect:** the discounts come off the issued amounts, never more than all of them. VAT is then
+  worked out again as at issue.
+- **Refused:**
+  - once anything is paid: `409 invoice_has_payments` ("void it and issue another");
+  - on a void invoice: `409 invoice_void`.
+
+**Void:**
+- **Request:** `{ "reason": "wrong agent" }`; the reason is optional.
+- **Effect:** frees the bookings to be invoiced again. Payments already recorded stay on the void
+  invoice, as in legacy.
+- **History:** `Invoice INV-… voided · reason: …`.
+- **Refused:** voiding twice is `409 invoice_void`.
+
+**Recording a payment** (legacy `acctRecordPayment`):
+- **Request:** `{ "amount": 3000, "method": "transfer", "paid_on": "2026-10-09", "ref": "…", "slip_ids": ["att_…"] }`.
+  - `method` is `transfer` (the default), `cash` or `card`.
+  - `paid_on` defaults to today in Bangkok.
+  - `slip_ids` name files uploaded with `POST /v1/attachments`.
+- **Refused:**
+  - an amount that is not above 0: `400`;
+  - a void invoice: `409 invoice_void`;
+  - more than the invoice still owes: `409 overpayment`, naming the amounts. Send
+    `overpay_anyway: true` to save anyway (legacy's "Save anyway?").
+- **History:** `Payment ฿3,000 (transfer) · partial` or `· paid in full`.
+
+**Correcting payments** (legacy `pfmEditSubmit`):
+- **Request:** one dialog's changes at once:
+  `{ "payments": [ { "id": "pay_1", "amount": 1500 }, { "id": "pay_2", "deleted": true } ], "reason": "typo" }`.
+  - Each entry may change `amount`, `method` and `paid_on`, or set `deleted: true`.
+  - `reason` is optional.
+- **A deleted payment stays.** It keeps `deleted_at`, `deleted_by` and `delete_reason`, and it leaves
+  every total. `GET /v1/payments` shows deleted payments only with `deleted=true`.
+- **History:** one line, as legacy writes it: `Payment correction · edited THB 2,000 -> THB 1,500 ·
+  deleted THB 3,000 (transfer, 2026-10-01) · reason: typo`.
+- **Refused:**
+  - a payment already deleted: `409 payment_deleted`;
+  - a result that pays more than the total: `409 overpayment`, unless `overpay_anyway: true`.
+- **Nothing changed** writes nothing.
+
+**On the booking.** Every booking read carries two fields the server works out:
+- `invoice`: the booking's live invoice, the newest one not void, as
+  `{ id, number, kind, fee_type, status, total, paid, balance }`, or `null`.
+- `payment_state`: `none`, `invoiced`, `partial` or `paid`.
+
+They replace legacy's stored `invoiceId` and `paymentStatus`. A booking `PATCH` that sends any of
+`invoice`, `invoice_id`, `invoiceId`, `payment_state` or `paymentStatus` with a different value is
+refused with `400`; an unchanged echo is accepted.
+
+**Cancel and restore bill, as legacy does:**
+- **Cancel** voids the booking's live invoice. A charge (`charge_type` `full` or `partial`) becomes an
+  invoice of its own:
+  - `kind: "fee"`, `fee_type: "cancellation"`, one line `Cancellation fee · <reason>`;
+  - no VAT, due now, whole baht;
+  - only when the booking's agent is in the catalogue.
+- **Restore** voids that fee invoice.
+- **A reschedule fee** collected on the invoice is a fee item on the booking. It is billed by the
+  booking's next invoice.
+
+**The agent's credit** (legacy `agCreditState`):
+- **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`.
+- **`used`** counts an `invoice` agent's bookings that are:
+  - not cancelled, rejected, a quote or a draft;
+  - not yet paid.
+
+  Each counts at its price plus its fee items. Other pay types use 0.
+- **Over the limit** is a warning only, as in legacy.
+
+**Import.** `import-legacy.ts` mirrors `sb_invoices` and `sb_payments` with their slips:
+- **Ids:** prefixed like the bookings (`lg_…`), and replaced on every run.
+- **Payments made here on an imported invoice** are replaced with it, because legacy stays master for
+  money until Money moves.
+- **Lines:** legacy kept none for a booking invoice, so its single line is rebuilt with the amount
+  legacy froze.
+- **Duplicate number:** `INV-2609-0003` imports its second invoice as `INV-2609-0003-2`.
+- **Status:** worked out here. The run prints where that differs from what legacy stored.
+- **Slips:** run `npm run import:attachments` first, or they are dropped.
+- **Rehearsal of 2026-10-09:**
+  - 467 invoices, ฿3,332,728;
+  - 385 payments, ฿2,788,328;
+  - 378 of 379 slips linked;
+  - one status corrected, from legacy's `issued` to `paid`.
+
 ### Upgrades
 
 **On-tour sales.** An upsell sold to the customer on the day ("Longtail · Join → เหมา (Charter)"):
@@ -1959,7 +2117,9 @@ the last number it saw and refetches only the records named.
     reconfirm, upgrades, its document check;
   - `seat_lock`;
   - `deployment`, with `entity_id` `<date>:<boat>`;
-  - `route`: its calendar.
+  - `route`: its calendar;
+  - `invoice`: issued, changed, voided, or a payment recorded or corrected. Its bookings are in the
+    feed as well, since their `invoice` and `payment_state` changed.
 
   `action` is `created`, `updated` or `deleted`.
 - **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking

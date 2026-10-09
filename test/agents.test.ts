@@ -127,7 +127,12 @@ test('both stores answer every agent read identically', { skip: !url && 'Postgre
     });
     assert.deepEqual(mine((await get(`/v1/agents${query}`)).agents), expected, `GET /v1/agents${query}`);
   }
-  for (const agent of agents) assert.deepEqual(await get(`/v1/agents/${agent.id}`), memory.agent(agent.id), `detail of ${agent.id}`);
+  for (const agent of agents) {
+    // `credit` is worked out from the agent's bookings (invoices.test.ts covers it); the rest is the store's.
+    const { credit, ...detail } = await get(`/v1/agents/${agent.id}`);
+    assert.deepEqual(detail, memory.agent(agent.id), `detail of ${agent.id}`);
+    assert.equal(typeof credit.used, 'number');
+  }
   assert.deepEqual((await get('/v1/agents/tag_a1/activity')).activity, memory.agentActivity('tag_a1', 50));
   assert.deepEqual((await get('/v1/agents/tag_a2/activity')).activity, [], 'no activity is an empty log');
 });

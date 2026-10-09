@@ -91,6 +91,8 @@ export function writeNeed(path: string): WriteNeed {
   if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
   if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
+  // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
+  if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
   return { kind: 'admin' };
 }
 

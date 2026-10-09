@@ -12,6 +12,7 @@ import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import type { Change, ChangeInput } from './changes.js';
 import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
+import { bookingIdsOf, bookingInvoice, copyInvoice, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment } from './invoices.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
@@ -183,6 +184,9 @@ export type Booking = BookingHeader & {
   allocated_pax: number;
   /** Did the customer confirm their pickup, and was the agent's list sent (`reconfirm.ts`). */
   reconfirm: Reconfirm | null;
+  /** The booking's live invoice and what is paid on it (`invoices.ts`). Computed. */
+  invoice: BookingInvoice | null;
+  payment_state: PaymentState;
 };
 
 /**
@@ -259,7 +263,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
 export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
-export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'doc_check' | 'doc_check_status'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'doc_check' | 'doc_check_status' | 'invoice' | 'payment_state'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
 
 /**
  * The wire shape of a stored booking.
@@ -280,7 +284,7 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 
 /** `dispatch` gives each trip's dispatch as a read shows it; without it, every trip's is empty. */
 export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch, reconfirm: StoredReconfirm | null = null,
-  files: ReadonlyMap<string, AttachmentRef> = new Map(), docCheck: DocCheck | null = null): Booking {
+  files: ReadonlyMap<string, AttachmentRef> = new Map(), docCheck: DocCheck | null = null, invoices: readonly InvoiceBrief[] = []): Booking {
   const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
     ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
     ...ovnOfIndex(stored.trips, ovn_of), operations: dispatch({ ovn_of, ...trip }),
@@ -295,7 +299,7 @@ export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) 
     doc_check: docCheckView(docCheck), doc_check_status: docCheckStatus(docCheck, (stored.attachments ?? []).length),
     allergy_list: (stored.allergy_list ?? []).map((a) => ({ ...a })), allergy_count: allergyCount(stored.allergy_list ?? [], stored.special_meals_allergies),
     attachments: (stored.attachments ?? []).map((d) => ({ ...(files.get(d.attachment_id) ?? { id: d.attachment_id, name: d.attachment_id, mime: 'application/octet-stream', size: 0 }), kind: d.kind, by: d.by, at: d.at })), route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
-    allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm),
+    allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm), ...bookingInvoice(invoices),
   };
 }
 
@@ -585,7 +589,8 @@ export class OperationsStore {
   private view(stored: StoredBooking): Booking {
     return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
       vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups), checkinsView(this.checkins.get(trip.id) ?? []),
-      activeUpgrade(this.tripUpgrades.filter((u) => u.booking_trip_id === trip.id))), this.reconfirms.get(stored.id) ?? null, this.fileRefs(), this.docChecks.get(stored.id) ?? null);
+      activeUpgrade(this.tripUpgrades.filter((u) => u.booking_trip_id === trip.id))), this.reconfirms.get(stored.id) ?? null, this.fileRefs(), this.docChecks.get(stored.id) ?? null,
+      this.invoiceBriefs(stored.id));
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
@@ -662,7 +667,40 @@ export class OperationsStore {
   attachmentRefs(ids: readonly string[]): Map<string, AttachmentRef> { const all = this.fileRefs(); return new Map(ids.filter((id) => all.has(id)).map((id) => [id, all.get(id)!])); }
   /** The bookings that point at a file, by their documents or their upgrade slips. */
   attachmentBookings(id: string): Booking[] {
-    return [...this.bookings.values()].filter((b) => b.attachments.some((d) => d.attachment_id === id) || b.upgrades.some((u) => u.slips.includes(id))).map((b) => this.view(b));
+    const slipped = new Set([...this.payments.values()].filter((p) => p.slips.includes(id)).flatMap((p) => bookingIdsOf(this.invoices.get(p.invoice_id) ?? { lines: [] })));
+    return [...this.bookings.values()].filter((b) => b.attachments.some((d) => d.attachment_id === id) || b.upgrades.some((u) => u.slips.includes(id)) || slipped.has(b.id)).map((b) => this.view(b));
+  }
+
+  // ── Invoices and payments (migration 045) ──
+  private invoices = new Map<string, StoredInvoice>();
+  private payments = new Map<string, StoredPayment>();
+  private invoiceCounters = new Map<string, number>();
+  private invoiceBriefs(bookingId: string): InvoiceBrief[] {
+    return [...this.invoices.values()].filter((i) => i.lines.some((l) => l.booking_id === bookingId)).map((i) => ({
+      id: i.id, number: i.number, kind: i.kind, fee_type: i.fee_type, total: i.total, issued_at: i.issued_at, voided: i.voided,
+      paid: [...this.payments.values()].filter((p) => p.invoice_id === i.id && !p.deleted_at).map((p) => p.amount),
+    }));
+  }
+  /** The next number of the month: one past the counter, or past the highest number already issued (an import). */
+  nextInvoiceNumber(month: string): number {
+    const issued = [...this.invoices.values()].map((i) => new RegExp(`^INV-${month}-(\\d+)`).exec(i.number)).map((m) => (m ? Number(m[1]) : 0));
+    const next = Math.max(this.invoiceCounters.get(month) ?? 0, ...issued) + 1;
+    this.invoiceCounters.set(month, next);
+    return next;
+  }
+  putInvoice(invoice: StoredInvoice): void { this.invoices.set(invoice.id, copyInvoice(invoice)); }
+  invoice(id: string): StoredInvoice | undefined { const i = this.invoices.get(id); return i && copyInvoice(i); }
+  /** Oldest first. */
+  listInvoices(q: { agentId?: string; bookingId?: string } = {}): StoredInvoice[] {
+    return [...this.invoices.values()].filter((i) => (!q.agentId || i.agent_id === q.agentId) && (!q.bookingId || i.lines.some((l) => l.booking_id === q.bookingId)))
+      .sort((a, b) => (a.issued_at === b.issued_at ? (a.id < b.id ? -1 : 1) : a.issued_at < b.issued_at ? -1 : 1)).map(copyInvoice);
+  }
+  invoicesOfBookings(ids: readonly string[]): StoredInvoice[] { return this.listInvoices().filter((i) => i.lines.some((l) => l.booking_id && ids.includes(l.booking_id))); }
+  putPayment(payment: StoredPayment): void { this.payments.set(payment.id, { ...payment, slips: [...payment.slips] }); }
+  /** Deleted ones too, oldest first. */
+  paymentsOf(invoiceIds: readonly string[]): StoredPayment[] {
+    return [...this.payments.values()].filter((p) => invoiceIds.includes(p.invoice_id))
+      .sort((a, b) => (a.recorded_at === b.recorded_at ? (a.id < b.id ? -1 : 1) : a.recorded_at < b.recorded_at ? -1 : 1)).map((p) => ({ ...p, slips: [...p.slips] }));
   }
   deleteAttachment(id: string): boolean { return this.files.delete(id); }
 

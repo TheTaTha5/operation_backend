@@ -5,10 +5,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 ## Deploy what is on `main`
 
 1. **Push `main`** again: deploying applies migrations 039–044 (add-on checks, attachments,
-   allergies, document check, pickup areas, the change feed).
+   allergies, document check, pickup areas, the change feed). Once `feat/invoices` is merged, 045
+   (invoices and payments) comes with it.
 1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
-   the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas.
+   the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas,
+   and (with 045) the invoices and payments with their slips.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -51,6 +53,13 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`): the
     server now prices every non-B2C booking on save and replaces a sent price (`price_warnings`). Its
     "use today's rate" button sends `rate: "agent"`; it sends `ovnCharge` and the charter price fields.
+  - accounting (once 045 is deployed): the Accounting screen and Daily PFM payments read and write
+    `/v1/invoices` (issue, `PATCH` header and WHT, `PUT …/discounts`, `/void`, `/payments`,
+    `/payment-corrections`) and `GET /v1/payments`. A booking's `invoice` and `payment_state` replace
+    its `invoiceId` and `paymentStatus`; the agent's credit is `GET /v1/agents/{id}` → `credit`.
+    Cancel and restore now issue and void the fee invoice on the server: stop calling
+    `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
+    legacy's "Save anyway?" and resend with `overpay_anyway: true`.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
   amend and cancel.

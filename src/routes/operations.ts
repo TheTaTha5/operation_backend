@@ -45,6 +45,11 @@ import {
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
+import {
+  assertPaymentEcho, bangkokDay, bookingIdsOf, correctPayments, creditOf, feeInvoice, invoiceLines, invoiceMonth, invoiceNumber, invoiceView, issuedLine, issueInvoice,
+  parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, voided, voidedLine, withDiscounts,
+  type PaymentMethod, type StoredInvoice,
+} from '../domain/invoices.js';
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
@@ -693,6 +698,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
       assertReconfirmEcho(body.reconfirm, stored.reconfirm);
       assertDocCheckEcho(body.doc_check, stored.doc_check);
+      assertPaymentEcho(body, stored);
       await fillPickups(changes.header?.pickup_area_id === undefined ? stored.pickup_area_id : changes.header.pickup_area_id ?? undefined,
         changes.header?.dropoff_area_id ?? undefined, changes.trips, changes.header?.pickup_area_id !== undefined);
       let header = changes.header;
@@ -742,13 +748,15 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const cancel = parseCancelRequest(withoutVersion(request.body));
     return store.transaction(async () => {
       await assertBookingFresh(request);
-      return (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found');
+      const done = (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found');
+      return (await invoicesOnCancel(done, actorOf(request.user) ?? null)) ? (await store.booking(done.id))! : done;
     });
   });
   app.post('/v1/bookings/:id/restore', async (request) => {
     const restored = await store.transaction(async () => {
       await assertBookingFresh(request);
-      return (await store.restoreBooking(bookingId(request), actorOf(request.user))) ?? notFound('Booking not found');
+      const done = (await store.restoreBooking(bookingId(request), actorOf(request.user))) ?? notFound('Booking not found');
+      return (await invoicesOnRestore(done.booking, actorOf(request.user) ?? null)) ? { ...done, booking: (await store.booking(done.booking.id))! } : done;
     });
     return { ...restored.booking, warnings: restored.warnings };
   });
@@ -930,6 +938,161 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       await store.stampPierMeals(done.id, new Date().toISOString(), actor ?? null);
       return (await store.booking(done.id))!;
     });
+  });
+
+  // ── Invoices and payments (todo/money-model.md slice 1; `invoices.ts`) ──
+  const invoiceNotFound = (id: string): never => notFound(`Invoice ${id} not found`);
+  /** An invoice with its payments and their slips, as every invoice endpoint answers it. */
+  const fullInvoices = async (invoices: readonly StoredInvoice[]) => {
+    const payments = await store.paymentsOf(invoices.map((i) => i.id));
+    const slips = payments.flatMap((p) => p.slips);
+    const files = slips.length ? await store.attachmentRefs(slips) : new Map();
+    return invoices.map((i) => invoiceView(i, payments.filter((p) => p.invoice_id === i.id), files));
+  };
+  const fullInvoice = async (invoice: StoredInvoice) => (await fullInvoices([invoice]))[0];
+  /** A login tied to one agent sees that agent's invoices only; another's is not found. */
+  const ownInvoice = async (request: { params: unknown; user?: { user?: StoredUser } }): Promise<StoredInvoice> => {
+    const id = (request.params as { id: string }).id;
+    const invoice = (await store.invoice(id)) ?? invoiceNotFound(id);
+    const agent = request.user?.user?.agent_id;
+    return agent && invoice.agent_id !== agent ? invoiceNotFound(id) : invoice;
+  };
+  const nextNumber = async (now: Date): Promise<string> => { const month = invoiceMonth(now); return invoiceNumber(month, await store.nextInvoiceNumber(month)); };
+  const newInvoiceId = (): string => `inv_${randomUUID()}`;
+  const historyOn = async (invoice: StoredInvoice, line: HistoryLine): Promise<void> => { for (const id of bookingIdsOf(invoice)) await store.addHistory(id, line); };
+
+  /**
+   * Cancel's accounting step (legacy `bkV2CancelBooking`): the booking's live invoice is voided, and a
+   * charge becomes a fee invoice of its own. True when it wrote anything.
+   */
+  async function invoicesOnCancel(booking: Booking, by: string | null): Promise<boolean> {
+    const now = new Date();
+    let wrote = false;
+    for (const inv of await store.invoicesOfBookings([booking.id])) {
+      if (inv.voided) continue;
+      await store.putInvoice(voided(inv, 'cancelled', now.toISOString(), by));
+      wrote = true;
+    }
+    // Legacy bills any agent the booking names; here the agent must be in the catalogue to be invoiced.
+    const charge = booking.cancellation?.charge_amount ?? 0;
+    if (charge > 0 && booking.agent_id && await store.agent(booking.agent_id)) {
+      const label = `Cancellation fee${booking.cancellation_reason ? ` · ${booking.cancellation_reason}` : ''}`;
+      const fee = feeInvoice({ id: newInvoiceId(), number: await nextNumber(now), agent_id: booking.agent_id, booking_id: booking.id, fee_type: 'cancellation', label, amount: charge, now: now.toISOString(), by });
+      if (fee) { await store.putInvoice(fee); wrote = true; }
+    }
+    return wrote;
+  }
+  /** Restore voids the cancellation's fee invoice (legacy `bkV2RestoreBooking`). */
+  async function invoicesOnRestore(booking: Booking, by: string | null): Promise<boolean> {
+    let wrote = false;
+    for (const inv of await store.invoicesOfBookings([booking.id])) {
+      if (inv.voided || inv.fee_type !== 'cancellation') continue;
+      await store.putInvoice(voided(inv, 'restored', new Date().toISOString(), by));
+      wrote = true;
+    }
+    return wrote;
+  }
+
+  app.get('/v1/invoices', async (request) => {
+    const q = parseInvoiceListQuery(request.query as Record<string, unknown>);
+    const agent = request.user?.user?.agent_id;
+    const views = await fullInvoices(await store.listInvoices({ agentId: agent ?? q.agent_id, bookingId: q.booking_id }));
+    return { invoices: views.filter((v) => (!q.status || q.status.includes(v.status)) && (!q.from || bangkokDay(v.issued_at) >= q.from) && (!q.to || bangkokDay(v.issued_at) <= q.to)) };
+  });
+  app.get('/v1/invoices/:id', async (request) => fullInvoice(await ownInvoice(request)));
+  /** Issue (legacy `acctCreateInvoice`): the server works out the lines, VAT, number and due date. */
+  app.post('/v1/invoices', async (request, reply) => {
+    const input = parseNewInvoice(record(request.body));
+    const by = actorOf(request.user) ?? null;
+    const issued = await store.transaction(async () => {
+      const agent = (await store.agent(input.agent_id)) ?? badRequest(`agent_id ${input.agent_id} is not an agent (GET /v1/agents)`);
+      const bookings: Booking[] = [];
+      for (const id of input.booking_ids) bookings.push((await store.booking(id)) ?? badRequest(`Booking ${id} not found`));
+      const routes = new Map((await store.listRoutes()).map((r) => [r.id, r.name]));
+      const now = new Date();
+      const invoice = issueInvoice({ id: newInvoiceId(), number: await nextNumber(now), request: input, agent, lines: invoiceLines(agent.id, bookings, (id) => routes.get(id)), now: now.toISOString(), by });
+      await store.putInvoice(invoice);
+      await historyOn(invoice, issuedLine(by, invoice));
+      return invoice;
+    });
+    return reply.code(201).send(await fullInvoice(issued));
+  });
+  /** The document's header text and withholding tax; everything the server works out is refused. */
+  app.patch('/v1/invoices/:id', async (request) => {
+    const body = record(request.body);
+    return store.transaction(async () => {
+      const invoice = await ownInvoice(request);
+      await store.putInvoice({ ...invoice, ...parseInvoicePatch(body, await fullInvoice(invoice)) });
+      return fullInvoice((await store.invoice(invoice.id))!);
+    });
+  });
+  app.put('/v1/invoices/:id/discounts', async (request) => {
+    const body = record(request.body);
+    return store.transaction(async () => {
+      const invoice = await ownInvoice(request);
+      await store.putInvoice(withDiscounts(invoice, await store.paymentsOf([invoice.id]), body));
+      return fullInvoice((await store.invoice(invoice.id))!);
+    });
+  });
+  app.post('/v1/invoices/:id/void', async (request) => {
+    const { reason } = parseVoid(record(request.body ?? {}));
+    const by = actorOf(request.user) ?? null;
+    return store.transaction(async () => {
+      const invoice = voided(await ownInvoice(request), reason, new Date().toISOString(), by);
+      await store.putInvoice(invoice);
+      await historyOn(invoice, voidedLine(by, invoice, reason));
+      return fullInvoice(invoice);
+    });
+  });
+  /** Record a payment (legacy `acctRecordPayment`). Answers the invoice. */
+  app.post('/v1/invoices/:id/payments', async (request, reply) => {
+    const body = record(request.body);
+    const by = actorOf(request.user) ?? null;
+    const invoice = await store.transaction(async () => {
+      const current = await ownInvoice(request);
+      const now = new Date();
+      const input = parsePayment(body, now);
+      if (input.slips.length) assertKnownFiles(input.slips, new Set((await store.attachmentRefs(input.slips)).keys()), 'slip_ids');
+      const { payment, history } = recordPayment(current, await store.paymentsOf([current.id]), input, `pay_${randomUUID()}`, now.toISOString(), by);
+      await store.putPayment(payment);
+      await historyOn(current, history);
+      return current;
+    });
+    return reply.code(201).send(await fullInvoice(invoice));
+  });
+  /** Change or delete payments, several at once with one reason (legacy `pfmEditSubmit`). Answers the invoice. */
+  app.post('/v1/invoices/:id/payment-corrections', async (request) => {
+    const body = record(request.body);
+    const by = actorOf(request.user) ?? null;
+    return store.transaction(async () => {
+      const invoice = await ownInvoice(request);
+      const { changed, history } = correctPayments(invoice, await store.paymentsOf([invoice.id]), body, new Date().toISOString(), by);
+      for (const p of changed) await store.putPayment(p);
+      if (history) await historyOn(invoice, history);
+      return fullInvoice(invoice);
+    });
+  });
+  /** Payments across invoices, newest last; deleted ones only with `deleted=true`. */
+  app.get('/v1/payments', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : undefined);
+    const day = (v: unknown, name: string) => { const s = str(v); return s === undefined ? undefined : calendarDate(s, name); };
+    const from = day(query.from, 'from'), to = day(query.to, 'to');
+    const method = str(query.method);
+    if (method !== undefined && !(PAYMENT_METHODS as readonly string[]).includes(method)) badRequest(`method must be one of ${PAYMENT_METHODS.join(', ')}`);
+    const deleted = query.deleted === 'true';
+    const agent = request.user?.user?.agent_id;
+    const invoices = new Map((await store.listInvoices({ agentId: agent ?? str(query.agent_id) })).map((i) => [i.id, i]));
+    const payments = await store.paymentsOf([...invoices.keys()]);
+    const slips = payments.flatMap((p) => p.slips);
+    const files = slips.length ? await store.attachmentRefs(slips) : new Map();
+    return {
+      payments: payments.filter((p) => (deleted || !p.deleted_at) && (!from || p.paid_on >= from) && (!to || p.paid_on <= to) && (!method || p.method === method as PaymentMethod))
+        .map((p) => {
+          const inv = invoices.get(p.invoice_id)!;
+          return { ...p, slips: p.slips.map((id) => files.get(id) ?? { id, name: id, mime: 'application/octet-stream', size: 0 }), invoice_number: inv.number, agent_id: inv.agent_id, booking_ids: bookingIdsOf(inv) };
+        }),
+    };
   });
 
   /**
@@ -1630,7 +1793,18 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.get('/v1/contracts/:id', async (request) => (await store.contract((request.params as { id: string }).id)) ?? notFound('Contract not found'));
   app.get('/v1/sales', async () => ({ sales: await store.listSalesPeople() }));
   app.get('/v1/agents', async (request) => ({ agents: await store.listAgents(agentListQuery(request.query as Record<string, unknown>)) }));
-  app.get('/v1/agents/:id', async (request) => (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found'));
+  /** The agent, and its credit (legacy `agCreditState`; todo/money-model.md slice 1). */
+  app.get('/v1/agents/:id', async (request) => {
+    const agent = (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found');
+    const bookings: Booking[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.listBookings({ agentId: agent.id, limit: 1000, ...(cursor ? { cursor } : {}) });
+      bookings.push(...page.bookings);
+      cursor = page.next_cursor;
+    } while (cursor);
+    return { ...agent, credit: creditOf(agent, bookings) };
+  });
   app.get('/v1/agents/:id/activity', async (request) => {
     const query = request.query as Record<string, unknown>;
     const limit = query.limit === undefined ? 50 : Number(query.limit);
