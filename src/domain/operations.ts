@@ -29,7 +29,8 @@ import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { clearedOnMove, dispatchView, EMPTY_DISPATCH, type StoredDispatch, type TripDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
-import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanPatch, type VanStatusRange, type VanStatusRangeInput } from './vans.js';
+import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
+import { copyStop, type VanStop } from './van-stops.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
 
@@ -589,7 +590,20 @@ export class OperationsStore {
   vanGroup(id: string): VanGroup | undefined { const g = this.vanGroups.get(id); return g && { ...g }; }
   storedVanParts(tripId: string): StoredVanPart[] { return (this.vanParts.get(tripId) ?? []).map((p) => ({ ...p, alt: p.alt && { ...p.alt } })); }
   writeVanGroup(group: VanGroup): void { this.vanGroups.set(group.id, { ...group }); }
-  deleteVanGroup(id: string): void { this.vanGroups.delete(id); }
+  /** Its stops stay on the day with no group, as PostgreSQL's ON DELETE SET NULL leaves them. */
+  deleteVanGroup(id: string): void {
+    this.vanGroups.delete(id);
+    for (const stop of this.vanStops.values()) if (stop.group_id === id) stop.group_id = null;
+  }
+
+  // ── Van stops (migration 034) ──
+  private vanStops = new Map<string, VanStop>();
+  vanStopsOn(date: string, routeId?: string): VanStop[] {
+    return [...this.vanStops.values()].filter((x) => x.service_date === date && (routeId === undefined || x.route_id === routeId)).map(copyStop);
+  }
+  vanStop(id: string): VanStop | undefined { const x = this.vanStops.get(id); return x && copyStop(x); }
+  writeVanStop(stop: VanStop): void { this.vanStops.set(stop.id, copyStop(stop)); }
+  deleteVanStop(id: string): boolean { return this.vanStops.delete(id); }
   /** `[]` is no rows: one whole, ungrouped part. */
   setVanParts(tripId: string, parts: readonly StoredVanPart[]): void {
     if (parts.length) this.vanParts.set(tripId, parts.map((p) => ({ ...p, alt: p.alt && { ...p.alt } }))); else this.vanParts.delete(tripId);
@@ -602,8 +616,43 @@ export class OperationsStore {
     this.setDispatch(tripId, d);
   }
 
-  // ── Vans and the month matrix (migration 016, slice A3) ──
+  // ── Vans and the month matrix (migration 016, slice A3; 034) ──
   private vans = new Map<string, Van>();
+  private vanZones: VanZoneRange[] = [];
+  private vanZoneSeq = 0;
+  private vanLogs = new Map<string, VanLogEntry[]>();
+
+  /** A van no group uses (outbound, return, or a part's return van) and with no day in the matrix. */
+  vanInUse(id: string): boolean {
+    return [...this.vanGroups.values()].some((g) => g.van_id === id || g.return_van_id === id)
+      || [...this.vanParts.values()].some((parts) => parts.some((p) => p.return_van_id === id))
+      || [...this.vanDayRows.values()].some((d) => d.van_id === id);
+  }
+  /** Its log, status ranges and zone ranges go with it. */
+  deleteVan(id: string): boolean {
+    if (!this.vans.delete(id)) return false;
+    this.vanLogs.delete(id);
+    this.vanRanges = this.vanRanges.filter((r) => r.van_id !== id);
+    this.vanZones = this.vanZones.filter((r) => r.van_id !== id);
+    return true;
+  }
+  vanZoneRanges(vanId?: string): VanZoneRange[] {
+    return this.vanZones.filter((r) => vanId === undefined || r.van_id === vanId).sort((a, b) => (a.van_id < b.van_id ? -1 : a.van_id > b.van_id ? 1 : a.id - b.id)).map((r) => ({ ...r }));
+  }
+  addZoneRange(vanId: string, input: VanZoneRangeInput): VanZoneRange {
+    const range = { id: ++this.vanZoneSeq, van_id: vanId, ...input };
+    this.vanZones.push(range);
+    return { ...range };
+  }
+  putZoneRange(range: VanZoneRange): void { this.vanZones = this.vanZones.map((r) => (r.id === range.id ? { ...range } : r)); }
+  deleteZoneRange(vanId: string, id: number): boolean {
+    const before = this.vanZones.length;
+    this.vanZones = this.vanZones.filter((r) => !(r.van_id === vanId && r.id === id));
+    return this.vanZones.length < before;
+  }
+  addVanLog(vanId: string, entries: readonly VanLogEntry[]): void { this.vanLogs.set(vanId, [...(this.vanLogs.get(vanId) ?? []), ...entries.map((e) => ({ ...e }))]); }
+  /** Newest first. */
+  vanLog(vanId: string, limit: number): VanLogEntry[] { return [...(this.vanLogs.get(vanId) ?? [])].reverse().slice(0, limit).map((e) => ({ ...e })); }
   private vanRanges: VanStatusRange[] = [];
   private vanRangeSeq = 0;
   private vanDayRows = new Map<string, StoredVanDay>();

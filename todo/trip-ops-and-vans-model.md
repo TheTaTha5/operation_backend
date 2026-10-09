@@ -394,20 +394,12 @@ The questions as they were asked:
    change on import.
 7. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
    stored.
-8. **Van fields legacy keeps that 016 cannot hold** (legacy, 2026-10-09):
-   - `ownership: "rented"` (เช่า), a third choice on legacy's form; 2 vans. 016's CHECK allows own/partner only, so the import reads them as own and the API refuses it.
-   - `note` on the van, 3 vans ("Khao Lak base", "รถร่วม").
-   - The van's change log (`sb_vehicles__log`, 1,967 lines: zone 1,379, status 379, edit 126, driver 47, created 36), shown on the Vans page.
-   - `dayZone`, a per-day zone override that feeds the return-van pool; 1 cell. `costperday` is never set.
-   - Legacy also deletes a van; here it is `active: false`.
-9. **Van stops** (legacy `VAN_STOPS`, `vsSeatsOfVan`, from late September): guides or staff picked up
-   by a van, outside any booking. They take seats, and legacy counts them in a group's pax for the
-   capacity check. They have no home here, so a group's `pax` and the `van_over_capacity` check
-   leave them out. Needs a design (and a count of legacy rows) before they can be added.
-10. **Overnight legs on the van board (R16).** Legacy skips an overnight return leg in its
+8. **Rented vans print as company vans on legacy's job order** (its owner tag checks `rental`/`charter`,
+   not `rented`). A legacy display bug, noted only: the van fields and van stops are built here.
+9. **Overnight legs on the van board (R16).** Legacy skips an overnight return leg in its
     second-round check and shows "no pickup leg" for it. Here a return-leg trip can be grouped like
     any other.
-11. **The day's board.** `GET /operations/van-groups` needs a `route_id`; the hand-off's computed
+10. **The day's board.** `GET /operations/van-groups` needs a `route_id`; the hand-off's computed
     `GET /operations/van-board` (pools, rounds, return alerts, warnings across routes) is a later
     phase for the Vue port.
 

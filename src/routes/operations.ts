@@ -23,12 +23,14 @@ import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import {
-  addMembers, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
+  addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
   vanDayState, visibleGroups, type VanGroup, type VanPlan,
 } from '../domain/van-groups.js';
 import {
-  applyVanDayPatch, emptyVanDay, parseNewVan, parseStatusRange, parseVanDayPatch, parseVanDayRange, parseVanPatch, patchStatusRange, vanMatrix, vanStatusOn, usableOn,
+  applyVanDayPatch, createdLine, emptyVanDay, parseLogLimit, parseNewVan, parseStatusRange, parseVanDayPatch, parseVanDayRange, parseVanPatch, parseZoneRange,
+  patchStatusRange, patchZoneRange, statusRangeLines, vanDayLines, vanEditLines, vanMatrix, zoneRangeDeletedLine, zoneRangeLines, type VanLogLine,
 } from '../domain/vans.js';
+import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
@@ -838,7 +840,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       let warnings: string[] = [];
       if (vanParts) {
         const day = await vanDayOf(found.trip.service_date, found.trip.route_id);
-        const result = setTripParts(day.state, tripId, vanParts, next.return_same_van, day.vans, day.routePiers);
+        const result = setTripParts(day.state, tripId, vanParts, next.return_same_van, day.vans);
         await applyVanPlan(result.plan);
         warnings = result.warnings;
       } else if (patch.return_same_van === true) {
@@ -857,10 +859,11 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    */
   async function vanDayOf(date: string, routeId: string) {
     await store.lockVanDay(date, routeId);
-    const state = vanDayState(await store.bookingsOn(date, routeId), await store.vanGroupsOn(date, routeId), date, routeId);
-    const [vans, ranges, days, routes] = [await store.listVans(), await store.vanStatusRanges(), await store.vanDays(date, date), await store.listRoutes()];
-    const onDay = vanMatrix(vans, ranges, days, [date]).map((d) => ({ van: vans.find((v) => v.id === d.van_id)!, usable: d.usable, route_ids: d.route_ids }));
-    return { state, vans: onDay, catalogue: vans, routePiers: new Map(routes.map((r) => [r.id, r.pier])) };
+    const state = await vanDayNow(date, routeId);
+    const vans = await store.listVans();
+    const onDay = vanMatrix(vans, await store.vanDays(date, date), [date], await matrixContext())
+      .map((d) => ({ van: vans.find((v) => v.id === d.van_id)!, usable: d.usable, route_ids: d.route_ids, zone: d.zone_on }));
+    return { state, vans: onDay, catalogue: vans };
   }
   async function applyVanPlan(plan: VanPlan): Promise<void> {
     for (const group of plan.groups) await store.writeVanGroup(group);
@@ -869,7 +872,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     for (const id of plan.deleteGroups) await store.deleteVanGroup(id);
   }
   /** One route's day as it reads now. */
-  const vanDayNow = async (date: string, routeId: string) => vanDayState(await store.bookingsOn(date, routeId), await store.vanGroupsOn(date, routeId), date, routeId);
+  const vanDayNow = async (date: string, routeId: string) =>
+    vanDayState(await store.bookingsOn(date, routeId), await store.vanGroupsOn(date, routeId), await store.vanStopsOn(date, routeId), date, routeId);
   /** The group as it reads after a write. */
   async function groupNow(group: VanGroup) {
     const state = await vanDayNow(group.service_date, group.route_id);
@@ -918,7 +922,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const body = record(request.body);
     return onGroup(request, async (day, group) => {
       const plan: VanPlan = { groups: [], deleteGroups: [], parts: new Map(), dispatch: new Map() };
-      setGroup(day.state, group.id, body, day.vans, day.routePiers, plan);
+      setGroup(day.state, group.id, body, day.vans, plan);
       await applyVanPlan(plan);
       return groupNow(group);
     });
@@ -933,67 +937,227 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   });
 
   /**
-   * The van fleet and its month matrix (todo/trip-ops-and-vans-model.md, slice A3), legacy's Vans
-   * page. Every field is the client's; the server checks shapes and works out each day's status.
-   * There is no delete: a retired van is `active: false`.
+   * The van fleet and its month matrix (todo/trip-ops-and-vans-model.md slice A3, and
+   * todo/van-extras-model.md), legacy's Vans page. Every field is the client's; the server works out
+   * each day's status and zone, and writes the van's log in legacy's words.
    */
   const vanId = (request: { params: unknown }): string => (request.params as { id: string }).id;
   const vanNotFound = (id: string): never => notFound(`Van ${id} not found`);
-  const rangeId = (request: { params: unknown }): number => {
+  const rangeId = (request: { params: unknown }, what: string): number => {
     const id = Number((request.params as { range_id: string }).range_id);
-    return Number.isInteger(id) && id > 0 ? id : notFound('Status range not found');
+    return Number.isInteger(id) && id > 0 ? id : notFound(`${what} not found`);
   };
+  const logVan = async (id: string, lines: readonly VanLogLine[], request: { user?: unknown }) => {
+    const at = new Date().toISOString(), by = actorOf(request.user as Parameters<typeof actorOf>[0]) ?? null;
+    if (lines.length) await store.addVanLog(id, lines.map((line) => ({ ...line, at, by })));
+  };
+  const matrixContext = async () => ({
+    statusRanges: await store.vanStatusRanges(), zoneRanges: await store.vanZoneRanges(),
+    routePiers: new Map((await store.listRoutes()).map((route) => [route.id, route.pier])),
+  });
+  const existingVan = async (request: { params: unknown }) => (await store.van(vanId(request))) ?? vanNotFound(vanId(request));
+
   app.get('/operations/vans', async () => ({ vans: await store.listVans() }));
   app.get('/operations/vans/:id', async (request) => {
-    const van = (await store.van(vanId(request))) ?? vanNotFound(vanId(request));
-    return { ...van, status_ranges: await store.vanStatusRanges(van.id) };
+    const van = await existingVan(request);
+    return { ...van, status_ranges: await store.vanStatusRanges(van.id), zone_ranges: await store.vanZoneRanges(van.id) };
   });
-  app.post('/operations/vans', async (request, reply) => reply.code(201).send(await store.transaction(() => store.createVan(parseNewVan(record(request.body))))));
+  app.get('/operations/vans/:id/log', async (request) => {
+    const limit = parseLogLimit(request.query as Record<string, unknown>);
+    return { log: await store.vanLog((await existingVan(request)).id, limit) };
+  });
+  app.post('/operations/vans', async (request, reply) => {
+    const input = parseNewVan(record(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      const van = await store.createVan(input);
+      await logVan(van.id, [createdLine], request);
+      return van;
+    }));
+  });
   app.patch('/operations/vans/:id', async (request) => {
     const patch = parseVanPatch(record(request.body));
-    return (await store.transaction(async () => store.updateVan(vanId(request), patch))) ?? vanNotFound(vanId(request));
+    return store.transaction(async () => {
+      const before = await existingVan(request);
+      const after = (await store.updateVan(before.id, patch))!;
+      await logVan(after.id, vanEditLines(before, after), request);
+      return after;
+    });
   });
+  /** Legacy deletes a van outright; here only one nothing uses (decided 2026-10-09). */
+  app.delete('/operations/vans/:id', async (request, reply) => {
+    await store.transaction(async () => {
+      const van = await existingVan(request);
+      if (await store.vanInUse(van.id)) {
+        refuseWith(`${van.name} is used by van groups or the month matrix: set it inactive instead`, 409, 'van_in_use');
+      }
+      await store.deleteVan(van.id);
+    });
+    return reply.code(204).send();
+  });
+
   app.post('/operations/vans/:id/status-ranges', async (request, reply) => {
     const input = parseStatusRange(record(request.body));
     return reply.code(201).send(await store.transaction(async () => {
-      if (!(await store.van(vanId(request)))) vanNotFound(vanId(request));
-      return store.addStatusRange(vanId(request), input);
+      const van = await existingVan(request);
+      const range = await store.addStatusRange(van.id, input);
+      await logVan(van.id, statusRangeLines(range), request);
+      return range;
     }));
   });
   app.patch('/operations/vans/:id/status-ranges/:range_id', async (request) => {
     const body = record(request.body);
     return store.transaction(async () => {
-      const range = (await store.vanStatusRanges(vanId(request))).find((r) => r.id === rangeId(request)) ?? notFound('Status range not found');
+      const range = (await store.vanStatusRanges(vanId(request))).find((r) => r.id === rangeId(request, 'Status range')) ?? notFound('Status range not found');
       const next = patchStatusRange(range, body);
       await store.putStatusRange(next);
+      await logVan(next.van_id, statusRangeLines(next), request);
       return next;
     });
   });
   app.delete('/operations/vans/:id/status-ranges/:range_id', async (request, reply) => {
-    if (!(await store.transaction(async () => store.deleteStatusRange(vanId(request), rangeId(request))))) notFound('Status range not found');
+    if (!(await store.transaction(async () => store.deleteStatusRange(vanId(request), rangeId(request, 'Status range'))))) notFound('Status range not found');
     return reply.code(204).send();
   });
+
+  app.post('/operations/vans/:id/zone-ranges', async (request, reply) => {
+    const input = parseZoneRange(record(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      const van = await existingVan(request);
+      const range = await store.addZoneRange(van.id, input);
+      await logVan(van.id, zoneRangeLines(range), request);
+      return range;
+    }));
+  });
+  app.patch('/operations/vans/:id/zone-ranges/:range_id', async (request) => {
+    const body = record(request.body);
+    return store.transaction(async () => {
+      const range = (await store.vanZoneRanges(vanId(request))).find((r) => r.id === rangeId(request, 'Zone range')) ?? notFound('Zone range not found');
+      const next = patchZoneRange(range, body);
+      await store.putZoneRange(next);
+      await logVan(next.van_id, zoneRangeLines(next), request);
+      return next;
+    });
+  });
+  app.delete('/operations/vans/:id/zone-ranges/:range_id', async (request, reply) => {
+    await store.transaction(async () => {
+      const range = (await store.vanZoneRanges(vanId(request))).find((r) => r.id === rangeId(request, 'Zone range')) ?? notFound('Zone range not found');
+      await store.deleteZoneRange(range.van_id, range.id);
+      await logVan(range.van_id, [zoneRangeDeletedLine(range)], request);
+    });
+    return reply.code(204).send();
+  });
+
   /** Every van × every date in the range, with what each day comes to, and the ranges that touch it. */
   app.get('/operations/van-days', async (request) => {
     const { from, to } = parseVanDayRange(request.query as Record<string, unknown>);
-    const [vans, ranges, days] = [await store.listVans(), await store.vanStatusRanges(), await store.vanDays(from, to)];
+    const [vans, days, ctx] = [await store.listVans(), await store.vanDays(from, to), await matrixContext()];
+    const touches = (r: { from_date: string | null; to_date: string | null }) => (r.from_date === null || r.from_date <= to) && (r.to_date === null || r.to_date >= from);
     return {
-      from, to, vans, days: vanMatrix(vans, ranges, days, [...eachDate(from, to)]),
-      status_ranges: ranges.filter((r) => r.from_date <= to && (r.to_date === null || r.to_date >= from)),
+      from, to, vans, days: vanMatrix(vans, days, [...eachDate(from, to)], ctx),
+      status_ranges: ctx.statusRanges.filter(touches), zone_ranges: ctx.zoneRanges.filter(touches),
     };
   });
   app.put('/operations/van-days/:service_date/:van_id', async (request) => {
     const { service_date: date, van_id: id } = request.params as { service_date: string; van_id: string };
     if (!isIsoDate(date)) badRequest('service_date must be YYYY-MM-DD');
-    const patch = parseVanDayPatch(record(request.body), new Set((await store.listRoutes()).map((route) => route.id)));
+    const routes = await store.listRoutes();
+    const patch = parseVanDayPatch(record(request.body), new Set(routes.map((route) => route.id)));
     return store.transaction(async () => {
       const van = (await store.van(id)) ?? vanNotFound(id);
-      const day = applyVanDayPatch((await store.vanDay(id, date)) ?? emptyVanDay(id, date), patch);
+      const before = (await store.vanDay(id, date)) ?? emptyVanDay(id, date);
+      const day = applyVanDayPatch(before, patch);
       await store.setVanDay(day);
-      const status = vanStatusOn(await store.vanStatusRanges(id), day, date);
-      return { ...day, status_on: status, usable: usableOn(van, status) };
+      await logVan(id, vanDayLines(before, day, (routeId) => routes.find((r) => r.id === routeId)?.name ?? routeId), request);
+      return vanMatrix([van], [day], [date], await matrixContext())[0];
     });
   });
+
+  /**
+   * Van stops (todo/van-extras-model.md): a guide riding along, or something to pick up, on a
+   * group's van. A ride-along takes seats in its group, checked like every other seat check.
+   */
+  const stopNotFound = (id: string): never => notFound(`Van stop ${id} not found`);
+  const seatsAnyway = (body: Record<string, unknown>): boolean => {
+    if (body.seats_anyway !== undefined && typeof body.seats_anyway !== 'boolean') badRequest('seats_anyway must be true or false');
+    return body.seats_anyway === true;
+  };
+  /** The group a stop rides: it must exist and have a van (legacy's button needs one: "เลือกรถก่อน"). */
+  const stopGroup = async (groupId: unknown): Promise<VanGroup> => {
+    if (typeof groupId !== 'string' || !groupId) badRequest("group_id is required: a stop rides a group's van");
+    const group = (await store.vanGroup(groupId as string)) ?? badRequest(`Van group ${groupId} not found`);
+    if (!group!.van_id) refuseWith(`Group ${group!.number} has no van yet: choose its van first, a stop rides the group's van`, 409, 'group_has_no_van');
+    return group!;
+  };
+  /** Adds the stop to its group's day and checks the seats, unless legacy's "Add anyway?" was answered. */
+  async function checkStopSeats(stop: VanStop, group: VanGroup, anyway: boolean): Promise<void> {
+    const day = await vanDayOf(group.service_date, group.route_id);
+    day.state.stops = [...day.state.stops.filter((x) => x.id !== stop.id), stop];
+    if (!anyway) assertCapacity(day.state, group, day.vans);
+  }
+
+  app.get('/operations/van-stops', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const date = query.service_date ?? query.date;
+    if (typeof date !== 'string' || !isIsoDate(date)) badRequest('service_date must be YYYY-MM-DD');
+    const routeId = typeof query.route_id === 'string' && query.route_id ? query.route_id : undefined;
+    return { stops: sortStops(await store.vanStopsOn(date as string, routeId)) };
+  });
+  app.post('/operations/van-stops', async (request, reply) => {
+    const body = record(request.body);
+    const fields = parseStopFields(body);
+    const anyway = seatsAnyway(body);
+    return reply.code(201).send(await store.transaction(async () => {
+      const group = await stopGroup(body.group_id);
+      const stop: VanStop = {
+        id: `vs_${randomUUID()}`, service_date: group.service_date, route_id: group.route_id, group_id: group.id, ...fields,
+        checked_in: null, created_at: new Date().toISOString(), created_by: actorOf(request.user) ?? null, updated_at: null, updated_by: null,
+      };
+      if (outboundSeats(stop) > 0) await checkStopSeats(stop, group, anyway);
+      await store.writeVanStop(stop);
+      return stop;
+    }));
+  });
+  app.patch('/operations/van-stops/:id', async (request) => {
+    const id = (request.params as { id: string }).id;
+    const body = record(request.body);
+    const anyway = seatsAnyway(body);
+    return store.transaction(async () => {
+      const current = (await store.vanStop(id)) ?? stopNotFound(id);
+      const fields = parseStopFields(body, current);
+      const group = body.group_id !== undefined ? await stopGroup(body.group_id) : current.group_id ? await store.vanGroup(current.group_id) : undefined;
+      const next: VanStop = {
+        ...current, ...fields, ...(group ? { group_id: group.id, service_date: group.service_date, route_id: group.route_id } : {}),
+        updated_at: new Date().toISOString(), updated_by: actorOf(request.user) ?? null,
+      };
+      // Seats are checked when the stop takes more of its group's than before: a new group, more people, the outbound leg.
+      const before = group && current.group_id === group.id ? outboundSeats(current) : 0;
+      if (group && outboundSeats(next) > before) await checkStopSeats(next, group, anyway);
+      await store.writeVanStop(next);
+      return next;
+    });
+  });
+  app.delete('/operations/van-stops/:id', async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    if (!(await store.transaction(async () => store.deleteVanStop(id)))) stopNotFound(id);
+    return reply.code(204).send();
+  });
+  /** Legacy `vsCheck`: checked in now, by the login, with the seats it takes; `DELETE` undoes it. */
+  for (const method of ['PUT', 'DELETE'] as const) {
+    app.route({
+      method, url: '/operations/van-stops/:id/check-in', handler: async (request) => {
+        const id = (request.params as { id: string }).id;
+        return store.transaction(async () => {
+          const stop = (await store.vanStop(id)) ?? stopNotFound(id);
+          const next: VanStop = {
+            ...stop,
+            checked_in: method === 'PUT' ? { at: new Date().toISOString(), by: actorOf(request.user) ?? null, seats: stop.kind === 'staff' ? stop.pax : 0 } : null,
+          };
+          await store.writeVanStop(next);
+          return next;
+        });
+      },
+    });
+  }
 
   /** Agents' contracts, read-only (todo/contracts-model.md); any login may read them. */
   app.get('/v1/contracts', async (request) => ({ contracts: await store.listContracts(parseContractListQuery(request.query as Record<string, unknown>)) }));

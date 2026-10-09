@@ -175,6 +175,7 @@ async function main() {
     const vanDayStatus = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__daystatus');
     const vanRanges = await read('SELECT * FROM sb_vehicles__statusranges ORDER BY sb_vehicles_id, idx');
     const vanDrivers = await read('SELECT key, driver, phone, plate FROM vanjob_driver');
+    const vanLogRows = await read('SELECT sb_vehicles_id, idx, at, kind, text FROM sb_vehicles__log ORDER BY sb_vehicles_id, idx');
     const vanSent = await read('SELECT key, value FROM vanjob_sent');
     const legacyMarkets = await read('SELECT * FROM sb_markets');
     const legacyMarketSubs = await read('SELECT sb_markets_id, idx, value FROM sb_markets__subs ORDER BY sb_markets_id, idx');
@@ -292,13 +293,13 @@ async function main() {
       const zone = str(v.zonebase);
       if (zone && zone !== 'PK' && zone !== 'KL') note(`van zone_base dropped: "${zone}"`);
       const ownership = str(v.ownership) || 'own';
-      if (ownership !== 'own' && ownership !== 'partner') note(`van ownership "${ownership}" read as own`);
+      if (!['own', 'rented', 'partner'].includes(ownership)) note(`van ownership "${ownership}" read as own`);
       if (!str(v.name)) note('vans with no name: named by id');
       vans.push({
         id, name: str(v.name) || id, plate: str(v.plate) || null, type: str(v.type) || null, capacity,
-        ownership: ownership === 'partner' ? 'partner' : 'own', partner_name: str(v.partnername) || null,
+        ownership: ['rented', 'partner'].includes(ownership) ? ownership : 'own', partner_name: ownership === 'own' ? null : str(v.partnername) || null,
         zone_base: zone === 'PK' || zone === 'KL' ? zone : null, color: str(v.color) || null,
-        driver: str(v.driver) || null, driver_phone: str(v.driverphone) || null, active: v.active !== false,
+        driver: str(v.driver) || null, driver_phone: str(v.driverphone) || null, active: v.active !== false, note: str(v.note) || null,
       });
     }
     const vanIds = new Set(vans.map((v) => String(v.id)));
@@ -335,8 +336,25 @@ async function main() {
     const vanDays = new Map<string, Row>();
     const vanDay = (vanId: string, day: string): Row => {
       const key = `${vanId}|${day}`;
-      return vanDays.get(key) ?? vanDays.set(key, { van_id: vanId, service_date: day, status: null, driver: null, driver_phone: null, plate: null, sent_at: null }).get(key)!;
+      return vanDays.get(key) ?? vanDays.set(key, { van_id: vanId, service_date: day, status: null, zone: null, driver: null, driver_phone: null, plate: null, sent_at: null }).get(key)!;
     };
+    // Legacy's dayZone map became one column per date on sb_vehicles (`dayzone_2026_06_12`).
+    for (const v of legacyVans) {
+      for (const [column, value] of Object.entries(v)) {
+        const at = column.match(/^dayzone_(\d{4})_(\d{2})_(\d{2})$/);
+        if (!at || !str(value) || !vanIds.has(str(v.id))) continue;
+        if (str(value) !== 'PK' && str(value) !== 'KL') { note(`day zones dropped: "${str(value)}"`); continue; }
+        vanDay(str(v.id), `${at[1]}-${at[2]}-${at[3]}`).zone = str(value);
+      }
+    }
+    // The van's change log, in legacy's order and words. Legacy kept no name.
+    const vanLog: Row[] = [];
+    for (const l of vanLogRows) {
+      const vanId = str(l.sb_vehicles_id), at = instant(l.at), kind = str(l.kind), text = str(l.text);
+      if (!vanIds.has(vanId) || !at || !text) { note('van log lines dropped: unknown van, no time or no text'); continue; }
+      if (!['created', 'edit', 'status', 'zone', 'driver'].includes(kind)) { note(`van log kind "${kind}" read as edit`); }
+      vanLog.push({ van_id: vanId, at, kind: ['created', 'status', 'zone', 'driver'].includes(kind) ? kind : 'edit', text, by: null });
+    }
     for (const s of vanDayStatus) {
       const vanId = str(s.sb_vehicles_id), day = str(s.key), status = str(jsonValue(s.value));
       if (!vanIds.has(vanId) || !ISO_DAY.test(day) || !status) continue;
@@ -788,7 +806,7 @@ async function main() {
     if (boatDays.length === 0) throw new Error('Legacy returned no deployments (trips__boat): refusing to mirror an empty source');
     const legacyVanIds = legacyVans.map((v) => str(v.id)).filter(Boolean);
     const staleVans = (await target.query('SELECT id FROM vans WHERE id <> ALL($1::text[]) ORDER BY id', [legacyVanIds])).rows.map((r) => String(r.id));
-    for (const table of ['van_day_routes', 'van_status_ranges', 'van_days']) {
+    for (const table of ['van_day_routes', 'van_status_ranges', 'van_days', 'van_zone_ranges', 'van_log']) {
       await target.query(`DELETE FROM ${table} WHERE van_id = ANY($1::text[])`, [[...importedVans, ...staleVans]]);
     }
     await target.query('DELETE FROM vans WHERE id = ANY($1::text[])', [staleVans]);
@@ -834,6 +852,7 @@ async function main() {
     await insert('van_day_routes', dayRoutes);
     await insert('van_status_ranges', statusRanges);
     await insert('van_days', [...vanDays.values()]);
+    await insert('van_log', vanLog);
     await insert('deployments', deployments,
       'ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, registered_persons = EXCLUDED.registered_persons');
     await insert('boat_capacity_overrides', overrides, 'ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason');
@@ -886,7 +905,7 @@ async function main() {
     console.log(`action records: ${cancellations.length} cancellations, ${reschedules.length} reschedules, ${partialCancels.length} partial cancels, ${feeItems.length} fee items, ${historyLines.length} history lines`);
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
-    console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations`);
+    console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
     console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
       + `${rateTypes.charter.length} charter rows, ${rateTypes.longtail.length} longtail rows, ${rateTypes.transfer.length} transfer prices `

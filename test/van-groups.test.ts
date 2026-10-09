@@ -147,10 +147,10 @@ test('rules: the main part takes a pax change; private vans; the return pool', (
   assert.equal(effectiveZone({ pickup_zone: 'PK', add_ons: [] }, { booking_mode: 'seat', zone: undefined, route_id: 'r1' }), 'PK');
   assert.equal(effectiveZone({ add_ons: [{ type: 'transfer-r2-KL-van', seq: 0 }] }, { booking_mode: 'seat', zone: 'NoTransfer', route_id: 'r1' }), 'NoTransfer', 'another route\'s van');
 
-  const van = (id: string, zone_base: 'PK' | 'KL', route_ids: string[], usable = true): VanOnDay => ({ van: { id, zone_base } as Van, usable, route_ids });
-  const vans = [van('on', 'PK', ['r1']), van('kl', 'KL', []), van('klpier', 'PK', ['r9']), van('off', 'KL', [], false)];
-  const piers = new Map([['r1', 'tublamu'], ['r9', 'tublamu']]);
-  assert.deepEqual(returnPool(vans, 'r1', 'KL', piers).map((v) => v.van.id), ['on', 'kl', 'klpier'], 'the outbound pool, plus usable vans in the zone that day');
-  assert.deepEqual(returnPool(vans, 'r1', 'NoTransfer', piers), []);
-  assert.deepEqual(returnPool(vans, 'r1', '__CHARTER__', piers).map((v) => v.van.id), ['on', 'kl', 'klpier']);
+  // Each van's zone that day comes from the matrix (vanZoneOn, tested in vans.test.ts).
+  const van = (id: string, zone: 'PK' | 'KL', route_ids: string[], usable = true): VanOnDay => ({ van: { id } as Van, usable, route_ids, zone });
+  const vans = [van('on', 'PK', ['r1']), van('kl', 'KL', []), van('klpier', 'KL', ['r9']), van('off', 'KL', [], false)];
+  assert.deepEqual(returnPool(vans, 'r1', 'KL').map((v) => v.van.id), ['on', 'kl', 'klpier'], 'the outbound pool, plus usable vans in the zone that day');
+  assert.deepEqual(returnPool(vans, 'r1', 'NoTransfer'), []);
+  assert.deepEqual(returnPool(vans, 'r1', '__CHARTER__').map((v) => v.van.id), ['on', 'kl', 'klpier']);
 });
