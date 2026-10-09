@@ -505,6 +505,39 @@ to these:
 - **Writes need the `operations` area** (the refund and credit too); spending credit is an invoice
   payment and needs `accounting`.
 
+### 2.9 Daily PFM, pier money, on-tour sales, Travel Summary decisions
+
+**Change: these move off the booking blob and `SB_EXTRAS`/`TS_COT`/`TRAVEL_SUM` onto commands; the
+server works out every amount** (README "Proforma (Daily PFM)", "Pier money", "After the trip"). Every
+`/v1/bookings/{id}/…` write below needs `If-Match` and moves the booking's `version` on.
+
+| Legacy | API |
+|---|---|
+| `renderDailyPFM` rows, tallies, `pfmInScope`, `pfmCutoff` | `GET /v1/pfm?from=&to=` → `rows` (status, cutoff, total, balance, decision) and `totals` |
+| `pfmApproveTravel` (the prompt's name → `approver`) | `POST /v1/bookings/{id}/pfm/approve-travel` `{ approver }` |
+| `pfmHold` | `POST /v1/bookings/{id}/pfm/hold` |
+| `pfmRemindAll` | `POST /v1/pfm/remind` `{ from, to }` |
+| `pckMoney`, `pckMoneyCell`, `pckPayGuard`'s amount | `GET /v1/pier-money?date=` (the board) or `GET /v1/bookings/{id}/pier-money?date=` → `due`, `gross`, `paid`, `no_slip` … |
+| `pckPaySave` (one line per method) | `POST /v1/bookings/{id}/pier-payments` `{ service_date, lines: [{ method, amount, fee_pct \| fee, note, slip_ids }] }` |
+| `pckPayAddSlip`, `pckPayDel` | `POST …/pier-payments/{pid}/slips`, `DELETE …/pier-payments/{pid}` |
+| `bkV2ExtraSave` (new / edit), `bkV2ExtraCollect`, `bkV2ExtraDelete` | `POST /v1/bookings/{id}/tour-sales`, `PATCH …/tour-sales/{sid}`, `POST …/{sid}/collect`, `DELETE …/{sid}` |
+| `tsCotPick`, `tsCotAmt`, `tsCotRefSave`, the COT slips; `tsCotClear` | `PUT /v1/bookings/{id}/cot-decisions/{date}` `{ mode, deduct, payout, ref, slip_ids }`; `DELETE` |
+| `tsPick`, `tsCustom`, `tsPostpone`; `tsClear` | `PUT /v1/bookings/{id}/noshow-charges/{date}` `{ decision, amount, note }`; `DELETE` |
+| Travel Summary's COT and charge columns | `GET /v1/after-trip?date=` |
+
+- **Delete client-side:** `bk.ops.pfm`, `bk.pierPayments`, `SB_EXTRAS`, `TS_COT`, `TRAVEL_SUM` and their
+  persists; every fee, commission, total and `due` sum; `pfmCotWarn` (the invoice now subtracts the
+  deduction itself: a minus line with `cot_date`, see 2.7).
+- **Confirms that become flags:** the pier's "บันทึกต่อไหม?" is `409 overpayment` → resend with
+  `overpay_anyway: true`.
+- **Refusals to show as they are:** `409 before_cutoff`, `pfm_paid`, `pfm_decided`, `not_proforma`;
+  `409 not_on_trip`, `booking_cancelled`, `payment_deleted`, `already_collected`, `commission_paid`,
+  `no_cash_on_tour`; `400` for a fee on cash, a card fee above 5% on a sale, a computed amount sent
+  different.
+- **Warnings** (saved anyway): `cot_over` (legacy's "หัก+โอนออก เกินยอด COT"), `invoice_overpaid`.
+- **New screens, no legacy:** the pier's day-close hand-over (`/v1/pier-handovers`, accepted by
+  accounting) and commission payouts (`/v1/commissions`, `/v1/commission-payouts`).
+
 ## 3. Day-of-operations
 
 **Change: every trip's `operations` is the truth for boats, vans, pickups and check-ins. Read it into
@@ -823,6 +856,9 @@ the server's list so ids and slips are kept.
 - Legacy spellings (`sellPrice`, `toCompany`, `feePct`) are accepted. `slips` are uploaded file ids
   (§3.11).
 - **Computed:** `commission`, `fee`, `customer_paid`, `at`. Values sent for them are replaced.
+- **`collected` is set once:** send it on a new sale; afterwards the "เก็บเงินแล้ว" tick calls
+  `POST /v1/bookings/{id}/upgrades/{upgrade_id}/collect` `{ method?, fee_pct?, slip_ids? }`. A
+  `PATCH` that flips it is `400`.
 - **Refused (`400`):** no `sell_price` above 0 ("ใส่ราคาขาย"), `fee_pct` above 100, an `id` twice,
   `settle` other than `pending`/`done`, a slip that is not an uploaded file.
 
@@ -1208,9 +1244,8 @@ work for the session only and save nowhere** (see "The one thing to know first")
 
 | Area | Legacy data / functions | Where it is tracked |
 |---|---|---|
-| Deposits, refunds, money reports (invoices and payments moved: 2.7) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, `renderTravelSum` | `todo/money-model.md` slices 2–6, open 5 |
-| Pier payments, booking payment slips, cash-on-tour collection, the unpaid-proforma decision (`ops.pfm`) | `pck*` payment flows, `paymentSlips`, `pfm*` | `booking-extras-model.md` open 1; `trip-ops-and-vans-model.md` 8. (The booking's `cash_on_tour_*` amounts are stored.) |
-| On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
+| Deposits, refunds, money reports (invoices, PFM, pier money and Travel Summary decisions moved: 2.7, 2.9) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, the Travel Summary totals | `todo/money-model.md` slices 5–6, open 1 |
+| Booking payment slips not tied to a payment | `paymentSlips` | `booking-extras-model.md` open 1 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
 | Fleet maintenance | `05-fleet.js` | `legacy-replacement.md` §9 (scope undecided) |
@@ -1328,6 +1363,11 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Agent rate seasons | `GET/PUT /v1/agents/{id}/rate-seasons`, `GET …/rate-type?date=` | To do |
 | Rate types, contracts (display) | `GET /v1/rate-types…`, `GET /v1/contracts…` | To do |
 | Invoices and payments (Accounting, Daily PFM payments) | `/v1/invoices…`, `GET /v1/payments` | To do |
+| Daily PFM list, extend, hold, remind | `GET /v1/pfm`, `/pfm/approve-travel`, `/pfm/hold`, `POST /v1/pfm/remind` | To do |
+| Pier check-in money column, pay dialog, slips | `GET /v1/pier-money`, `/pier-payments…` | To do |
+| Day-of extras (on-tour sales), upgrade collect | `/tour-sales…`, `/upgrades/{id}/collect` | To do |
+| Travel Summary COT and no-show decisions | `GET /v1/after-trip`, `/cot-decisions/{date}`, `/noshow-charges/{date}` | To do |
+| Pier hand-over, commission payouts (new screens) | `/v1/pier-handovers…`, `/v1/commissions`, `/v1/commission-payouts…` | Not in legacy |
 | Pier money, on-tour extras, weather closures, fleet maintenance | — | Not in API (§7) |
 
 ## Rules and gotchas

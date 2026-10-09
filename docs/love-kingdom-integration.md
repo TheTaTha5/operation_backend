@@ -151,6 +151,7 @@ POST /v1/bookings
 | `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
 | `total` | `total` | THB, as a number. Kept as you send it: your bookings are B2C (agent `a_b2c`), which this service does not re-price, unlike staff bookings. The add-on `amount`s are kept too. |
 | private charter item | `trips[].bookingMode: "charter"` + `charterBoatId` | The boat must be deployed that day. |
+| payment: method, amount paid, status, deposit, balance | `paymentSnapshot: { method, paid, paidStatus, deposit, balance }` (or flat `payment_method`, `payment_paid`, `payment_paid_status`, `payment_deposit`, `payment_balance`) | **New (2026-10-09).** Your facts, stored as sent. The pier collects `balance` on the travel day and reads `method`/`paidStatus` to tell staff whether the customer already paid (legacy §b2cPayOne). Send them again on every update: a balance you don't update is collected twice. |
 
 Fields not in the README's "Booking header fields" table are **dropped, not stored**. If you need
 one kept, ask for it to be modelled.

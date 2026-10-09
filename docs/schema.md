@@ -56,6 +56,9 @@ flowchart LR
   weather -- "weather_cases.booking_id, refunds.booking_id" --> bookings
   weather -- "refunds.invoice_id" --> money
   weather -- "refunds.agent_id" --> sales
+  daymoney["Proforma, pier money, after the trip<br/>booking_pfm_events, booking_pier_payments, booking_tour_sales,<br/>booking_cot_decisions, booking_noshow_charges, pier_handovers, commission_payouts"]
+  daymoney -- "booking_id" --> bookings
+  daymoney -. "a COT deduct is a minus line" .-> money
 ```
 
 ## 1. Catalogue and seat pool
@@ -1134,6 +1137,139 @@ erDiagram
 - **The agent's credit balance** is its `credit` rows less its live payments with `method = 'credit'`.
 - **`changes.kind`** also takes `weather_closure` (060).
 
+## 9. Proforma, pier money and after the trip
+
+Money slices 2–4 (migrations 110–112, `todo/money-model.md`). The rules are in `src/domain/pfm.ts`,
+`src/domain/pier-money.ts` and `src/domain/after-trip.ts`. Nothing derived is stored: the PFM row,
+the amount owed at the pier, a sale's total and commission, a hand-over's difference are worked out
+on read. Every booking-owned row goes with its booking (`ON DELETE CASCADE`).
+
+```mermaid
+erDiagram
+  booking_pfm_events {
+    bigserial id PK
+    text booking_id FK
+    text kind "approved, hold or reminded"
+    text approver "approved only: as typed"
+    text by
+    timestamptz at
+  }
+  booking_pier_payments {
+    text id PK "pp_… ; lg_pp_… imported"
+    text booking_id FK
+    date service_date
+    text method "cash, transfer or card"
+    numeric amount "above 0: pays the debt"
+    numeric fee "card only; kept apart from amount"
+    numeric fee_pct "card only"
+    text note
+    text by
+    timestamptz at
+    timestamptz deleted_at "kept, out of every total"
+    text deleted_by
+    text delete_reason
+  }
+  booking_pier_payment_slips {
+    text payment_id PK, FK
+    int seq PK
+    text attachment_id FK
+  }
+  booking_tour_sales {
+    text id PK "ex_… ; lg_ex_… imported"
+    text booking_id FK
+    date trip_date "null on legacy's oldest"
+    text service
+    int qty
+    numeric unit_price
+    numeric to_company "at most qty × unit_price"
+    text seller
+    text method "cash, transfer, card or cot (to collect)"
+    numeric fee_pct
+    numeric fee "stored: legacy's are whole baht"
+    timestamptz collected_at
+    text collected_by
+    timestamptz sold_at
+    text sold_by
+  }
+  booking_tour_sale_slips {
+    text sale_id PK, FK
+    int seq PK
+    text attachment_id FK
+  }
+  pier_handovers {
+    text id PK "ho_…"
+    date service_date "one live per day and pier (partial unique index)"
+    text pier
+    jsonb expected "what the server worked out when handed over"
+    numeric cash_counted
+    text note
+    text handed_by
+    timestamptz handed_at
+    text accepted_by "accounting"
+    timestamptz accepted_at
+    text voided_by
+    timestamptz voided_at
+  }
+  commission_payouts {
+    text id PK "cp_…"
+    text seller
+    numeric amount "the items' commission"
+    text method "cash or transfer"
+    date paid_on
+    text ref
+    timestamptz voided_at
+  }
+  commission_payout_items {
+    text payout_id PK, FK
+    text kind PK "tour_sale or upgrade"
+    text booking_id PK "no key"
+    text item_id PK "no key"
+    numeric amount
+  }
+  booking_cot_decisions {
+    text booking_id PK, FK
+    date service_date PK
+    text mode "full, part, none, payout or nocol"
+    numeric deduct "off the agent's invoice"
+    numeric payout "paid back to the agent"
+    text ref "nocol: why"
+    text by
+    timestamptz at
+  }
+  booking_cot_decision_slips {
+    text booking_id PK, FK
+    date service_date PK, FK
+    int seq PK
+    text attachment_id FK
+  }
+  booking_noshow_charges {
+    text booking_id PK, FK
+    date service_date PK
+    text decision "full, partial, none or postpone"
+    numeric amount
+    text note
+    text by
+    timestamptz at
+  }
+  bookings { text id PK }
+  attachments { text id PK }
+  bookings ||--o{ booking_pfm_events : "decided"
+  bookings ||--o{ booking_pier_payments : "paid at the pier"
+  booking_pier_payments ||--o{ booking_pier_payment_slips : "slips"
+  bookings ||--o{ booking_tour_sales : "sold on tour"
+  booking_tour_sales ||--o{ booking_tour_sale_slips : "slips"
+  commission_payouts ||--o{ commission_payout_items : "pays"
+  bookings ||--o{ booking_cot_decisions : "cash on tour"
+  booking_cot_decisions ||--o{ booking_cot_decision_slips : "slips"
+  bookings ||--o{ booking_noshow_charges : "no-show"
+  attachments ||--o{ booking_pier_payment_slips : "file"
+```
+
+- **`bookings`** gains Love Kingdom's payment state: `payment_paid`, `payment_paid_status`,
+  `payment_deposit`, `payment_balance` (111).
+- **`invoice_lines.cot_date`** (112): set on a cash-on-tour deduction's minus line, one per trip date.
+- **`changes.kind`** also takes `pier_handover` and `commission_payout` (111).
+
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration
@@ -1152,6 +1288,8 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
 | `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
+| `commission_payout_items.booking_id`, `item_id` | `booking_tour_sales`, `booking_upgrades` | An upgrade list is rewritten whole on every save, and an import replaces bookings (111). |
+| `pier_handovers.pier` | `routes.pier` | A pier is a route's text field, `other` when none (111). |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer
