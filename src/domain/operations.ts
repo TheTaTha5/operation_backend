@@ -480,6 +480,7 @@ export class OperationsStore {
     this.directory.activity.delete(id);
     this.seasons.delete(id);
     this.history.delete(id);
+    for (const doc of [...this.documents.values()]) if (doc.agent_id === id) this.documents.delete(doc.id);
   }
   private history = new Map<string, ContractHistoryEntry[]>();
   /** Newest first. */
