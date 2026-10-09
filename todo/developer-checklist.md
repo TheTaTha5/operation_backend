@@ -4,7 +4,9 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 ## Deploy what is on `main`
 
-1. **Push `main`.** It is about 25 commits ahead of GitHub; Railway runs none of it until then.
+1. **Push `main`.** It is 56 commits ahead of GitHub; Railway runs none of it until then. Deploying
+   applies migrations 024–038; the day-of-operations import (vans, check-ins, reconfirm, upgrades)
+   needs a fresh legacy import run afterwards.
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
    `AUTH_JWT_SECRET` and `AUTH_REQUIRED=true`; set `B2C_API_KEY` to legacy's value.
 3. **Import the users — nobody can log in until you do:**
@@ -28,6 +30,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     `409 stale_version` as "someone changed this; reload".
   - the agent's season table reads and saves `GET/PUT /v1/agents/{id}/rate-seasons`, and prices can
     use `GET /v1/agents/{id}/rate-type?date=` instead of computing it.
+  - day-of-operations now lives here, read from every booking's `trips[].operations`: boat, van parts,
+    check-ins, pier note, route upgrade; and `reconfirm`, `alt_pickups`, `upgrades` on the booking.
+    Its screens write through `PATCH /operations/trip-ops/{trip}`, the check-in, van-group, van-stop
+    and vans endpoints, `PUT /v1/bookings/{id}/reconfirm`, `POST /v1/reconfirm/sent` and
+    `POST /v1/bookings/{id}/upgrade` (README → "Dispatch" to "Upgrades"). Upgrade payment slips are
+    refused until attachments exist.
   - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`): the
     server now prices every non-B2C booking on save and replaces a sent price (`price_warnings`). Its
     "use today's rate" button sends `rate: "agent"`; it sends `ovnCharge` and the charter price fields.
@@ -38,6 +46,7 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 ## Decisions waiting for you
 
 - **Live updates** (`change-feed-model.md`): the 5 questions at the end.
+- **Day-of-operations leftovers** (`trip-ops-and-vans-model.md` → "Needs a decision"): 5 items.
 - **Next slice:** pricing (`pricing-model.md`, decided: contracts first) or deployment guards
   (`deployment-guards-model.md`, has questions to answer).
 - **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
