@@ -25,6 +25,7 @@ import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
 import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeUndoneLine } from '../domain/upgrades.js';
 import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checkin.js';
+import { checkDeploymentChange, placedOn } from '../domain/deployment-guards.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
   addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
@@ -860,12 +861,47 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const query = request.query as Record<string, unknown>;
     return { deployments: await store.listDeployments(optionalString(query.from), optionalString(query.to), optionalString(query.route_id)) };
   });
-  app.post('/operations/deployments', async (request, reply) => reply.code(201).send(await store.transaction(() => store.createDeployment(deployment(request.body)))));
+  /**
+   * Deployment guards (todo/deployment-guards-model.md, decided 2026-10-09): past days only for an admin,
+   * a chartered boat stays, and a boat with bookings on it leaves only with `remove_anyway`.
+   */
+  const removeAnyway = (value: unknown): boolean => {
+    if (value === undefined || value === false || value === 'false') return false;
+    if (value === true || value === 'true') return true;
+    return badRequest('remove_anyway must be true or false');
+  };
+  const guardDeployment = async (request: { user?: { user?: StoredUser } }, date: string, boatId: string, after: Deployment | undefined, anyway: boolean) => {
+    const before = (await store.listDeployments(date, date)).find((d) => d.boat_id === boatId);
+    const boat = (await store.listBoats()).find((b) => b.id === boatId);
+    const user = request.user?.user;
+    return {
+      before,
+      warnings: checkDeploymentChange(before, after, {
+        today: todayInThailand(), admin: !user || user.role === 'admin', removeAnyway: anyway, boatName: boat?.name ?? boatId,
+        catalogueLicense: boat?.license_pax,
+        placedBefore: before ? placedOn(await store.bookingsOn(date, before.route_id), boatId, before.route_id, date) : { bookings: 0, pax: 0, charter: null },
+      }),
+    };
+  };
+  app.post('/operations/deployments', async (request, reply) => {
+    const body = record(request.body);
+    const input = deployment(body);
+    const anyway = removeAnyway(body.remove_anyway);
+    return reply.code(201).send(await store.transaction(async () => {
+      const { warnings } = await guardDeployment(request, input.service_date, input.boat_id, input, anyway);
+      const saved = await store.createDeployment(input);
+      return warnings.length ? { ...saved, warnings } : saved;
+    }));
+  });
   app.delete('/operations/deployments/:service_date/:boat_id', async (request, reply) => {
     const params = request.params as { service_date: string; boat_id: string };
-    const removed = await store.transaction(async () => await store.deleteDeployment(params.service_date, params.boat_id));
-    if (!removed) notFound('Deployment not found');
-    return reply.code(204).send();
+    const anyway = removeAnyway((request.query as Record<string, unknown>).remove_anyway);
+    const warnings = await store.transaction(async () => {
+      const { before, warnings } = await guardDeployment(request, params.service_date, params.boat_id, undefined, anyway);
+      if (!before || !(await store.deleteDeployment(params.service_date, params.boat_id))) notFound('Deployment not found');
+      return warnings;
+    });
+    return warnings.length ? reply.code(200).send({ warnings }) : reply.code(204).send();
   });
 
   /**

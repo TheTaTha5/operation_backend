@@ -64,7 +64,10 @@ test('a boat taken off the day shows as pulled; a moved trip keeps only its pier
   const b = await booking(day);
   const tripId = b.trips[0].id;
   await ops(tripId, { boat_id: 'disp-d', pier_note: 'meet at gate 2', return_same_van: true });
-  await send('DELETE', `/operations/deployments/${day}/disp-d`);
+  const refused = await send('DELETE', `/operations/deployments/${day}/disp-d`);
+  assert.deepEqual([refused.statusCode, refused.json().code], [409, 'seats_sold'], 'a booking is on it');
+  const pulled = await send('DELETE', `/operations/deployments/${day}/disp-d?remove_anyway=true`);
+  assert.equal(pulled.json().warnings[0].code, 'boat_pulled');
   assert.equal((await send('GET', `/v1/bookings/${b.id}`)).json().trips[0].operations.boat_pulled, true);
   await deploy('disp-d', day);
   const moved = await send('POST', `/v1/bookings/${b.id}/reschedule`, { route_id: 'r1', service_date: later });
