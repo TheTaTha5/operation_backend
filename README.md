@@ -552,8 +552,13 @@ Validation errors are `400` and name the path, for example:
 
 ### Operations
 
-- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons? }`; creates or replaces a boat's deployment for that date. `license_pax` is taken from the boat catalogue when omitted.
-- `DELETE /operations/deployments/{service_date}/{boat_id}` — removes a deployment.
+- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons?, remove_anyway? }`; creates or replaces a boat's deployment for that date. `license_pax` is the boat catalogue's: taken from it when omitted, and a different value is `400` (a boat not in the catalogue keeps what is sent).
+- `DELETE /operations/deployments/{service_date}/{boat_id}[?remove_anyway=true]` — removes a deployment: `204`, or `200 { warnings }` when it went ahead with `remove_anyway`.
+- **Guards** (legacy `bop2GuardPast`, `bop2UnassignBoat`; decided 2026-10-09):
+  - a date before today (Asia/Bangkok) is `409 past_date`, except for an admin correcting history;
+  - a boat a charter booking holds can't leave its route: `409 charter_boat` ("Cancel the charter booking first");
+  - removing a boat, moving it to another route, or shrinking it below the passengers **placed on it** that day (as legacy counts: not the whole route-day) is `409 seats_sold` ("N booking(s) (P pax) on it"), unless `remove_anyway: true` (legacy's confirm dialog). Then the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id, service_date, boat_id, bookings, pax}]`, and those bookings read `boat_pulled: true`.
+  - `available_seats` goes negative on an oversold day; it shows the oversell.
 - `GET /operations/deployments?from=&to=&route_id=` — lists deployments.
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
 - `GET /v1/manifest?date=&route_id=` — allotment plus bookings for the operating day.
