@@ -171,5 +171,10 @@ Not in Money:
 
 ## Open
 
-1. **Deposits and refunds** (`SB_DEPOSITS`, the weather outcomes refund and credit): never saved by
-   legacy, not built here.
+1. **Deposits and refunds.** The weather outcomes are built (migration 061, README "Weather closures,
+   refund and credit"): a `refunds` row of kind `refund` (owed to the agent) or `credit` (the agent's
+   balance, spent as a payment with method `credit`). Still open:
+   - legacy's manual deposit ("รับมัดจำ", `acctDepositSubmit`): money received with no invoice. It fits
+     as a `credit` with no invoice, which `refunds.invoice_id NOT NULL` does not allow yet;
+   - paying a refund out (method, date, slip): legacy had no step either;
+   - the agent statement's "Deposit held" (slice 6) reads `credit_balance`.

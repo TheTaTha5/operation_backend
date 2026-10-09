@@ -177,7 +177,7 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 
 | Area | Writes |
 |---|---|
-| `operations` | bookings and their commands, seat locks, deployments |
+| `operations` | bookings and their commands (a weather cancel's refund and credit included), seat locks, deployments, weather closures |
 | `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys) |
 | `sales` | rate types, agents |
 | `config` | the route calendar |
@@ -853,12 +853,13 @@ server checks the move is allowed from where the booking is and records who made
 | `POST /v1/bookings/{id}/confirm` | `draft`, `quote`, `pending` | as a create with `intent: confirm`: `confirmed`; `pending_foc` with FOC passengers (`foc_reason` required); `pending_approval` with a discount. The seats it holds are not weighed again |
 | `POST /v1/bookings/{id}/approve` | `pending_approval`, `pending_foc` | the approval's `target_status` (`confirmed` unless FOC passengers still wait: `pending_foc`). Over the allotment, it now holds its seats |
 | `POST /v1/bookings/{id}/reject` | `pending_approval`, `pending_foc` | `rejected` (seats given back) |
-| `POST /v1/bookings/{id}/cancel-weather` | any status that holds seats | `cancelled_weather`, `cancellation_reason` `weather` (seats given back) |
+| `POST /v1/bookings/{id}/cancel-weather` | any status that holds seats | `cancelled_weather`, `cancellation_reason` `weather` (seats given back); its money, see [Weather closures](#weather-closures-refund-and-credit) |
 | `POST /v1/bookings/{id}/cancel` | any status that holds seats | `cancelled` — see [Booking actions](#booking-actions-cancel-restore-partial-cancel-reschedule) |
 | `POST /v1/bookings/{id}/restore` | `cancelled`, `rejected`, `cancelled_weather` | `confirmed` |
 
 - `confirm`, `approve`, `reject` and `cancel-weather` take an optional `{ "note": "…" }`, written
-  into the history (and, for `approve`/`reject`, onto the approval). Each answers the booking plus
+  into the history (and, for `approve`/`reject`, onto the approval). `cancel-weather` also takes
+  `outcome` (`cancel`, the default, `refund` or `credit`) and answers `refunds` too. Each answers the booking plus
   `warnings`, `404` for an unknown one, and `409` with `code: "wrong_status"` (or
   `already_cancelled` / `booking_closed`) when the move is not allowed from the current status.
 - **Approving past the registered seats is allowed, with a warning**, as legacy allows it ("add a
@@ -878,8 +879,9 @@ server checks the move is allowed from where the booking is and records who made
 - A legacy-imported `pending_approval` or `pending_foc` booking has no approval record. It holds
   its seats (legacy reads it the same way), `/approve` moves it to `confirmed`, and the decision is
   recorded as a new, already-decided entry in `approvals`.
-- `cancel-weather` handles the booking only. Refunds and credits stay in legacy until money moves
-  here. Undo it with `/restore`.
+- `cancel-weather` takes only this booking's share off its invoice and refunds or keeps as credit
+  what it had paid: see [Weather closures](#weather-closures-refund-and-credit). Undo the status with
+  `/restore`; the money stays as it was.
 - These are legacy's rules (`bkV2ApproveBooking`, `bkV2RejectBooking`, `bkV2FocApprove`,
   `bkV2FocReject`, `bkV2WeatherResolveOne`). Nothing in legacy ever sets `completed`, so no command
   does either.
@@ -1091,6 +1093,10 @@ this works on multi-trip bookings.
 The older body `{ route_id, service_date, pax? }` still works. It moves a single-trip booking
 anywhere and writes no reschedule record (it does write a history line).
 
+Either body moving a booking off a trip closed for weather resolves its follow-up there (outcome
+`reschedule`, `new_date` the day it went to): see [Weather closures](#weather-closures-refund-and-credit).
+Legacy's weather screen sends `reason: "weather"`.
+
 #### History and who made a change
 
 **Every write is signed by the token's user**: `preferred_username`, else the token subject.
@@ -1111,7 +1117,10 @@ Each write appends one line to the booking's history, in the same transaction:
 | confirm | `edit` | `Confirmed` (`FOC`/`Approval` when it waits) | `Confirmed`, or one of the waiting lines above; `· <note>` |
 | approve | `confirm` | `Approval` (`FOC` from `pending_foc`) | `Approved · booking confirmed`, `Approved · now <status>`, or `FOC approved · <n> pax · booking confirmed`; `· <note>` |
 | reject | `cancel` | `Approval` (`FOC` from `pending_foc`) | `Rejected`, or `FOC rejected`; `· <note>` |
-| cancel-weather | `weather` | `Weather` | `Cancelled for weather · <note>` |
+| cancel-weather | `weather` | `Cancel`, `Refund` or `Credit` | `Cancelled for weather · No refund · <note>`; `Refund ฿<n>` or `Kept as credit ฿<n>` in place of `No refund` |
+| close a trip for weather | `weather` | `Weather` | `Trip <route> · <date> cancelled due to weather`, on every booking then on the trip |
+| notify (weather) | `weather` | `Notify` | `Notified agent · awaiting customer decision (reschedule/cancel)` |
+| undo a weather closure | `weather` | `Weather` | `Trip <route> · <date> re-opened · weather cancellation undone`, on every unresolved booking |
 | cancel | `cancel` | `Cancel` | `Cancelled · <charge> · <category label> · <note>` |
 | restore | `edit` | `Confirmed` | `Restored`, plus `· seat lock <id>: <got>/<wanted> seats back` per short lock |
 | partial cancel | `cancel` | `Cancel` | `Partial cancel · −2 pax · <category label> · charge 0 (฿0) · waive 2 (฿4,000)` |
@@ -1714,6 +1723,7 @@ is billed and what was paid. Writes need the `accounting` area; any login may re
 | `POST /v1/invoices/{id}/payments` | Record a payment; answers `201` and the invoice |
 | `POST /v1/invoices/{id}/payment-corrections` | Change or delete payments; answers the invoice |
 | `GET /v1/payments?agent_id=&from=&to=&method=&deleted=` | Payments across invoices, oldest first |
+| `GET /v1/refunds?agent_id=&booking_id=&kind=&from=&to=` | Refunds and credits, oldest first: see [Weather closures](#weather-closures-refund-and-credit) |
 
 ```jsonc
 // An invoice, as every endpoint above answers it
@@ -1762,6 +1772,12 @@ is billed and what was paid. Writes need the `accounting` area; any login may re
 `balance` is what is still owed; a void invoice owes nothing. Withholding tax does not count towards
 paid, as in legacy: an agent that pays `total − wht_amount` leaves the invoice `partial`.
 
+**Refunds and credits** (a weather cancel's, migration 061): `paid` stays every live payment;
+`refunded` and `credited` are what refunds and credits took back from the invoice, and `refunds`
+lists them. `status`, `balance` and the overpayment check count `paid − refunded − credited`. A line a
+weather cancel took off keeps its place with `removed_at`, `removed_by` and `removed_reason`
+(`weather`) and leaves every total; the other lines are `null` there.
+
 **`PATCH`** changes `note`, `ref`, `dear`, `accept_at`, `remark` and `wht_amount` (0 or `null`
 clears it). `payment_amount` is `total − wht_amount`, what the document asks to be paid. A field the
 server works out is refused with `400` naming what to use instead (`total cannot be changed: it is
@@ -1785,7 +1801,9 @@ worked out from the lines`). An unchanged echo of it is accepted.
 
 **Recording a payment** (legacy `acctRecordPayment`):
 - **Request:** `{ "amount": 3000, "method": "transfer", "paid_on": "2026-10-09", "ref": "…", "slip_ids": ["att_…"] }`.
-  - `method` is `transfer` (the default), `cash` or `card`.
+  - `method` is `transfer` (the default), `cash`, `card`, or `credit`: spending the agent's credit
+    balance (see [Weather closures](#weather-closures-refund-and-credit)), never more than it holds
+    (`409 credit_short`).
   - `paid_on` defaults to today in Bangkok.
   - `slip_ids` name files uploaded with `POST /v1/attachments`.
 - **Refused:**
@@ -1806,7 +1824,9 @@ worked out from the lines`). An unchanged echo of it is accepted.
   deleted THB 3,000 (transfer, 2026-10-01) · reason: typo`.
 - **Refused:**
   - a payment already deleted: `409 payment_deleted`;
-  - a result that pays more than the total: `409 overpayment`, unless `overpay_anyway: true`.
+  - a result that pays more than the total: `409 overpayment`, unless `overpay_anyway: true`;
+  - changing a `credit` payment's amount or method, or making a payment `credit`: `409 credit_payment`
+    (delete it, which gives the credit back, and record it again).
 - **Nothing changed** writes nothing.
 
 **On the booking.** Every booking read carries two fields the server works out:
@@ -1833,7 +1853,9 @@ refused with `400`; an unchanged echo is accepted.
     now), and no fee item, so it is never billed twice. Legacy left this fee unbilled.
 
 **The agent's credit** (legacy `agCreditState`):
-- **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`.
+- **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`. (Its
+  `credit_balance` is something else: money kept for the agent by a weather cancel, see
+  [Weather closures](#weather-closures-refund-and-credit).)
 - **`used`** counts an `invoice` agent's bookings that are:
   - not cancelled, rejected, a quote or a draft;
   - not yet paid.
@@ -1843,8 +1865,8 @@ refused with `400`; an unchanged echo is accepted.
 
 **Import.** `import-legacy.ts` mirrors `sb_invoices` and `sb_payments` with their slips:
 - **Ids:** prefixed like the bookings (`lg_…`), and replaced on every run.
-- **Payments made here on an imported invoice** are replaced with it, because legacy stays master for
-  money until Money moves.
+- **Payments, refunds and credits made here on an imported invoice** are replaced with it, because
+  legacy stays master for money until Money moves.
 - **Lines:** legacy kept none for a booking invoice, so its single line is rebuilt with the amount
   legacy froze.
 - **Duplicate number:** `INV-2609-0003` imports its second invoice as `INV-2609-0003-2`.
@@ -1855,6 +1877,117 @@ refused with `400`; an unchanged echo is accepted.
   - 385 payments, ฿2,788,328;
   - 378 of 379 slips linked;
   - one status corrected, from legacy's `issued` to `paid`.
+
+### Weather closures, refund and credit
+
+Legacy's "Cancel trip (weather)" and its "Manage bookings · trip cancelled (weather)" panel
+(todo/weather-closures-model.md, migrations 060 and 061). A closure says a route did not run on a day
+because of weather; the follow-up list is what staff do about each booking on it: **notify the agent,
+then reschedule or cancel**. Writes need the `operations` area (the refund and credit too); any login
+may read, and a login tied to one agent sees only its own bookings on the list.
+
+| Method + path | Does |
+|---|---|
+| `GET /v1/weather-closures?from=&to=&route_id=&include_reopened=true` | Closures by date, with `counts` and `pax`; open ones unless `include_reopened` |
+| `GET /v1/weather-closures/{id}` | One, with `bookings`: the follow-up list |
+| `POST /v1/weather-closures` | Close a trip: `{ "route_id": "r10", "service_date": "2026-07-02", "note": "high waves 3m" }` → `201` |
+| `PATCH /v1/weather-closures/{id}` | Change the note (legacy's "Update note") |
+| `POST /v1/weather-closures/{id}/bookings/{booking_id}/notify` | `awaiting` → `notified` (legacy's "Notify agent"; nothing is sent) |
+| `POST /v1/weather-closures/{id}/undo` | Re-open the trip: `{ "undo_anyway": true }` when bookings are already resolved |
+| `POST /v1/bookings/{id}/reschedule` | Resolves the booking's follow-up as `reschedule` when it moves off the closed day |
+| `POST /v1/bookings/{id}/cancel-weather` | Resolves it as `cancel`, `refund` or `credit`, with the money below |
+| `GET /v1/refunds?agent_id=&booking_id=&kind=&from=&to=` | Refunds and credits, oldest first, each with its `invoice_number` |
+
+```jsonc
+// GET /v1/weather-closures/wx_…
+{ "id": "wx_…", "route_id": "r10", "service_date": "2026-07-02", "note": "high waves 3m",
+  "closed_by": "ops1", "closed_at": "2026-07-01T04:57:02.238Z", "updated_by": null, "updated_at": null,
+  "reopened_by": null, "reopened_at": null,
+  "counts": { "awaiting": 1, "notified": 1, "resolved": 2 },
+  "pax": { "pending": 6, "cancelled": 2, "rescheduled": 4, "total": 12 },
+  "bookings": [
+    { "booking_id": "BK-1", "voucher_ref": "V-881", "agent_id": "a01", "lead_pax": "Ann", "booking_status": "confirmed",
+      "booking_mode": "seat", "pax": 4, "on_trip": true, "payment_state": "paid", "refundable": 5600,
+      "status": "notified", "notified_at": "…", "notified_by": "ops1",
+      "outcome": null, "new_date": null, "resolved_at": null, "resolved_by": null } ] }
+```
+
+**A closure refuses nothing**, as in legacy: a booking can still be sold, moved or synced onto the
+closed trip. It is a record and a to-do list.
+
+- **Who decides:** `route_id`, `service_date` and `note` are the client's. `id`, `closed_by`,
+  `closed_at`, `updated_*`, `reopened_*`, `counts`, `pax` and the list are the server's: sent on create
+  they are `400`; sent to `PATCH` they are `400` unless they repeat the stored value.
+- **Past days** may be closed. **One open closure per trip:** a second is `409 already_closed`, naming
+  the open one; change its note with `PATCH`.
+- **The list is worked out on every read:** every booking with a trip on that route and day that holds
+  its seats (charters too), plus every booking with a follow-up row. A booking sold onto the trip
+  later is on it at once (legacy tagged it only when someone opened the panel). A booking with no row
+  reads `awaiting`; a row is written when it is notified or resolved.
+- Each entry: `pax` is its passengers on that route; `on_trip` is false once it has moved away or
+  been cancelled; `refundable` (single read only) is what a weather cancel would give back now, the
+  "Paid ฿x" legacy shows.
+- `counts` and `pax` are legacy's "To notify / Notified / Resolved" and its calendar tally
+  (`bkV2WeatherCountsFor`): `pending` is not yet resolved, `cancelled` is resolved any way but
+  `reschedule`.
+
+**Notify** needs the booking on the list (`404 not_on_closed_trip`) and `awaiting` (`409 wrong_status`).
+
+**Resolving is the booking's own command** (a full new day is refused, lock seats go back, as for any
+reschedule):
+- `/reschedule` moving the booking off the closed day: outcome `reschedule`, `new_date` where it went.
+- `/cancel-weather`: outcome `cancel`, `refund` or `credit`. It resolves every open follow-up of the
+  booking.
+- A row needs no notify first, and a row already resolved keeps its first outcome. A `PATCH` move or
+  an ordinary `/cancel` resolves nothing.
+
+**The money of a weather cancel** (`POST /v1/bookings/{id}/cancel-weather`,
+`{ "outcome": "refund", "note": "…" }`):
+1. **Only this booking's share comes off its invoice.** On each live booking or prepay invoice
+   carrying its lines: if no other booking has a live line on it, the invoice is voided
+   (`void_reason: "weather"`), as legacy does; otherwise only this booking's lines are taken off
+   (`removed_*`) and the totals and VAT are worked out from the lines left. Fee invoices stand.
+   Legacy voided the whole invoice, so the other bookings on it went back to unpaid.
+2. **What it had paid** is the invoice's payments, less refunds and credits already taken from it,
+   less what the invoice still asks; never below 0. On a shared invoice the bookings still travelling
+   are paid first, so only money the invoice no longer needs comes back.
+3. **The outcome:**
+   - `cancel` (default, legacy "No refund"): nothing more; what was paid stays on the invoice.
+   - `refund`: a `refund` of that amount, owed to the agent. Paying it out is not modelled.
+   - `credit`: a `credit` of that amount for the invoice's agent. Nothing paid is `409 nothing_paid`;
+     an invoice with no agent is `409 no_agent`.
+4. `amount` cannot be sent (`400`): the server works it out.
+
+```jsonc
+// POST /v1/bookings/BK-1/cancel-weather  { "outcome": "credit", "version": 7 }
+{ "...": "the booking", "status": "cancelled_weather", "invoice": null, "warnings": [],
+  "refunds": [ { "id": "rf_…", "kind": "credit", "invoice_id": "inv_…", "booking_id": "BK-1", "agent_id": "a01",
+                 "amount": 5600, "reason": "weather", "created_by": "ops1", "created_at": "…" } ] }
+```
+
+**The agent's credit balance** (legacy's deposits): `GET /v1/agents/{id}` carries
+`credit_balance: { credited, used, available }`: its credits, less its live payments with
+`method: "credit"`. Spend it with `POST /v1/invoices/{id}/payments` and `method: "credit"`.
+
+**Restore** of a weather-cancelled booking puts its status back only: it stays off its old invoice
+(issue a new one), a refund or credit stays, and its follow-up keeps its outcome.
+
+**Undo** (legacy "Undo cancel · re-open trip") keeps the closure as reopened, deletes the follow-up of
+every unresolved booking with a history line, and leaves resolved bookings as they are. With any
+resolved it first answers `409 has_resolved`, listing them (`BK-1 · reschedule`); send
+`undo_anyway: true`. A reopened closure refuses notify, `PATCH` and undo (`409 closure_reopened`); the
+trip may be closed again, as a new closure.
+
+**Change feed:** kind `weather_closure`, `route_days` its trip, for every closure write and for a
+booking command that resolved one of its rows.
+
+**Calendars** that grey out a closed trip read `GET /v1/weather-closures?from=&to=`: availability does
+not change, as legacy's seat count did not.
+
+**Import.** `import-legacy.ts` mirrors `sb_weather` and the bookings' `weatherResolve`
+(`legacy-weather.ts`), `lg_`-prefixed and replaced on every run, as legacy has them (the 3 stale
+`awaiting` follow-ups included). Rehearsal of 2026-10-09: 5 closures, 40 follow-ups (3 awaiting,
+37 resolved), the same 13 / 15 / 9 / 1 / 2 per closure as legacy.
 
 ### Upgrades
 
@@ -2352,6 +2485,10 @@ the last number it saw and refetches only the records named.
     feed as well, since their `invoice` and `payment_state` changed.
   - `b2c_held_order`: Love Kingdom's write held for review, retried, resolved or dismissed (see
     [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)). `route_days` is `null`.
+    feed as well, since their `invoice` and `payment_state` changed. A weather cancel's lines taken
+    off, refund or credit count as a change;
+  - `weather_closure`: closed, its note, a notify, undo, or a booking command that resolved one of
+    its follow-ups (`route_days` is its trip).
 
   `action` is `created`, `updated` or `deleted`.
 - **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking

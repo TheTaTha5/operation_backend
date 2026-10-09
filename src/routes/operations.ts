@@ -15,14 +15,14 @@ import { parseBookingAddOns, type BookingAddOnInput } from '../domain/booking-ad
 import { parseBookingAdjustments, type BookingAdjustmentInput } from '../domain/booking-adjustments.js';
 import type { AgentListQuery } from '../domain/agents.js';
 import {
-  actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
+  actorOf, assertOpen, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
 } from '../domain/booking-actions.js';
 import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, charterSynced, checkBoatAssignment, parseDispatchPatch, parseRaise, paxByBoat } from '../domain/dispatch.js';
-import { changeContext, trackChanges } from './change-tracking.js';
+import { changeContext, noteWeatherClosure, trackChanges } from './change-tracking.js';
 import { parseSince } from '../domain/changes.js';
 import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
 import { areaId, inheritedCells, lookupPickupTime, parseAreaPatch, parseCell, parseNewArea, parseProfile, sortAreas, type PickupArea } from '../domain/pickup-areas.js';
@@ -48,9 +48,16 @@ import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import {
   assertPaymentEcho, bangkokDay, bookingIdsOf, correctPayments, creditOf, feeInvoice, invoiceLines, invoiceMonth, invoiceNumber, invoiceView, issuedLine, issueInvoice,
-  parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, voided, voidedLine, withDiscounts,
+  parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, returnedOf, voided, voidedLine, withDiscounts,
   type PaymentMethod, type StoredInvoice,
 } from '../domain/invoices.js';
+import {
+  assertCreditCovers, creditBalance, matchesRefundQuery, parseRefundListQuery, refundableFor, weatherMoney, type CreditBalance,
+} from '../domain/refunds.js';
+import {
+  assertOpenClosure, closedLine, closureView, followUps, notifiedLine, parseClosureListQuery, parseClosurePatch, parseNewClosure, parseUndo, parseWeatherCancel,
+  planClose, planNotify, planUndo, reopenedLine, resolvedRows, type CaseOutcome, type FollowUp, type WeatherClosure,
+} from '../domain/weather.js';
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
@@ -795,7 +802,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return warnings.length ? { ...booking, price_warnings: warnings } : booking;
     });
   }
-  for (const command of STATUS_COMMANDS) {
+  for (const command of STATUS_COMMANDS.filter((c) => c !== 'cancel-weather')) {
     app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
       const body = parseStatusCommandRequest(withoutVersion(request.body));
       const changed = await store.transaction(async () => {
@@ -806,6 +813,54 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       // `warnings` is the days an approval puts past the boats' registered seats; empty otherwise.
       return { ...changed.booking, warnings: changed.warnings };
     });
+  }
+  /**
+   * A weather cancel (legacy `bkV2WeatherResolveOne`'s refund, credit and cancel). The money first, as
+   * a plan: only this booking's share comes off its invoice, and what it had paid beyond what the
+   * invoice still asks is refunded or kept as credit (`refunds.ts`). Then the status, then the writes,
+   * and the booking's open weather follow-ups are resolved with the outcome (`weather.ts`).
+   */
+  app.post('/v1/bookings/:id/cancel-weather', { schema: docs.statusCommand('cancel-weather') }, async (request) => {
+    const body = parseWeatherCancel(withoutVersion(request.body));
+    const by = actorOf(request.user);
+    const done = await store.transaction(async () => {
+      await assertBookingFresh(request);
+      const before = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+      assertOpen(before.status, 'cancel');
+      const invoices = await store.invoicesOfBookings([before.id]);
+      const payments = await store.paymentsOf(invoices.map((i) => i.id));
+      const refunds = await store.listRefunds({ invoiceIds: invoices.map((i) => i.id) });
+      const money = weatherMoney({ booking_id: before.id, outcome: body.outcome, invoices, payments, refunds, now: new Date().toISOString(), by: by ?? null, newId: () => `rf_${randomUUID()}` });
+      const changed = (await store.changeBookingStatus(before.id, 'cancel-weather', { ...(body.note ? { note: body.note } : {}), weather: { outcome: body.outcome, amount: money.amount } }, by))
+        ?? notFound('Booking not found');
+      for (const invoice of money.invoices) await store.putInvoice(invoice);
+      for (const refund of money.refunds) await store.putRefund(refund);
+      await resolveWeather(before, changed.booking, body.outcome, null, true, by ?? null);
+      return { booking: (await store.booking(before.id))!, refunds: money.refunds };
+    });
+    return { ...done.booking, warnings: [], refunds: done.refunds };
+  });
+  /**
+   * The weather follow-ups a booking command resolved (decision 5): the open closures the booking left,
+   * and for a weather cancel its other open rows too. Written in the command's own transaction.
+   */
+  async function resolveWeather(before: Booking, after: Booking, outcome: CaseOutcome, newDate: string | null, allOpenRows: boolean, by: string | null): Promise<void> {
+    const dates = before.trips.map((t) => t.service_date).sort();
+    const closures = (dates.length ? await store.listWeatherClosures({ from: dates[0], to: dates[dates.length - 1] }) : [])
+      .filter((c) => before.trips.some((t) => t.route_id === c.route_id && t.service_date === c.service_date));
+    // A reschedule off no closed trip resolves nothing: no more to read (each read can collide in a serializable transaction).
+    if (!closures.length && !allOpenRows) return;
+    const rows = await store.weatherCasesOfBooking(before.id);
+    for (const row of rows) {
+      if (closures.some((c) => c.id === row.closure_id)) continue;
+      const closure = await store.weatherClosure(row.closure_id);
+      if (closure) closures.push(closure);
+    }
+    const now = new Date().toISOString();
+    for (const row of resolvedRows({ before, after, closures, rows, outcome, new_date: newDate, allOpenRows, now, by })) {
+      await store.putWeatherCase(row);
+      noteWeatherClosure(row.closure_id);
+    }
   }
   app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request, reply) => {
     const outcome = await holdOnBadInput(request, 'cancel', async () => {
@@ -1048,9 +1103,17 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   /** An invoice with its payments and their slips, as every invoice endpoint answers it. */
   const fullInvoices = async (invoices: readonly StoredInvoice[]) => {
     const payments = await store.paymentsOf(invoices.map((i) => i.id));
+    const refunds = await store.listRefunds({ invoiceIds: invoices.map((i) => i.id) });
     const slips = payments.flatMap((p) => p.slips);
     const files = slips.length ? await store.attachmentRefs(slips) : new Map();
-    return invoices.map((i) => invoiceView(i, payments.filter((p) => p.invoice_id === i.id), files));
+    return invoices.map((i) => invoiceView(i, payments.filter((p) => p.invoice_id === i.id), files, refunds.filter((r) => r.invoice_id === i.id)));
+  };
+  /** What refunds and credits took back from an invoice: no longer counted as paid. */
+  const returnedFrom = async (invoiceId: string): Promise<number> => returnedOf(await store.listRefunds({ invoiceIds: [invoiceId] }));
+  /** An agent's credit balance (legacy `acctAgentDepositAvail`): its credits less its `credit` payments. */
+  const agentCredit = async (agentId: string): Promise<CreditBalance> => {
+    const invoices = await store.listInvoices({ agentId });
+    return creditBalance(await store.listRefunds({ agentId }), await store.paymentsOf(invoices.map((i) => i.id)));
   };
   const fullInvoice = async (invoice: StoredInvoice) => (await fullInvoices([invoice]))[0];
   /** A login tied to one agent sees that agent's invoices only; another's is not found. */
@@ -1170,7 +1233,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const now = new Date();
       const input = parsePayment(body, now);
       if (input.slips.length) assertKnownFiles(input.slips, new Set((await store.attachmentRefs(input.slips)).keys()), 'slip_ids');
-      const { payment, history } = recordPayment(current, await store.paymentsOf([current.id]), input, `pay_${randomUUID()}`, now.toISOString(), by);
+      // Spending credit (legacy "Use deposit"): never more than the agent holds.
+      if (input.method === 'credit') assertCreditCovers(current, current.agent_id ? await agentCredit(current.agent_id) : creditBalance([], []), input.amount);
+      const { payment, history } = recordPayment(current, await store.paymentsOf([current.id]), input, `pay_${randomUUID()}`, now.toISOString(), by, await returnedFrom(current.id));
       await store.putPayment(payment);
       await historyOn(current, history);
       return current;
@@ -1183,7 +1248,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const by = actorOf(request.user) ?? null;
     return store.transaction(async () => {
       const invoice = await ownInvoice(request);
-      const { changed, history } = correctPayments(invoice, await store.paymentsOf([invoice.id]), body, new Date().toISOString(), by);
+      const { changed, history } = correctPayments(invoice, await store.paymentsOf([invoice.id]), body, new Date().toISOString(), by, await returnedFrom(invoice.id));
       for (const p of changed) await store.putPayment(p);
       if (history) await historyOn(invoice, history);
       return fullInvoice(invoice);
@@ -1210,6 +1275,115 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
           return { ...p, slips: p.slips.map((id) => files.get(id) ?? { id, name: id, mime: 'application/octet-stream', size: 0 }), invoice_number: inv.number, agent_id: inv.agent_id, booking_ids: bookingIdsOf(inv) };
         }),
     };
+  });
+  /** Refunds owed to agents and credits kept for them (`refunds.ts`), oldest first. */
+  app.get('/v1/refunds', async (request) => {
+    const agent = request.user?.user?.agent_id;
+    const q = { ...parseRefundListQuery(request.query as Record<string, unknown>), ...(agent ? { agent_id: agent } : {}) };
+    const refunds = (await store.listRefunds({ agentId: q.agent_id, bookingId: q.booking_id })).filter((r) => matchesRefundQuery(r, q));
+    const numbers = new Map<string, string>();
+    for (const id of new Set(refunds.map((r) => r.invoice_id))) numbers.set(id, (await store.invoice(id))?.number ?? id);
+    return { refunds: refunds.map((r) => ({ ...r, invoice_number: numbers.get(r.invoice_id)! })) };
+  });
+
+  // ── Weather closures (todo/weather-closures-model.md; `weather.ts`) ──
+  const closureId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+  const closureNotFound = (id: string): never => notFound(`Weather closure ${id} not found`);
+  const routeNameOf = async (id: string): Promise<string> => (await store.listRoutes()).find((r) => r.id === id)?.name ?? id;
+  /**
+   * A closure's follow-up list: the bookings on the trip and every booking with a row. `refundable`
+   * (what a weather cancel would give back now) only for a single closure's read.
+   */
+  const followUpsOf = async (closure: WeatherClosure, withRefundable = false): Promise<FollowUp[]> => {
+    const rows = await store.weatherCases(closure.id);
+    const bookings = new Map((await store.bookingsOn(closure.service_date, closure.route_id)).map((b) => [b.id, b]));
+    for (const row of rows) {
+      if (bookings.has(row.booking_id)) continue;
+      const b = await store.booking(row.booking_id);
+      if (b) bookings.set(b.id, b);
+    }
+    const list = [...bookings.values()];
+    if (!withRefundable) return followUps(closure, list, rows);
+    const ids = followUps(closure, list, rows).map((e) => e.booking_id);
+    const invoices = await store.invoicesOfBookings(ids);
+    const payments = await store.paymentsOf(invoices.map((i) => i.id));
+    const refunds = await store.listRefunds({ invoiceIds: invoices.map((i) => i.id) });
+    return followUps(closure, list, rows, new Map(ids.map((id) => [id, refundableFor(id, invoices, payments, refunds)])));
+  };
+  /** A login tied to one agent sees its own bookings on the list only. */
+  const closureRead = async (closure: WeatherClosure, withBookings: boolean, agent?: string | null) => {
+    const entries = await followUpsOf(closure, withBookings);
+    return closureView(closure, agent ? entries.filter((e) => e.agent_id === agent) : entries, withBookings);
+  };
+  const storedClosure = async (request: { params: unknown }): Promise<WeatherClosure> => (await store.weatherClosure(closureId(request))) ?? closureNotFound(closureId(request));
+
+  app.get('/v1/weather-closures', async (request) => {
+    const closures = await store.listWeatherClosures(parseClosureListQuery(request.query as Record<string, unknown>));
+    const agent = request.user?.user?.agent_id;
+    const out = [];
+    for (const closure of closures) out.push(await closureRead(closure, false, agent));
+    return { weather_closures: out };
+  });
+  app.get('/v1/weather-closures/:id', async (request) => closureRead(await storedClosure(request), true, request.user?.user?.agent_id));
+  /**
+   * Close a trip for weather (legacy `bkV2WeatherMarkConfirm`). Refuses no sale (decision 1); writes
+   * legacy's history line on every booking then on the trip. Past dates are allowed (decision 11).
+   */
+  app.post('/v1/weather-closures', async (request, reply) => {
+    const input = parseNewClosure(record(request.body));
+    const by = actorOf(request.user) ?? null;
+    const created = await store.transaction(async () => {
+      const routes = await store.listRoutes();
+      // With no catalogue (the in-process store unseeded) there is nothing to check against, as for bookings.
+      if (routes.length && !routes.some((r) => r.id === input.route_id)) badRequest(`route_id ${input.route_id} is not a route (GET /v1/routes)`);
+      const open = (await store.listWeatherClosures({ route_id: input.route_id, from: input.service_date, to: input.service_date }))[0];
+      const closure = planClose(input, open, `wx_${randomUUID()}`, new Date().toISOString(), by);
+      await store.putWeatherClosure(closure);
+      const name = routes.find((r) => r.id === closure.route_id)?.name ?? closure.route_id;
+      for (const entry of await followUpsOf(closure)) await store.addHistory(entry.booking_id, closedLine(by, name, closure.service_date));
+      return closure;
+    });
+    return reply.code(201).send(await closureRead(created, true));
+  });
+  /** The note (legacy's "Update note"). */
+  app.patch('/v1/weather-closures/:id', async (request) => {
+    const body = record(request.body);
+    const by = actorOf(request.user) ?? null;
+    return store.transaction(async () => {
+      const closure = await storedClosure(request);
+      assertOpenClosure(closure);
+      const patch = parseClosurePatch(body, await closureRead(closure, true));
+      if (patch.note !== undefined && patch.note !== closure.note) await store.putWeatherClosure({ ...closure, note: patch.note, updated_by: by, updated_at: new Date().toISOString() });
+      return closureRead((await store.weatherClosure(closure.id))!, true);
+    });
+  });
+  /** Legacy `bkV2WeatherNotify`: staff told the agent. Nothing is sent. */
+  app.post('/v1/weather-closures/:id/bookings/:booking_id/notify', async (request) => {
+    const by = actorOf(request.user) ?? null;
+    return store.transaction(async () => {
+      const closure = await storedClosure(request);
+      const row = planNotify(closure, await followUpsOf(closure), (request.params as { booking_id: string }).booking_id, new Date().toISOString(), by);
+      await store.putWeatherCase(row);
+      await store.addHistory(row.booking_id, notifiedLine(by));
+      return closureRead(closure, true);
+    });
+  });
+  /** Legacy `bkV2WeatherUncancel`: re-open the trip; resolved bookings stay as they are (decision 8). */
+  app.post('/v1/weather-closures/:id/undo', async (request) => {
+    const { undo_anyway } = parseUndo(record(request.body ?? {}));
+    const by = actorOf(request.user) ?? null;
+    return store.transaction(async () => {
+      const closure = await storedClosure(request);
+      const plan = planUndo(closure, await followUpsOf(closure), undo_anyway, new Date().toISOString(), by);
+      await store.putWeatherClosure(plan.closure);
+      const rows = new Set((await store.weatherCases(closure.id)).map((r) => r.booking_id));
+      const name = await routeNameOf(closure.route_id);
+      for (const id of plan.back) {
+        if (rows.has(id)) await store.deleteWeatherCase(closure.id, id);
+        await store.addHistory(id, reopenedLine(by, name, closure.service_date));
+      }
+      return closureRead(plan.closure, true);
+    });
   });
 
   /**
@@ -1401,6 +1575,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const invoiced = reschedule.kind === 'record' && before.invoice !== null;
       let moved = (await store.rescheduleBooking(before.id, invoiced ? { ...reschedule, invoiced } : reschedule, actorOf(request.user))) ?? notFound('Booking not found');
       if (invoiced && await invoiceRescheduleFee(moved, actorOf(request.user) ?? null)) moved = (await store.booking(moved.id))!;
+      // Moving a booking off a weather-closed trip resolves its follow-up there (decision 5).
+      await resolveWeather(before, moved, 'reschedule', reschedule.kind === 'record' ? reschedule.to_date : reschedule.service_date, false, actorOf(request.user) ?? null);
       return (await syncAltParts(moved)) ? (await store.booking(moved.id))! : moved;
     });
   });
@@ -2032,7 +2208,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       bookings.push(...page.bookings);
       cursor = page.next_cursor;
     } while (cursor);
-    return { ...agent, credit: creditOf(agent, bookings) };
+    // `credit` is the credit limit's use; `credit_balance` is money kept for the agent (weather credits), spent as payments.
+    return { ...agent, credit: creditOf(agent, bookings), credit_balance: await agentCredit(agent.id) };
   });
   app.get('/v1/agents/:id/activity', async (request) => {
     const query = request.query as Record<string, unknown>;

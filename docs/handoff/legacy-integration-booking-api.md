@@ -220,8 +220,9 @@ copies.**
 | `t.charterPriceMode` / `Manual` / `Note` | `trips[].charter_price_mode` / `charter_price_manual` / `charter_price_note` |
 
 - **`mergeInto` keeps only what the API does not hold:** `history` (until `refreshDetail` replaces
-  it), `weatherResolve`, `rebook`, `b2cOverride`, `refund`, `createdAt`. (`invoiceId` and
-  `paymentStatus` now come from the booking's `invoice` and `payment_state`: see 2.7.)
+  it), `rebook`, `b2cOverride`, `createdAt`. (`invoiceId` and `paymentStatus` now come from the
+  booking's `invoice` and `payment_state`: see 2.7. `weatherResolve` and `refund` come from the
+  weather closures and `GET /v1/refunds`: see 2.8.)
   Remove `ops`, `upgrades`, `altPickups`, `docCheck`, `adjustments` from its keep list, and stop
   copying `ops`, `ovnCharge`, `promoId`, `rtRef` from the old trips. Its comment "adjustments are not
   stored by the server yet" is out of date.
@@ -466,6 +467,40 @@ Accounting screen and the Daily PFM payment dialogs move from `SB_INVOICES`/`SB_
   `overpay_anyway: true`.
 - **Writes need the `accounting` area.**
 - **A deleted payment stays** with `deleted_at`. Leave it out of what you list.
+
+### 2.8 Weather closures, refund and credit (Boat Operation popover, the weather panel)
+
+**The server keeps the closures and the follow-up now** (README "Weather closures, refund and
+credit"). `SB_WEATHER_CLOSURES`, `bk.weatherResolve`, `bk.refund` and the weather `SB_DEPOSITS` move
+to these:
+
+| Legacy | API |
+|---|---|
+| `bkV2IsWeatherClosed`, `bkV2WeatherNote`, the calendars' closed marker | `GET /v1/weather-closures?from=&to=` (open ones; `counts`, `pax`) |
+| `bkV2WeatherMarkConfirm` (new) | `POST /v1/weather-closures` `{ route_id, service_date, note }` |
+| `bkV2WeatherMarkConfirm` ("Update note") | `PATCH /v1/weather-closures/{id}` `{ note }` |
+| `bkV2WeatherUncancel` | `POST /v1/weather-closures/{id}/undo`; on `409 has_resolved` show the message as the confirm, and on yes resend with `undo_anyway: true` |
+| `bkV2WeatherTagBookings`, `bkV2WeatherEventBookings`, `bkV2WeatherPanel`, `bkV2WeatherInlineCell` | `GET /v1/weather-closures/{id}` → `bookings` (status, outcome, `new_date`, `refundable` = "Paid ฿x") |
+| `bkV2WeatherNotify` | `POST /v1/weather-closures/{id}/bookings/{booking_id}/notify` |
+| `bkV2WeatherResolveOne` "Reschedule" | `POST /v1/bookings/{id}/reschedule` `{ from_date: <closed day>, to_date, reason: "weather" }` |
+| `bkV2WeatherResolveOne` "Refund" / "Credit" / "Cancel" | `POST /v1/bookings/{id}/cancel-weather` `{ outcome: "refund" \| "credit" \| "cancel" }` |
+| `bkV2WeatherCountsFor` | the closure's `pax` |
+| `_dashBoardData` weather count | `GET /v1/weather-closures` → sum of `counts.awaiting + counts.notified` |
+| `acctAgentDepositAvail`, "Deposit held" | `GET /v1/agents/{id}` → `credit_balance` |
+| `acctPayUseDeposit`, `acctApplyDeposit` | `POST /v1/invoices/{id}/payments` `{ amount, method: "credit" }` |
+
+- **Delete client-side:** the tagging on panel open, the weather branch of `bkV2WeatherResolveOne`
+  (trip move, `bk.rebook`, the negative payment, `acctVoidInvoice`, `acctCreateDeposit`), and
+  `weatherResolve` and `refund` from `mergeInto`'s keep list. The server moves the trips, takes only
+  this booking's share off its invoice and writes the history lines.
+- **What behaves differently:** a full new day refuses the reschedule (`409`, show it); the "Credit"
+  option should be greyed when `refundable` is 0 (else `409 nothing_paid`); a shared invoice is no
+  longer voided whole.
+- **Refusals to show as they are:** `409 already_closed`, `409 closure_reopened`, `409 wrong_status`,
+  `404 not_on_closed_trip`, `409 nothing_paid`, `409 no_agent`, `409 credit_short`,
+  `409 credit_payment`.
+- **Writes need the `operations` area** (the refund and credit too); spending credit is an invoice
+  payment and needs `accounting`.
 
 ## 3. Day-of-operations
 

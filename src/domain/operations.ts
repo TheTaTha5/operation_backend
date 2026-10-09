@@ -12,7 +12,8 @@ import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import type { Change, ChangeInput } from './changes.js';
 import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
-import { bookingIdsOf, bookingInvoice, copyInvoice, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment } from './invoices.js';
+import { bookingIdsOf, bookingInvoice, copyInvoice, returnedOf, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment, type StoredRefund } from './invoices.js';
+import { matchesClosureQuery, planClose, sortClosures, type ClosureListQuery, type WeatherCase, type WeatherClosure } from './weather.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
@@ -701,10 +702,12 @@ export class OperationsStore {
   private invoices = new Map<string, StoredInvoice>();
   private payments = new Map<string, StoredPayment>();
   private invoiceCounters = new Map<string, number>();
+  /** As PostgreSQL's: the invoices naming the booking on a line not taken off. */
   private invoiceBriefs(bookingId: string): InvoiceBrief[] {
-    return [...this.invoices.values()].filter((i) => i.lines.some((l) => l.booking_id === bookingId)).map((i) => ({
+    return [...this.invoices.values()].filter((i) => i.lines.some((l) => l.booking_id === bookingId && !l.removed_at)).map((i) => ({
       id: i.id, number: i.number, kind: i.kind, fee_type: i.fee_type, total: i.total, issued_at: i.issued_at, voided: i.voided,
       paid: [...this.payments.values()].filter((p) => p.invoice_id === i.id && !p.deleted_at).map((p) => p.amount),
+      returned: returnedOf([...this.refundRows.values()].filter((r) => r.invoice_id === i.id)),
     }));
   }
   /** The next number of the month: one past the counter, or past the highest number already issued (an import). */
@@ -729,6 +732,43 @@ export class OperationsStore {
       .sort((a, b) => (a.recorded_at === b.recorded_at ? (a.id < b.id ? -1 : 1) : a.recorded_at < b.recorded_at ? -1 : 1)).map((p) => ({ ...p, slips: [...p.slips] }));
   }
   deleteAttachment(id: string): boolean { return this.files.delete(id); }
+
+  // ── Refunds and credits (migration 061) ──
+  private refundRows = new Map<string, StoredRefund>();
+  putRefund(refund: StoredRefund): void { this.refundRows.set(refund.id, { ...refund }); }
+  /** Oldest first. */
+  listRefunds(q: { invoiceIds?: readonly string[]; agentId?: string; bookingId?: string } = {}): StoredRefund[] {
+    return [...this.refundRows.values()].filter((r) => (!q.invoiceIds || q.invoiceIds.includes(r.invoice_id)) && (!q.agentId || r.agent_id === q.agentId) && (!q.bookingId || r.booking_id === q.bookingId))
+      .sort((a, b) => (a.created_at === b.created_at ? (a.id < b.id ? -1 : 1) : a.created_at < b.created_at ? -1 : 1)).map((r) => ({ ...r }));
+  }
+
+  // ── Weather closures (migration 060) ──
+  private weatherClosures = new Map<string, WeatherClosure>();
+  private weatherCaseRows: WeatherCase[] = [];
+  listWeatherClosures(q: Partial<ClosureListQuery> = {}): WeatherClosure[] {
+    return sortClosures([...this.weatherClosures.values()].filter((c) => matchesClosureQuery(c, q))).map((c) => ({ ...c }));
+  }
+  weatherClosure(id: string): WeatherClosure | undefined { const c = this.weatherClosures.get(id); return c && { ...c }; }
+  /** As PostgreSQL's unique index: one open closure per trip. */
+  putWeatherClosure(closure: WeatherClosure): void {
+    const clash = [...this.weatherClosures.values()].find((c) => c.id !== closure.id && c.reopened_at === null && closure.reopened_at === null
+      && c.route_id === closure.route_id && c.service_date === closure.service_date);
+    if (clash) planClose(closure, clash, closure.id, closure.closed_at, closure.closed_by);
+    this.weatherClosures.set(closure.id, { ...closure });
+  }
+  /** By booking id. */
+  weatherCases(closureId: string): WeatherCase[] {
+    return this.weatherCaseRows.filter((r) => r.closure_id === closureId).sort((a, b) => (a.booking_id < b.booking_id ? -1 : 1)).map((r) => ({ ...r }));
+  }
+  weatherCasesOfBooking(bookingId: string): WeatherCase[] {
+    return this.weatherCaseRows.filter((r) => r.booking_id === bookingId).sort((a, b) => (a.closure_id < b.closure_id ? -1 : 1)).map((r) => ({ ...r }));
+  }
+  putWeatherCase(row: WeatherCase): void {
+    this.weatherCaseRows = [...this.weatherCaseRows.filter((r) => !(r.closure_id === row.closure_id && r.booking_id === row.booking_id)), { ...row }];
+  }
+  deleteWeatherCase(closureId: string, bookingId: string): void {
+    this.weatherCaseRows = this.weatherCaseRows.filter((r) => !(r.closure_id === closureId && r.booking_id === bookingId));
+  }
 
   /** Route upgrades (migration 038), kept after an undo. */
   private tripUpgrades: TripUpgrade[] = [];

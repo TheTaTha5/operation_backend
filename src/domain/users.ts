@@ -82,6 +82,9 @@ export function writeNeed(path: string): WriteNeed {
   // Love Kingdom's held orders: ops resolve or dismiss them (todo/b2c-sync-model.md). Its own login is
   // refused above, as every write outside /v1/bookings is.
   if (path.startsWith('/v1/b2c/')) return { kind: 'area', areas: ['operations'] };
+  // Weather closures: legacy saves them only with operations (`sbWeatherPersist`, decision 10). Their
+  // refund and credit are made by `/cancel-weather`, under the bookings above.
+  if (path === '/v1/weather-closures' || path.startsWith('/v1/weather-closures/')) return { kind: 'area', areas: ['operations'] };
   // Legacy's Re-confirm page sends the agent's list.
   if (path === '/v1/reconfirm/sent') return { kind: 'area', areas: ['operations'] };
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).

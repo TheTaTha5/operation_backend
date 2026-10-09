@@ -51,6 +51,11 @@ flowchart LR
   money -- "invoice_lines.booking_id" --> bookings
   money -- "invoices.agent_id" --> sales
   b2c["Love Kingdom's held orders<br/>b2c_held_orders"] -- "booking_id, resolved_booking_id" --> bookings
+  weather["Weather closures, refunds and credits<br/>weather_closures, weather_cases, refunds"]
+  weather -- "weather_closures.route_id" --> catalogue
+  weather -- "weather_cases.booking_id, refunds.booking_id" --> bookings
+  weather -- "refunds.invoice_id" --> money
+  weather -- "refunds.agent_id" --> sales
 ```
 
 ## 1. Catalogue and seat pool
@@ -840,6 +845,9 @@ erDiagram
     text label
     numeric amount "as issued; never recomputed"
     numeric discount
+    timestamptz removed_at "taken off by a weather cancel; out of every total (061)"
+    text removed_by
+    text removed_reason "weather"
   }
   invoice_number_counters {
     text year_month PK "YYMM"
@@ -849,7 +857,7 @@ erDiagram
     text id PK
     text invoice_id FK
     numeric amount "above 0"
-    text method "transfer, cash or card"
+    text method "transfer, cash, card or credit (061: spends the agent's credit)"
     date paid_on
     text ref
     text recorded_by
@@ -914,6 +922,64 @@ erDiagram
   replaces.
 - **`changes.kind`** also takes `b2c_held_order` (100). The migration adds it to whatever list the
   constraint has, so another branch's kind is kept whichever runs first.
+## 8. Weather closures, refunds and credits
+
+Legacy's weather cancel (migrations 060 and 061, `todo/weather-closures-model.md`). The rules are in
+`src/domain/weather.ts` and `src/domain/refunds.ts`. The follow-up list is not stored: it is the
+bookings on the closed trip plus the rows of `weather_cases`, worked out on read.
+
+```mermaid
+erDiagram
+  weather_closures {
+    text id PK "wx_… ; lg_… imported"
+    text route_id FK
+    date service_date "one open closure per route and day (partial unique index)"
+    text note
+    text closed_by
+    timestamptz closed_at
+    text updated_by "the last note change"
+    timestamptz updated_at
+    text reopened_by "undo; the closure is kept"
+    timestamptz reopened_at
+  }
+  weather_cases {
+    text closure_id PK, FK "ON DELETE CASCADE"
+    text booking_id PK, FK "ON DELETE CASCADE"
+    text status "awaiting, notified or resolved"
+    timestamptz notified_at
+    text notified_by
+    text outcome "reschedule, refund, credit or cancel; set exactly when resolved"
+    date new_date "a reschedule's new day"
+    timestamptz resolved_at
+    text resolved_by
+  }
+  refunds {
+    text id PK "rf_…"
+    text kind "refund (owed to the agent) or credit (the agent's balance)"
+    text invoice_id FK "the invoice the money comes off"
+    text booking_id FK
+    text agent_id FK "the invoice's agent; required for a credit"
+    numeric amount "above 0"
+    text reason "weather"
+    text created_by
+    timestamptz created_at
+  }
+  routes { text id PK }
+  bookings { text id PK }
+  invoices { text id PK }
+  agents { text id PK }
+  routes ||--o{ weather_closures : "closed on"
+  weather_closures ||--o{ weather_cases : "follows up"
+  bookings ||--o{ weather_cases : "followed up"
+  invoices ||--o{ refunds : "gives back"
+  bookings |o--o{ refunds : "for"
+  agents |o--o{ refunds : "to"
+```
+
+- **A row is written only when something happens to a booking** (notified, resolved, imported). A
+  booking on the trip with no row reads `awaiting`.
+- **The agent's credit balance** is its `credit` rows less its live payments with `method = 'credit'`.
+- **`changes.kind`** also takes `weather_closure` (060).
 
 ## Ids with no foreign key
 

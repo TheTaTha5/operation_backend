@@ -35,7 +35,8 @@ import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
 import type { Allergy } from './allergies.js';
 import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
-import type { InvoiceBrief, InvoiceLine, StoredInvoice, StoredPayment } from './invoices.js';
+import type { InvoiceBrief, InvoiceLine, StoredInvoice, StoredPayment, StoredRefund } from './invoices.js';
+import { type ClosureListQuery, type WeatherCase, type WeatherClosure } from './weather.js';
 import { DOC_ITEMS, type DocCheck } from './doc-check.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
 import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
@@ -170,8 +171,9 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
   (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
     FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
   COALESCE((SELECT jsonb_agg(jsonb_build_object('id', i.id, 'number', i.number, 'kind', i.kind, 'fee_type', i.fee_type, 'total', i.total, 'issued_at', i.issued_at,
-      'voided', i.voided, 'paid', COALESCE((SELECT jsonb_agg(p.amount) FROM payments p WHERE p.invoice_id = i.id AND p.deleted_at IS NULL), '[]'::jsonb)))
-    FROM invoices i WHERE i.id IN (SELECT invoice_id FROM invoice_lines WHERE booking_id = b.id)), '[]'::jsonb) AS invoices,
+      'voided', i.voided, 'paid', COALESCE((SELECT jsonb_agg(p.amount) FROM payments p WHERE p.invoice_id = i.id AND p.deleted_at IS NULL), '[]'::jsonb),
+      'returned', (SELECT COALESCE(sum(rf.amount), 0) FROM refunds rf WHERE rf.invoice_id = i.id)))
+    FROM invoices i WHERE i.id IN (SELECT invoice_id FROM invoice_lines WHERE booking_id = b.id AND removed_at IS NULL)), '[]'::jsonb) AS invoices,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('from_date', r.from_date::text, 'to_date', r.to_date::text, 'reason', r.reason, 'charge_type', r.charge_type,
       'charge_amount', r.charge_amount, 'collect', r.collect, 'at', r.at, 'by', r.by) ORDER BY r.at, r.id)
@@ -209,8 +211,25 @@ const storedInvoice = (r: QueryResultRow): StoredInvoice => ({
   created_by: r.created_by ?? null,
   lines: ((r.lines as Record<string, unknown>[]) ?? []).map((l): InvoiceLine => ({
     seq: Number(l.seq), booking_id: (l.booking_id as string) ?? null, label: String(l.label), amount: Number(l.amount), discount: numOrNull(l.discount),
+    removed_at: l.removed_at ? jsonInstant(l.removed_at) : null, removed_by: (l.removed_by as string) ?? null, removed_reason: (l.removed_reason as string) ?? null,
   })),
 });
+const storedRefund = (r: QueryResultRow): StoredRefund => ({
+  id: String(r.id), kind: r.kind, invoice_id: String(r.invoice_id), booking_id: r.booking_id ?? null, agent_id: r.agent_id ?? null,
+  amount: Number(r.amount), reason: String(r.reason), created_by: r.created_by ?? null, created_at: asIso(r.created_at),
+});
+const weatherClosureRow = (r: QueryResultRow): WeatherClosure => ({
+  id: String(r.id), route_id: String(r.route_id), service_date: String(r.service_date), note: r.note ?? null,
+  closed_by: r.closed_by ?? null, closed_at: asIso(r.closed_at), updated_by: r.updated_by ?? null, updated_at: r.updated_at ? asIso(r.updated_at) : null,
+  reopened_by: r.reopened_by ?? null, reopened_at: r.reopened_at ? asIso(r.reopened_at) : null,
+});
+const weatherCaseRow = (r: QueryResultRow): WeatherCase => ({
+  closure_id: String(r.closure_id), booking_id: String(r.booking_id), status: r.status,
+  notified_at: r.notified_at ? asIso(r.notified_at) : null, notified_by: r.notified_by ?? null,
+  outcome: r.outcome ?? null, new_date: r.new_date ?? null, resolved_at: r.resolved_at ? asIso(r.resolved_at) : null, resolved_by: r.resolved_by ?? null,
+});
+const WEATHER_CLOSURE_COLUMNS = 'id, route_id, service_date::text AS service_date, note, closed_by, closed_at, updated_by, updated_at, reopened_by, reopened_at';
+const WEATHER_CASE_COLUMNS = 'closure_id, booking_id, status, notified_at, notified_by, outcome, new_date::text AS new_date, resolved_at, resolved_by';
 const textOrNull = (value: unknown): string | null => (value === null || value === undefined ? null : String(value));
 
 const NUMERIC_HEADER = new Set<string>(BOOKING_HEADER_NUMERIC_COLUMNS);
@@ -354,7 +373,7 @@ const booking = (row: QueryResultRow): Booking => {
   }, storedReconfirm(row.reconfirm), new Map(((row.files as AttachmentRef[]) ?? []).map((f) => [f.id, { id: f.id, name: f.name, mime: f.mime, size: Number(f.size) }])), storedDocCheck(row.doc_check),
   ((row.invoices as Record<string, unknown>[]) ?? []).map((i): InvoiceBrief => ({
     id: String(i.id), number: String(i.number), kind: i.kind as InvoiceBrief['kind'], fee_type: (i.fee_type as InvoiceBrief['fee_type']) ?? null, total: Number(i.total),
-    issued_at: jsonInstant(i.issued_at), voided: i.voided === true, paid: ((i.paid as unknown[]) ?? []).map(Number),
+    issued_at: jsonInstant(i.issued_at), voided: i.voided === true, paid: ((i.paid as unknown[]) ?? []).map(Number), returned: Number(i.returned ?? 0),
   })));
 };
 /** A check-in record from `CHECKINS_JSON`: its columns as jsonb, timestamps as ISO text. */
@@ -1726,13 +1745,15 @@ export class PostgresOperationsStore {
     [i.id, i.number, i.agent_id, i.kind, i.fee_type, i.vat_mode, i.vat_rate, i.subtotal, i.net_amount, i.vat_amount, i.total, i.wht_amount,
       i.issued_at, i.due_at, i.note, i.ref, i.dear, i.accept_at, i.remark, i.voided, i.voided_at, i.voided_by, i.void_reason, i.created_by]);
     await this.client().query('DELETE FROM invoice_lines WHERE invoice_id = $1', [i.id]);
-    await this.client().query(`INSERT INTO invoice_lines (invoice_id, seq, booking_id, label, amount, discount)
-      SELECT $1, l.seq, l.booking_id, l.label, l.amount, l.discount FROM jsonb_to_recordset($2::jsonb) AS l(seq int, booking_id text, label text, amount numeric, discount numeric)`,
+    await this.client().query(`INSERT INTO invoice_lines (invoice_id, seq, booking_id, label, amount, discount, removed_at, removed_by, removed_reason)
+      SELECT $1, l.seq, l.booking_id, l.label, l.amount, l.discount, l.removed_at, l.removed_by, l.removed_reason
+      FROM jsonb_to_recordset($2::jsonb) AS l(seq int, booking_id text, label text, amount numeric, discount numeric, removed_at timestamptz, removed_by text, removed_reason text)`,
     [i.id, JSON.stringify(i.lines)]);
   }
   private async invoicesWhere(where: string, params: unknown[]): Promise<StoredInvoice[]> {
     const { rows } = await this.client().query(`SELECT i.*, i.accept_at::text AS accept_at, COALESCE((SELECT jsonb_agg(jsonb_build_object('seq', l.seq, 'booking_id', l.booking_id,
-        'label', l.label, 'amount', l.amount, 'discount', l.discount) ORDER BY l.seq) FROM invoice_lines l WHERE l.invoice_id = i.id), '[]'::jsonb) AS lines
+        'label', l.label, 'amount', l.amount, 'discount', l.discount, 'removed_at', l.removed_at, 'removed_by', l.removed_by, 'removed_reason', l.removed_reason) ORDER BY l.seq)
+        FROM invoice_lines l WHERE l.invoice_id = i.id), '[]'::jsonb) AS lines
       FROM invoices i WHERE ${where} ORDER BY i.issued_at, i.id`, params);
     return rows.map(storedInvoice);
   }
@@ -1765,6 +1786,61 @@ export class PostgresOperationsStore {
       recorded_by: r.recorded_by ?? null, recorded_at: asIso(r.recorded_at), deleted_at: r.deleted_at ? asIso(r.deleted_at) : null,
       deleted_by: r.deleted_by ?? null, delete_reason: r.delete_reason ?? null, slips: (r.slips as string[]) ?? [],
     }));
+  }
+
+  // ── Refunds and credits (migration 061) ──
+  async putRefund(r: StoredRefund): Promise<void> {
+    await this.client().query(`INSERT INTO refunds (id, kind, invoice_id, booking_id, agent_id, amount, reason, created_by, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [r.id, r.kind, r.invoice_id, r.booking_id, r.agent_id, r.amount, r.reason, r.created_by, r.created_at]);
+  }
+  /** Oldest first. */
+  async listRefunds(q: { invoiceIds?: readonly string[]; agentId?: string; bookingId?: string } = {}): Promise<StoredRefund[]> {
+    const { rows } = await this.client().query(`SELECT * FROM refunds WHERE ($1::text[] IS NULL OR invoice_id = ANY($1::text[]))
+      AND ($2::text IS NULL OR agent_id = $2) AND ($3::text IS NULL OR booking_id = $3) ORDER BY created_at, id COLLATE "C"`, [q.invoiceIds ? [...q.invoiceIds] : null, q.agentId ?? null, q.bookingId ?? null]);
+    return rows.map(storedRefund);
+  }
+
+  // ── Weather closures (migration 060) ──
+  async listWeatherClosures(q: Partial<ClosureListQuery> = {}): Promise<WeatherClosure[]> {
+    const { rows } = await this.client().query(`SELECT ${WEATHER_CLOSURE_COLUMNS} FROM weather_closures
+      WHERE ($1::date IS NULL OR service_date >= $1) AND ($2::date IS NULL OR service_date <= $2) AND ($3::text IS NULL OR route_id = $3) AND ($4 OR reopened_at IS NULL)
+      ORDER BY service_date, route_id COLLATE "C", closed_at, id COLLATE "C"`, [q.from ?? null, q.to ?? null, q.route_id ?? null, q.include_reopened === true]);
+    return rows.map(weatherClosureRow);
+  }
+  async weatherClosure(id: string): Promise<WeatherClosure | undefined> {
+    const { rows: [row] } = await this.client().query(`SELECT ${WEATHER_CLOSURE_COLUMNS} FROM weather_closures WHERE id = $1`, [id]);
+    return row && weatherClosureRow(row);
+  }
+  /** One open closure per trip: the unique index's refusal is the same `409` the route gives. */
+  async putWeatherClosure(c: WeatherClosure): Promise<void> {
+    try {
+      await this.client().query(`INSERT INTO weather_closures (id, route_id, service_date, note, closed_by, closed_at, updated_by, updated_at, reopened_by, reopened_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at,
+          reopened_by = EXCLUDED.reopened_by, reopened_at = EXCLUDED.reopened_at`,
+      [c.id, c.route_id, c.service_date, c.note, c.closed_by, c.closed_at, c.updated_by, c.updated_at, c.reopened_by, c.reopened_at]);
+    } catch (error) {
+      // Only a close racing another one gets here (the route checks first); the transaction is aborted, so nothing more is read.
+      if ((error as { constraint?: string }).constraint !== 'weather_closures_open') throw error;
+      refuse(`${c.route_id} on ${c.service_date} is already closed for weather`, 409, 'already_closed');
+    }
+  }
+  /** By booking id. */
+  async weatherCases(closureId: string): Promise<WeatherCase[]> {
+    return (await this.client().query(`SELECT ${WEATHER_CASE_COLUMNS} FROM weather_cases WHERE closure_id = $1 ORDER BY booking_id COLLATE "C"`, [closureId])).rows.map(weatherCaseRow);
+  }
+  async weatherCasesOfBooking(bookingId: string): Promise<WeatherCase[]> {
+    return (await this.client().query(`SELECT ${WEATHER_CASE_COLUMNS} FROM weather_cases WHERE booking_id = $1 ORDER BY closure_id COLLATE "C"`, [bookingId])).rows.map(weatherCaseRow);
+  }
+  async putWeatherCase(r: WeatherCase): Promise<void> {
+    await this.client().query(`INSERT INTO weather_cases (closure_id, booking_id, status, notified_at, notified_by, outcome, new_date, resolved_at, resolved_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT (closure_id, booking_id) DO UPDATE SET status = EXCLUDED.status, notified_at = EXCLUDED.notified_at, notified_by = EXCLUDED.notified_by,
+        outcome = EXCLUDED.outcome, new_date = EXCLUDED.new_date, resolved_at = EXCLUDED.resolved_at, resolved_by = EXCLUDED.resolved_by`,
+    [r.closure_id, r.booking_id, r.status, r.notified_at, r.notified_by, r.outcome, r.new_date, r.resolved_at, r.resolved_by]);
+  }
+  async deleteWeatherCase(closureId: string, bookingId: string): Promise<void> {
+    await this.client().query('DELETE FROM weather_cases WHERE closure_id = $1 AND booking_id = $2', [closureId, bookingId]);
   }
 
   /** A boat's capacity for one day (migration 046 records who and when): the trip-ops raise. */
