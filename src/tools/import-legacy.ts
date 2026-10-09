@@ -1,7 +1,11 @@
 /**
  * Backfills this service's database from the legacy monolith's (`operation_schemas`).
  *
- *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…] [--rate-types]
+ *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…] [--rate-types] [--b2c=all|pushed|none]
+ *
+ * Love Kingdom's orders (`b2c_…`) are imported unless `--b2c` says otherwise (`legacy-b2c.ts`): `pushed`
+ * leaves out the orders Love Kingdom has pushed here itself, `none` leaves them all out. The test
+ * orders `b2c_BK-…` never come.
  *
  * Without `--commit` it is a dry run: every write happens inside one transaction on the target, the
  * report is printed, and the transaction is rolled back. The source is opened read-only either way.
@@ -55,6 +59,7 @@ import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 import { mapLegacyMoney } from './legacy-invoices.js';
+import { b2cSkipReason, parseB2CMode } from './legacy-b2c.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -64,6 +69,8 @@ const commit = process.argv.includes('--commit');
 const remove = (process.argv.find((arg) => arg.startsWith('--remove='))?.slice('--remove='.length) ?? '').split(',').filter(Boolean);
 /** Rate types are this API's since 2026-10-09: imported only to seed an empty database. */
 const withRateTypes = process.argv.includes('--rate-types');
+/** How far Love Kingdom's push has taken over its orders (todo/b2c-sync-model.md): `all` until someone says. */
+const b2cMode = parseB2CMode(process.argv);
 const sourceUrl = process.env.SOURCE_DATABASE_URL;
 const targetUrl = process.env.TARGET_DATABASE_URL;
 if (!sourceUrl || !targetUrl) throw new Error('Set SOURCE_DATABASE_URL and TARGET_DATABASE_URL');
@@ -603,8 +610,12 @@ async function main() {
     const approvalDayLicensedFree = (await target.query(`SELECT 1 FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = 'booking_approval_days' AND column_name = 'licensed_free'`)).rowCount === 1;
     const report = { skip, note };
+    // Love Kingdom's orders pushed here (`legacy-b2c.ts`): with `--b2c=pushed` legacy's copy of them stays out.
+    const pushedOrders = new Set((await target.query(`SELECT external_id FROM bookings WHERE external_id IS NOT NULL AND id NOT LIKE '${PREFIX}%'`)).rows.map((r) => String(r.external_id)));
     for (const b of legacyBookings) {
       const legacyId = str(b.id);
+      const b2cSkip = b2cSkipReason(legacyId, b2cMode, pushedOrders);
+      if (b2cSkip) { note(b2cSkip); continue; }
       const status = str(b.status);
       if (!isBookingStatus(status)) { skip('booking', legacyId, `status ${status || '(blank)'}`); continue; }
       const legacyTripRows = tripsOf.get(legacyId) ?? [];
@@ -1194,6 +1205,7 @@ async function main() {
       (SELECT count(*) FROM rate_type_longtail_prices)::int rate_longtail_prices, (SELECT count(*) FROM rate_type_transfer_prices)::int rate_transfer_prices`);
 
     console.log(`\n${commit ? 'COMMIT' : 'DRY RUN (rolled back)'}`);
+    console.log(`Love Kingdom's orders: --b2c=${b2cMode}; ${pushedOrders.size} booking(s) here carry an external_id (pushed)`);
     console.log(`read from legacy: ${legacyBookings.length} bookings, ${legacyTrips.length} trips, ${legacyPassengers.length} passengers, ${boatDays.length} boat-days, ${legacyLocks.length} locks, ${capOverrides.length} overrides`);
     console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks`);
     console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
