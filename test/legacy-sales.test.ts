@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales } from '../src/tools/legacy-sales.js';
+import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales, mapLegacyStaffAndBoard } from '../src/tools/legacy-sales.js';
 
 // The import's mapping of legacy's sales data (`legacy-sales.ts`), on rows shaped as legacy's tables
 // hold them (read from production 2026-10-09).
@@ -62,4 +62,35 @@ test('insurance: the lead on the booking, a passenger by legacy index, text ages
   assert.deepEqual([booking.lead_age, booking.lead_insurance_reviewed_at], [47, new Date(1791522226454).toISOString()]);
   assert.deepEqual([second.age, second.insurance_reviewed_at], [2.5, null]);
   assert.equal(notes.length, 3);
+});
+
+test('staff keep legacy\'s ids and codes (clashes included) and their 2026 quota; targets and marks parse legacy\'s keys', () => {
+  const at = '2026-10-10T00:00:00.000Z';
+  const out = mapLegacyStaffAndBoard({
+    at, salesIds: new Set(['s01', 's05']), agentIds: new Set(['a56']),
+    staff: [
+      { id: 'st01', code: 'EMP-001', name: 'Natthaphat Chotejirawarachat · ', dept: 'Sales', active: true, quota_2026: '3' },
+      { id: 'st03', code: 'EMP-010', name: 'Nirin', dept: 'Sales', active: null, quota_2026: '0' },
+      { id: 'st10', code: 'EMP-010', name: 'Suchawadee', dept: '', active: false, quota_2026: null },
+      { id: 'st11', code: '', name: '', dept: null, active: true, quota_2026: '-1' },
+      { id: '', name: 'nobody' },
+    ],
+    sales: [
+      { id: 's01', targets: JSON.stringify({ '2026-07': 120, '2026-08': 0, 'July': 5 }), followup: JSON.stringify({ '2026-07::a56': true, 'foc:2026-07::a56': true, '2026-07::a99': true, '2026-13::a56': true, '2026-08::a56': false }) },
+      { id: 's05', targets: null, followup: '{}' },
+      { id: 's_gone', targets: JSON.stringify({ '2026-07': 10 }), followup: null },
+      { id: 's01x', targets: 'not json', followup: null },
+    ],
+  });
+  assert.deepEqual(out.staff, [
+    { id: 'st01', code: 'EMP-001', name: 'Natthaphat Chotejirawarachat ·', dept: 'Sales', active: true },
+    { id: 'st03', code: 'EMP-010', name: 'Nirin', dept: 'Sales', active: true },
+    { id: 'st10', code: 'EMP-010', name: 'Suchawadee', dept: null, active: false },
+    { id: 'st11', code: null, name: '', dept: null, active: true },
+  ]);
+  assert.deepEqual(out.quotas, [{ staff_id: 'st01', year: 2026, free_seats: 3 }, { staff_id: 'st03', year: 2026, free_seats: 0 }]);
+  assert.deepEqual(out.targets, [{ sales_id: 's01', month: '2026-07', pax: 120, set_at: at, set_by: null }]);
+  assert.deepEqual(out.followups.map((f) => [f.sales_id, f.month, f.agent_id, f.kind]), [['s01', '2026-07', 'a56', 'agent'], ['s01', '2026-07', 'a56', 'foc']]);
+  assert.equal(out.issues.length, 6, out.issues.join('\n'));
+  assert.ok(out.issues.some((i) => i.includes('agent a99 is not here')));
 });
