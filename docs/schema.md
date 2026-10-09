@@ -173,7 +173,9 @@ erDiagram
     text holder_type "agent, office or global (048)"
     text agent_id FK "set for, and only for, agent"
     text boat_id "a whole-boat hold (047); no FK"
-    text status "active or released"
+    text boat_deal "a hold's fixed or any (180)"
+    text status "active, released, or converted (a hold, 180)"
+    text converted_booking_id "the charter a hold became (180); no FK"
     date expiry "past it, holds nothing (048)"
     text reason
     text group_id FK "a bulk lock's departure"
@@ -234,6 +236,11 @@ erDiagram
   day, one level deep. Only a top-level lock holds seats in the pool: `pax − released_pax − drawn −
   pending_pax`, its sub-groups dividing that. Expiry, the release cutoff and `overdue` are worked out
   on read (`src/domain/seat-locks.ts`), never written into `status`.
+- **Whole-boat holds (047, 180).** A lock with `boat_id` takes that boat as a charter does; `pax` is
+  the minimum seats promised and `boat_deal` says whether the boat itself (`fixed`) or any boat that
+  big (`any`) was promised (both set together: `CHECK ((boat_id IS NULL) = (boat_deal IS NULL))`).
+  Making one places the boat on the route (a `deployments` row) when it was not. `converted` is a
+  hold's status only, and only with `converted_booking_id`.
 
 - **A boat sails one route per day.** `deployments` is keyed on `(service_date, boat_id)`, so
   deploying the same boat again that day *moves* it rather than adding a second row.

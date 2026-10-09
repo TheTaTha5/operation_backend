@@ -3,21 +3,28 @@
 **Status:** decided and built 2026-10-09 on `feat/seat-lock-extras` (migration 048; README "Agent
 seat locks"; code in `src/domain/seat-locks.ts`, `seat-lock-service.ts`, `seat-lock-input.ts`;
 import in `src/tools/legacy-locks.ts`). Legacy read: wt-lk-inbox@658298d, `08-app.js` `bkV2Lock*`.
-What is left, and what to look at before merging, is below.
+Whole-boat holds (decision 5) built 2026-10-10 on `feat/boat-holds-commands` (migration 180; README
+"Whole-boat holds"; `src/domain/boat-holds.ts`, `boat-hold-service.ts`). What is left, and what to
+look at before merging, is below.
 
 ## Open
 
-1. **Whole-boat holds: creating and converting them** (legacy `bkV2BoatLock*`, the charter
-   conversion, "fixed/any", the refusals). Their own design (decision 5). Here a hold is made by the
-   import only; every command but a full release refuses it (`400 boat_hold`).
-2. **Editing a bulk lock's range or weekdays** is refused (`400 server_owned`: "release it and make
+1. **Editing a bulk lock's range or weekdays** is refused (`400 server_owned`: "release it and make
    a new one"). Legacy allows it while nothing is drawn (7 `edit` log lines in all, none changing a
    range). Ask ops whether they need it; building it means adding and removing departures.
-3. **A login tied to one agent (Love Kingdom's) may lock seats for any holder.** Bookings refuse
-   another agent (`403`); locks never checked it. Decide whether `/v1/seat-locks` should too.
-4. **Legacy's KPI per agent** (`bkV2LockKpiByAgent`: seats locked vs drawn, conversion %) has no
+2. **A login tied to one agent (Love Kingdom's) may lock seats for any holder.** Bookings refuse
+   another agent (`403`); locks never checked it. Decide whether `/v1/seat-locks` should too (holds
+   included).
+3. **Legacy's KPI per agent** (`bkV2LockKpiByAgent`: seats locked vs drawn, conversion %) has no
    endpoint; a screen can sum `GET /v1/seat-locks?agent_id=` (`pax`, `drawn_pax`, `state`). Ask
    whether one is wanted.
+4. **A hold's boat seats in the list.** Legacy's hold rows show the boat's seats that day
+   (`bkV2BoatCapOn`); `GET /v1/seat-locks` does not carry them. A screen reads them from
+   `/v1/seat-locks/boat-options` or the boat (`GET /v1/boats`). Add `boat_capacity` to a hold if the
+   screen wants it in one read.
+5. **The boat's pier by date.** Legacy asks the boat's pier on the travel date (§boatPierDate); here
+   a boat has one `pier`, so a boat that moves pier for a season is checked against its catalogue
+   pier.
 
 ## Flagged
 
@@ -89,3 +96,37 @@ cover them (legacy's behaviour unless said otherwise).
   `verify-import`: every mapped lock and log line present; locked seats per route and day match
   legacy on all 179 route-days. A replay of legacy's pool hold (`bkV2LockPoolHold`) for every active
   day lock from today matches on all 41 route-days.
+
+**Whole-boat holds** (2026-10-10, migration 180; legacy §bkLock, 8 holds: 4 active, 3 released, 1
+converted, all `fixed`)
+
+- *Placing the boat:* legacy writes the boat-board cell, creating it when the boat was not on the
+  board; here a hold **creates the boat's deployment** on its route (catalogue capacity and licence)
+  when missing, and the change feed announces it. Release or a move leaves it as a normal boat, as
+  legacy's `CellClear`. A hold moved to another route on the same day and boat moves the deployment.
+- *Deviations from legacy, decided here:*
+  - the "sold more than the other boats seat" blocker counts only when the boat is on the hold's
+    route; legacy took the boat's seats off the route even when it was not there, refusing an extra
+    boat on a sold-out day;
+  - an `any` hold is checked against its boat's seats on create too (legacy: edit and swap only);
+  - convert refuses a booking without a charter of the held boat on the hold's route and date (`400
+    hold_mismatch`; legacy saved the booking and left the hold active) and a quote (`400 hold_quote`;
+    legacy converted the hold but, for a quote, did not take the boat, so it went back to the pool);
+  - a route change is checked like a move (legacy re-checked only a new date or boat);
+  - refusals and the pick list's reasons are in English (legacy's list said them in Thai).
+- *Kept from legacy:* the booking's agent may differ from the holder's; expiry may already be past
+  when made (the hold then reads `overdue`); no past-date check on the hold itself; locks are not
+  counted in "sold" (legacy's `seatsConsumed`); a boat's readiness and pier have no "anyway" (legacy's
+  list just does not offer such a boat); bookings that do not hold seats (quotes, cancelled) never
+  block (legacy counted quotes).
+- *Changes to existing behaviour:* `POST /v1/seat-locks` with `boat_id` makes a hold (`boat_id` was
+  ignored); `PATCH` on a hold edits it (was `400 boat_hold` for seats or a move); `boat_id` on an
+  ordinary lock's `PATCH` still `400 server_owned`, now saying how to make a hold; Boat Operation's
+  remove or move of a held boat is `409 boat_held` (was open item 1 of `deployment-guards-model.md`);
+  a hold's release logs legacy's `manual · {boat}` with no seats (was seats 0 and no note). Booking create
+  was split into plan and write (`src/routes/operations.ts`) so convert runs it in its transaction;
+  `createBooking` in both stores takes an exclusion.
+- *The import:* `converted` stays `converted` with `lg_` + the booking its `convert` line names (a
+  converted hold with no such line → released); `boat_deal` from `subname`. Rehearsed on a throwaway
+  import 2026-10-10: 8 holds, deals and statuses as legacy, the converted one's booking present, 13
+  log lines; `verify-import`'s lock checks 0 differences.

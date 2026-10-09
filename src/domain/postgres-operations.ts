@@ -480,12 +480,12 @@ const heldOrderRow = (r: QueryResultRow): HeldOrder => ({
 });
 /** Every `seat_locks` column, its dates cast to text. */
 const LOCK_COLUMNS = `id, version, route_id, service_date::text AS service_date, pax, pending_pax, released_pax, holder_type, agent_id, status, expiry::text AS expiry,
-  reason, group_id, parent_id, sub_name, boat_id, created_at, created_by, updated_at, released_at`;
+  reason, group_id, parent_id, sub_name, boat_id, boat_deal, converted_booking_id, created_at, created_by, updated_at, released_at`;
 const lockRow = (row: QueryResultRow): LockRow => ({
   id: String(row.id), version: Number(row.version), route_id: String(row.route_id), service_date: String(row.service_date), pax: Number(row.pax),
   pending_pax: Number(row.pending_pax), released_pax: Number(row.released_pax), holder_type: row.holder_type as HolderType, agent_id: row.agent_id ?? null,
   status: row.status as LockRow['status'], expiry: row.expiry ?? null, reason: row.reason ?? null, group_id: row.group_id ?? null, parent_id: row.parent_id ?? null,
-  sub_name: row.sub_name ?? null, boat_id: row.boat_id ?? null, created_at: asIso(row.created_at), created_by: row.created_by ?? null, updated_at: asIso(row.updated_at),
+  sub_name: row.sub_name ?? null, boat_id: row.boat_id ?? null, boat_deal: row.boat_deal ?? null, converted_booking_id: row.converted_booking_id ?? null, created_at: asIso(row.created_at), created_by: row.created_by ?? null, updated_at: asIso(row.updated_at),
   released_at: row.released_at ? asIso(row.released_at) : null,
 });
 const GROUP_COLUMNS = `id, version, route_id, holder_type, agent_id, date_from::text AS date_from, date_to::text AS date_to, weekdays, pax,
@@ -1060,7 +1060,8 @@ export class PostgresOperationsStore {
     await this.client().query(`UPDATE bookings SET updated_at = now(), version = version + 1, updated_by = COALESCE($2, updated_by)${extra} WHERE id = $1`, [id, actor ?? null, ...values]);
   }
 
-  async createBooking(input: BookingInput, actor?: string): Promise<Booking> {
+  /** `exclude` leaves a lock out of the seats it is weighed against: a whole-boat hold being converted into this booking. */
+  async createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Promise<Booking> {
     if (input.external_id !== undefined) {
       const { rows: [taken] } = await this.client().query('SELECT id FROM bookings WHERE external_id = $1', [input.external_id]);
       if (taken) externalIdTaken(input.external_id, String(taken.id));
@@ -1071,7 +1072,7 @@ export class PostgresOperationsStore {
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
-      overDays: await this.weighTrips(input.trips, {}, [], input.agent_id),
+      overDays: await this.weighTrips(input.trips, exclude, [], input.agent_id),
     }, actor);
     const status = decision.status;
     const head: BookingHeader = { ...input.header, ...(status === 'confirmed' ? confirmationStamp(actor, new Date().toISOString()) : {}) };
@@ -1329,9 +1330,9 @@ export class PostgresOperationsStore {
     const { rows } = await this.client().query(`SELECT ${LOCK_COLUMNS} FROM seat_locks
       WHERE ($1::text[] IS NULL OR id = ANY($1)) AND ($2::text IS NULL OR route_id = $2) AND ($3::date IS NULL OR service_date = $3)
         AND ($4::date IS NULL OR service_date >= $4) AND ($5::date IS NULL OR service_date <= $5) AND ($6::text IS NULL OR group_id = $6)
-        AND ($7::text[] IS NULL OR parent_id = ANY($7)) AND ($8::text IS NULL OR agent_id = $8)
+        AND ($7::text[] IS NULL OR parent_id = ANY($7)) AND ($8::text IS NULL OR agent_id = $8) AND ($9::boolean IS NULL OR (boat_id IS NOT NULL) = $9)
       ORDER BY created_at, id`,
-    [q.ids ? [...q.ids] : null, q.routeId ?? null, q.serviceDate ?? null, q.from ?? null, q.to ?? null, q.groupId ?? null, q.parentIds ? [...q.parentIds] : null, q.agentId ?? null]);
+    [q.ids ? [...q.ids] : null, q.routeId ?? null, q.serviceDate ?? null, q.from ?? null, q.to ?? null, q.groupId ?? null, q.parentIds ? [...q.parentIds] : null, q.agentId ?? null, q.boat ?? null]);
     return rows.map(lockRow);
   }
   async lockDrawn(ids: readonly string[]): Promise<Map<string, number>> {
@@ -1345,14 +1346,15 @@ export class PostgresOperationsStore {
   }
   async putLock(r: LockRow): Promise<void> {
     await this.client().query(`INSERT INTO seat_locks (id, version, route_id, service_date, pax, pending_pax, released_pax, holder_type, agent_id, status, expiry,
-        reason, group_id, parent_id, sub_name, boat_id, created_at, created_by, updated_at, released_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+        reason, group_id, parent_id, sub_name, boat_id, boat_deal, converted_booking_id, created_at, created_by, updated_at, released_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
       ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, route_id = EXCLUDED.route_id, service_date = EXCLUDED.service_date, pax = EXCLUDED.pax,
         pending_pax = EXCLUDED.pending_pax, released_pax = EXCLUDED.released_pax, holder_type = EXCLUDED.holder_type, agent_id = EXCLUDED.agent_id,
         status = EXCLUDED.status, expiry = EXCLUDED.expiry, reason = EXCLUDED.reason, group_id = EXCLUDED.group_id, parent_id = EXCLUDED.parent_id,
-        sub_name = EXCLUDED.sub_name, boat_id = EXCLUDED.boat_id, updated_at = EXCLUDED.updated_at, released_at = EXCLUDED.released_at`,
+        sub_name = EXCLUDED.sub_name, boat_id = EXCLUDED.boat_id, boat_deal = EXCLUDED.boat_deal, converted_booking_id = EXCLUDED.converted_booking_id,
+        updated_at = EXCLUDED.updated_at, released_at = EXCLUDED.released_at`,
     [r.id, r.version, r.route_id, r.service_date, r.pax, r.pending_pax, r.released_pax, r.holder_type, r.agent_id, r.status, r.expiry,
-      r.reason, r.group_id, r.parent_id, r.sub_name, r.boat_id, r.created_at, r.created_by, r.updated_at, r.released_at]);
+      r.reason, r.group_id, r.parent_id, r.sub_name, r.boat_id, r.boat_deal, r.converted_booking_id, r.created_at, r.created_by, r.updated_at, r.released_at]);
   }
   async lockGroupRows(q: { ids?: readonly string[]; routeId?: string; agentId?: string }): Promise<GroupRow[]> {
     const { rows } = await this.client().query(`SELECT ${GROUP_COLUMNS} FROM seat_lock_groups

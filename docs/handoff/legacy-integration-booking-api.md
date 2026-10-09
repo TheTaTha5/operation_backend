@@ -992,6 +992,7 @@ dialog resends with `remove_anyway`.**
 |---|---|---|
 | `409 seats_sold` ("N booking(s) (P pax) on it") | removing a boat, moving it to another route, or shrinking it below the passengers placed on it | legacy's confirm (`bop2UnassignBoat`, `bop2AssignBoat`) with the server's message; on yes resend with `remove_anyway: true` (`?remove_anyway=true` on `DELETE`) |
 | `409 charter_boat` ("Cancel the charter booking first") | a boat a charter holds | show it |
+| `409 boat_held` ("… held whole for an agent. Release the hold on the Seat Locks page first.") | removing or moving a boat an active whole-boat hold takes | show it, as `bop2UnassignBoat` does |
 | `409 past_date` | a date before today (Asia/Bangkok), unless the login is an admin | show it |
 | `409 boat_not_ready` ("… is not ready on …: fixing, held by MJ-058") | putting a boat that is fixing/unavailable that day (its log or a started job), or a charter boat not chartered that day, on a route or another route | single assign: the pool already hides such a boat; if it still happens, confirm with the message and resend with `deploy_anyway: true`. Range and weekly forms: skip that day as `statusBlocked` does. Copy week/day, templates: resend with `deploy_anyway: true` to keep legacy's behaviour |
 | `400` | a `license_pax` that differs from the boat catalogue's | show it |
@@ -1232,6 +1233,25 @@ POST /v1/seat-locks   { "route_id": "r1", "service_date": "2026-10-12", "pax": 6
 POST /v1/seat-lock-groups { "route_id": "r5", "date_from": "2026-11-01", "date_to": "2027-03-31", "weekdays": [2, 4], "pax": 30,
                             "agent_id": "amrsvysasrifkh", "release_days_before": 2, "release_time": "15:00" }
 ```
+
+**Whole-boat holds (§bkLock; built 2026-10-10, migration 180, README "Whole-boat holds").** The
+Hold-whole-boat form and its buttons move to the API; the browser stops writing `scope: 'boat'`
+locks and the boat-board cell (`boatLockId`): the server places the boat and takes it.
+
+| Legacy | API |
+|---|---|
+| `bkV2BoatLockSubmit` → `bkV2CreateBoatLock` | `POST /v1/seat-locks { route_id, service_date, boat_id, pax, boat_deal, agent_id \| holder_type, expiry, reason }` (`pax` = the minimum, `boat_deal` = `fixed`/`any` instead of `subName`) |
+| `bkV2BoatLockPickList` | `GET /v1/seat-locks/boat-options?route_id=&service_date=[&lock_id=]`: each boat's `capacity`, `ok`, `why.message`, `placed_route_id`, `own` |
+| `bkV2BoatLockBlockers` table | the `409 boat_taken`'s `blockers.bookings` (`voucher_ref`, `agent_id`, `pax`, `from_lock`) |
+| `bkV2BoatLockEdit`, `bkV2BoatLockSwap` | `PATCH /v1/seat-locks/{id}` with `If-Match`; the "names a specific boat … Continue?" confirm is `409 fixed_boat` → resend with `change_boat_anyway: true` |
+| `bkV2BoatLockRelease` | `POST /v1/seat-locks/{id}/release` with `If-Match` (no `pax`) |
+| `bkV2BoatLockToCharter` + `bkV2BoatLockOnConvert` | the booking form posts to `POST /v1/seat-locks/{id}/convert` (same body as `POST /v1/bookings`, with `If-Match` of the hold) instead of `POST /v1/bookings` + `d._boatLockId` → `201 { booking, seat_lock }` |
+| `bkV2BoatLockOverdue` | the lock's `overdue` |
+
+- **Breaking:** a free-text holder is refused (`400`), as for every lock; a hold may not be saved as a
+  quote through convert (`400 hold_quote`), and a convert whose booking is not a charter of the held
+  boat on its route and date is refused (`400 hold_mismatch`) instead of leaving the hold active.
+- `GET /v1/seat-locks?kind=boat` lists the holds (the "Whole-boat holds" card), `kind=seats` the rest.
 
 ### 6.2 Availability (`ops/50-ops-availability.js`)
 

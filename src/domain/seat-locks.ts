@@ -15,9 +15,12 @@ import { refuse } from './booking-actions.js';
 export const HOLDER_TYPES = ['agent', 'office', 'global'] as const;
 export type HolderType = (typeof HOLDER_TYPES)[number];
 export const isHolderType = (value: unknown): value is HolderType => HOLDER_TYPES.includes(value as HolderType);
-export type LockStatus = 'active' | 'released';
+/** `converted`: a whole-boat hold that became a charter booking (legacy `bkV2BoatLockOnConvert`). */
+export type LockStatus = 'active' | 'released' | 'converted';
 /** Legacy's labels: `depleted` is a lock with nothing left that sold something. */
-export type LockState = 'active' | 'depleted' | 'expired' | 'released';
+export type LockState = 'active' | 'depleted' | 'expired' | 'released' | 'converted';
+/** A whole-boat hold's deal: this boat (`fixed`), or any boat that seats the minimum (`any`). Legacy's reused `subName`. */
+export type BoatDeal = 'fixed' | 'any';
 /** The answer to "not enough free seats": lock what is free and keep the rest pending, or keep it all pending. */
 export type PendingChoice = 'split' | 'all';
 
@@ -46,6 +49,10 @@ export type LockRow = {
   sub_name: string | null;
   /** A whole-boat hold (migration 047): it takes this boat, as a charter does. */
   boat_id: string | null;
+  /** A hold's deal (migration 180); `null` on any other lock. */
+  boat_deal: BoatDeal | null;
+  /** The charter booking a hold became (`status: converted`). */
+  converted_booking_id: string | null;
   created_at: string;
   created_by: string | null;
   updated_at: string;
@@ -129,6 +136,8 @@ export type LockQuery = {
   groupId?: string;
   parentIds?: readonly string[];
   agentId?: string;
+  /** `true`: whole-boat holds only; `false`: every other lock. */
+  boat?: boolean;
 };
 
 /** One order for both stores: oldest first, then by id. A sub-group's share of pending seats follows it. */
@@ -140,7 +149,7 @@ export function matchesLock(row: LockRow, q: LockQuery): boolean {
   return (!q.ids || q.ids.includes(row.id)) && (!q.routeId || row.route_id === q.routeId)
     && (!q.serviceDate || row.service_date === q.serviceDate) && (!q.from || row.service_date >= q.from) && (!q.to || row.service_date <= q.to)
     && (!q.groupId || row.group_id === q.groupId) && (!q.parentIds || (row.parent_id !== null && q.parentIds.includes(row.parent_id)))
-    && (!q.agentId || row.agent_id === q.agentId);
+    && (!q.agentId || row.agent_id === q.agentId) && (q.boat === undefined || (row.boat_id !== null) === q.boat);
 }
 
 // ── Holding, expiry and the release cutoff ─────────────────────────────────────────────────────
@@ -278,7 +287,8 @@ export function lockViews(rows: readonly LockRow[], drawn: ReadonlyMap<string, n
     const overdue = top.boat_id !== null
       ? top.status === 'active' && top.expiry !== null && top.expiry < today
       : holding && release_at !== null && now.getTime() >= Date.parse(release_at);
-    const topState: LockState = top.status === 'released' ? (tree.used > 0 ? 'depleted' : 'released')
+    const topState: LockState = top.status === 'converted' ? 'converted'
+      : top.status === 'released' ? (tree.used > 0 ? 'depleted' : 'released')
       : !holding ? 'expired'
       : kids.length === 0 && tree.parent.remaining === 0 && tree.pend === 0 && tree.used > 0 ? 'depleted' : 'active';
     out.set(top.id, {

@@ -277,7 +277,7 @@ is: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` (several, joined
 | `PATCH /v1/bookings/{id}` | only trips it adds, or moves to another route or day |
 | `POST /v1/bookings/{id}/reschedule` | the trips it moves |
 | `POST /v1/bookings/{id}/restore` | every trip |
-| `POST /v1/seat-locks`, `PATCH` moving one, `POST /v1/seat-lock-groups` | its day (a bulk lock: only the days the route runs become departures) |
+| `POST /v1/seat-locks`, `PATCH` moving one, `POST /v1/seat-lock-groups` | its day (a bulk lock: only the days the route runs become departures; a whole-boat hold too) |
 | `/confirm`, `/approve`, `/reject`, `/cancel`, partial cancel | nothing: they do not choose a day |
 
 A trip a `PATCH` leaves where it is was sold already, so a booking whose day closed after the sale
@@ -863,6 +863,7 @@ Validation errors are `400` and name the path, for example:
 - **Guards** (legacy `bop2GuardPast`, `bop2UnassignBoat`; decided 2026-10-09):
   - a date before today (Asia/Bangkok) is `409 past_date`, except for an admin correcting history;
   - a boat a charter booking holds can't leave its route: `409 charter_boat` ("Cancel the charter booking first");
+    nor can one an active whole-boat hold takes: `409 boat_held` ("Release the hold on the Seat Locks page first");
   - removing a boat, moving it to another route, or shrinking it below the passengers **placed on it** that day (as legacy counts: not the whole route-day) is `409 seats_sold` ("N booking(s) (P pax) on it"), unless `remove_anyway: true` (legacy's confirm dialog). Then the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id, service_date, boat_id, bookings, pax}]`, and those bookings read `boat_pulled: true`.
   - a catalogue boat that is not ready that day (fixing, unavailable or retired in its log, held by a
     started job, or a charter boat not chartered that day: `GET /v1/fleet/availability`) is
@@ -3397,7 +3398,8 @@ the last number it saw and refetches only the records named.
     reconfirm, upgrades, its document check;
   - `seat_lock`: any write to it, every departure a bulk-lock write touches, and each lock a
     booking write draws on or returns seats to;
-  - `deployment`, with `entity_id` `<date>:<boat>`;
+  - `deployment`, with `entity_id` `<date>:<boat>`: by its own endpoints, or a whole-boat hold that
+    placed its boat on a route or took it to another (a hold's `convert` adds its new `booking`);
   - `route`: created, edited, deleted, reordered, or its calendar;
   - `invoice`: issued, changed, voided, or a payment recorded or corrected. Its bookings are in the
     feed as well, since their `invoice` and `payment_state` changed. A weather cancel's lines taken
@@ -3455,18 +3457,20 @@ overdue are worked out on every read (`src/domain/seat-locks.ts`), the same in b
 | `agent_id` | client, checked | Required for `agent`, refused for the others (`400`); must be an agent (`400`, `GET /v1/agents`). |
 | `reason` | client | Free text, up to 500 characters (legacy's "Love Boom", "Fam Trip 11 + 1 guide"). |
 | `expiry` | client | A date. Past it (Asia/Bangkok) the lock stops holding; a lock expiring today holds all day. |
-| `status` | server | `active` or `released`, moved only by the commands below. |
+| `status` | server | `active` or `released` (a whole-boat hold also `converted`), moved only by the commands below. |
 | `pending_pax` | server | Of `pax`, seats waiting for room: they hold nothing and cannot be drawn. |
 | `released_pax` | server | Of `pax`, seats given back by a release. |
 | `group_id` | server | The bulk lock this is one departure of. |
 | `parent_id`, `sub_name` | server / client | Set on a sub-group: the lock it is carved from, and its name. |
-| `boat_id` | import | A whole-boat hold (below). `null` on an ordinary lock. |
+| `boat_id` | client, checked | A whole-boat hold (below). `null` on an ordinary lock, which can't become one. |
+| `boat_deal` | client | A hold's `fixed` (this boat) or `any` (any boat that seats `pax`). `null` on an ordinary lock. |
+| `converted_booking_id` | server | The charter booking a hold became (`convert`). |
 | `drawn_pax` | server | Seats bookings that hold seats have drawn from it. |
 | `remaining_pax` | server | What a booking may draw from it now. A parent's are its seats in no sub-group. |
 | `held_pax` | server | What it keeps off general sale now. A sub-group `0` (its parent holds); a whole-boat hold `null`. |
 | `allocated_pax`, `sub_group_room` | server | A top-level lock: seats split into sub-groups, and seats a new sub-group may still take. |
 | `holding` | server | Active, not past `expiry`, and for a sub-group its parent holding. |
-| `state` | server | Legacy's label: `active`, `depleted` (nothing left, something drawn), `expired`, `released`. |
+| `state` | server | Legacy's label: `active`, `depleted` (nothing left, something drawn), `expired`, `released`, `converted`. |
 | `release_at`, `overdue` | server | A bulk departure's release cutoff as an instant, and whether it has passed while the lock still holds. A whole-boat hold is `overdue` past its expiry. |
 
 A lock with no sub-groups and nothing pending holds `pax − released_pax − drawn_pax`, and that is
@@ -3477,15 +3481,19 @@ what a new draw may take. A screen that shows legacy's single "seats" number sho
 #### Endpoints
 
 - `GET /v1/seat-locks` — every lock; filter by `route_id`, `service_date` (or `date`), `from`/`to`,
-  `group_id`, `parent_id`, `agent_id`. Oldest first. `400` for a bad date.
+  `group_id`, `parent_id`, `agent_id`, `kind` (`boat`: whole-boat holds only; `seats`: the rest).
+  Oldest first. `400` for a bad date or kind.
 - `GET /v1/seat-locks/{id}`; `GET /v1/seat-locks/{id}/log` → `{ events: [...] }`, oldest first. `404` if unknown.
 - `POST /v1/seat-locks` — `{ route_id, service_date, pax, holder_type?, agent_id?, reason?, expiry?, pending? }` → `201`.
+  With `boat_id` it makes a whole-boat hold instead (below).
 - `PATCH /v1/seat-locks/{id}` — client facts only: `pax`, `holder_type`, `agent_id`, `reason`,
   `expiry`, `route_id`, `service_date` (moves it, with its sub-groups), a sub-group's `sub_name`, and
   `pending: "split"` when a raise or a move is short. A server-owned field (`status`, `pending_pax`,
   `released_pax`, `group_id`, `parent_id`, `boat_id`, the numbers) with a **different** value is
   `400 server_owned`, naming the command that sets it; echoed unchanged it is ignored, as a booking's.
-  `pax` cannot go below `released_pax` + drawn + split into sub-groups (`409 below_floor`).
+  `pax` cannot go below `released_pax` + drawn + split into sub-groups (`409 below_floor`). A
+  whole-boat hold's `PATCH` is its own form (below).
+- `POST /v1/seat-locks/{id}/convert`, `GET /v1/seat-locks/boat-options` — whole-boat holds (below).
 - `POST /v1/seat-locks/{id}/add` — `{ pax, note?, pending? }`: legacy "+ seats". A released lock is
   active again. A sub-group grows only into its parent's room (`409 no_room`).
 - `POST /v1/seat-locks/{id}/release` — `{ pax? }`: legacy Release. That many undrawn seats back
@@ -3593,20 +3601,107 @@ and `global` locks serve any booking (legacy `bkV2LocksForAgent`).
 `{ events: [{ id, lock_id, group_id, type, qty, trip_date, booking_id, note, day, at, by, imported }] }`.
 The server writes a line, in the same transaction, for `create`, `add`, `edit` (`pax: 4 → 6 ·
 reason: — → Love Boom`, legacy's form), `release`, `release-round`, `pend` (`free 0 of 2`),
-`pend-confirm`, and from booking writes `draw`, `return` (with the command as its note: `edit`,
+`pend-confirm`, `convert` (a whole-boat hold, with its `booking_id`; a hold's `edit` reads legacy's
+`route: r3 → r5 · boat: Oceanus → Verona · min: … · deal: … · holder: agent:a7 → … · note: …`), and
+from booking writes `draw`, `return` (with the command as its note: `edit`,
 `cancel`, …) and `resched-return`. Legacy's lines are imported with `imported: true`; many of them
 (`release`, `expire`) have no `at` or `by`, and none is made up.
 
-**Whole-boat holds** (legacy §bkLock, migration 047). A lock with a `boat_id` holds a whole boat for
-an agent who has not confirmed numbers; `pax` is the minimum seats promised.
-- **On a boat deployed that day,** a hold counts exactly as a charter does:
-  - the boat's sellable and licensed seats leave the pool, whatever number was promised;
-  - the boat reads `chartered` in `/v1/availability`;
-  - a seat booking can't be put on it (`409 boat_chartered`), and neither can another charter;
-  - the hold holds nothing more, and nothing draws from it.
-- **On a boat not deployed that day,** it holds its `pax` as a plain lock.
-- **Who creates them:** only the legacy import, for now; only a full release applies to one here
-  (`400 boat_hold` for the other commands). Creating and converting holds is their own design.
+#### Whole-boat holds
+
+Legacy's Hold-whole-boat form (§bkLock; migrations 047 and 180). A lock with a `boat_id` holds a
+whole boat on one route and day for a holder who has not confirmed numbers, until it is released or
+turned into a charter booking. `pax` is the **minimum seats promised**, not seats held; `boat_deal`
+is `fixed` (this boat was promised) or `any` (any boat that seats `pax`).
+
+- **It takes its boat exactly as a charter does:** the boat's sellable and licensed seats leave the
+  pool, whatever number was promised; the boat reads `chartered` in `/v1/availability`; a seat
+  booking can't be put on it (`409 boat_chartered`), nor another charter; Boat Operation can't remove
+  it or move it to another route (`409 boat_held`: "Cannot unassign - this boat is held whole for an
+  agent. Release the hold on the Seat Locks page first."). It holds nothing more (`held_pax: null`),
+  and nothing draws from it. (A hold the import brought in on a boat not deployed that day holds its
+  `pax` as a plain lock.)
+- **It never expires by itself:** past its `expiry` it still holds and reads `overdue: true` (legacy
+  §lkNoAuto); release it by hand.
+- `add` and `sub-groups` don't apply to a hold (`400 boat_hold`); it has no pending seats to
+  confirm; `release-departure` releases it as `release` does.
+
+**Make one:** `POST /v1/seat-locks` →`201` the hold.
+
+```json
+{ "route_id": "r3", "service_date": "2026-10-15", "boat_id": "b8", "pax": 38, "boat_deal": "fixed",
+  "agent_id": "amrg7d9d50aycj", "expiry": "2026-10-14", "reason": "Fam Trip Georgia" }
+```
+
+Refused, in legacy's words:
+
+| Answer | When |
+|---|---|
+| `400` "Expiry date is required for a whole-boat hold" | no `expiry` |
+| `400` "Expiry must be on or before the travel date" | `expiry` after `service_date` |
+| `400` "Enter the minimum seats promised" | `pax` missing or not above 0 |
+| `400 land_route` "A land programme has no boat to hold" | a land route |
+| `400` | an unknown route, boat or agent; `boat_deal` other than `fixed`/`any`; `pending` |
+| `409 route_closed` | the route does not run that day |
+| `409 boat_retired`, `409 boat_other_pier`, `409 boat_not_ready` | a retired boat, a boat at another pier than the route's, a boat not ready that day (`GET /v1/fleet/availability`). Legacy's list does not offer them, so there is no "anyway". |
+| `409 boat_other_route` "That boat is already placed on {route} for {date}. A boat placed on another programme cannot be held here. Move it in Boat Operation first, or pick another boat." | the boat is deployed on another route that day |
+| `409 boat_taken` | a charter booking or another hold has the boat that day (any route); bookings holding seats have passengers placed on it; or it is on this route and the day has sold more seats than its other boats seat |
+| `409 boat_too_small` "That boat has fewer seats than the minimum promised" | an `any` hold on a boat that seats fewer than `pax` |
+
+`boat_other_route` and `boat_taken` carry what stands in the way, legacy's blocker table included:
+
+```json
+{ "statusCode": 409, "code": "boat_taken", "error": "Conflict",
+  "message": "That boat is not free on 2026-10-15: 1 booking(s) (6 pax) are on it. Move them to another boat first",
+  "blockers": { "charter_booking_id": null, "hold_id": null, "placed_route_id": "r3",
+    "bookings": [{ "booking_id": "booking_…", "voucher_ref": "BH-V1", "agent_id": "a7", "route_id": "r3", "pax": 6, "from_lock": 0 }],
+    "pax": 6, "sold": 30, "short": 0 } }
+```
+
+When the boat is not deployed that day, making the hold **deploys it on the route** (the boat
+catalogue's capacity and licence), as legacy writes the boat-board cell; the change feed announces
+that deployment too. Releasing or moving the hold leaves the deployment as a normal boat.
+
+**The boat list:** `GET /v1/seat-locks/boat-options?route_id=&service_date=[&lock_id=]` → legacy's
+list in the form (`bkV2BoatLockPickList`): every boat of the route's pier (another pier's are not
+listed), biggest free one first, each `{ boat_id, name, capacity, pier, own, ok, why, placed_route_id,
+blockers }`; `why` is `{ code, message }` (the codes above) or `null`. `lock_id` names the hold being
+edited: its own boat is listed first and always `ok`.
+
+**Edit:** `PATCH /v1/seat-locks/{id}` (with `If-Match`) takes `route_id`, `service_date`, `boat_id`,
+`pax`, `boat_deal`, `holder_type`, `agent_id`, `expiry`, `reason` — legacy's one form. The same `400`s
+as making one; a new route, date or boat is checked like a new hold, its own boat left out. Changing
+the boat of a `fixed` hold is `409 fixed_boat` ("This hold names a specific boat for {holder}. {old}
+-> {new}. The agent may already be selling that boat name. Tell them first…") until it is sent again
+with `change_boat_anyway: true`. A hold that moves to another route takes its boat's deployment along.
+A released or converted hold can't be edited (`409 hold_not_active`, `409 hold_converted`). Nothing
+changed: nothing is written. `status`, `converted_booking_id` and the numbers are `400 server_owned`;
+on an ordinary lock `boat_id` and `boat_deal` are too.
+
+**Release:** `POST /v1/seat-locks/{id}/release` (with `If-Match`, no `pax`: `400 boat_hold`) frees
+the boat at once (log `release`, note `manual · {boat}`). A converted hold is `409 hold_converted`;
+a released one is answered as it is.
+
+**Convert into a charter:** `POST /v1/seat-locks/{id}/convert` (with the hold's `If-Match`) takes the
+body of `POST /v1/bookings`; what it leaves out is filled from the hold, as legacy's prefilled form:
+`agent_id` (an agent hold), and on `trips[0]` (or the flat form) `route_id`, `service_date`,
+`booking_mode: "charter"` and `charter_boat_id`. In one transaction the booking is created (priced,
+checked and weighed as any create, with the hold left out, so the boat is free to it alone) and the
+hold becomes `converted` with `converted_booking_id` (log `convert`, note `เหมาลำ {boat}`).
+
+```json
+// POST /v1/seat-locks/lock_…/convert   If-Match: "1"
+{ "trips": [{ "pax": { "ad": 40 } }], "lead_pax": "Mikhail" }
+// 201
+{ "booking": { "id": "booking_…", "agent_id": "a77", "status": "confirmed",
+    "trips": [{ "route_id": "r7", "service_date": "2026-12-18", "booking_mode": "charter", "charter_boat_id": "b13", … }], … },
+  "seat_lock": { "id": "lock_…", "status": "converted", "state": "converted", "converted_booking_id": "booking_…", … } }
+```
+
+A booking with no charter of the held boat on the hold's route and date is `400 hold_mismatch`, a
+quote `400 hold_quote`; any refusal of the booking (`400`, `409`) leaves the hold as it was. Only a
+hold converts (`400 not_a_hold`); a converted one again is `409 hold_converted`. The booking's agent
+may differ from the holder's (legacy's form could be changed).
 
 ### Fleet maintenance: stock, memos, projects, Daily Fleet Log, safety
 
