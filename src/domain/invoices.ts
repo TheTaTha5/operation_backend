@@ -117,19 +117,19 @@ export type BookingInvoice = { id: string; number: string; kind: InvoiceKind; fe
 export type PaymentState = 'none' | 'invoiced' | 'partial' | 'paid';
 
 /**
- * The booking's live invoice (`acctBookingInvoice`): the newest one not void, of any kind; a cancelled
- * booking's is its fee invoice. Its `payment_state` replaces legacy's stored `paymentStatus`, a copy
- * that went wrong whenever a fee invoice was involved.
+ * The booking's invoice (`acctBookingInvoice`): its live booking or prepay invoice, else its newest
+ * live fee invoice (a cancelled booking's cancellation fee). `payment_state` counts every live
+ * invoice, a reschedule fee's too: `paid` once all are paid, `partial` once anything is. It replaces
+ * legacy's stored `paymentStatus`, a copy that went wrong whenever a fee invoice was involved.
  */
 export function bookingInvoice(briefs: readonly InvoiceBrief[]): { invoice: BookingInvoice | null; payment_state: PaymentState } {
   const live = briefs.filter((b) => !b.voided).sort((a, b) => (a.issued_at === b.issued_at ? (a.id < b.id ? -1 : 1) : a.issued_at < b.issued_at ? -1 : 1));
-  const latest = live[live.length - 1];
-  if (!latest) return { invoice: null, payment_state: 'none' };
-  const paid = sum(latest.paid);
-  const { status, balance } = invoiceState({ voided: false, total: latest.total }, paid);
+  if (!live.length) return { invoice: null, payment_state: 'none' };
+  const states = live.map((b) => ({ b, paid: sum(b.paid), ...invoiceState({ voided: false, total: b.total }, sum(b.paid)) }));
+  const main = [...states].reverse().find((s) => s.b.kind !== 'fee') ?? states[states.length - 1];
   return {
-    invoice: { id: latest.id, number: latest.number, kind: latest.kind, fee_type: latest.fee_type, status, total: latest.total, paid, balance },
-    payment_state: status === 'paid' ? 'paid' : status === 'partial' ? 'partial' : 'invoiced',
+    invoice: { id: main.b.id, number: main.b.number, kind: main.b.kind, fee_type: main.b.fee_type, status: main.status, total: main.b.total, paid: main.paid, balance: main.balance },
+    payment_state: states.every((s) => s.status === 'paid') ? 'paid' : states.some((s) => s.paid > 0) ? 'partial' : 'invoiced',
   };
 }
 

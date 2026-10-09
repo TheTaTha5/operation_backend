@@ -988,6 +988,20 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     }
     return wrote;
   }
+  /**
+   * A reschedule charged on a booking already invoiced gets a fee invoice of its own (decided
+   * 2026-10-09; legacy left it unbilled). The record just written says what was charged.
+   */
+  async function invoiceRescheduleFee(booking: Booking, by: string | null): Promise<boolean> {
+    const record = booking.reschedules[booking.reschedules.length - 1];
+    if (!record || record.collect !== 'invoice' || !(record.charge_amount > 0) || !booking.agent_id || !(await store.agent(booking.agent_id))) return false;
+    const now = new Date();
+    const fee = feeInvoice({ id: newInvoiceId(), number: await nextNumber(now), agent_id: booking.agent_id, booking_id: booking.id, fee_type: 'reschedule',
+      label: `Reschedule fee · ${record.from_date} → ${record.to_date} · ${record.reason}`, amount: record.charge_amount, now: now.toISOString(), by });
+    if (!fee) return false;
+    await store.putInvoice(fee);
+    return true;
+  }
   /** Restore voids the cancellation's fee invoice (legacy `bkV2RestoreBooking`). */
   async function invoicesOnRestore(booking: Booking, by: string | null): Promise<boolean> {
     let wrote = false;
@@ -1286,7 +1300,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const reschedule = parseRescheduleRequest(withoutVersion(request.body, true));
     return store.transaction(async () => {
       await assertBookingFresh(request);
-      const moved = (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found');
+      const before = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+      const invoiced = reschedule.kind === 'record' && before.invoice !== null;
+      let moved = (await store.rescheduleBooking(before.id, invoiced ? { ...reschedule, invoiced } : reschedule, actorOf(request.user))) ?? notFound('Booking not found');
+      if (invoiced && await invoiceRescheduleFee(moved, actorOf(request.user) ?? null)) moved = (await store.booking(moved.id))!;
       return (await syncAltParts(moved)) ? (await store.booking(moved.id))! : moved;
     });
   });

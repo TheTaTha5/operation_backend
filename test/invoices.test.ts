@@ -197,3 +197,25 @@ test('an invoice write is in the change feed, with its booking', async () => {
   assert.deepEqual(changes.filter((c) => c.entity_id === inv.id).map((c) => [c.kind, c.action]), [['invoice', 'created'], ['invoice', 'updated']]);
   assert.equal(changes.filter((c) => c.entity_id === b.id && c.kind === 'booking').length, 2);
 });
+
+test('a reschedule charged on an invoiced booking gets a fee invoice of its own, and no fee item', async () => {
+  const b = await booking('inv_a1', 3000, '2056-03-01');
+  await send('POST', '/operations/deployments', { boat_id: 'inv-boat-2056-03-02', route_id: 'r1', service_date: '2056-03-02', capacity: 40 });
+  const inv = (await issue('inv_a1', [b.id])).json();
+  const moved = await send('POST', `/v1/bookings/${b.id}/reschedule`, { from_date: '2056-03-01', to_date: '2056-03-02', reason: 'weather', charge_type: 'partial', charge_amount: 500 });
+  assert.equal(moved.statusCode, 200, moved.body);
+  assert.deepEqual(moved.json().fee_items, [], 'billed by its own invoice, so not on the next one too');
+  assert.equal(moved.json().invoice.id, inv.id, 'the booking\'s invoice is still its main one');
+  assert.equal(moved.json().payment_state, 'invoiced');
+  const fee = (await send('GET', `/v1/invoices?booking_id=${b.id}`)).json().invoices.find((i: { kind: string }) => i.kind === 'fee');
+  assert.deepEqual([fee.fee_type, fee.total, fee.vat_amount, fee.lines[0].label], ['reschedule', 500, 0, 'Reschedule fee · 2056-03-01 → 2056-03-02 · weather']);
+
+  await send('POST', `/v1/invoices/${inv.id}/payments`, { amount: 3000, method: 'cash' }, acct);
+  assert.equal((await send('GET', `/v1/bookings/${b.id}`)).json().payment_state, 'partial', 'paid only once the fee is paid too');
+  await send('POST', `/v1/invoices/${fee.id}/payments`, { amount: 500, method: 'cash' }, acct);
+  assert.equal((await send('GET', `/v1/bookings/${b.id}`)).json().payment_state, 'paid');
+
+  const notYet = await booking('inv_a1', 1000, '2056-03-01');
+  const later = (await send('POST', `/v1/bookings/${notYet.id}/reschedule`, { from_date: '2056-03-01', to_date: '2056-03-02', reason: 'x', charge_type: 'partial', charge_amount: 200 })).json();
+  assert.deepEqual(later.fee_items.map((f: { amount: number }) => f.amount), [200], 'not invoiced yet: a fee item for its next invoice, as legacy');
+});
