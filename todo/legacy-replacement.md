@@ -58,6 +58,14 @@ Built too: the van job orders, with the sent tick, special requests, Thai pickup
 group order (README "Van job orders"; open items in `van-job-orders-model.md`). Still to come: the
 computed van board for the Vue port.
 
+## 8b. Pier office
+
+Built: petty cash per pier (`po_cash_rows`, `po_cash_lt`, `po_cash_pk`, `po_cash_co`) and the office
+lists (`pier_kinds`, `pier_items`, `pier_codes`, `pier_sect`, `pier_lic_types`, `pier_lic_classes`,
+`pier_staff`): README "Pier office". Left (`pier-office-model.md`, Open): `pier_moves`, `pier_sheet`,
+`pier_shift`, `pier_duty`, `pier_job`, `pier_team`, `pier_licenses`, `pier_cfg`, and the petty cash
+sheets' booked side.
+
 ## 9. Fleet maintenance
 
 Built (`todo/fleet-maintenance-model.md`; README "Fleet maintenance", three sections): assets,

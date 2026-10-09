@@ -500,7 +500,7 @@ Pier assignments and the Daily Log's day pier, certificate status and renewal, t
 wizard, the Daily Log flags, the monthly fuel budget, the cost / upkeep / fuel reports and the
 dashboard, the repair history (computed), and the log lines legacy writes from memos and jobs
 (migration 190; README "Fleet maintenance: assignments, certificates, replace wizard, reports";
-handoff §6.8). `import:fleet` copies the assignments. Rehearsed 2026-10-10 on a copy: 6 assignments
+handoff §6.9). `import:fleet` copies the assignments. Rehearsed 2026-10-10 on a copy: 6 assignments
 (1 cancelled), every other fleet count as part A and part B; in July–September 76 of 174 Daily Log
 boat rows sit under Panwa by their assignment instead of the home pier. `invLostScan`/`invLostFix`
 are not built: a repair for legacy's colliding stock ids, which cannot happen here.
@@ -513,7 +513,7 @@ are not built: a repair for legacy's colliding stock ids, which cannot happen he
    hours since the last service). Decide which definitions the API answers before building them.
 2. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
    `boats[].docs` (renewal), `repairHistory`, `fleet_fuelbudget` and the memo / project log lines once
-   fleet cuts over (handoff §6.8).
+   fleet cuts over (handoff §6.9).
 
 ## Flagged (extras)
 

@@ -55,6 +55,7 @@ import { registerFleetExtrasRoutes } from './fleet-extras.js';
 import { pierOn, shopOf } from '../domain/fleet-assignments.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
 import { registerMoneyRoutes } from './money.js';
+import { registerPierOfficeRoutes } from './pier-office.js';
 import { cotDeductions } from '../domain/after-trip.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
@@ -1931,6 +1932,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   /** Fleet maintenance, the extras: pier assignments, certificates, the replace wizard, fuel budget, reports (`fleet-extras.ts`). */
   registerFleetExtrasRoutes(app, { store });
   registerMoneyRoutes(app, { store, assertBookingFresh });
+  /** The pier office: petty cash and the office lists (`pier-office.ts`, todo/pier-office-model.md). */
+  registerPierOfficeRoutes(app, { store });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an
