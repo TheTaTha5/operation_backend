@@ -56,6 +56,7 @@ import { sortHeld, type HeldOrder, type HeldStatus } from './b2c.js';
 import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
 import type { StoredSalesPerson, SalesPersonSummary } from './team.js';
 import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
+import type { SalesFollowup, SalesTarget } from './sales-board.js';
 import { sortAddonServices, type AddonService } from './addon-services.js';
 import type { StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
@@ -1758,6 +1759,32 @@ export class PostgresOperationsStore {
     return { logins: u.logins, rate_types: u.rate_types };
   }
   async deleteSalesPerson(id: string): Promise<void> { await this.client().query('DELETE FROM sales_people WHERE id = $1', [id]); }
+
+  /** The Sales Board's targets and follow-up marks (migration 201). */
+  async listSalesTargets(salesId?: string): Promise<SalesTarget[]> {
+    const { rows } = await this.client().query('SELECT sales_id, month, pax, set_at, set_by FROM sales_targets WHERE ($1::text IS NULL OR sales_id = $1) ORDER BY sales_id, month', [salesId ?? null]);
+    return rows.map((r) => ({ sales_id: r.sales_id, month: r.month, pax: Number(r.pax), set_at: asIso(r.set_at), set_by: r.set_by ?? null }));
+  }
+  /** `null` clears the month's target. */
+  async setSalesTarget(salesId: string, month: string, target: SalesTarget | null): Promise<void> {
+    if (!target) { await this.client().query('DELETE FROM sales_targets WHERE sales_id = $1 AND month = $2', [salesId, month]); return; }
+    await this.client().query(`INSERT INTO sales_targets (sales_id, month, pax, set_at, set_by) VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (sales_id, month) DO UPDATE SET pax = EXCLUDED.pax, set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by`,
+    [target.sales_id, target.month, target.pax, target.set_at, target.set_by]);
+  }
+  async listSalesFollowups(month?: string): Promise<SalesFollowup[]> {
+    const { rows } = await this.client().query('SELECT sales_id, month, agent_id, kind, marked_at, marked_by FROM sales_followups WHERE ($1::text IS NULL OR month = $1)', [month ?? null]);
+    return rows.map((r) => ({ sales_id: r.sales_id, month: r.month, agent_id: r.agent_id, kind: r.kind, marked_at: asIso(r.marked_at), marked_by: r.marked_by ?? null }));
+  }
+  /** `marked` false clears it; marking one already marked keeps its first stamp. */
+  async setSalesFollowup(row: SalesFollowup, marked: boolean): Promise<void> {
+    if (!marked) {
+      await this.client().query('DELETE FROM sales_followups WHERE sales_id = $1 AND month = $2 AND agent_id = $3 AND kind = $4', [row.sales_id, row.month, row.agent_id, row.kind]);
+      return;
+    }
+    await this.client().query(`INSERT INTO sales_followups (sales_id, month, agent_id, kind, marked_at, marked_by) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT DO NOTHING`, [row.sales_id, row.month, row.agent_id, row.kind, row.marked_at, row.marked_by]);
+  }
 
   async listTemplates(): Promise<ContractTemplate[]> {
     const { rows } = await this.client().query(`SELECT id, code, name, active, is_default, created_date::text, note, form, accent, accent_hex, font, sections, text, created_at, updated_at

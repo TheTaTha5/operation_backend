@@ -38,6 +38,7 @@ import {
 } from '../domain/contract-templates.js';
 import { parseActiveFilter, planAddonServiceCreate, planAddonServicePatch } from '../domain/addon-services.js';
 import { nationalityList, planNationality } from '../domain/nationalities.js';
+import { boardRange, parseFollowup, parseMonth, parseTarget, salesBoard } from '../domain/sales-board.js';
 import { parseInsurance, planInsurance } from '../domain/insurance.js';
 
 type Request = FastifyRequest;
@@ -438,6 +439,51 @@ export function registerSalesRoutes(app: FastifyInstance, deps: {
       await store.deleteSalesPerson(stored.id);
     });
     return reply.code(204).send();
+  });
+
+  // ── The Sales Board (sales-board.ts): targets and follow-up marks, area `sales` ──
+
+  /** Legacy `sbEditTarget`: only a login not bound to a salesperson sees the edit. */
+  app.put('/v1/sales/:id/targets/:month', async (request) => {
+    const month = parseMonth(param(request, 'month'));
+    const pax = parseTarget(record(request.body));
+    if (scope(request) !== undefined) fail('A salesperson cannot set targets', 403, 'forbidden');
+    return store.transaction(async () => {
+      const person = (await store.salesPerson(param(request))) ?? notFound('Salesperson not found');
+      await store.setSalesTarget(person.id, month, pax ? { sales_id: person.id, month, pax, set_at: nowIso(), set_by: by(request) } : null);
+      return { sales_id: person.id, month, pax };
+    });
+  });
+  /** Legacy `salesToggleFollow`, on the salesperson's own board. */
+  app.put('/v1/sales/:id/followups', async (request) => {
+    const mark = parseFollowup(record(request.body));
+    const own = scope(request);
+    if (own !== undefined && own !== param(request)) fail('Only your own board\'s follow-ups can be marked', 403, 'forbidden');
+    return store.transaction(async () => {
+      const person = (await store.salesPerson(param(request))) ?? notFound('Salesperson not found');
+      const agent = (await store.agentRecord(mark.agent_id)) ?? bad(`agent_id ${mark.agent_id} is not an agent (GET /v1/agents)`);
+      if (agent.sales_id !== person.id) bad(`Agent ${agent.id} is not ${person.name}'s`);
+      await store.setSalesFollowup({ sales_id: person.id, month: mark.month, agent_id: agent.id, kind: mark.kind, marked_at: nowIso(), marked_by: by(request) }, mark.marked);
+      return { sales_id: person.id, ...mark };
+    });
+  });
+  /** Legacy's Sales Board: everyone sees the leaderboard, a sales-bound login only its own agents. */
+  app.get('/v1/sales-board', async (request) => {
+    const q = query(request);
+    const month = q.month === undefined ? todayInThailand().slice(0, 7) : parseMonth(q.month);
+    const targets = await store.listSalesTargets();
+    const range = boardRange(month, targets);
+    const bookings: Booking[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.listBookings({ from: range.from, to: range.to, limit: 1000, ...(cursor ? { cursor } : {}) });
+      bookings.push(...page.bookings);
+      cursor = page.next_cursor;
+    } while (cursor);
+    return salesBoard({
+      month, sales: await store.listSalesPeople(), agents: await store.agentRecords(), bookings, targets,
+      followups: await store.listSalesFollowups(month), scope: scope(request),
+    });
   });
 
   app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));

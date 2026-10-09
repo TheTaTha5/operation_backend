@@ -57,6 +57,7 @@ import {
 import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
 import { salesSummary, type StoredSalesPerson, type SalesPersonSummary } from './team.js';
 import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
+import type { SalesFollowup, SalesTarget } from './sales-board.js';
 import { addonServiceView, sortAddonServices, type AddonService } from './addon-services.js';
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
@@ -495,6 +496,7 @@ export class OperationsStore {
     this.directory.activity.delete(id);
     this.seasons.delete(id);
     this.history.delete(id);
+    this.followups = this.followups.filter((f) => f.agent_id !== id);
     for (const doc of [...this.documents.values()]) if (doc.agent_id === id) this.documents.delete(doc.id);
   }
   private history = new Map<string, ContractHistoryEntry[]>();
@@ -526,7 +528,33 @@ export class OperationsStore {
   salesUsage(id: string): { logins: number; rate_types: number } {
     return { logins: this.users.filter((u) => u.sales_id === id).length, rate_types: [...this.rateTypes.values()].filter((r) => r.rate.owner_sales_id === id).length };
   }
-  deleteSalesPerson(id: string): void { this.directory.sales = this.directory.sales.filter((p) => p.id !== id); }
+  deleteSalesPerson(id: string): void {
+    this.directory.sales = this.directory.sales.filter((p) => p.id !== id);
+    this.targets = this.targets.filter((t) => t.sales_id !== id);
+    this.followups = this.followups.filter((f) => f.sales_id !== id);
+  }
+
+  /** The Sales Board's targets and follow-up marks (migration 201), as the rows PostgreSQL holds. */
+  private targets: SalesTarget[] = [];
+  private followups: SalesFollowup[] = [];
+  listSalesTargets(salesId?: string): SalesTarget[] {
+    return this.targets.filter((t) => salesId === undefined || t.sales_id === salesId).map((t) => ({ ...t }))
+      .sort((a, b) => (a.sales_id < b.sales_id ? -1 : a.sales_id > b.sales_id ? 1 : a.month < b.month ? -1 : 1));
+  }
+  /** `null` clears the month's target. */
+  setSalesTarget(salesId: string, month: string, target: SalesTarget | null): void {
+    this.targets = this.targets.filter((t) => !(t.sales_id === salesId && t.month === month));
+    if (target) this.targets.push({ ...target });
+  }
+  listSalesFollowups(month?: string): SalesFollowup[] {
+    return this.followups.filter((f) => month === undefined || f.month === month).map((f) => ({ ...f }));
+  }
+  /** `marked` false clears it; marking one already marked keeps its first stamp. */
+  setSalesFollowup(row: SalesFollowup, marked: boolean): void {
+    const same = (f: SalesFollowup) => f.sales_id === row.sales_id && f.month === row.month && f.agent_id === row.agent_id && f.kind === row.kind;
+    if (!marked) this.followups = this.followups.filter((f) => !same(f));
+    else if (!this.followups.some(same)) this.followups.push({ ...row });
+  }
 
   private templates = new Map<string, ContractTemplate>();
   private copyTemplate = (t: ContractTemplate): ContractTemplate => JSON.parse(JSON.stringify(t)) as ContractTemplate;
