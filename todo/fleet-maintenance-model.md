@@ -1,6 +1,6 @@
 # Fleet maintenance, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Both parts are built: part A
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Both parts and the extras are built: part A
 (availability, assets, incidents, jobs) and part B (stock, memos, Daily Fleet Log, projects, safety);
 see the end. Data counted on 2026-10-09 through `ORIGINAL_DATABASE_URL`, read-only.
 
@@ -166,8 +166,8 @@ Odd rows:
 ## Already here
 
 - **Boats** (catalogue editing, migration 070): the whole boat form, `ownership`, certificates
-  (`documents`, as stored data), the status log, `retired`, `seed:boats`. Not here: certificate
-  expiry status and renewal, assignments.
+  (`documents`, as stored data), the status log, `retired`, `seed:boats`; certificate expiry and
+  renewal and pier assignments since the extras.
 - **Part A** (migration 130): availability, assets, incidents, jobs (see "Part A: built").
 - **Attachments:** `/v1/attachments` (6 MB, jpeg/png/pdf) fits project documents.
   `import-attachments` already copies the files fleet projects name. Upload and delete need
@@ -313,17 +313,9 @@ and `deploy_anyway`.
 
 ## Open (part A)
 
-1. **The seams to part B are wired** (`src/domain/fleet-seams.ts`): projects hold their boat,
-   engine hours read the Daily Log meters, a job's cost counts its memos, job parts come from stock.
-   Still open: a job made under a project does not write onto the project's log (`_projCreateForId`);
-   it writes its own line naming the project.
-2. **Pier assignments and certificate expiry/renewal** (catalogue open item 4) are not built.
-3. **Repair history** (`boats.repairHistory`, 60 legacy rows) is not stored: it is the boat's done
-   jobs (`GET /v1/fleet/jobs?boat_id=&status=done`). Legacy's rows snapshot the cost at close; not
-   imported. Say if a stored history is wanted.
-4. **Change feed:** a job's start, close and boat status emit a `boat` change; asset, incident and
+1. **Change feed:** a job's start, close and boat status emit a `boat` change; asset, incident and
    job writes emit none (no new change kind). Add kinds if a screen needs live fleet updates.
-5. **Whole-boat holds** (`bkV2BoatLockBlockers` refuses a boat that is not ready) do not check
+2. **Whole-boat holds** (`bkV2BoatLockBlockers` refuses a boat that is not ready) do not check
    availability here yet.
 
 ## Flagged
@@ -415,17 +407,10 @@ item's stock equal to legacy's.
 
 ## Open (part B)
 
-1. **Legacy writes a job log line** when a memo on the job is created, edited or cancelled
-   (`flPushLog`); not done. `job_id` and `engine_id` have no foreign keys yet.
+1. **`job_id` and `engine_id` have no foreign keys yet** (memos, movements, meters, consumables).
 2. **Bill gate bugs copied from legacy** (bug 8): a pending "Final Invoice" entry with no file passes,
    and the cost leaves out project memos although the message says to add one. Ask whether to fix.
-3. **Not built:** the safety replace wizard (it creates an incident, a job and a memo: part A);
-   cost analytics, upkeep, fuel intelligence, insights and the dashboard (only memo spend is a
-   report); the Daily Log anomaly flags; the monthly fuel budget (legacy loses it); `invLostScan` /
-   `invLostFix` (a legacy-bug repair: use `adjust`).
-4. **A boat's pier for the day lock** is its home `pier`. Legacy uses its pier assignment that day
-   (6 temporary Tub Lamu → Panwa moves); use it once assignments are built.
-5. **Fleet writes are not on the change feed** (no change kind added); screens refetch.
+3. **Fleet writes are not on the change feed** (no change kind added); screens refetch.
 
 ## Flagged (part B)
 
@@ -509,179 +494,80 @@ Import:
 - Dropped: 3 boat-days with neither fuel (above 0) nor pax, 8 lock rows with no pier set to true.
 - A rerun upserts by legacy id and replaces imported child rows; it never deletes a row legacy dropped.
 
-## Design — extras (branch `feat/fleet-extras`)
+## Extras: built (branch `feat/fleet-extras`)
 
-The items part A and part B left open, read from legacy (wt-lk-inbox, `05-fleet.js`, `06-engine-assign.js`,
-`08-app.js`, `04-data-core.js`) on 2026-10-10. Legacy is copied; what I decided is marked **(mine)** and
-listed under "Flagged (extras)". Migration `190_fleet_extras.sql`. No new change-feed kind: assignments
-and renewals are under `/v1/boats/{id}/…`, which already announces a `boat` change; the reports are reads.
+Pier assignments and the Daily Log's day pier, certificate status and renewal, the safety replace
+wizard, the Daily Log flags, the monthly fuel budget, the cost / upkeep / fuel reports and the
+dashboard, the repair history (computed), and the log lines legacy writes from memos and jobs
+(migration 190; README "Fleet maintenance: assignments, certificates, replace wizard, reports";
+handoff §6.8). `import:fleet` copies the assignments. Rehearsed 2026-10-10 on a copy: 6 assignments
+(1 cancelled), every other fleet count as part A and part B; in July–September 76 of 174 Daily Log
+boat rows sit under Panwa by their assignment instead of the home pier. `invLostScan`/`invLostFix`
+are not built: a repair for legacy's colliding stock ids, which cannot happen here.
 
-### 1. Pier assignments (legacy `flSaveAssignment`, `flCancelAssignment`, `getBoatCurrentPier`)
+## Open (extras)
 
-Legacy: a boat moves to another pier for a while (`temporary`) or for good (`permanent`). The form asks
-from, to, type, start, end (both required), reason, cost. Refused: the same pier at both ends ("From
-และ To ต้องต่างกัน"), a missing date, an end before the start. No overlap check. A `permanent` one that
-is active on the day it is saved sets the boat's home `pier`; cancelling never sets it back. Cancel is
-a soft `status: 'cancelled'`; there is no edit and no delete. Readers ignore the stored status except
-`cancelled`: active = `start <= day <= end`. Legacy data: 6 rows (5 active, 1 cancelled).
+1. **Fleet Insights (`flRenderInsights`) and the Fleet Report (`rep-fleet`) are not built.** Both are
+   reads over the same data, but legacy's screens disagree with each other: five definitions of a
+   job's cost and date, three rules for "service due" (500 h fixed, the engine's interval by modulo,
+   hours since the last service). Decide which definitions the API answers before building them.
+2. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
+   `boats[].docs` (renewal), `repairHistory`, `fleet_fuelbudget` and the memo / project log lines once
+   fleet cuts over (handoff §6.8).
 
-| Field | Authority |
-|---|---|
-| `id` (`asn_…`), `created_at`, `created_by`, `created_date` | computed |
-| `type`, `from_pier`, `to_pier`, `start_date`, `end_date` | validated (the checks above) |
-| `reason`, `cost` (฿, 0 or more) | client fact |
-| `status` (`planned`/`active`/`completed`/`cancelled`) | computed from the dates and `cancelled` (legacy's `flAutoUpdateAssignments` rule) |
-| `cancelled`, `cancelled_at`, `cancelled_by` | set by `/cancel` |
+## Flagged (extras)
 
-**A boat's pier on a day** (pure, `fleet-assignments.ts` `pierOn`, legacy `getBoatCurrentPier`): the
-first assignment (oldest created) covering the day → its `to_pier`; else the status-log entry covering
-the day whose `loc` names a pier (`panwa`; `ranong`/`grand andaman`/`se la va`; `tub`/`tublamu`/`tab
-lamu`); else the home `pier`. Legacy's first step (`'shop'`: a started job with a location holding the
-boat) is `at_shop` beside it. The **Daily Fleet Log** groups and locks a boat by this pier, a boat at
-the shop by its home pier (`_drPier`), so a day lock follows the assignment.
+Behaviour changes against legacy:
 
-```sql
-CREATE TABLE boat_assignments (
-  id TEXT PRIMARY KEY,
-  boat_id TEXT NOT NULL REFERENCES boats (id) ON DELETE CASCADE,
-  type TEXT NOT NULL CHECK (type IN ('temporary', 'permanent')),
-  from_pier TEXT NOT NULL CHECK (from_pier IN ('tublamu', 'panwa', 'ranong')),
-  to_pier TEXT NOT NULL CHECK (to_pier IN ('tublamu', 'panwa', 'ranong')),
-  start_date DATE NOT NULL, end_date DATE NOT NULL,
-  reason TEXT, cost NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (cost >= 0),
-  cancelled BOOLEAN NOT NULL DEFAULT false, cancelled_at TIMESTAMPTZ, cancelled_by TEXT,
-  created_date DATE NOT NULL, created_at TIMESTAMPTZ NOT NULL, created_by TEXT,
-  CHECK (from_pier <> to_pier), CHECK (end_date >= start_date)
-);
-```
+- **Who may write:** assignments and renewals need `fleet` or `config`; the replace wizard and the
+  fuel budget `fleet`. Legacy checked no area for any of them.
+- **The day lock follows the day's pier:** a boat assigned to Panwa is locked by Panwa's lock (legacy
+  `_drPier`). Imported locks are all Panwa, so July–September they now cover the 5 assigned Tub Lamu
+  boats too, as legacy's screen grouped them.
+- **The replace wizard:** numbers are the client's (legacy counted the list, `length + 1`, and
+  collides after a delete); "no stock, go below zero" really takes the stock below zero (legacy wrote a
+  withdraw line and changed nothing); `expiry_date` may be sent (legacy copied the old, possibly
+  expired, date: still the default).
+- **Reports, where legacy's figure contradicts its own label:** central spend follows the chosen
+  period (legacy: always all time); the monthly chart is always the last 12 months (legacy: only the
+  period's rows); outcomes count jobs only (legacy counted paid direct memos as successes); every job
+  cost is computed (legacy's dashboard trend read a stale stored `cost`); the dashboard's pier counts
+  use the chosen date (legacy: today); low stock reads the computed stock; the fuel anomaly list is
+  not capped at 3.
+- **A `parent_project_id` that is not a project is `400`** on job create and `PATCH` (legacy's picker
+  only offered real ones).
+- **Repair history is computed:** legacy's 61 rows (40 jobs, all still present) are not imported;
+  a cost is today's (legacy snapshot at close: MJ-006 shows ฿0 there, ฿47,101 here).
+- **Renewing writes the boat:** it is then "edited here" and `seed:boats` stops refreshing it (as
+  part A's job start does).
 
-| Endpoint | Area | Answers |
-|---|---|---|
-| `GET /v1/boats/{id}/assignments` | read | `{assignments, active, planned, past, pier_today}` (lists without cancelled, as legacy's panels) |
-| `POST /v1/boats/{id}/assignments` | `fleet`, `config` **(mine)** | `201 {assignment, boat_pier}`; `400` as above |
-| `POST /v1/boats/{id}/assignments/{asn_id}/cancel` | `fleet`, `config` | `200` the assignment; `409 already_cancelled` |
+Kept as legacy (flag only):
 
-`GET /v1/boats` and `/v1/boats/{id}` gain `pier_today` and `at_shop` (the shop's name or null).
+- A permanent assignment moves the home pier only if active the day it is saved; cancelling never
+  moves it back. No overlap check: the oldest covering assignment wins.
+- `pier_today` takes the pier a status entry's location names (`panwa`, `ranong`/`grand andaman`/`se la
+  va`, `tub`/`tab lamu`) when no assignment covers the day; the shop step is `at_shop`, read from the
+  started jobs as they are now (not as of the day).
+- Renew `exp` for a name with no row changes nothing; `processing` with a date overwrites the old
+  expiry.
+- The wizard's memo names no job and no supplier (`ref_note` only), so the job's cost is its parts
+  (`ค่าแรง` for labour) and nothing counts twice; receiving that memo later adds stock for a part already
+  fitted (legacy bug B6). The incident is `resolved`, the job `done` without touching the boat's status.
+- The Daily Log flags: `high_fuel_per_pax` above 20 L; pax is the actual count, else booked; booked pax
+  ignores a trip split across boats; `price_missing` is the section header's rule (no boat or pier
+  price that day).
+- The fuel report prices strictly (the boat's, else the home pier's, that day; legacy's fuel page,
+  not the P&L's fallback), reads engine hours from the `normal` meters only, and counts revenue from
+  every booking, any boat.
+- Bill gate bugs (part B open 2): left as legacy, the developer has not decided.
 
-```jsonc
-// POST /v1/boats/b4/assignments
-{ "type": "temporary", "from_pier": "tublamu", "to_pier": "panwa", "start_date": "2026-05-29", "end_date": "2026-09-30", "reason": "high season", "cost": 0 }
-// 201
-{ "assignment": { "id": "asn_…", "boat_id": "b4", "type": "temporary", "from_pier": "tublamu", "to_pier": "panwa",
-    "start_date": "2026-05-29", "end_date": "2026-09-30", "reason": "high season", "cost": 0, "status": "active",
-    "cancelled": false, "cancelled_at": null, "cancelled_by": null, "created_date": "2026-05-29", "created_at": "…", "created_by": "anon" },
-  "boat_pier": "tublamu" }
-```
+My decisions:
 
-Import: `import:fleet` copies `boats__assignments` (legacy id kept; `status: 'cancelled'` → `cancelled`).
-
-### 2. Certificates: expiry status and renewal (legacy `flDocStatus`, `flDocBetter`, `depSave`)
-
-Rows stay the boat's `documents` (migration 070). Computed per row, never stored:
-
-- `status` (`flDocStatus`, in this order): `renew_status = 'processing'` → `processing`; no expiry →
-  `na`; days left (`ceil`) `< 0` → `exp`, `< 30` → `warn30`, `< 90` → `warn90`; else `ok`.
-- `doc_type` (`flGuessDocType`): `lic`, `inspect`, `ins`, `similan`, `surin`, `pp`, `phangnga`,
-  `tarn`, else `other`; `current`: the row the Documents matrix shows for that type (`flDocBetter`: a
-  processing row, else a row not `done`, else one with an expiry, else the later expiry).
-
-| Endpoint | Area | Answers |
-|---|---|---|
-| `GET /v1/fleet/certificates` | read | the Documents matrix: company boats (not charter, not retired) × the 8 types, each cell the current row with `status` and `days_left`; `counts {ok, warn90, warn30, exp, processing, na}`, `valid_pct`, `expired_boats`, `issues` (cells `warn30` or `exp`) |
-| `GET /v1/boats/{id}/documents` | read | `{documents: [{idx, name, expires_on, renew_status, doc_type, status, days_left, current}]}` |
-| `POST /v1/boats/{id}/documents/renew` | `fleet`, `config` **(mine)** | `{name, state: "exp" \| "processing" \| "ok", expires_on?}` → the documents as `GET` |
-
-Renew is `depSave`: `exp` clears `renew_status` on the latest row of that name (no row: nothing
-changes, as legacy); `processing` marks the latest row `processing` (and sets its expiry when sent), or
-adds `{name, expires_on, processing}`; `ok` needs `expires_on` (`400`), adds a new row and marks the
-name's `processing` rows `done`.
-
-### 3. The safety replace wizard (legacy `swapDocExecute`)
-
-`POST /v1/fleet/safety/{id}/replace` (`fleet`) does in one transaction what the wizard does:
-
-```jsonc
-{ "reason": "broken",            // broken | expired | upgrade | scheduled | lost
-  "description": "pump motor stuck", "date": "2026-10-10",
-  "source": "inventory",         // or "buy"
-  "item_id": "inv_…", "warehouse": "panwa",      // inventory; warehouse defaults as legacy (the boat's pier with stock, else any with stock)
-  "brand": "Rule", "model": "1100", "supplier": "Marine Shop", "price": 2400,  // buy
-  "serial": "BP-002", "install_date": "2026-10-10", "installer": "Somchai", "labour": 300,
-  "incident_no": "INC-074", "job_no": "MJ-123", "memo_no": "MO-225",       // numbers are the client's (decision 4)
-  "expiry_date": null, "allow_negative": false, "serial_anyway": false }
-```
-
-It writes, as legacy: a **resolved incident** (title `เปลี่ยน {category} · {reason}`, the safety item as
-damaged asset, priority 5/3/2, severity `critical`/`medium`/`low`, legacy's four lines); a **done job**
-(corrective, `set_fixing: false`, no boat status change, legacy's three lines); in buy mode a **stock
-item** (category `safety`, 0 in stock) and a **memo** (`pending_approval`, VAT 7 %, one line, `ref_note`
-`Replace … via INC (MJ)`; no `job_id`, as legacy); in inventory mode a **withdraw** of 1 with the job's
-id; the old item `replaced` with a `replace` log line; a **new item** (name, category, qty, location
-copied; brand/model from the purchase in buy mode; `next_pm` = install + 1 month; an initial `pass`
-inspection; `install` log line).
-
-- **Job cost (mine):** legacy stored `cost = part + labour`. Here a job's cost is computed from its parts
-  and memos, so the job gets parts: the withdrawn item (inventory) or the purchase at its price with no
-  stock item (buy), and `ค่าแรง` for labour. The memo is not linked, so nothing counts twice.
-- Refused: a replaced item (`409 already_replaced`), no item picked (`400`), buy with neither brand nor
-  model (`400`), a taken number (`409 number_taken`, `409 memo_no_taken`), no serial (`409 no_serial`
-  until `serial_anyway: true`, legacy's confirm), stock short (`409 stock_short` until
-  `allow_negative: true`, legacy's confirm).
-- `201 {incident, job, memo, withdrawn_item, old_item, new_item}`.
-
-### 4. Reports (computed `GET`s, read for any login)
-
-| Endpoint | Legacy | What |
-|---|---|---|
-| `GET /v1/fleet/reports/cost?period=all\|ytd\|last30\|month` | `costAggregate` | jobs done/in progress split equally over their assets' categories (hull, engine, gearbox, propeller, other), boat-linked direct memos (`memo`, share not bought into stock), central spend, by boat, top 10 units, by job type, outcomes, 12 months, `rows` for the drill-downs |
-| `GET /v1/fleet/reports/upkeep?month=YYYY-MM` | `renderConsumables` | per boat: repairs (`flBoatRepairCostMonth`: jobs started that month, any status) + consumables (`qty × unit_cost`), oil drawn, the month's draws |
-| `GET /v1/fleet/reports/fuel?month=YYYY-MM` | `renderFuelIntel`, `_fuelAgg`, `_fuelWkAgg` | company boats' fuel, cost (boat's else home pier's price that day), booked pax, trip-days, ฿/pax and its change on last month, projection and budget, anomalies (> 1.3 × the boat's month average, 3+ fuel days), missing fuel days, per boat (routes inside), L per engine hour and the median, by programme family with revenue, weekly W1–W5, per boat by week and by month (6) |
-| `GET /v1/fleet/dashboard?date=` | `flRenderDashboard` | pier counts, the work board's header and lanes, pending work per boat, engines by model, spares, low stock, memo chips, open incidents, service due (500 h), 6-month cost trend |
-| `GET /v1/fleet/repair-history?boat_id=` | `boats.repairHistory` | computed: the boat's done jobs in legacy's row shape (item 7) |
-
-Booked pax per boat and day is legacy's `flBoatBookingsFor`: bookings not cancelled, rejected or
-weather-cancelled, trips that day whose dispatch boat is the boat, `pax_total` (FOC and infants in).
-
-### 5. Daily Log flags, fuel budget, `invLostFix`
-
-- **Flags** on each boat row of `GET /v1/fleet/daily-log` (legacy `flRenderDR`): `pax_booked`, `pax`
-  (actual, else booked), `litres_per_pax`, `meter_deltas` (against `flPrevMeter`: the engine's latest
-  earlier reading above 0), and `flags`: `high_fuel_per_pax` (> 20 L/pax, the one anomaly legacy counts),
-  `meter_backwards`, `water_negative`, `price_missing` (fuel without a boat or pier price that day). A day
-  gains `totals {fuel, pax, litres_per_pax}` and `anomalies`.
-- **Monthly fuel budget** (legacy kept it in one browser): one amount per month for the fleet, in baht.
-
-  ```sql
-  CREATE TABLE fleet_fuel_budgets (month TEXT PRIMARY KEY CHECK (month ~ '^\d{4}-(0[1-9]|1[0-2])$'),
-    amount NUMERIC(12,2) NOT NULL CHECK (amount > 0), set_at TIMESTAMPTZ NOT NULL, set_by TEXT);
-  ```
-
-  `GET /v1/fleet/fuel-budgets`; `PUT /v1/fleet/fuel-budgets/{month} {amount}` (`fleet`; `null` or empty
-  removes it, as legacy's prompt). The fuel report reads it.
-- **`invLostScan`/`invLostFix` are not built:** a repair for legacy's colliding stock ids (received stock
-  booked to the wrong item). Ids here cannot collide; a leftover is fixed with `adjust` and `receive`.
-
-### 6. Log lines legacy writes
-
-- **Memo on a job** (`flSaveMemo`, `moLiveSave`, `flCancelMemo` → `flPushLog`): create writes the job a
-  line `📋 สร้าง Memo {no} · ฿{amount}` (dated the memo's date) and its incident `📋 สร้าง Memo {no} ·
-  {title} · ฿{amount}`; an edit writes the incident `✏️ แก้ไข Memo {no} · ฿{amount}`; a cancel `🚫 ยกเลิก
-  Memo {no} · {reason}`; `by` is `ระบบ`. Approve, order, receive and pay write none (legacy).
-- **Memo on a project:** create writes the project `Memo {no} · {title} · ฿{amount} (Project overhead)`,
-  `by: user`.
-- **Job under a project** (`_projCreateForId`): the project gets `+ Created MJ {no} · {title}` and the job
-  `+ Created under project {project no}`; a split `+ Split {no} → {nos}`; a `PATCH` of
-  `parent_project_id` `+ Linked MJ {no} · {title}` / `− Unlinked MJ {no}` and on the job `🔗 Linked to
-  project {no} · {name}` / `🔗 Unlinked from project {no}`. A `parent_project_id` that is not a project is
-  `400` **(mine)**.
-
-### 7. Repair history
-
-Legacy writes `boats.repairHistory` at every close (61 rows, 40 distinct jobs, all still present) and
-nothing reads it; its "recent repairs" reads the done jobs. So it stays computed
-(`GET /v1/fleet/repair-history`), and the 61 rows are not imported.
-
-### 8. Project bill gate
-
-The two copied bugs stay as legacy and flagged (developer to decide).
-
+- `status` of an assignment is computed and never stored; `created_by` and the cancel's time and
+  login are kept (legacy had none). Import orders legacy's same-day rows by their list position.
+- Certificates: the API gives each row its `status` and `current` flag and the matrix; the other
+  screens' thresholds (insights 14/60 days, overview 90) are the client's display of `days_left`.
+- The wizard's buy mode registers the stock item at the boat's pier's warehouse with 0 and a
+  `register` movement; brand and model default to the old item's (the wizard's prefilled fields).
+- Memo lines: create also writes the job a line dated the memo's date (legacy); a per-asset job create
+  under a project writes one `+ Created MJ` line per job.

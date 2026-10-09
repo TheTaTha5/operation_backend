@@ -58,17 +58,16 @@ Built too: the van job orders, with the sent tick, special requests, Thai pickup
 group order (README "Van job orders"; open items in `van-job-orders-model.md`). Still to come: the
 computed van board for the Vue port.
 
-## 9. Fleet maintenance (scope undecided)
+## 9. Fleet maintenance
 
-Each gets `GET` list, `GET /{id}`, `POST`, `PATCH /{id}`, `POST /{id}/log`:
+Built (`todo/fleet-maintenance-model.md`; README "Fleet maintenance", three sections): assets,
+incidents, jobs (part A); stock, consumables, memos, projects, the Daily Fleet Log, safety (part B);
+pier assignments (`boats__assignments`), certificate status and renewal (`boats__docs`), the safety
+replace wizard, the fuel budget (`fleet_fuelbudget`), the cost, upkeep and fuel reports, the dashboard
+and the repair history (`boats__repairhistory`, computed from done jobs; legacy's rows not imported).
 
-```
-/v1/fleet/engines   /v1/fleet/gearboxes   /v1/fleet/propellers
-/v1/fleet/maintenance   /v1/fleet/incidents   /v1/fleet/safety
-/v1/fleet/inventory   /v1/fleet/projects   /v1/fleet/memos
-GET/POST /v1/fleet/consumable-logs,   GET/PUT /v1/fleet/fuel-prices/{date}
-GET /v1/boats/{id}/repair-history     (documents are on the boat: `PATCH /v1/boats/{id}`)
-```
+Still to give a home: Fleet Insights and the Fleet Report (computed reads; the rules to use are a
+question), and the Fleet Deployment planning board (browser-only drafts, decided to stay out).
 
 ## Not replaced
 
@@ -78,10 +77,8 @@ GET /v1/boats/{id}/repair-history     (documents are on the boat: `PATCH /v1/boa
 
 ## Open
 
-- **Is fleet maintenance ours?** Section 9 may belong in a separate service.
 - **The B2C booking sync** (`/api/b2c/raw`, `/reset`, `/health`): do we take it over?
   (`/v1/availability` already accepts Love Kingdom's `X-Api-Key`.)
 - **Email images** (`/api/mailimg`, `/m/:id`) look like marketing, not operations. Confirm they can go.
 - **Resources mapped from field names only.** Check with someone who uses the screens:
   - `trips`: looks like the old per-day boat board, which deployments replace.
-  - `fleet_drlock`: not identified.

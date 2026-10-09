@@ -429,7 +429,9 @@ A boat:
 - **Capacity above the licence is accepted**, as legacy accepts it: the answer warns
   `capacity_above_licence`, and a day sells at most the licence (`deploymentSeats`).
 - **`documents`** replace the list: `[{ name, expires_on?, renew_status? }]`, `renew_status`
-  `processing`, `done` or none.
+  `processing`, `done` or none. Their expiry state and the renewal dialog are
+  `GET /v1/boats/{id}/documents` and `POST …/documents/renew` (see "Fleet maintenance: assignments,
+  certificates, replace wizard, reports"), as are `pier_today`, `at_shop` and the pier assignments.
 - **`status`** is the form's pick (`available`, `fixing`, `unavailable`). A new boat starts its log
   with it (default `available`); on an edit, when it differs from today's stored status, an
   open-ended entry from today is added at the boat's pier, after closing what it overlaps (legacy
@@ -3612,11 +3614,20 @@ legacy `flProjCalcCost`: jobs whose `parent_project_id` is the project, memos in
 `bill_days`.
 
 **Daily Fleet Log.** `GET /v1/fleet/daily-log?from=&to=` (at most 93 days) → `{days: [{date,
-boats: [{boat_id, pier, fuel_litres, pax_actual, meters: {normal: {engine_id: reading}}, water:
-{open, close, used, by, at}, issues: {item_id: qty}, extras, fuel_price: {price, src, from}}],
-fuel_prices, locks, requests}], issue_items}`. `fuel_price` is legacy's effective price: the boat's,
-else its pier's, else another boat's at the pier that day, else the latest within 30 days (`src`:
-`boat`, `pier`, `sib`, `back`), else 0.
+boats: [{boat_id, pier, fuel_litres, pax_actual, pax_booked, pax, litres_per_pax, meters: {normal:
+{engine_id: reading}}, meter_deltas, water: {open, close, used, by, at}, issues: {item_id: qty},
+extras, fuel_price: {price, src, from}, flags}], fuel_prices, locks, requests, totals: {fuel, pax,
+litres_per_pax}, anomalies: [{boat_id, litres_per_pax}]}], issue_items}`. `fuel_price` is legacy's
+effective price: the boat's, else its (home) pier's, else another boat's at the pier that day, else
+the latest within 30 days (`src`: `boat`, `pier`, `sib`, `back`), else 0.
+
+Computed on each boat row (legacy `flRenderDR`): `pax_booked` (bookings not cancelled, rejected or
+weather-cancelled whose trip that day is dispatched on the boat, FOC and infants in; a split across
+boats is not counted), `pax` (`pax_actual`, else booked), `litres_per_pax`, `meter_deltas` (each
+reading less the engine's latest earlier reading above 0, on any boat; null with none) and `flags`:
+`high_fuel_per_pax` (more than 20 L a passenger: the one anomaly legacy counts, also in the day's
+`anomalies`), `meter_backwards`, `water_negative`, `price_missing` (fuel with neither the boat's nor its
+pier's price that day). `totals.pax` counts every boat logged or booked that day.
 
 | Method + path | Body | Area |
 |---|---|---|
@@ -3631,7 +3642,9 @@ else its pier's, else another boat's at the pier that day, else the latest withi
 
 Writes answer the day. **The day lock is enforced:** "Save day" (`lock`) locks a pier's day and
 every write to it — a boat whose pier it is, a request at that pier, its price — is `409
-day_locked` until "Edit" (`unlock`). A boat's pier is its `pier` on the boat record. A fuel of 0 is
+day_locked` until "Edit" (`unlock`). A boat's pier is its pier **that day** (legacy `_drPier`): the
+pier assignment covering the day, else the pier its status entry that day names, else its home `pier`;
+a boat held at a shop by a started job counts at its home pier. A fuel of 0 is
 no fuel (legacy); a meter that goes backwards is not refused. An issue item is turned `off`, never
 deleted; adding a name that exists turns it back on. Nothing is deleted after 120 days (legacy did).
 
@@ -3652,6 +3665,94 @@ supplier, type, scope, boat and status.
 master. The eight warehouse spellings map to the three; where an item's history does not add up to
 legacy's stock, an `import` movement makes it match; duplicates and odd rows come as they are and are
 listed (`--all` lists every row).
+
+### Fleet maintenance: assignments, certificates, replace wizard, reports
+
+Legacy's Fleet extras (todo/fleet-maintenance-model.md, "Design — extras", migration 190). Writes on a
+boat need `fleet` or `config`; the rest `fleet`. Every report is a read for any login.
+
+**Pier assignments** (legacy `flSaveAssignment`, `flCancelAssignment`): a boat moved to another pier for
+a while (`temporary`) or for good (`permanent`).
+
+| Method + path | Body | Rule |
+|---|---|---|
+| `GET /v1/boats/{id}/assignments` | — | `{assignments (newest first), active, planned, past, pier_today}`; the panels leave cancelled ones out |
+| `POST /v1/boats/{id}/assignments` | `{type?, from_pier, to_pier, start_date, end_date, reason?, cost?}` | `201 {assignment, boat_pier}`. `400`: the same pier at both ends, a date missing, an end before the start, a pier or type that is not one. No overlap check (legacy). A `permanent` one active today sets the boat's home `pier` |
+| `POST /v1/boats/{id}/assignments/{asn_id}/cancel` | — | kept, `cancelled: true`; `409 already_cancelled`. A home pier it moved stays moved (legacy) |
+
+An assignment: `{id, boat_id, type, from_pier, to_pier, start_date, end_date, reason, cost, status,
+cancelled, cancelled_at, cancelled_by, created_date, created_at, created_by}`. `status` is computed
+(`planned`, `active`, `completed`, `cancelled`); sending it is `400`. `GET /v1/boats` and
+`/v1/boats/{id}` carry `pier_today` (the assignment covering today, else the pier today's status entry
+names, else the home pier; legacy `getBoatCurrentPier`) and `at_shop` (the location of a started job
+holding the boat, or null). Both are computed: `PATCH` refuses them. When two assignments cover one day
+the older wins (legacy's list order). The Daily Fleet Log groups and locks by this pier.
+
+**Certificates** (legacy `flDocStatus`, `flRenderDocsList`, `depSave`). The rows stay the boat's
+`documents`; their state is computed on read:
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /v1/boats/{id}/documents` | — | `{documents: [{idx, name, expires_on, renew_status, doc_type, status, days_left, current}]}` |
+| `GET /v1/fleet/certificates` | — | the Documents matrix: each company boat in service × `types` (`lic`, `inspect`, `ins`, `similan`, `surin`, `pp`, `phangnga`, `tarn`), each cell the row shown for it or null; `others`; `counts {ok, warn90, warn30, exp, processing, na}`; `valid_pct`; `expired_boats`; `issues` (cells `exp` or `warn30`) |
+| `POST /v1/boats/{id}/documents/renew` | `{name, state: "exp" \| "processing" \| "ok", expires_on?}` | the documents as `GET` |
+
+`status`: `processing` (being renewed), else `na` (no expiry), else by the days left: `exp` (< 0),
+`warn30` (< 30), `warn90` (< 90), `ok`. `doc_type` is read from the name (legacy `flGuessDocType`);
+`current` is the row the matrix shows for its type (a processing row, else one not `done`, else the
+later expiry). Renew: `exp` clears the mark on the latest row of that name; `processing` marks it (and
+sets `expires_on` when sent), or adds a row; `ok` needs `expires_on`, adds the renewed row and marks the
+name's processing rows `done`.
+
+**The safety replace wizard** (legacy `swapDocExecute`): `POST /v1/fleet/safety/{id}/replace` → `201
+{incident, job, memo, withdrawn_item, old_item, new_item}`.
+
+```jsonc
+{ "reason": "broken",                // broken, expired, upgrade, scheduled, lost
+  "description": "motor stuck", "date": "2026-10-10",
+  "source": "inventory",             // or "buy"
+  "item_id": "inv_…", "warehouse": "panwa",                              // inventory
+  "brand": "Rule", "model": "1100", "supplier": "Marine", "price": 2400,  // buy (brand and model default to the old item's)
+  "serial": "BP-002", "install_date": "2026-10-10", "installer": "Somchai", "labour": 300,
+  "incident_no": "INC-074", "job_no": "MJ-123", "memo_no": "MO-225",   // numbers are the client's
+  "expiry_date": null, "allow_negative": false, "serial_anyway": false }
+```
+
+In one transaction: a `resolved` incident (priority 5/3/2 by the reason, legacy's four lines); a
+`done` corrective job that leaves the boat's status alone, its parts the withdrawn item (or the
+purchase at its price) and `ค่าแรง` for the labour, so its cost is legacy's; from stock, a `withdraw` of
+1 with the job's id (the warehouse defaults to the boat's pier with stock, else any with stock); bought,
+a new stock item (category `safety`, nothing in stock) and a `pending_approval` memo (VAT 7 %, not linked
+to the job, as legacy); the old item `replaced` with a `replace` log line; a new `active` item (name,
+category, qty, location copied, `expiry_date` the old one's unless sent, `next_pm` a month after
+install, an initial `pass` inspection). Refused: `409 already_replaced`, `400` (no stock item picked; a
+purchase with neither brand nor model; a number missing), `409 number_taken`/`memo_no_taken`, `409
+no_serial` (until `serial_anyway: true`), `409 stock_short` (until `allow_negative: true`: the stock goes
+below zero).
+
+**Log lines legacy writes.** A memo on a job: on create the job gets `📋 สร้าง Memo {no} · ฿{amount}`
+and its incident `📋 สร้าง Memo {no} · {title} · ฿{amount}`; an edit and a cancel write the incident
+(`✏️ แก้ไข Memo …`, `🚫 ยกเลิก Memo {no} · {reason}`). A memo for a project writes the project `Memo {no}
+· {title} · ฿{amount} (Project overhead)`. A job made under a project writes it `+ Created MJ {no} ·
+{title}` (and the job `+ Created under project {project no}`); a split `+ Split {no} → {nos}`; a `PATCH`
+of `parent_project_id` links or unlinks with a line on each side. A `parent_project_id` that is not a
+project is `400`.
+
+**Fuel budget.** `GET /v1/fleet/fuel-budgets` → `{budgets: [{month, amount, set_at, set_by}]}`; `PUT
+/v1/fleet/fuel-budgets/{YYYY-MM} {amount}` (baht, more than 0; `null` removes it) → the month.
+
+**Reports.**
+
+| `GET` | What (legacy) |
+|---|---|
+| `/v1/fleet/reports/cost?period=all\|ytd\|last30\|month` | `costAggregate`: jobs done or in progress, each costed as `GET /v1/fleet/jobs` does and split equally over the categories of its assets (`hull`, `engine`, `gearbox`, `propeller`, `other`); memos with a boat and no job as `memo` (the share not bought into stock, `directShare`); `central` (no boat, or the stock share) apart from the total. `{total, done, proc, n_done, n_proc, n_jobs, boats_serviced, average_per_job, central, categories, by_type, outcomes, months (12), boats, units (top 10), rows}`. A job's date is its end date, else its start |
+| `/v1/fleet/reports/upkeep?month=YYYY-MM` | `renderConsumables`: per boat `repairs` (jobs started that month, any status) + `consumables` (`qty × unit_cost`, rounded) = `upkeep`; `draws`, `oil_drawn` |
+| `/v1/fleet/reports/fuel?month=YYYY-MM` | `renderFuelIntel`: company boats' days that ran (booked pax, a route, or fuel); cost = fuel × the boat's, else its home pier's, price that day (no other fallback: `price_missing`). `{cost, fuel, pax, trip_days, cost_per_pax, previous, change_pct, projection, budget, over_budget, anomalies (a day above 1.3 × the boat's month average, 3+ fuel days), missing (ran, no fuel), logged_pct, boats (with routes), efficiency (L per engine hour from the `normal` meters, best/thirsty), efficiency_median, families (fuel, cost, pax, revenue, % of revenue), weekly (W1–W5), trend (per boat: base month, weeks, 6 months)}` |
+| `/v1/fleet/dashboard?date=` | `flRenderDashboard`: `piers` (company boats by pier that day), `board` (open jobs not parked by lane, `boats_down`, `money_tied`, `silent_over_60`, `no_owner`, `parked`), `pending_work` per boat, `engines` by model, `spares`, `low_stock`, `memos`, `incidents`, `service_due` (500 h, ≥ 70 % of the way), `cost_trend` (6 months) |
+| `/v1/fleet/repair-history?boat_id=` | the boat's done jobs in legacy's `repairHistory` shape, latest first: legacy wrote a copy at every close and read none; here it is computed |
+
+**Import.** `import:fleet` also copies `boats__assignments` (legacy's id; `cancelled` kept; legacy kept
+no creator).
 
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Every write is a `SERIALIZABLE` transaction, retried on a serialization failure (`40001`) or deadlock; **a retry runs alone**: each transaction holds a gate (an advisory lock taken before `BEGIN`) shared, a retry takes it exclusive, so it waits for the transactions in flight and none runs beside it. A first attempt never waits, so writes stay concurrent until two collide; a collision then costs one retry, not a `500`. (Only a serializable transaction from outside this store, which skips the gate, could still cancel a retry; there are 8 attempts for that.) Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
