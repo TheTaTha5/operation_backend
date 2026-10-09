@@ -76,7 +76,7 @@ GET    /v1/reports/market-stats?from=&to=    computed from bookings, not stored
 
 ## 8. Pickups and vans
 
-`trip-ops-and-vans-model.md` owns the detail.
+Built (README → "Dispatch" to "Upgrades"); open items in `trip-ops-and-vans-model.md`.
 
 ```
 GET    /v1/pickup-areas, PUT /v1/pickup-areas/{id}

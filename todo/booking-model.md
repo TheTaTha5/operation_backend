@@ -32,7 +32,7 @@ counts from.
 
 ### Alternate pickups
 
-Designed in `trip-ops-and-vans-model.md` (slice D).
+Built (migration 037, README → "Alternate pickups").
 
 ### `docCheck`
 
