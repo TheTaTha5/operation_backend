@@ -177,10 +177,10 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 
 | Area | Writes |
 |---|---|
-| `operations` | bookings and their commands (a weather cancel's refund and credit included), seat locks, deployments, weather closures, a boat's seats for one day |
+| `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities |
 | `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat |
-| `sales` | rate types, agents |
-| `config` | routes, their families and calendar; boats (the whole boat form and its status timeline) |
+| `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
+| `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
 | `accounting` | invoices, their discounts and payments |
 
 - `role: admin` may do everything, including the user screens.
@@ -476,18 +476,20 @@ normal number. Area `operations`.
 
 ### Agents
 
-Resellers, the markets they sell into, and the salespeople who own them. **Read-only for now.**
-Agents arrive through the legacy import (`src/tools/import-legacy.ts`) with legacy's ids (`a01`,
-`a_b2c`, …), which are the ids `bookings.agent_id` and `seat_locks.agent_id` already hold. Creating
-and editing agents comes later. Any login may read them.
+Resellers, the markets they sell into, and the salespeople who own them. **This API is the master
+for agents, markets and salespeople** (moved 2026-10-09, todo/sales-editing-model.md): edit them
+here, not in legacy. `import-legacy.ts --sales` imports them once, to seed an empty database, with
+legacy's ids (`a01`, `a_b2c`, …), the ids `bookings.agent_id` and `seat_locks.agent_id` already hold;
+without `--sales` the import leaves them alone.
 
-**Every caller sees every agent.** Legacy hid other salespeople's agents only in the browser. Doing
-it here needs the caller's salesperson id in the token, and that has not been decided yet.
+**A sales-bound login sees only its own agents.** A login with a `sales_id` that is not an admin
+(legacy's `laSalesScoped`) lists only agents with that salesperson; opening another salesperson's
+agent, its activity, seasons, rate type or documents, or a contract or document of theirs, is `403`
+(`This agent belongs to another salesperson`), and so is every write to it. `GET /v1/contracts`
+lists only its agents' contracts. House agents have no salesperson, so they are out of its scope, as
+in legacy. Any other login reads every agent.
 
-- `GET /v1/markets`: `{ markets: [{ id, name, color, sort, subs: [name…] }] }`, by `sort` (unsorted
-  last), then id.
-- `GET /v1/sales`: `{ sales: [{ id, code, name, full_name, designation, email, tel, color, active }] }`,
-  by name. An inactive salesperson can still own agents.
+- `GET /v1/markets`, `GET /v1/sales`: see [Salespeople and markets](#salespeople-and-markets).
 - `GET /v1/agents?market=&sales=&q=&active=`: summary rows for the list, its filters and header
   counts, A–Z by name (case-insensitive), then id.
   - `market` and `sales` are ids.
@@ -510,6 +512,10 @@ it here needs the caller's salesperson id in the token, and that has not been de
   - `booking_channel`: `{ method, cutoff, cancel_policy, email, phone }`
   - `programs`: `[{ route_id, book_from, book_to, note }]` in the agent's order
   - `credit`: `{ limit, used, available, pct, over }`, worked out (see "Invoices and payments")
+  - `contract_history`: what each renewal archived, newest first: `[{ version, archived_at, contract_start,
+    contract_end, rate_type_id, programs, signatory, archived_by }]`
+  - `contract_template_effective_id`: the template its contract prints with: the bound one if it
+    exists and is active, else the default (legacy `ctTmplForAgent`).
 - `GET /v1/agents/{id}/activity?limit=`: the audit log, newest first:
   `{ activity: [{ at, by, kind, text }] }`. `limit` defaults to 50 and may be 1–200. `404` if the
   agent is unknown.
@@ -527,13 +533,58 @@ Field notes:
 - **`programs`** are the routes the agent may sell. `book_from`/`book_to` is the booking window sales
   entered, and `null` means open. Travel dates are not stored: they come from the rate type (see
   [Rate types](#rate-types)).
-- **`house`** marks `a_walkin`, `a_staff` and `a_b2c`: accounts the business sells through itself.
-- **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). It
-  is not validated yet. The foreign key is a migration that can only ship after the import has run
-  in production: before it, agents hold rate type ids that `rate_types` does not have yet.
-- **Not here yet:** credit used and available (needs invoices and payments, which this service
-  doesn't have), rate seasons and add-on prices (legacy never saved them to its database), and
-  contract history (the Contracts port).
+- **`house`** marks `a_walkin`, `a_staff`, `a_company` and `a_b2c`: accounts the business sells through itself.
+- **`rate_type_id`** is the rate type the agent is priced with (see [Rate types](#rate-types)). A write
+  checks it exists; the column has no foreign key (legacy agents name rate types legacy deleted).
+- **`code`** is unique ignoring case for a new or changed code (`409 code_taken`). Legacy never
+  checked, and 21 of its codes are shared by 2–3 agents; those stay until sales cleans them.
+- **Not here:** per-agent add-on prices (legacy never saved them).
+
+#### Creating and editing agents
+
+Writes need the `sales` area (and a sales-bound login, its own agents: see above). Each answers the
+agent as `GET /v1/agents/{id}` does, and writes one line per change to its activity, in legacy's
+wording and signed with the login (legacy's `by` was always blank).
+
+- `POST /v1/agents` → `201`. The body is the detail's client facts (flat fields and the `company`,
+  `signatory`, `booking_channel` groups) plus `rate_type_id`. Required, as legacy's form: `name`,
+  `company.legal_name`, `company.address`, `market_id`, `rate_type_id`, `pay_type`, `vat_mode`
+  (`400 Missing: …`). The server makes the `id`, the `code` when none is sent (the name's first 8
+  letters and digits, numbered on a clash), the contract fields (`active`, `v<year>-1`, today to a
+  year less a day), the programmes (every route the rate prices, booked within the contract dates)
+  and legacy's defaults (credit 0 unless `pay_type` is `invoice`; company tel = phone; signatory =
+  contact, `Authorized Signatory`, phone; legacy's booking channel). A sales-bound login's agent gets
+  its salesperson. `409 possible_duplicate` when an agent's name matches once normalised (legacy's
+  `agFindDup`), unless `create_anyway: true`. A sub-market new to the market joins its list.
+  ```jsonc
+  { "name": "Sun Tour", "market_id": "ru", "pay_type": "invoice", "vat_mode": "exclude", "rate_type_id": "rt003",
+    "credit_days": 30, "credit_limit": 200000, "email": "ops@sun.test",
+    "company": { "legal_name": "Sun Tour Co., Ltd.", "address": "1 Beach Rd" } }
+  ```
+- `PATCH /v1/agents/{id}`: the client facts it names; a group merges field by field. Sending the
+  whole `GET` back is fine: a server-owned field that repeats the stored value is ignored, and a
+  different one is `400` naming the command (`rate_type_id cannot be changed here: use PUT
+  /v1/agents/{id}/rate-type`). `name`, `company.legal_name`, `market_id`, `pay_type` and `code` cannot
+  be cleared. Credit days and limit stay as sent whatever the payment type (legacy).
+- `PUT /v1/agents/{id}/programs` `{ "programs": [{ "route_id": "r5", "book_from": …, "book_to": …, "note": … } | "r6"] }`:
+  the whole list, in order, one row per route. A bare route id keeps that route's window and note.
+- `PUT /v1/agents/{id}/rate-type` `{ "rate_type_id": "rt005", "drop_unpriced": true }`: the rate (or
+  `null`); the agent's main contracts that are not expired or void take it (legacy `_ctSyncMainRate`);
+  a route the rate prices joins the programmes. When the agent sells routes the new rate does not
+  price, `drop_unpriced` must say whether to remove them (legacy's confirm): absent is
+  `409 unpriced_programs` naming them. A rate owned by another salesperson is `400`.
+- `POST /v1/agents/{id}/renew` `{ "version": "v2027-1", "start": "2027-10-01", "end": "2028-09-30",
+  "rate_type_id": "rt009", "carry": { "programs": true, "booking": true, "signatory": false, "company": true } }`:
+  legacy's renewal. It archives the contract fields into `contract_history`, sets the new ones, moves
+  every programme's booking window by as many days as the start moved, applies a new rate to the main
+  contracts, and clears what is not carried (no programmes; an empty booking channel; the signed
+  date; the company fields). No contract row is made, as in legacy. `400` unless `end` is after `start`.
+- `POST /v1/agents/{id}/deactivate`, `/activate`. A booking for an inactive agent is refused
+  (`409 agent_inactive`); its existing bookings are untouched.
+- `DELETE /v1/agents/{id}` → `204`, an admin only, and only while no booking, contract, seat lock,
+  invoice or login names it (`409 in_use`: deactivate it instead).
+- `GET /v1/agents/{id}/documents`, `POST /v1/agents/{id}/documents`: see
+  [Contract templates and documents](#contract-templates-and-documents).
 
 #### Rate seasons
 
@@ -558,8 +609,11 @@ A rate type a season uses is in use: `DELETE /v1/rate-types/{id}` refuses it (`4
 ### Contracts
 
 An agent's contracts, from legacy (`sb_contracts`): one `main` contract (its rate type and the
-routes it covers), and time-boxed `promo` overlays. Read-only for now; nothing prices from them
-until the quote (`todo/pricing-model.md`). Any login may read them.
+routes it covers), and time-boxed `promo` overlays. No write endpoint yet (promos come with the
+quote, `todo/contracts-model.md`), but two agent commands change them: a rate type change or a
+renewal with a new rate sets the rate of the agent's main contracts that are not expired or void,
+and issuing a document stamps `doc_id`. Any login may read them; a sales-bound login, only its own
+agents' (see [Agents](#agents)).
 
 - `GET /v1/contracts?agent_id=&kind=&status=` → `{ "contracts": [...] }`, by agent, then main
   before promo, then the latest `active_from` first. `kind` is `main` or `promo`, `status` is
@@ -594,7 +648,104 @@ a dry run unless `--commit`, after `seed:routes` and the agents and rate types i
 legacy wins for every contract it has (its periods and prices are replaced whole); one only this
 service has is left alone. What does not fit is listed: a contract whose agent is gone is skipped, a
 rate type that no longer exists becomes `null`, a period whose window runs backwards is dropped
-(legacy could never match it).
+(legacy could never match it). Since agents are edited here, a rerun also overwrites a main
+contract's rate and `doc_id` set here: run it only to seed (see todo/sales-editing-model.md, Flagged).
+
+### Contract templates and documents
+
+A **template** is the wording and style an agent's contract prints with (legacy's Contract Templates
+screen). Area `sales` for writes; any login reads.
+
+- `GET /v1/contract-templates?active=` → `{ "contract_templates": [summary…] }` by code; a summary
+  has no `sections`/`text` and adds `agents`, how many agents are bound to it. `active` is `true`,
+  `false` or absent for all.
+- `GET /v1/contract-templates/{id}` → the template with `sections` (`{ "cover": true, … }`) and
+  `text` (`{ "en": { "childRateTitle": "…", "notRecItems": ["…"] }, "th": { … } }`), and `agents`.
+- `POST /v1/contract-templates` → `201`. Any of `code`, `name`, `note`, `active`, `form`, `accent`,
+  `accent_hex`, `font`, `sections`, `text`; what is not sent is copied from the default (legacy
+  `cttNew`), the name defaults to `Template ใหม่` and the code to the next free `CT-NN`. The first
+  template is the default.
+- `PATCH /v1/contract-templates/{id}`: those fields. `409 code_taken` for another template's code
+  (ignoring case); `409 default_template` to switch the default off; `400` for `is_default` (use the
+  command) or an `accent_hex` that is not `#RRGGBB`.
+- `POST /v1/contract-templates/{id}/default`: makes it the one default, and active.
+- `DELETE /v1/contract-templates/{id}` → `204`; `409 default_template` for the default. Its agents
+  fall back to the default, each with a line in its activity.
+
+A **document** is a contract issued to an agent, frozen as it was printed (legacy's
+`agent_artifacts`): a template or rate edited later does not change it.
+
+- `POST /v1/agents/{id}/documents` → `201`, body `{ "lang": "en" | "th", "contract_id"?, "template_id"?,
+  "page_count"?, "content": { … } }`. `content` is the render (sections, style, the template's text,
+  overrides, custom clauses), stored as sent. The server records `id` (`gc_…`), `version` (the agent's
+  contract version, else `draft`), `generated_at`, `generated_by`, `template_name`, and `rate_type_ref`
+  and `rate_type_name` (the contract's rate, else the agent's); it stamps the contract's `doc_id` and
+  writes `Contract generated · v2025-1 · EN` to the activity. `400` for a contract of another agent or
+  an unknown template.
+- `GET /v1/agents/{id}/documents` → `{ "documents": [summary…] }`, newest first, without `content`.
+- `GET /v1/contract-documents/{id}` → the document with `content`.
+- `DELETE /v1/contract-documents/{id}` → `204` (legacy's "Remove from history"); clears the contract's
+  `doc_id` if it was this one.
+
+### Salespeople and markets
+
+Legacy's Team & Markets screen; writes need the `config` area. Any login reads.
+
+- `GET /v1/sales` → `{ "sales": [{ id, code, name, full_name, designation, email, tel, color, active,
+  has_signature }] }` by name. An inactive salesperson can still own agents.
+- `GET /v1/sales/{id}` → the same with `signature`, a `data:image/png;base64,…` URL (it can be
+  several hundred KB, so the list leaves it out).
+- `POST /v1/sales` → `201`: `code` (1–3 characters, uppercased, unique ignoring case:
+  `409 code_taken`) and `name` required; `full_name`, `designation` (default `Sales Executive`),
+  `email`, `tel`, `color`, `signature` (a PNG or JPEG data URL up to 1 MB, or `null`), `active`.
+- `PATCH /v1/sales/{id}`: those fields.
+- `DELETE /v1/sales/{id}` → `204`: their agents are left with no salesperson, each with a line in its
+  activity (legacy `tmDeleteSales`). `409 in_use` while a login or a rate type names them: make them
+  inactive instead.
+- `GET /v1/markets` → `{ "markets": [{ id, name, color, sort, subs: [name…] }] }`, by `sort`
+  (unsorted last), then id.
+- `POST /v1/markets` → `201`: `id` (lowercase letters and digits; `409 exists`), `name`, `color`,
+  `subs` (blanks and repeats dropped). A new market goes last.
+- `PATCH /v1/markets/{id}`: `name`, `color`, `subs`. The id never changes.
+- `PUT /v1/markets/order` `{ "ids": [...] }`: every market once, in the new order.
+- `DELETE /v1/markets/{id}` → `204`; `409 in_use` while an agent is in it.
+
+An agent's `sub_market` is free text; a new one joins its market's `subs` when the agent is saved.
+
+### Add-on services
+
+The catalogue of extra services sales offers, with their variants and prices (legacy's "Add-on
+Services" screen, which never saved). It starts empty: what it lists comes from sales. Booking add-ons
+are still priced from rate types ([Add-ons](#add-ons)). Area `sales` for writes.
+
+- `GET /v1/addon-services?active=` → `{ "addon_services": [...] }` by `sort`, then name.
+- `GET /v1/addon-services/{id}`.
+- `POST /v1/addon-services` → `201`, `PATCH /v1/addon-services/{id}`, `DELETE /v1/addon-services/{id}` → `204`.
+
+```jsonc
+{ "id": "aos_mv0…", "name": "Long-tail Boat (Pileh Lagoon)", "type": "boat", "description": "…", "active": true, "sort": null,
+  "variants": [ { "id": "v_mv0…", "name": "Join Long-tail", "unit": "per person · share boat", "selling": 280, "net": 180 } ],
+  "created_at": "…", "updated_at": "…" }
+```
+
+`name` and `type` (`boat`, `van`, `guide`, `other`) are required; `variants` replaces the whole list,
+a variant's `id` is made when absent, and prices are numbers ≥ 0 or `null`.
+
+### Nationalities
+
+The list the booking form picks a nationality from: legacy's 73 built-ins and the custom ones staff
+add. Passengers' `nationality` stays free text.
+
+- `GET /v1/nationalities` → `{ "nationalities": [{ code, name, custom }] }`: the built-ins, then the
+  custom ones as they were added, `OTHER` last (legacy `bkV2AllNats`).
+- `POST /v1/nationalities` `{ "name": "Ghanaian" }`, area `operations`: legacy's `bkV2AddCustomNat`.
+  The name is cleaned (a ` · CODE` suffix, stray brackets and punctuation removed); fewer than 2
+  letters is `400`. One whose name matches ignoring case and punctuation, or whose code is the text, is
+  answered `200` with `created: false`; else a custom one is made, coded with the first three
+  letters (`CUS` when there are none), numbered on a clash, `201` with `created: true`.
+
+Legacy's 66 custom ones arrive with the import, duplicates included; merging them rewrites bookings
+and is a later decision.
 
 ### Rate types
 
@@ -1316,8 +1467,8 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | Group | Fields |
 | --- | --- |
 | identity | `schema_ver`, `external_id`, `voucher_ref` |
-| commercial | `agent_id`, `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` |
-| lead | `lead_pax`, `lead_nationality`, `lead_type`, `lead_foc`, `lead_phone`, `lead_email` |
+| commercial | `agent_id` (an inactive agent is `409 agent_inactive` on create), `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` |
+| lead | `lead_pax`, `lead_nationality`, `lead_type`, `lead_foc`, `lead_phone`, `lead_email`; `lead_age`, `lead_insurance_reviewed_at`, `lead_insurance_reviewed_by` (read-only here: see [Insurance](#insurance)) |
 | pickup | `pickup_area_id`, `pickup_self`, `pickup_area`, `pickup_zone`, `hotel_name`, `room_number` |
 | dropoff | `dropoff_same`, `dropoff_area_id`, `dropoff_area`, `dropoff_hotel_name` |
 | guides | `guide_english`, `guide_russian`, `guide_chinese`, `guide_other_lang` |
@@ -1382,6 +1533,27 @@ array position and is not something you send.
 Unlike the header, **`passengers` does not merge on `PATCH`** — sending it replaces the whole list,
 the same way `trips` replaces the itinerary. Omitting it on an amendment leaves the existing list
 untouched. There is no way to add or edit one passenger without resending the full list.
+
+#### Insurance
+
+Each passenger's age for the insurer, and who reviewed the row and when (legacy's Insurance page,
+area `operations`). The lead's are header fields, `lead_age`, `lead_insurance_reviewed_at` and
+`lead_insurance_reviewed_by`; every other passenger's are on its row, `age`, `insurance_reviewed_at`
+and `insurance_reviewed_by`. All are absent until set.
+
+- `PUT /v1/bookings/{id}/insurance` with `If-Match` (or `version`), as every booking write:
+  ```json
+  { "version": 4, "passengers": [ { "passenger": "lead", "age": 47, "reviewed": true }, { "passenger": 0, "age": 2.5 } ] }
+  ```
+  `passenger` is `"lead"` or a passenger's `seq`. `age` is a number from 0 to 999, fractions allowed
+  (legacy's text ages such as `"47"` are read as numbers); `null` clears it. `reviewed: true` stamps
+  the login and the time (a row already reviewed keeps its first stamp), `false` clears them, absent
+  leaves them. Answers the booking, with a line in its history (`Insurance · lead age 47 reviewed ·
+  #0 age 2.5`). `400` for a passenger the booking does not have or a bad age.
+- These fields change only through the command: a `PATCH` may echo them, and a different value is
+  `400` naming it. A `PATCH` that replaces `passengers` keeps a passenger's age and review when the
+  row at the same position has the same name, and drops them otherwise (legacy kept them by position
+  alone and moved them onto whoever took it).
 
 #### Add-ons
 

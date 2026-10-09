@@ -37,14 +37,12 @@ whole-boat holds, their own design (not written yet; the pool side is migration 
 ## 6. Sales: agents, prices, contracts
 
 ```
-POST   /v1/agents, PATCH /v1/agents/{id}, PUT /v1/agents/{id}/programs        (agents.md)
-POST   /v1/agents/{id}/deactivate, /v1/agents/{id}/activate
-PUT    /v1/agents/{id}/rate-bindings
 POST   /v1/contracts, PATCH /v1/contracts/{id}           (contracts-model.md)
-GET    /v1/contract-templates, PUT /v1/contract-templates/{id}
-GET    /v1/nationalities
-GET    /v1/insurance-overrides, PUT /v1/insurance-overrides/{date}
+staff and welfare quotas; sales targets                 (sales-editing-model.md)
 ```
+
+Built: agents, programmes, rate type, renewal, (de)activate, templates, issued documents, salespeople,
+markets, the add-on catalogue, nationalities, insurance (README → "Agents" to "Nationalities").
 
 ## 7. Money
 
@@ -76,8 +74,7 @@ GET /v1/boats/{id}/repair-history     (documents are on the boat: `PATCH /v1/boa
 
 - **Whole-state data routes:** `/api/load`, `/api/save`, `/api/v1/:resource`, `/api/v1/_batch`.
 - **Cookie login:** `/api/login`, `/api/logout`. Replaced by `POST /v1/login` and Bearer tokens.
-- **Browser-side state:** `_app_hooks`, `nat_learn` (a nationality-guessing cache),
-  `agent_artifacts`.
+- **Browser-side state:** `_app_hooks`, `nat_learn` (a nationality-guessing cache).
 
 ## Open
 

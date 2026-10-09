@@ -107,6 +107,12 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/boats' || path.startsWith('/v1/boats/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/route-families' || path.startsWith('/v1/route-families/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/routes' || path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
+  // Sales editing (todo/sales-editing-model.md): templates, issued documents and the add-on catalogue
+  // are sales'; salespeople and markets are the Team & Markets screen's, under `config` (decision 2);
+  // a nationality is added from the booking form (decision 11).
+  if (/^\/v1\/(contract-templates|contract-documents|addon-services)(\/|$)/.test(path)) return { kind: 'area', areas: ['sales'] };
+  if (/^\/v1\/(sales|markets)(\/|$)/.test(path)) return { kind: 'area', areas: ['config'] };
+  if (path === '/v1/nationalities') return { kind: 'area', areas: ['operations'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
   if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
   return { kind: 'admin' };

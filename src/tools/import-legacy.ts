@@ -1,7 +1,7 @@
 /**
  * Backfills this service's database from the legacy monolith's (`operation_schemas`).
  *
- *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…] [--rate-types] [--b2c=all|pushed|none]
+ *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/import-legacy.ts [--commit] [--remove=<booking id>,…] [--rate-types] [--b2c=all|pushed|none] [--sales]
  *
  * Love Kingdom's orders (`b2c_…`) are imported unless `--b2c` says otherwise (`legacy-b2c.ts`): `pushed`
  * leaves out the orders Love Kingdom has pushed here itself, `none` leaves them all out. The test
@@ -17,9 +17,13 @@
  * because legacy is master while this import runs (until cutover) and a boat taken off a day there
  * must stop selling seats here. A row legacy still has but this import skipped is kept and listed.
  * A van still referenced by something this import did not create cannot be deleted, and the whole
- * run rolls back. Agents, markets and salespeople keep legacy's ids and are upserted too; an agent's
- * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
- * bookings named in `--remove`.
+ * run rolls back. Nothing else is touched except the bookings named in `--remove`.
+ *
+ * The sales area moved here on 2026-10-09 (todo/sales-editing-model.md): agents, markets, salespeople,
+ * contract templates and issued documents are edited here, and a run leaves them alone. Only `--sales`
+ * imports them, to seed a database that has none: legacy's ids kept and upserted; an agent's programmes,
+ * activity and renewal archive and a market's sub-markets replaced; a document already here kept.
+ * Legacy's custom nationalities and its insurance ages and review ticks follow the bookings, on every run.
  *
  * Routes and boats are this API's since 2026-10-09 (`seed:routes`, `seed:boats`): the import reads
  * them and writes neither. A boat's seats for a day set here (`set_at`) are neither replaced nor
@@ -68,6 +72,8 @@ import { mapLegacyMoney } from './legacy-invoices.js';
 import { groupOrders, jobNotes, sentMarks, thaiNames, type ImportedGroup } from './legacy-van-jobs.js';
 import { b2cSkipReason, parseB2CMode } from './legacy-b2c.js';
 import { mapLegacyWeather } from './legacy-weather.js';
+import { HOUSE_AGENT_IDS } from '../domain/agent-writes.js';
+import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales } from './legacy-sales.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -79,6 +85,12 @@ const remove = (process.argv.find((arg) => arg.startsWith('--remove='))?.slice('
 const withRateTypes = process.argv.includes('--rate-types');
 /** How far Love Kingdom's push has taken over its orders (todo/b2c-sync-model.md): `all` until someone says. */
 const b2cMode = parseB2CMode(process.argv);
+/**
+ * The sales area is this API's since 2026-10-09 (todo/sales-editing-model.md): agents, their programmes,
+ * activity and renewals, markets, salespeople, contract templates and issued documents are imported only
+ * to seed a database that has none.
+ */
+const withSales = process.argv.includes('--sales');
 const sourceUrl = process.env.SOURCE_DATABASE_URL;
 const targetUrl = process.env.TARGET_DATABASE_URL;
 if (!sourceUrl || !targetUrl) throw new Error('Set SOURCE_DATABASE_URL and TARGET_DATABASE_URL');
@@ -223,6 +235,12 @@ async function main() {
     const legacyAgentPeriods = await read('SELECT * FROM sb_agents__programperiods ORDER BY sb_agents_id, idx');
     const legacyAgentActivity = await read('SELECT * FROM sb_agents__activity ORDER BY sb_agents_id, idx');
     const rateBindings = await read('SELECT id, ratetypeid FROM sb_agents_rate_bindings');
+    const legacyContractHistory = await read('SELECT * FROM sb_agents__contracthistory ORDER BY sb_agents_id, idx');
+    const legacyTemplates = await read('SELECT id, value FROM contract_templates ORDER BY id');
+    const legacyArtifacts = await read('SELECT id, value FROM agent_artifacts ORDER BY id');
+    // Bookings' data, mirrored on every run while bookings are legacy's: custom nationalities and insurance ages.
+    const legacyNationalities = await read('SELECT code, name FROM sb_nationalities ORDER BY id');
+    const legacyInsurance = await read('SELECT key, value FROM insurance_overrides ORDER BY key');
     // Rate types. Legacy keeps a private-transfer table per route it has ever priced; they are found
     // by name, so a route legacy adds a table for is read without a change here.
     const transferTables = (await read(`SELECT table_name FROM information_schema.tables
@@ -561,6 +579,8 @@ async function main() {
     cellsFrom(legacyFlatTimes, () => FLAT, (c) => groupOfColumn.get(c));
 
     const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [], allergies: Row[] = [], docChecks: Row[] = [], docResults: Row[] = [];
+    /** Legacy passenger index → seq here, per booking: a nameless passenger is dropped, so they differ. */
+    const passengerSeq = new Map<string, number>();
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -721,6 +741,7 @@ async function main() {
       for (const p of passengersOf.get(legacyId) ?? []) {
         const name = str(p.name);
         if (!name) { note('passengers dropped: no name'); continue; }
+        passengerSeq.set(`${legacyId}::${int(p.idx)}`, seq);
         passengers.push({ booking_id: id, seq: seq++, name, nationality: str(p.nationality) || null, type: str(p.type) || null, foc: p.foc ?? null });
       }
       // Discounts and extras (migration 031), as legacy saved them: a row that does not fit is dropped and counted.
@@ -863,6 +884,12 @@ async function main() {
     const returnRuns = new Set(allocations.filter((a) => a.return_van_id).map((a) => `${tripAt.get(String(a.booking_trip_id))}|${a.return_van_id}`));
     const jobSends = sentMarks(vanSent, imported, returnRuns, note);
     const pickupNames = thaiNames(vanPickupTh, note);
+    // ── Insurance ages and review ticks, onto the bookings just mapped (migration 093, `legacy-sales.ts`) ──
+    const insuranceApplied = applyLegacyInsurance(legacyInsurance, {
+      bookingId: (legacyId) => PREFIX + legacyId, bookings: new Map(bookings.map((b) => [String(b.id), b])), passengerSeq,
+      passengers: new Map(passengers.map((row) => [`${row.booking_id}::${row.seq}`, row])),
+    }, note);
+    const customNationalities = mapLegacyNationalities(legacyNationalities);
 
     // ── Agents, their markets and salespeople. Legacy ids are kept, because bookings and seat locks
     //    already carry them in `agent_id`. Upserted like vans; an agent's programmes and activity are
@@ -892,15 +919,16 @@ async function main() {
       if (!str(s.name)) note('salespeople with no name: named by code or id');
       salesPeople.push({
         id, code: str(s.code) || null, name: str(s.name) || str(s.code) || id, full_name: str(s.fullname) || null,
-        designation: str(s.designation) || null, email: str(s.email) || null, tel: str(s.tel) || null, color: str(s.color) || null, active: true,
+        designation: str(s.designation) || null, email: str(s.email) || null, tel: str(s.tel) || null, color: str(s.color) || null, active: s.active !== false,
+        signature: /^data:image\/(png|jpeg);base64,/.test(str(s.signature)) ? str(s.signature) : null,
       });
     }
     const marketIds = new Set(markets.map((m) => String(m.id)));
     const salesIds = new Set(salesPeople.map((s) => String(s.id)));
     const placeholders: string[] = [];
 
-    // Legacy re-seeds three house accounts on every load (08-app.js:436-466); they are ours, not resellers.
-    const HOUSE_AGENTS = new Set(['a_walkin', 'a_staff', 'a_b2c']);
+    // Legacy re-seeds its house accounts on every load (08-app.js:436-466); they are ours, not resellers (a_company: decision 14).
+    const HOUSE_AGENTS = new Set<string>(HOUSE_AGENT_IDS);
     // Legacy's `_seedContractExpiryVariety` (agents.js:43-110) overwrote these on every load with demo
     // values computed from 2026-09-02, and they were persisted. The real dates are gone from legacy, so a
     // value matching the demo exactly is dropped rather than imported as a contract that expires tomorrow.
@@ -1010,7 +1038,13 @@ async function main() {
     }
 
     // ── Rate types: after salespeople, because a rate's owner must be one (placeholders included) ──
-    const rateTypes = mapLegacyRateTypes(legacyRateTypes, routePiers, salesIds);
+    // Without --sales the salespeople are this API's, so a rate's owner must be one of those here.
+    const salesHere = new Set((await target.query('SELECT id FROM sales_people')).rows.map((r) => String(r.id)));
+    const agentsHere = new Set((await target.query('SELECT id FROM agents')).rows.map((r) => String(r.id)));
+    const rateTypes = mapLegacyRateTypes(legacyRateTypes, routePiers, withSales ? salesIds : salesHere);
+    // Templates, issued documents and the renewal archive (`legacy-sales.ts`), with --sales only.
+    const contractsHere = new Set((await target.query('SELECT id FROM contracts')).rows.map((r) => String(r.id)));
+    const sales = mapLegacySales({ templates: legacyTemplates, artifacts: legacyArtifacts, history: legacyContractHistory, agentIds, contractIds: contractsHere });
     // A code is what this import matches rate types on. If one already belongs to a different rate
     // type here (one created through the API), the unique index would abort the whole run: that rate
     // type is left out and listed instead, for someone to rename one of the two.
@@ -1034,7 +1068,7 @@ async function main() {
     const routeNames = new Map((await target.query('SELECT id, name FROM routes')).rows.map((r) => [String(r.id), String(r.name)]));
     const firstTrips = new Map(trips.filter((t) => Number(t.seq) === 0).map((t) => [String(t.booking_id), t]));
     const money = mapLegacyMoney(legacyMoney, {
-      prefix: PREFIX, agents: agentIds, files: filesHere, routeName: (id) => routeNames.get(id),
+      prefix: PREFIX, agents: withSales ? agentIds : agentsHere, files: filesHere, routeName: (id) => routeNames.get(id),
       bookings: new Map(bookings.map((b) => [String(b.id), {
         voucher_ref: (b.voucher_ref as string | null) ?? null, legacy_id: String(b.external_id),
         route_id: String(firstTrips.get(String(b.id))?.route_id ?? ''), service_date: String(firstTrips.get(String(b.id))?.service_date ?? ''),
@@ -1087,15 +1121,31 @@ async function main() {
       RETURNING service_date::text AS day, boat_id`, [capOverrides.map((o) => str(o.key))])).rows;
     const upsert = (rows: Row[], extra = '') => `ON CONFLICT (id) DO UPDATE SET ${Object.keys(rows[0] ?? { id: 0 }).filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).concat(extra ? [extra] : []).join(', ')}`;
     await insert('vans', vans, upsert(vans));
-    // Agents before their children; programmes, activity and sub-markets are replaced, not merged.
-    await insert('markets', markets, upsert(markets));
-    await target.query('DELETE FROM market_subs WHERE market_id = ANY($1::text[])', [[...marketIds]]);
-    await insert('market_subs', subs);
-    await insert('sales_people', salesPeople, upsert(salesPeople));
-    await insert('agents', agents, upsert(agents, 'updated_at = now()'));
-    await target.query('DELETE FROM agent_programs WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
-    await target.query('DELETE FROM agent_activity WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
-    await insert('agent_programs', agentPrograms);
+    // The sales area moved here (2026-10-09): without --sales nothing below writes an agent, a market,
+    // a salesperson, a template, an issued document or a renewal.
+    if (withSales) {
+      // Agents before their children; programmes, activity, sub-markets and the archive are replaced, not merged.
+      await insert('markets', markets, upsert(markets));
+      await target.query('DELETE FROM market_subs WHERE market_id = ANY($1::text[])', [[...marketIds]]);
+      await insert('market_subs', subs);
+      await insert('sales_people', salesPeople, upsert(salesPeople));
+      await insert('agents', agents, upsert(agents, 'updated_at = now()'));
+      await target.query('DELETE FROM agent_programs WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
+      await target.query('DELETE FROM agent_activity WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
+      await insert('agent_programs', agentPrograms);
+      await target.query('DELETE FROM agent_contract_history WHERE agent_id = ANY($1::text[])', [[...agentIds]]);
+      await target.query(`INSERT INTO agent_contract_history (agent_id, version, archived_at, contract_start, contract_end, rate_type_id, programs, signatory, archived_by)
+        SELECT r.agent_id, r.version, r.archived_at, r.contract_start, r.contract_end, r.rate_type_id, r.programs, r.signatory, r.archived_by
+        FROM jsonb_populate_recordset(NULL::agent_contract_history, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(sales.history)]);
+      // One default: legacy's takes over from any made here, as a seed's upsert would.
+      const legacyDefault = sales.templates.find((t) => t.is_default)?.id;
+      if (legacyDefault) await target.query('UPDATE contract_templates SET is_default = false WHERE is_default AND id <> $1', [legacyDefault]);
+      await insert('contract_templates', sales.templates, upsert(sales.templates, 'updated_at = now()'));
+      // An issued document is frozen: one already here is left as it is.
+      await insert('contract_documents', sales.documents, 'ON CONFLICT (id) DO NOTHING');
+    }
+    // Legacy's custom nationalities, on every run while bookings are legacy's; never deleted, never a built-in.
+    await insert('nationalities', customNationalities.nationalities, 'ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name WHERE NOT nationalities.builtin');
 
     // Rate types: the header is upserted; under it, only what legacy can hold is replaced.
     await insert('rate_types', rateTypes.rateTypes, upsert(rateTypes.rateTypes, 'updated_at = now()'));
@@ -1118,8 +1168,10 @@ async function main() {
       [rateIds, legacyRateTypes.transfers.map((t) => t.routeId)]);
     await insert('rate_type_transfer_prices', rateTypes.transfer);
     // In legacy's order, oldest first, so the serial id breaks ties between entries at the same instant.
-    await target.query(`INSERT INTO agent_activity (agent_id, at, by, kind, text)
-      SELECT r.agent_id, r.at, r.by, r.kind, r.text FROM jsonb_populate_recordset(NULL::agent_activity, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(agentActivity)]);
+    if (withSales) {
+      await target.query(`INSERT INTO agent_activity (agent_id, at, by, kind, text)
+        SELECT r.agent_id, r.at, r.by, r.kind, r.text FROM jsonb_populate_recordset(NULL::agent_activity, $1::jsonb) WITH ORDINALITY AS r ORDER BY r.ordinality`, [JSON.stringify(agentActivity)]);
+    }
     await insert('van_day_routes', dayRoutes);
     await insert('van_status_ranges', statusRanges);
     await insert('van_days', [...vanDays.values()]);
@@ -1223,7 +1275,12 @@ async function main() {
     console.log(`van job orders: ${jobSends.length} of ${vanSent.length} sent marks (${jobSends.filter((s) => !s.group_id).length} return-only), `
       + `${bookings.filter((b) => b.job_note !== null).length} special requests (${bookings.filter((b) => b.job_note === '').length} blanked), `
       + `${pickupNames.length} of ${vanPickupTh.length} Thai pickup names, ${order.size} groups ordered`);
-    console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
+    if (!withSales) console.log('agents, markets, salespeople, templates, documents: not imported (this API is their master since 2026-10-09; --sales seeds an empty database)');
+    else {
+      console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
+      console.log(`sales: ${sales.templates.length} contract templates, ${sales.documents.length} issued documents, ${sales.history.length} archived contracts`);
+    }
+    console.log(`nationalities: ${customNationalities.nationalities.length} custom of ${legacyNationalities.length}; insurance: ${insuranceApplied} of ${legacyInsurance.length} rows on imported bookings`);
     if (!withRateTypes) console.log('rate types: not imported (this API is their master since 2026-10-09; --rate-types seeds an empty database)');
     else console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
       + `${rateTypes.charter.length} charter rows, ${rateTypes.longtail.length} longtail rows, ${rateTypes.transfer.length} transfer prices `
@@ -1238,6 +1295,9 @@ async function main() {
     for (const id of staleVans) console.log(`  van ${id}`);
     console.log(`\nplaceholders created (${placeholders.length}):`);
     for (const p of placeholders) console.log(`  ${p}`);
+    const salesIssues = [...(withSales ? sales.issues : []), ...customNationalities.issues];
+    console.log(`\nsales data to check (${salesIssues.length}):`);
+    for (const i of salesIssues) console.log(`  ${i}`);
     console.log(`\nagent data to check (${agentData.length}):`);
     for (const d of agentData) console.log(`  ${d}`);
     console.log(`\nrate type data to check (${rateTypes.issues.length}):`);

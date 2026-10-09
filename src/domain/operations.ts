@@ -51,6 +51,12 @@ import {
   blankBoat, boatOf, compactRoute, copyBoat, LEGACY_FAMILIES, sortFamilies,
   type BoatRecord, type RouteFamily, type RouteFields, type RouteUsage, type StoredOverride,
 } from './catalogue.js';
+import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
+import { salesSummary, type StoredSalesPerson, type SalesPersonSummary } from './team.js';
+import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
+import { addonServiceView, sortAddonServices, type AddonService } from './addon-services.js';
+import { builtinNationalities, type StoredNationality } from './nationalities.js';
+import { carryInsurance, type InsuranceFields } from './insurance.js';
 
 export type Deployment = {
   boat_id: string;
@@ -401,16 +407,16 @@ export class OperationsStore {
     { routes: [], seasons: [], overrides: [], boats: [], boatOverrides: [], families: LEGACY_FAMILIES.map((f) => ({ ...f })) };
 
   /** Agents and what they point at. Empty unless seeded: a PostgreSQL deployment gets these from the import. */
-  private directory: { markets: Market[]; sales: SalesPerson[]; agents: StoredAgent[]; activity: Map<string, StoredActivity[]> } =
+  private directory: { markets: Market[]; sales: StoredSalesPerson[]; agents: StoredAgent[]; activity: Map<string, StoredActivity[]> } =
     { markets: [], sales: [], agents: [], activity: new Map() };
 
   /**
    * Loads agents, markets, salespeople and activity, as `import-legacy.ts` does for PostgreSQL.
    * Activity is given oldest first; its position is what orders two entries at the same instant.
    */
-  seedAgents(data: Partial<{ markets: Market[]; sales: SalesPerson[]; agents: StoredAgent[]; activity: Record<string, AgentActivity[]> }>): void {
+  seedAgents(data: Partial<{ markets: Market[]; sales: (SalesPerson & { signature?: string | null })[]; agents: StoredAgent[]; activity: Record<string, AgentActivity[]> }>): void {
     if (data.markets) this.directory.markets = data.markets.map((market) => ({ ...market, subs: [...market.subs] }));
-    if (data.sales) this.directory.sales = data.sales.map((person) => ({ ...person }));
+    if (data.sales) this.directory.sales = data.sales.map((person) => ({ ...person, signature: person.signature ?? null }));
     if (data.agents) this.directory.agents = data.agents.map((agent) => ({ ...agent, programs: agent.programs.map((program) => ({ ...program })) }));
     if (data.activity) {
       this.directory.activity = new Map(Object.entries(data.activity).map(([agentId, entries]) =>
@@ -418,7 +424,7 @@ export class OperationsStore {
     }
   }
   listMarkets(): Market[] { return sortMarkets(this.directory.markets).map((market) => ({ ...market, subs: [...market.subs] })); }
-  listSalesPeople(): SalesPerson[] { return sortSalesPeople(this.directory.sales).map((person) => ({ ...person })); }
+  listSalesPeople(): SalesPersonSummary[] { return sortSalesPeople(this.directory.sales).map(salesSummary); }
   listAgents(query: AgentListQuery): AgentSummary[] {
     return selectAgents(this.directory.agents, this.directory.markets, this.directory.sales, query).map(agentSummary);
   }
@@ -442,6 +448,125 @@ export class OperationsStore {
   agentActivity(id: string, limit: number): AgentActivity[] | undefined {
     if (!this.directory.agents.some((agent) => agent.id === id)) return undefined;
     return latestActivity(this.directory.activity.get(id) ?? [], limit);
+  }
+
+  // ── Sales editing (todo/sales-editing-model.md): the rules are `agent-writes.ts`'s and the
+  //    other modules'; these only keep the rows, as PostgreSQL does. ──
+
+  private copyAgent = (agent: StoredAgent): StoredAgent => ({ ...agent, programs: agent.programs.map((p) => ({ ...p })) });
+  /** An agent as stored, for a write to start from; undefined when unknown. */
+  agentRecord(id: string): StoredAgent | undefined { const found = this.directory.agents.find((a) => a.id === id); return found && this.copyAgent(found); }
+  agentRecords(): StoredAgent[] { return this.directory.agents.map(this.copyAgent); }
+  /** Inserts or replaces the agent, its programmes included, and appends the activity lines in order. */
+  saveAgent(agent: StoredAgent, activity: readonly AgentActivity[]): void {
+    const i = this.directory.agents.findIndex((a) => a.id === agent.id);
+    if (i >= 0) this.directory.agents[i] = this.copyAgent(agent); else this.directory.agents.push(this.copyAgent(agent));
+    this.addAgentActivity(agent.id, activity);
+  }
+  addAgentActivity(agentId: string, activity: readonly AgentActivity[]): void {
+    if (!activity.length) return;
+    const log = this.directory.activity.get(agentId) ?? [];
+    for (const entry of activity) log.push({ ...entry, seq: log.length });
+    this.directory.activity.set(agentId, log);
+  }
+  agentUsage(id: string): AgentUsage {
+    return {
+      bookings: [...this.bookings.values()].filter((b) => b.agent_id === id).length,
+      contracts: this.contracts.filter((c) => c.agent_id === id).length,
+      seat_locks: [...this.locks.values()].filter((l) => l.agent_id === id).length,
+      invoices: [...this.invoices.values()].filter((i) => i.agent_id === id).length,
+      logins: this.users.filter((u) => u.agent_id === id).length,
+    };
+  }
+  deleteAgent(id: string): void {
+    this.directory.agents = this.directory.agents.filter((a) => a.id !== id);
+    this.directory.activity.delete(id);
+    this.seasons.delete(id);
+    this.history.delete(id);
+    for (const doc of [...this.documents.values()]) if (doc.agent_id === id) this.documents.delete(doc.id);
+  }
+  private history = new Map<string, ContractHistoryEntry[]>();
+  /** Newest first. */
+  contractHistory(agentId: string): ContractHistoryEntry[] {
+    return [...(this.history.get(agentId) ?? [])].reverse().map((h) => ({ ...h, programs: h.programs.map((p) => ({ ...p })), signatory: h.signatory && { ...h.signatory } }));
+  }
+  addContractHistory(agentId: string, entry: ContractHistoryEntry): void {
+    this.history.set(agentId, [...(this.history.get(agentId) ?? []), { ...entry, programs: entry.programs.map((p) => ({ ...p })) }]);
+  }
+  /** Sets a contract's rate or document; legacy's `_ctSyncMainRate` and `ctArtifactSave` write nothing else. */
+  setContractFields(id: string, fields: Partial<Pick<Contract, 'rate_type_id' | 'doc_id'>>): void {
+    const found = this.contracts.find((c) => c.id === id);
+    if (found) Object.assign(found, fields);
+  }
+
+  saveMarket(market: Market): void {
+    const copy = { ...market, subs: [...market.subs] };
+    const i = this.directory.markets.findIndex((m) => m.id === market.id);
+    if (i >= 0) this.directory.markets[i] = copy; else this.directory.markets.push(copy);
+  }
+  deleteMarket(id: string): void { this.directory.markets = this.directory.markets.filter((m) => m.id !== id); }
+
+  salesPerson(id: string): StoredSalesPerson | undefined { const found = this.directory.sales.find((p) => p.id === id); return found && { ...found }; }
+  saveSalesPerson(person: StoredSalesPerson): void {
+    const i = this.directory.sales.findIndex((p) => p.id === person.id);
+    if (i >= 0) this.directory.sales[i] = { ...person }; else this.directory.sales.push({ ...person });
+  }
+  salesUsage(id: string): { logins: number; rate_types: number } {
+    return { logins: this.users.filter((u) => u.sales_id === id).length, rate_types: [...this.rateTypes.values()].filter((r) => r.rate.owner_sales_id === id).length };
+  }
+  deleteSalesPerson(id: string): void { this.directory.sales = this.directory.sales.filter((p) => p.id !== id); }
+
+  private templates = new Map<string, ContractTemplate>();
+  private copyTemplate = (t: ContractTemplate): ContractTemplate => JSON.parse(JSON.stringify(t)) as ContractTemplate;
+  listTemplates(): ContractTemplate[] { return sortTemplates([...this.templates.values()]).map(this.copyTemplate); }
+  saveTemplate(template: ContractTemplate): void { this.templates.set(template.id, this.copyTemplate(template)); }
+  /** Makes it the default, and active (legacy `cttSetDefault`); every other one stops being the default. */
+  setDefaultTemplate(id: string, now: string): void {
+    for (const t of this.templates.values()) {
+      if (t.id === id) Object.assign(t, { is_default: true, active: true, updated_at: now });
+      else if (t.is_default) Object.assign(t, { is_default: false, updated_at: now });
+    }
+  }
+  deleteTemplate(id: string): void { this.templates.delete(id); }
+
+  private documents = new Map<string, ContractDocument>();
+  listDocuments(agentId: string): ContractDocument[] {
+    return sortDocuments([...this.documents.values()].filter((d) => d.agent_id === agentId)).map((d) => JSON.parse(JSON.stringify(d)) as ContractDocument);
+  }
+  contractDocument(id: string): ContractDocument | undefined { const found = this.documents.get(id); return found && JSON.parse(JSON.stringify(found)) as ContractDocument; }
+  addDocument(doc: ContractDocument): void { this.documents.set(doc.id, JSON.parse(JSON.stringify(doc)) as ContractDocument); }
+  deleteDocument(id: string): void {
+    this.documents.delete(id);
+    for (const c of this.contracts) if (c.doc_id === id) c.doc_id = null;
+  }
+
+  private addonServices = new Map<string, AddonService>();
+  listAddonServices(): AddonService[] { return sortAddonServices([...this.addonServices.values()]).map(addonServiceView); }
+  addonService(id: string): AddonService | undefined { const found = this.addonServices.get(id); return found && addonServiceView(found); }
+  saveAddonService(service: AddonService): void { this.addonServices.set(service.id, addonServiceView(service)); }
+  deleteAddonService(id: string): void { this.addonServices.delete(id); }
+
+  private nationalities: StoredNationality[] = builtinNationalities();
+  listNationalities(): StoredNationality[] { return this.nationalities.map((n) => ({ ...n })); }
+  addNationality(nationality: StoredNationality): void { this.nationalities.push({ ...nationality }); }
+
+  /** The insurance command's result (`insurance.ts`): the lead's fields and the named passengers'. */
+  setInsurance(bookingId: string, lead: InsuranceFields | undefined, passengers: ReadonlyMap<number, InsuranceFields>): void {
+    const booking = this.bookings.get(bookingId);
+    if (!booking) return;
+    const put = (target: Record<string, unknown>, key: string, value: unknown) => { if (value === null) delete target[key]; else target[key] = value; };
+    if (lead) {
+      put(booking as Record<string, unknown>, 'lead_age', lead.age);
+      put(booking as Record<string, unknown>, 'lead_insurance_reviewed_at', lead.reviewed_at);
+      put(booking as Record<string, unknown>, 'lead_insurance_reviewed_by', lead.reviewed_by);
+    }
+    for (const p of booking.passengers) {
+      const f = passengers.get(p.seq);
+      if (!f) continue;
+      put(p as Record<string, unknown>, 'age', f.age);
+      put(p as Record<string, unknown>, 'insurance_reviewed_at', f.reviewed_at);
+      put(p as Record<string, unknown>, 'insurance_reviewed_by', f.reviewed_by);
+    }
   }
 
   /**
@@ -1306,7 +1431,7 @@ export class OperationsStore {
     }
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
-    if (changes.passengers) booking.passengers = withSeq(changes.passengers);
+    if (changes.passengers) booking.passengers = withSeq(carryInsurance(booking.passengers, changes.passengers));
     if (changes.add_ons) booking.add_ons = withSeq(changes.add_ons);
     if (changes.adjustments) booking.adjustments = withSeq(changes.adjustments);
     if (changes.alt_pickups) booking.alt_pickups = changes.alt_pickups.map((a) => ({ ...a }));

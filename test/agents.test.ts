@@ -129,11 +129,14 @@ test('both stores answer every agent read identically', { skip: !url && 'Postgre
   }
   for (const agent of agents) {
     // `credit` is worked out from the agent's bookings (invoices.test.ts covers it), `credit_balance` from
-    // its weather credits (weather-closures.test.ts); the rest is the store's.
-    const { credit, credit_balance: balance, ...detail } = await get(`/v1/agents/${agent.id}`);
+    // its weather credits (weather-closures.test.ts), the renewals and the template that prints from
+    // their own tables (sales-editing.test.ts); the rest is the store's.
+    const { credit, credit_balance: balance, contract_history: history, contract_template_effective_id: template, ...detail } = await get(`/v1/agents/${agent.id}`);
     assert.deepEqual(detail, memory.agent(agent.id), `detail of ${agent.id}`);
     assert.equal(typeof credit.used, 'number');
     assert.equal(typeof balance.available, 'number');
+    assert.deepEqual(history, []);
+    assert.ok(template === null || typeof template === 'string');
   }
   assert.deepEqual((await get('/v1/agents/tag_a1/activity')).activity, memory.agentActivity('tag_a1', 50));
   assert.deepEqual((await get('/v1/agents/tag_a2/activity')).activity, [], 'no activity is an empty log');

@@ -357,7 +357,8 @@ export const movedLine = (by: string | undefined, from: string, to: string): His
  * when, and who confirmed it and when, come from the login and the clock; the status moves only
  * through a command. `updated_by` is stamped by `stampActor`.
  */
-export const SERVER_OWNED_HEADER = ['created_by', 'booked_at', 'confirmed_by', 'confirmed_at', 'special_meals_pier_at', 'special_meals_pier_by'] as const;
+export const SERVER_OWNED_HEADER = ['created_by', 'booked_at', 'confirmed_by', 'confirmed_at', 'special_meals_pier_at', 'special_meals_pier_by',
+  'lead_age', 'lead_insurance_reviewed_at', 'lead_insurance_reviewed_by'] as const;
 type OwnedField = typeof SERVER_OWNED_HEADER[number] | 'status';
 
 /** What to do instead, for each refusal. */
@@ -369,6 +370,9 @@ const INSTEAD: Record<OwnedField, string> = {
   booked_at: 'it is the time the booking was created',
   special_meals_pier_at: 'it is stamped by PUT /v1/bookings/{id}/meals, the pier\'s meal editor',
   special_meals_pier_by: 'it is stamped by PUT /v1/bookings/{id}/meals, the pier\'s meal editor',
+  lead_age: 'it is set by PUT /v1/bookings/{id}/insurance',
+  lead_insurance_reviewed_at: 'it is stamped by PUT /v1/bookings/{id}/insurance',
+  lead_insurance_reviewed_by: 'it is stamped by PUT /v1/bookings/{id}/insurance',
 };
 const ownedRefusal = (field: OwnedField, verb: string): never => badRequest(`${field} cannot be ${verb}: ${INSTEAD[field]}`);
 
@@ -376,7 +380,8 @@ const ownedRefusal = (field: OwnedField, verb: string): never => badRequest(`${f
 function sameValue(field: OwnedField, sent: unknown, stored: unknown): boolean {
   const empty = (v: unknown) => v === undefined || v === null || v === '';
   if (empty(sent) || empty(stored)) return empty(sent) && empty(stored);
-  if (field === 'booked_at' || field === 'confirmed_at' || field === 'special_meals_pier_at') {
+  if (field === 'lead_age') return Number(sent) === Number(stored);
+  if (field === 'booked_at' || field === 'confirmed_at' || field === 'special_meals_pier_at' || field === 'lead_insurance_reviewed_at') {
     const a = Date.parse(String(sent)), b = Date.parse(String(stored));
     if (!Number.isNaN(a) && !Number.isNaN(b)) return a === b;
   }
@@ -411,7 +416,9 @@ export function stripServerOwned(changes: BookingChanges, stored: Record<string,
  */
 export function createHeader(header: BookingHeader, actor: string | undefined, now: string): BookingHeader {
   if (header.created_by !== undefined && header.created_by !== actor) ownedRefusal('created_by', 'set');
-  for (const field of ['booked_at', 'confirmed_by', 'confirmed_at', 'special_meals_pier_at', 'special_meals_pier_by'] as const) if (header[field] !== undefined) ownedRefusal(field, 'set');
+  for (const field of ['booked_at', 'confirmed_by', 'confirmed_at', 'special_meals_pier_at', 'special_meals_pier_by', 'lead_age', 'lead_insurance_reviewed_at', 'lead_insurance_reviewed_by'] as const) {
+    if (header[field] !== undefined) ownedRefusal(field, 'set');
+  }
   const out: BookingHeader = { ...header, booked_at: now };
   delete out.updated_by;
   delete out.created_by;
