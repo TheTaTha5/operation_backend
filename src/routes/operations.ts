@@ -22,6 +22,7 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
 import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checkin.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
@@ -248,6 +249,7 @@ function bookingInput(body: unknown): BookingInput & { viaStatus: boolean } {
     passengers: parseBookingPassengers(input.passengers),
     add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)),
     adjustments: parseBookingAdjustments(input.adjustments),
+    alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups ?? []),
     // booking_data: input,
   };
 }
@@ -313,6 +315,7 @@ function bookingChanges(body: unknown): BookingChanges {
     ...(addOnsOf(input) === undefined ? {} : { add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)) }),
     // Present replaces the list, `null` or `[]` clears it, absent leaves it.
     ...(input.adjustments === undefined ? {} : { adjustments: parseBookingAdjustments(input.adjustments) }),
+    ...((input.alt_pickups ?? input.altPickups) === undefined ? {} : { alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
@@ -642,7 +645,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
         ...(priced ? { rate_type_ref: priced.rateTypeRef ?? undefined } : {}),
         ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
       }, actor);
-      if (!q) return booking;
+      await syncAltParts(booking);
+      if (!q) return (await store.booking(booking.id))!;
       await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
       return (await store.booking(booking.id))!;
     });
@@ -683,6 +687,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const rezoned = rezonedParts(stored, amended);
       for (const [tripId, parts] of rezoned) await store.setVanParts(tripId, parts);
       if (rezoned.size) amended = (await store.booking(amended.id))!;
+      if (await syncAltParts(amended)) amended = (await store.booking(amended.id))!;
       if (!priced) return warnings.length ? { ...amended, price_warnings: warnings } : amended;
       await store.setPrices(amended.id, { trips: priced.quote.trips, add_ons: priced.quote.add_ons.map((a) => a.amount) });
       const booking = (await store.booking(amended.id))!;
@@ -719,7 +724,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const partial = parsePartialCancelRequest(withoutVersion(request.body, true));
     return store.transaction(async () => {
       await assertBookingFresh(request);
-      return (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found');
+      const done = (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found');
+      return (await syncAltParts(done)) ? (await store.booking(done.id))! : done;
     });
   });
   /**
@@ -766,7 +772,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const reschedule = parseRescheduleRequest(withoutVersion(request.body, true));
     return store.transaction(async () => {
       await assertBookingFresh(request);
-      return (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found');
+      const moved = (await store.rescheduleBooking(bookingId(request), reschedule, actorOf(request.user))) ?? notFound('Booking not found');
+      return (await syncAltParts(moved)) ? (await store.booking(moved.id))! : moved;
     });
   });
   /** Oldest first. Not part of the booking read, because it only grows. */
@@ -894,6 +901,13 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return { trip: (await store.tripForDispatch(tripId))!.trip, warnings };
     });
   });
+
+  /** Rebuilds the van parts a booking's alternate pickups call for (`altPartsPlan`); true when it changed them. */
+  async function syncAltParts(booking: Booking): Promise<boolean> {
+    const plan = altPartsPlan(booking);
+    if (plan) await store.setVanParts(plan.tripId, plan.parts);
+    return plan !== undefined;
+  }
 
   /**
    * Check-in (todo/trip-ops-and-vans-model.md, slice C): one record per trip, side (van or pier) and

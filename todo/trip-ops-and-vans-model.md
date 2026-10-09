@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`); slice B, reconfirm (`src/domain/reconfirm.ts`); slice C, check-in (`src/domain/checkin.ts`). Still to build: alternate pickups (D), upgrades (E).
+Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`); slice B, reconfirm (`src/domain/reconfirm.ts`); slice C, check-in (`src/domain/checkin.ts`); slice D, alternate pickups (`src/domain/alt-pickups.ts`). Still to build: upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -275,8 +275,10 @@ schema above: `booking_trip_checkin_event_tries`, for legacy's "tried again, not
 
 **Reconfirm:** built (migration 035, `src/domain/reconfirm.ts`, README → "Reconfirm").
 
-**Booking fields** (`booking:write`): `altPickups`/`alt_pickups` and `upgrades` are accepted on
-`POST /v1/bookings` and `PATCH /v1/bookings/{id}`. Each list replaces outright, with absent =
+**Alternate pickups:** built (migration 037, `src/domain/alt-pickups.ts`, README → "Alternate pickups").
+
+**Booking fields** (`booking:write`): `upgrades` is accepted on
+`POST /v1/bookings` and `PATCH /v1/bookings/{id}`. The list replaces outright, with absent =
 unchanged and `[]` = clear, exactly like `passengers` and `addOns`. A malformed entry is a 400 with
 its index (`upgrades[1].sell_price must be a number ≥ 0`).
 
@@ -293,7 +295,6 @@ Legacy keeps four things the 016 tables have no home for; see Open 8.
 ### What both stores need
 
 Pure functions in `src/domain/`, called by both stores (the `calendar.ts` pattern):
-- **`altPickupParts(altPickups, tripPax, current)`:** port of `bkV2SyncAltPickupSplits` (Decision 4: the server builds them).
 
 
 ## Data check — 2026-10-06, legacy production, read-only
@@ -387,12 +388,16 @@ The questions as they were asked:
 10. **The day's board.** `GET /operations/van-groups` needs a `route_id`; the hand-off's computed
     `GET /operations/van-board` (pools, rounds, return alerts, warnings across routes) is a later
     phase for the Vue port.
+11. **Alternate pickups follow two legacy rules that may be bugs** (copied, 2026-10-09):
+    - Parts are built on the booking's **first day only** (legacy writes `b.ops`). A two-day booking's
+      second day has no alternate-pickup parts.
+    - When the entries take **every passenger**, nothing is split. BK-26100284-2D4T (3 passengers,
+      3 entries at 3 hotels) has one part, at the booking's pickup.
 
 ## Follow-ups
 
-- **The import** brings boats, splits, final pickups, pier notes, vans, reconfirmations and check-ins. Until the
-  other slices extend it, legacy bookings arrive with **no alternate pickups (4) or
-  upgrades (11)**.
+- **The import** brings boats, splits, final pickups, pier notes, vans, reconfirmations, check-ins and
+  alternate pickups. Until slice E extends it, legacy bookings arrive with **no upgrades (11)**.
 
 ## From the van hand-off
 

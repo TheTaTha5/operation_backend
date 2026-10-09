@@ -28,6 +28,7 @@ import { pickupFields } from './pickup.js';
 import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import type { StoredReconfirm } from './reconfirm.js';
+import type { AltPickup } from './alt-pickups.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
@@ -102,7 +103,7 @@ const CHECKINS_JSON = `COALESCE((SELECT jsonb_agg(to_jsonb(ck) || jsonb_build_ob
 // A van part (`a`, booking_trip_van_allocations) and its group (`g`, van_groups), as jsonb fields.
 const VAN_PART_FIELDS = `'idx', a.idx, 'source', a.source, 'ad', a.ad, 'chd', a.chd, 'inf', a.inf, 'foc', a.foc, 'group_id', a.van_group_id,
   'sequence', a.sequence, 'return_van_id', a.return_van_id, 'pick_area_id', a.pick_area_id, 'pick_hotel', a.pick_hotel, 'pick_zone', a.pick_zone,
-  'drop_area_id', a.drop_area_id, 'drop_hotel', a.drop_hotel, 'drop_zone', a.drop_zone`;
+  'drop_area_id', a.drop_area_id, 'drop_hotel', a.drop_hotel, 'drop_zone', a.drop_zone, 'pick_time', a.pick_time, 'alt_who', a.alt_who`;
 const VAN_GROUP_JSON = `CASE WHEN g.id IS NULL THEN NULL ELSE jsonb_build_object('id', g.id, 'service_date', g.service_date::text, 'route_id', g.route_id,
   'zone', g.zone, 'number', g.number, 'van_id', g.van_id, 'return_van_id', g.return_van_id, 'pickup_time', g.pickup_time) END`;
 
@@ -138,6 +139,10 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', j.seq, 'kind', j.kind, 'mode', j.mode, 'value', j.value, 'label', j.label, 'note', j.note) ORDER BY j.seq)
     FROM booking_adjustments j WHERE j.booking_id = b.id), '[]'::jsonb) AS adjustments,
+  COALESCE((
+    SELECT jsonb_agg(jsonb_build_object('seq', x.seq, 'who', x.who, 'ad', x.ad, 'chd', x.chd, 'inf', x.inf, 'foc', x.foc, 'area_id', x.area_id, 'area', x.area, 'zone', x.zone, 'place', x.place,
+      'drop_same', x.drop_same, 'drop_area_id', x.drop_area_id, 'drop_area', x.drop_area, 'drop_zone', x.drop_zone, 'drop_place', x.drop_place) ORDER BY x.seq)
+    FROM booking_alt_pickups x WHERE x.booking_id = b.id), '[]'::jsonb) AS alt_pickups,
   (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
     FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
   COALESCE((
@@ -226,6 +231,9 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
     ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
   })),
+  alt_pickups: (row.alt_pickups as Record<string, unknown>[]).map(({ seq: _seq, ...a }) => ({
+    ...a, ad: Number(a.ad ?? 0), chd: Number(a.chd ?? 0), inf: Number(a.inf ?? 0), foc: Number(a.foc ?? 0),
+  }) as AltPickup),
   adjustments: (row.adjustments as Record<string, unknown>[]).map((a): BookingAdjustment => ({
     seq: Number(a.seq), kind: a.kind as BookingAdjustment['kind'], mode: a.mode as BookingAdjustment['mode'], value: Number(a.value),
     ...(a.label == null ? {} : { label: String(a.label) }),
@@ -276,7 +284,7 @@ const vanPart = (p: Record<string, unknown>): StoredVanPart => ({
   idx: Number(p.idx), source: p.source as StoredVanPart['source'], ad: Number(p.ad), chd: Number(p.chd), inf: Number(p.inf), foc: Number(p.foc),
   group_id: text(p.group_id), sequence: p.sequence === null || p.sequence === undefined ? null : Number(p.sequence), return_van_id: text(p.return_van_id),
   alt: p.source === 'alt_pickup' ? { pick_area_id: text(p.pick_area_id), pick_hotel: text(p.pick_hotel), pick_zone: text(p.pick_zone),
-    drop_area_id: text(p.drop_area_id), drop_hotel: text(p.drop_hotel), drop_zone: text(p.drop_zone) } : null,
+    drop_area_id: text(p.drop_area_id), drop_hotel: text(p.drop_hotel), drop_zone: text(p.drop_zone), pick_time: text(p.pick_time), alt_who: text(p.alt_who) } : null,
 });
 const vanGroup = (g: Record<string, unknown>): VanGroup => ({
   id: String(g.id), service_date: String(g.service_date), route_id: String(g.route_id), zone: String(g.zone), number: Number(g.number),
@@ -603,6 +611,14 @@ export class PostgresOperationsStore {
   }
 
   /** Replaces the whole list, as `writeAddOns` does. */
+  private async writeAltPickups(bookingId: string, alts: readonly AltPickup[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_alt_pickups WHERE booking_id = $1', [bookingId]);
+    for (const [seq, a] of alts.entries()) {
+      await this.client().query(`INSERT INTO booking_alt_pickups (booking_id, seq, who, ad, chd, inf, foc, area_id, area, zone, place, drop_same, drop_area_id, drop_area, drop_zone, drop_place)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+        [bookingId, seq, a.who, a.ad, a.chd, a.inf, a.foc, a.area_id, a.area, a.zone, a.place, a.drop_same, a.drop_area_id, a.drop_area, a.drop_zone, a.drop_place]);
+    }
+  }
   private async writeAdjustments(bookingId: string, adjustments: readonly BookingAdjustmentInput[]): Promise<void> {
     await this.client().query('DELETE FROM booking_adjustments WHERE booking_id = $1', [bookingId]);
     for (const [seq, a] of adjustments.entries()) {
@@ -753,6 +769,7 @@ export class PostgresOperationsStore {
     await this.writePassengers(id, input.passengers ?? []);
     await this.writeAddOns(id, input.add_ons ?? []);
     await this.writeAdjustments(id, input.adjustments ?? []);
+    await this.writeAltPickups(id, input.alt_pickups ?? []);
     await this.requestApprovals(id, decision.approvals);
     await this.log(id, createdLine(actor));
     for (const line of decision.history) await this.log(id, line);
@@ -823,6 +840,7 @@ export class PostgresOperationsStore {
     if (changes.passengers) await this.writePassengers(id, changes.passengers);
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
+    if (changes.alt_pickups) await this.writeAltPickups(id, changes.alt_pickups);
     if (reweighed?.request) await this.requestApprovals(id, [reweighed.request]);
     else if (reweighed) await this.replacePending(id, 'approval');
     for (const line of reweighed?.history ?? []) await this.log(id, line);
@@ -1249,9 +1267,9 @@ export class PostgresOperationsStore {
     await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = $1', [tripId]);
     for (const p of parts) {
       await this.client().query(`INSERT INTO booking_trip_van_allocations (booking_trip_id, idx, ad, chd, inf, foc, van_group_id, sequence, return_van_id, source,
-          pick_area_id, pick_hotel, pick_zone, drop_area_id, drop_hotel, drop_zone) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+          pick_area_id, pick_hotel, pick_zone, drop_area_id, drop_hotel, drop_zone, pick_time, alt_who) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
         [tripId, p.idx, p.ad, p.chd, p.inf, p.foc, p.group_id, p.sequence, p.return_van_id, p.source,
-          p.alt?.pick_area_id ?? null, p.alt?.pick_hotel ?? null, p.alt?.pick_zone ?? null, p.alt?.drop_area_id ?? null, p.alt?.drop_hotel ?? null, p.alt?.drop_zone ?? null]);
+          p.alt?.pick_area_id ?? null, p.alt?.pick_hotel ?? null, p.alt?.pick_zone ?? null, p.alt?.drop_area_id ?? null, p.alt?.drop_hotel ?? null, p.alt?.drop_zone ?? null, p.alt?.pick_time ?? null, p.alt?.alt_who ?? null]);
     }
   }
   /** Sets some of a trip's dispatch fields; a new final pickup is a plain time, with no window. */
