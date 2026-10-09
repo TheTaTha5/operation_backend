@@ -6,7 +6,7 @@
  *   SOURCE_DATABASE_URL=<legacy> TARGET_DATABASE_URL=<a database the importers filled> \
  *     npx tsx src/tools/build-quote-fixture.ts [--compare <reprice results.json>]
  *
- * TARGET is a scratch database after `sync:routes`, `sync:boats`, `import-legacy.ts --commit` and
+ * TARGET is a scratch database after `seed:routes`, `seed:boats`, `import-legacy.ts --commit` and
  * `import:contracts --commit`: the rates, agents, contracts and boats are read from it, as the API
  * would read them. The bookings are read from legacy, read-only.
  *

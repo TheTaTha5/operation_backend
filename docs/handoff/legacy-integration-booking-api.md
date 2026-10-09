@@ -34,6 +34,8 @@ are done.*
    header.
 9. Deployments handle `409 seats_sold` with `remove_anyway`; seat locks send `If-Match`.
 10. Live updates come from `GET /v1/changes/stream`. The 30 s, 60 s and 120 s polls go.
+11. Programs, the boat form, Boat Status and the day-seats dialog save to `/v1/routes`,
+    `/v1/route-families` and `/v1/boats` (§3.14). Routes and boats are the API's now.
 
 ## How to read this
 
@@ -866,8 +868,45 @@ dialog resends with `remove_anyway`.**
 - **Behaviour change:** `bop2GuardPast` blocks everyone on a past date; the server lets an admin
   correct history. See "Questions".
 - **Delete:** `baAssignedBookings` as the decider of the warning count (use the server's message).
-- Boat per-day seat overrides (`boatCapPersist`) still go out as the deployment's `capacity`; the API
-  has no separate override write yet.
+- Boat per-day seat overrides (`boatCapSet`) now have their own write (§3.14); stop sending them as
+  the deployment's `capacity`. A retired boat can't be deployed: `409 boat_retired`, show it.
+
+### 3.14 The catalogue: Programs, the boat form, Boat Status, the day-seats dialog
+
+**Change: routes, families and boats are edited on the API (2026-10-09). Their screens save through
+the endpoints below; `save('config')` and `boatCapPersist` stop writing the catalogue.** README
+"Editing routes", "Editing boats", "A boat's seats for one day" are the field reference.
+
+| Screen (legacy function) | Call |
+|---|---|
+| Programs: add / edit (`saveRoute`) | `POST /v1/routes`, `PATCH /v1/routes/{id}` `{name, islands, times, kind, pier, family_id}` |
+| Programs: delete (`delRoute`) | `DELETE /v1/routes/{id}`; `409 route_in_use` names what uses it: show it, nothing is deleted |
+| Programs: drag (`stApplyRouteOrder`) | `POST /v1/routes/order {pier, route_ids}` (every route of that pier, in the new order; `pier: null` for the land ones) |
+| Family drop-down (`_BKV2_FAMILIES`, `_famFillRouteSelect`) | `GET /v1/route-families`; blank choice = `family_id: null` |
+| Boat form: add / edit (`saveBoat`, `flOpenEditBoatModal`) | `POST /v1/boats`, `PATCH /v1/boats/{id}` with the form's fields (legacy names accepted), `documents`, and the status pick as `status` |
+| Boat Status timeline (`saveStatus`, `editStatus`, `delStatus`) | `POST /v1/boats/{id}/status-log`, `PATCH …/status-log/{entry_id}`, `DELETE …/status-log/{entry_id}` |
+| Restore a boat (`flUnretireBoat`) | `POST /v1/boats/{id}/restore` (and `/retire {reason}`, which legacy never wired) |
+| Day-seats dialog (`boatCapModalOpen`, `_bcapSave`, `_bcapClear`) | `PUT /v1/boats/{id}/capacity-overrides/{date} {capacity, reason}`, `DELETE …/{date}`; `GET /v1/boats/{id}/capacity-overrides?from=&to=` for the badge and "set by" |
+
+- **Load** `ROUTES` from `GET /v1/routes` (`familyId` ← `family_id`, `extId` ← `ext_id`) and `BOATS`
+  from `GET /v1/boats` (`cap` ← `capacity`, `licensePax` ← `license_pax`, `totalcap` ←
+  `registered_persons`, `log` ← `status_log` with `s` ← `status`, `from`/`to` ← `from_date`/`to_date`,
+  `docs` ← `documents` with `exp` ← `expires_on`). Use `status_today` instead of `getStoredStatus`
+  for today.
+- **Refusals to show as they are:** `400` (the message names the field: a blank name, a marine route
+  with no pier, an unknown family, over the licence on the day-seats dialog, a missing reason),
+  `403` (the area, or "unlock boat capacity" on a raise), `409 route_in_use`, `409 family_in_use`,
+  `409 future_deployments` (retire), `409 past_date` (day seats).
+- **`409 seats_sold` on a boat edit** (a capacity cut below the passengers placed on a future day):
+  confirm with the server's message and resend with `capacity_anyway: true`; the answer's
+  `warnings` list the oversold days.
+- **Behaviour changes (server rules):** the boat form needs `config` and now says so (`403`) instead
+  of losing the edit; a capacity above the licence saves with a `capacity_above_licence` warning; a
+  blank capacity is 40 but `0` is `400`; the day-seats dialog refuses over the licence instead of
+  clamping; the day-seats "set by" is the login (legacy wrote `—`); `daily_cap` (land quota) is not
+  kept (`400` for a value).
+- **Delete:** `boatCapPersist`, the `BOAT_CAP_OVR` local copy, `ROUTE_COLORS` picking and route/boat
+  id making (`'r'+Date.now()`, `LA_UID('b')`): the server does them.
 
 ---
 
@@ -954,7 +993,8 @@ whole availability cache after any write. Legacy's `_laStartSSE` (`EventSource('
 | `booking` (edits, commands, dispatch, check-in, van parts and groups, reconfirm, upgrades, doc check) | the booking's server id (`bk.opsId`) | `GET /v1/bookings/{id}` → `O.bookings.upsert` |
 | `seat_lock` | the lock id | `GET /v1/seat-locks?route_id=&service_date=` for its `route_days` |
 | `deployment` | `<date>:<boat>` | `GET /operations/deployments?from=<date>&to=<date>` |
-| `route` (its calendar) | the route id | `GET /v1/routes?from=&to=`, and take that route (as `refreshCalendar` in `ops/10-ops-catalogue.js` does) |
+| `route` (created, edited, deleted, reordered, its calendar) | the route id | `GET /v1/routes?from=&to=`, and take that route (as `refreshCalendar` in `ops/10-ops-catalogue.js` does); a deleted one is gone |
+| `boat` (created, edited, status timeline, retire, restore, day seats) | the boat id | `GET /v1/boats/{id}`; its `route_days` are the availability cells whose seats moved |
 
 - **`route_days`** name the cells whose seats moved, before and after. Refetch availability only for
   those (`GET /v1/availability?route_id=&date=`); `null` on a route calendar.
@@ -962,7 +1002,8 @@ whole availability cache after any write. Legacy's `_laStartSSE` (`EventSource('
   (`busyIds`) or the same `updated_at`.
 - `health.migrations_pending` is what `/api/version` used to report; show it where legacy did, if
   wanted.
-- **Not in the feed yet:** vans, van stops, pickup areas, attachments, users, agents, rate types.
+- **Not in the feed yet:** vans, van stops, pickup areas, attachments, users, agents, rate types,
+  route families.
   Keep refetching those when their screen opens. The legacy import writes no changes: reload after an
   import.
 - **Delete:** the three `setInterval` polls, the 30 s detail refresh, and `O.onWrite`'s clear-all
@@ -1034,7 +1075,6 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | Deposits, refunds, money reports (invoices and payments moved: 2.7) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, `renderTravelSum` | `todo/money-model.md` slices 2–6, open 5 |
 | Pier payments, booking payment slips, cash-on-tour collection, the unpaid-proforma decision (`ops.pfm`) | `pck*` payment flows, `paymentSlips`, `pfm*` | `booking-extras-model.md` open 1; `trip-ops-and-vans-model.md` 8. (The booking's `cash_on_tour_*` amounts are stored.) |
 | On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
-| Route and boat catalogue editing, boat per-day seat overrides, `act-capunlock` gate | `ROUTES`, `BOATS`, `boatCapSet` | README "Routes and boats are still edited in legacy"; `legacy-replacement.md` §2; `deployment-guards-model.md` 2 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Agent create/edit, programs, contracts, markets, salespeople, add-on catalogue, nationalities, insurance overrides | `ag*` (already shown read-only), `ct*`, `insPersist` | `legacy-replacement.md` §6, `agents.md` |
 | Seat-lock extras: sub-groups, pending seats, cutoff, expiry, reason, log, bulk grouping | `bookingV2Lock*` | `ops/30-ops-locks.js` header; `legacy-replacement.md` §5 (log) |
@@ -1136,6 +1176,9 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Doc Check page | `PUT /v1/bookings/{id}/doc-check/…` | To do |
 | Boat Operation | `POST /operations/deployments`, `DELETE …` | Partial (`remove_anyway`, `past_date`) |
 | Settings → Programs calendar | `/v1/routes/{id}/seasons…`, `/days/{date}` | Done |
+| Settings → Programs: add, edit, delete, drag; families | `/v1/routes`, `/v1/routes/{id}`, `/v1/routes/order`, `/v1/route-families` | To do |
+| Boat form, Boat Status timeline, restore | `/v1/boats`, `/v1/boats/{id}`, `…/status-log`, `…/retire`, `…/restore` | To do |
+| Day-seats dialog (`boatCapSet`) | `PUT/DELETE /v1/boats/{id}/capacity-overrides/{date}` | To do |
 | Seat locks | `/v1/seat-locks…` | Partial (`If-Match`) |
 | Availability everywhere (`getAllotment`) | `GET /v1/availability`, `GET /operations/allotment` | Done |
 | Pickup time setup (areas, profiles, cells) | `/v1/pickup-areas…`, `/v1/pickup-time-profiles…` | To do |
@@ -1145,7 +1188,7 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Agent rate seasons | `GET/PUT /v1/agents/{id}/rate-seasons`, `GET …/rate-type?date=` | To do |
 | Rate types, contracts (display) | `GET /v1/rate-types…`, `GET /v1/contracts…` | To do |
 | Invoices and payments (Accounting, Daily PFM payments) | `/v1/invoices…`, `GET /v1/payments` | To do |
-| Pier money, on-tour extras, weather closures, catalogue editing, fleet maintenance | — | Not in API (§7) |
+| Pier money, on-tour extras, weather closures, fleet maintenance | — | Not in API (§7) |
 
 ## Rules and gotchas
 

@@ -78,7 +78,7 @@ seats-left number as one legacy made, after a reload.
 
 ### 2. Settings → Programs writes the calendar
 
-**Why.** The route calendar is now edited in operation-backend, and only there: `sync:routes` no longer
+**Why.** The route calendar is now edited in operation-backend, and only there: `seed:routes` no longer
 copies it from legacy. Today the screen edits the local `ROUTES` only, and `save('config')` is
 dropped, so an edit seems to vanish on reload.
 

@@ -15,6 +15,11 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 1b2. **Rate types are this API's now** (`feat/rate-types-cutover`): the import no longer touches
    them. If Railway has none yet (`SELECT count(*) FROM rate_types`), run the import once with
    `--rate-types`. From then on prices are edited here, not in legacy.
+1b3. **Routes and boats are this API's now** (`feat/catalogue-editing`, migration 070): after
+   deploying, run `npm run seed:routes -- --commit` and `npm run seed:boats -- --commit` against
+   Railway once. They add the 5 charter boats and fill every boat's form fields, documents and
+   status log; a route or boat edited here is never overwritten. From then on ops edit Programs and
+   boats here, not in legacy (stop `save('config')` writing them). `sync:routes`/`sync:boats` are gone.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -23,7 +28,7 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    `SOURCE_DATABASE_URL=<legacy> TARGET_DATABASE_URL=<railway> npm run import:users -- --commit`,
    after the agents import (so the sales staff's `sales_id` connects). Rerun until cutover.
 3b. **Import the contracts:** `npm run import:contracts -- --commit` against Railway, after
-   `sync:routes` and the agents and rate types imports. Rerun until cutover.
+   `seed:routes` and the agents and rate types imports. Rerun until cutover.
 4. **Create Love Kingdom's service user**: `POST /v1/users` with `agent_id: "a_b2c"`,
    `edit_areas: ["operations"]`. Send them the username and password.
 5. **Give `act-approve`** to the staff who approve over the allotment and FOC
@@ -64,9 +69,15 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     Cancel and restore now issue and void the fee invoice on the server: stop calling
     `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
     legacy's "Save anyway?" and resend with `overpay_anyway: true`.
+  - the catalogue (once 070 is deployed): Programs, the boat form, Boat Status and the day-seats
+    dialog save to `/v1/routes`, `/v1/route-families`, `/v1/boats` and
+    `/v1/boats/{id}/capacity-overrides/{date}` (handoff §3.14); a boat edit that cuts seats below
+    placed passengers answers `409 seats_sold`: resend with `capacity_anyway: true`.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.
+  New products' routes are created with `POST /v1/routes` instead of legacy's `/api/b2c/routes`
+  (§3b): read `route.id`; `pricing` is no longer part of it (ops price routes in rate types).
 
 ## Ask ops
 

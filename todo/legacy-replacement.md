@@ -17,15 +17,9 @@ Built: login and users, the change feed (`/v1/changes`, replacing `/api/version`
 
 ## 2. Catalogue: routes, boats
 
-```
-POST   /v1/routes
-PATCH  /v1/routes/{id}
-PUT    /v1/routes/{id}/times          departure times
-POST   /v1/boats
-PATCH  /v1/boats/{id}
-PUT    /v1/boats/{id}/capacity-overrides/{date}      one day's seats (legacy boat_capovr)
-DELETE /v1/boats/{id}/capacity-overrides/{date}
-```
+Built: routes, families, boats (the whole form, documents, status log, retire), a boat's seats for
+one day (README "Editing routes", "Editing boats"). Left: meal venues, with costing
+(`catalogue-editing-model.md`).
 
 ## 3. Operations
 
@@ -78,7 +72,7 @@ Each gets `GET` list, `GET /{id}`, `POST`, `PATCH /{id}`, `POST /{id}/log`:
 /v1/fleet/maintenance   /v1/fleet/incidents   /v1/fleet/safety
 /v1/fleet/inventory   /v1/fleet/projects   /v1/fleet/memos
 GET/POST /v1/fleet/consumable-logs,   GET/PUT /v1/fleet/fuel-prices/{date}
-GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
+GET /v1/boats/{id}/repair-history     (documents are on the boat: `PATCH /v1/boats/{id}`)
 ```
 
 ## Not replaced

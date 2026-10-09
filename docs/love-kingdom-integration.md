@@ -30,7 +30,7 @@ we create for you: it books for agent `a_b2c` only, and sees and changes only `a
 - `POST /v1/login {"username": "…", "password": "…"}` returns a 12-hour token (`access_token`,
   `expires_in`). Log in again when it expires, or on any `401`.
 - A booking without `agent_id` gets `a_b2c`; another agent is `403`. Another agent's booking reads
-  as `404`. Any write outside `/v1/bookings` is `403`.
+  as `404`. Any write outside `/v1/bookings` is `403`, except creating a route (`POST /v1/routes`, §3b).
 - 15 failed logins in 3 minutes lock the username for up to 3 minutes (`429`).
 
 **Edit conflicts (required):** every booking response carries `version` (and an `ETag`). Send it
@@ -61,6 +61,46 @@ not allow your browser origin (CORS), and a token in the page would let anyone b
 
 **Keep the `id` we return.** It is the booking's id here. Store it on your booking, for example
 next to `opsAgentCode`, and use it for every later call.
+
+## 3b. Creating a route for a new product
+
+This replaces legacy's `POST /api/b2c/routes` (`b2c-catalog.js`): when you add a product (or a
+variant) that needs an ops route, create it here and store the route `id` we return as its
+`ops_route_id`. One route per variant, as before. Your service user may call this without any
+other catalogue right; editing or deleting a route stays with ops.
+
+```json
+POST /v1/routes
+{ "ext_id": "PTP-009:VT-001", "name": "Fantasea Show + Dinner", "kind": "land", "family_id": "activity",
+  "times": ["18:00"], "seasons": [{ "kind": "open", "from_date": "2030-01-01", "to_date": "2030-12-31" }] }
+→ 201 { "created": true, "route": { "id": "r1791234567890", "name": "Fantasea Show + Dinner", "kind": "land",
+        "ext_id": "PTP-009:VT-001", "family_id": "activity", "color": "#378ADD", "sort": 58, "times": ["18:00"],
+        "seasons": [{ "id": "season_…", "kind": "open", "from_date": "2030-01-01", "to_date": "2030-12-31" }], "overrides": [] },
+       "warnings": [] }
+```
+
+- **Idempotent on `ext_id`:** the same `ext_id` again answers `200 { "created": false, "route": … }`
+  with the route we already have, and changes nothing (a retry or a double submit is safe).
+- **What changed from legacy's endpoint:**
+
+  | Legacy `/api/b2c/routes` | Now |
+  |---|---|
+  | `X-Api-Key` | your service user's Bearer token (the API key opens availability only) |
+  | `externalId`, `familyId` | `ext_id`, `family_id` (the old spellings are still accepted) |
+  | `seasons: [{type, from, to}]` | `[{kind, from_date, to_date}]` (the old spellings are still accepted) |
+  | answer `{ok, routeId, created}` | `{created, route: {id, …}, warnings}`; read `route.id` |
+  | families: a fixed list of nine, `activity` refused | `GET /v1/route-families`: ops add families; `activity` exists |
+  | `dailyCap`, `code` stored | not kept: a value is `400` (an empty one is ignored) |
+  | `pricing` wrote seat prices into a rate type | not here: ops price the route in rate types (`/v1/rate-types`) |
+  | `GET /api/b2c/routes[?externalId=]` | `GET /v1/routes` (each route has `ext_id`), or `GET /v1/routes/{id}` |
+
+- **Rules:** `name` is required. `kind` is `land` or `marine`; a marine route needs `pier`
+  (`tublamu`, `panwa`, `ranong`); `pier: "other"` still means land. Left out, `family_id` is guessed
+  as before (land: `citytour` when the name says City Tour, else `transfer`; marine: from the name);
+  no guess is `400`. `times` default to `["08:00"]`.
+- **Warnings** (not refusals): `duplicate_name` when another route already has the name.
+- **Errors:** `400` for bad input (the message names the field), `409 ext_id_taken` never happens
+  on create (the same `ext_id` answers the route instead).
 
 ## 4. A booking, mapped from yours
 
@@ -199,3 +239,5 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 5. Create with a `foc` passenger and no `focReason`, and expect `400`.
 6. Lock → book with `lockDraws` → release, and check `locked_pax` returns to 0.
 7. Cancel, and check the seats come back.
+8. Create a test route with an `ext_id` (`POST /v1/routes`), send it again, and expect `200`,
+   `created: false` and the same `route.id`.

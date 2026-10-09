@@ -9,7 +9,7 @@
  *
  * Re-runnable: until cutover legacy is the master, so legacy wins for every contract it has (its
  * periods and prices are replaced whole). A contract only this service has is left alone. Run it
- * after `sync:routes` and the agents and rate types imports: a contract needs its agent, and the
+ * after `seed:routes` and the agents and rate types imports: a contract needs its agent, and the
  * routes and rate type it names must exist. What does not fit is skipped or dropped and listed (`legacy-contracts.ts`).
  */
 import { Client } from 'pg';
