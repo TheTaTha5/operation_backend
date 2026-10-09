@@ -74,6 +74,8 @@ export function vanPartsView(stored: readonly StoredVanPart[], pax: readonly Pax
  */
 export function rebalanceParts(stored: readonly StoredVanPart[], pax: readonly PaxRow[]): StoredVanPart[] {
   if (stored.length === 0) return [];
+  // With no main part to take the change (alternate pickups taking everyone), the parts are rebuilt from them instead.
+  if (stored[0].source !== 'main') return stored.map((p) => ({ ...p, alt: p.alt && { ...p.alt } }));
   const want = countsOf(pax);
   const [main, ...rest] = stored.map((p) => ({ ...p }));
   for (const c of PAX_CATEGORIES) {
@@ -354,7 +356,6 @@ export function parseVanParts(value: unknown): PartInput[] {
     };
   });
   if (new Set(parts.map((p) => p.idx)).size !== parts.length) bad('van_parts names an idx twice');
-  if (parts.length && !parts.some((p) => p.idx === 0)) bad('van_parts needs the main part, idx 0');
   return parts.sort((a, b) => a.idx - b.idx);
 }
 
@@ -370,6 +371,8 @@ export function setTripParts(state: VanDayState, tripId: string, input: PartInpu
   const trip = state.trips.find((t) => t.trip_id === tripId)!;
   const alt = trip.parts.filter((p) => p.source === 'alt_pickup');
   const rows = input.length ? input : [{ idx: 0, ...trip.pax, group_id: null, sequence: null, return_van_id: null }];
+  // Every trip has a main part, idx 0, except one whose alternate pickups take every passenger.
+  if (!rows.some((r) => r.idx === 0) && trip.parts.some((p) => p.source === 'main')) bad('van_parts needs the main part, idx 0');
   for (const a of alt) {
     const sent = rows.find((r) => r.idx === a.idx);
     if (!sent || PAX_CATEGORIES.some((c) => sent[c] !== a[c]) || (sent.source !== undefined && sent.source !== 'alt_pickup')) {

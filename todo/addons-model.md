@@ -8,7 +8,7 @@
 712 rows on 572 bookings, at most 3 per booking; 15 distinct types (open set, none blank); no
 orphans. The import brings 711 (the other is on a cancelled B2C booking the import skips whole).
 
-| Proposed constraint | Holds? |
+| Constraint (added in migration 039, except one per type) | Holds? |
 |---|---|
 | `CHECK (qty >= 1)` (NULL allowed: 38 rows) | yes, range 1..18 |
 | `CHECK (amount >= 0)` | yes, 106 rows are 0 |
@@ -19,8 +19,6 @@ orphans. The import brings 711 (the other is on a cancelled B2C booking the impo
 
 ## Open
 
-1. **Add the constraints above** (decided 2026-10-09): all but `UNIQUE (booking_id, type)`, so Love
-   Kingdom is never refused for two lines of one type. Not built yet.
 2. **Two joins of nobody.** BK-26090340-EYLX and BK-26090892-XCJQ have a `longtail-join` with 0
    adults and 0 children ("Longtail Join (0A + 0C)", amount 0). Here 0 means nobody joins, not
    "count every passenger"; they are imported as legacy has them.

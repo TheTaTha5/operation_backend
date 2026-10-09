@@ -59,14 +59,20 @@ export function parseBookingAddOns(input: unknown, label = 'addOns'): BookingAdd
     }
     const adults = row.jAd !== undefined ? 'jAd' : 'join_adults';
     const children = row.jChd !== undefined ? 'jChd' : 'join_children';
+    const join_adults = integer(row[adults], `${at}.${adults}`, 0, 'a non-negative integer');
+    const join_children = integer(row[children], `${at}.${children}`, 0, 'a non-negative integer');
+    // How many join only means something on a longtail join (migration 039).
+    if ((join_adults !== undefined || join_children !== undefined) && !type.startsWith('longtail-join')) {
+      invalid(`${at}: join counts are only for a longtail-join add-on, not ${type}`);
+    }
     return {
       type,
       label: text(row.label, `${at}.label`),
       amount,
       qty: integer(row.qty, `${at}.qty`, 1, 'a positive integer'),
       note: text(row.note, `${at}.note`),
-      join_adults: integer(row[adults], `${at}.${adults}`, 0, 'a non-negative integer'),
-      join_children: integer(row[children], `${at}.${children}`, 0, 'a non-negative integer'),
+      join_adults,
+      join_children,
     };
   });
 }

@@ -47,7 +47,7 @@ test('each alternate pickup becomes a van part; the main part keeps the rest, ca
   }
 });
 
-test('legacy\'s rules: a hand-made split is left alone; an entry taking everyone splits nothing; a drop-off-only entry rides with the main part', async () => {
+test('a hand-made split is left alone; entries taking everyone leave no main part; a drop-off-only entry rides with the main part', async () => {
   const date = '2050-03-02';
   const b = await booking(date, {});
   const manual = await send('PATCH', `/operations/trip-ops/${b.trips[0].id}`, { van_parts: [{ idx: 0, ad: 2, chd: 1 }, { idx: 1, ad: 1 }] });
@@ -55,7 +55,11 @@ test('legacy\'s rules: a hand-made split is left alone; an entry taking everyone
   assert.deepEqual(partsOf(await patch(b.id, { alt_pickups: [kata] })), [[0, 'main', 2, 1, null], [1, 'manual', 1, 0, null]]);
 
   const all = await booking(date, { alt_pickups: [{ ...kata, ad: 3, chd: 1 }] });
-  assert.deepEqual(partsOf(all), [[0, 'main', 3, 1, null]]);
+  assert.deepEqual(partsOf(all), [[1, 'alt_pickup', 3, 1, 'Kata Palm']], 'decided 2026-10-09: split anyway (legacy split nothing)');
+  const edit = await send('PATCH', `/operations/trip-ops/${all.trips[0].id}`, { van_parts: [{ idx: 1, ad: 3, chd: 1, sequence: 2 }] });
+  assert.equal(edit.statusCode, 200, edit.body);
+  const over = await booking(date, { alt_pickups: [{ ...kata, ad: 1, chd: 2 }] });
+  assert.deepEqual(partsOf(over), [[0, 'main', 3, 1, null]], 'entries asking for more children than the trip has split nothing');
 
   const van = (await send('POST', '/operations/vans', { name: 'Alt van', capacity: 10 })).json();
   await send('PUT', `/operations/van-days/${date}/${van.id}`, { route_ids: ['r1'] });
@@ -78,4 +82,13 @@ test('legacy\'s rules: a hand-made split is left alone; an entry taking everyone
     van_parts: after.trips[0].operations.van_parts.map((p) => ({ idx: p.idx, ad: p.ad, chd: p.chd, ...(p.idx === 0 ? { pick_time: '06:10' } : {}) })),
   });
   assert.equal(notOwn.statusCode, 400, notOwn.body);
+});
+
+test('every trip of a booking gets the alternate-pickup parts (decided 2026-10-09; legacy did day 1 only)', async () => {
+  const [d1, d2] = ['2050-03-05', '2050-03-06'];
+  for (const date of [d1, d2]) await send('POST', '/operations/deployments', { boat_id: `alt-boat-${date}`, route_id: 'r1', service_date: date, capacity: 40 });
+  const created = await send('POST', '/v1/bookings', { trips: [{ route_id: 'r1', date: d1, pax: { ad: 3 }, zone: 'PK' }, { route_id: 'r1', date: d2, pax: { ad: 3 }, zone: 'PK' }], alt_pickups: [kata] });
+  assert.equal(created.statusCode, 201, created.body);
+  const b = created.json() as Booking;
+  assert.deepEqual(b.trips.map((t) => t.operations.van_parts.map((p) => [p.idx, p.ad])), [[[0, 2], [1, 1]], [[0, 2], [1, 1]]]);
 });

@@ -1270,7 +1270,8 @@ Like `passengers`, **add-ons do not merge on `PATCH`**:
 Validation errors are `400` and name the key you used and the position, for example
 `addOns[2].amount must be a number`, `addOns[1].type is required`, `addOns[0].amount must not be
 negative`, `addOns[0].qty must be a positive integer`, `addOns[0].jAd must be a non-negative
-integer`. A refused request writes nothing.
+integer`, `addOns[0]: join counts are only for a longtail-join add-on`. A refused request writes
+nothing. The database holds the same rules (migration 039).
 
 The legacy import brings every booking's add-ons through the same parser, as legacy saved them (a
 missing join count stays missing: every passenger joins).
@@ -1465,7 +1466,7 @@ counts as that many adults.
 
 **The server builds the van parts** from them, after every create, edit, partial cancel and
 reschedule (legacy `bkV2SyncAltPickupSplits`, which ran in each browser):
-- It works on the booking's first day only, and not on a cancelled booking, as legacy does.
+- It works on every trip of the booking (legacy did day 1 only), and not on a cancelled booking.
 - An entry counts when it has passengers and a place, area, name or drop-off.
 - The main part (idx 0) keeps the rest of the trip's passengers, category by category. Each entry
   becomes an `alt_pickup` part, carrying its points in `alt` (`pick_*`, `drop_*` when
@@ -1473,8 +1474,9 @@ reschedule (legacy `bkV2SyncAltPickupSplits`, which ran in each browser):
 - Parts keep their van group, order and return van by position:
   - a new entry with its own pickup starts ungrouped;
   - a drop-off-only entry rides with the main part.
-- With no entries, or when they take every passenger, or the trip has one passenger, an automatic
-  split folds back into one part that keeps the main part's group.
+- When the entries take every passenger, there is no main part: just their parts (legacy split
+  nothing). With no entries, entries asking for more passengers of a kind than the trip has, or a
+  trip of one passenger, an automatic split folds back into one part that keeps the main part's group.
 - **A split made by hand** (`van_parts` with `manual` parts) is left alone.
 - An alternate-pickup part's passengers can't be changed in `van_parts` (`409 alt_pickup_split`).
   Its group, order, return van and own `pick_time` can (`van_parts[i].pick_time`). Only a part
@@ -1615,7 +1617,7 @@ until something is recorded:
 | Method + path | Body | Answers |
 |---|---|---|
 | `PUT /v1/bookings/{id}/reconfirm` | `{status, via?}` | the booking |
-| `DELETE /v1/bookings/{id}/reconfirm` | — | the booking |
+| `DELETE /v1/bookings/{id}/reconfirm[?all=true]` | — | the booking |
 | `POST /v1/reconfirm/sent` | `{booking_ids: [...], sent: true\|false}` | `{bookings: [{id, reconfirm}], skipped: [{id, reason}]}` |
 
 - **`status`** is what the customer said:
@@ -1628,7 +1630,9 @@ until something is recorded:
   **`via`** is where it was recorded: `reconfirm` (the Re-confirm page, the default), or `list` /
   `phone` (the ops board). The server stamps `at` and `by` from the login. Anything else is `400`.
 - **Sending the list is a separate fact** (legacy §rcSplit):
-  - setting or clearing the status keeps `sent` as it was;
+  - setting or clearing the status from the Re-confirm page keeps `sent` as it was;
+  - from the ops board, setting a status (`via` `list` or `phone`) replaces the record whole, and
+    its clear (`?all=true`) removes it: both drop `sent`, as legacy's board buttons do;
   - sending never changes the status;
   - `sent: true` stamps `sent_at` and `sent_by` (again on a resend);
   - `sent: false` undoes it;
@@ -1640,8 +1644,6 @@ until something is recorded:
 - `PATCH /v1/bookings/{id}` may echo `reconfirm` back unchanged; any other value is `400`.
 - Writes need the `operations` edit area. They don't change the booking's `version`.
 - **Legacy differences:**
-  - the ops board's "re-confirmed (list/phone)" and its clear button dropped the "sent" mark in
-    legacy; here they keep it, as legacy's own Re-confirm page does;
   - re-confirming every booking on a trip at once is one `PUT` per booking: skip those already
     `done`, as legacy does.
 - The import brings every legacy record. One saved before legacy split out "sent" counts as sent
