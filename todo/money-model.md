@@ -159,17 +159,22 @@ Not in Money:
 - Trip P&L needs the cost model and fleet actuals, so it waits for Fleet.
 
 
+## Decided (2026-10-09)
+
+- **COT deduction (slice 4):** the invoice subtracts the cash-on-tour `deduct` once the after-trip
+  decision says so; legacy only warned. The design must handle an invoice already issued (PFM invoices
+  are issued before travel): a minus line, or a credit, decided in slice 4's detail pass.
+- **Proforma decisions (slice 2):** copy legacy: anyone may approve travel (free-text approver), and
+  hold is a label that blocks nothing.
+- **Settlement (slices 3 and 5):** build it with the slices: commission payouts, the pier cash
+  hand-over at day close, and van bills sent and paid.
+- **A reschedule fee charged after the booking is invoiced** gets a fee invoice of its own
+  (`fee_type: reschedule`), as a cancellation charge does. To build on slice 1; see Open 1.
+
 ## Open
 
-1. **(Slice 4) COT deduction:** should the invoice subtract the COT `deduct` itself, ending the double
-   collection, or copy legacy, where it only warns?
-2. **(Slice 2) Proforma decisions:** who may approve travel, and does hold block check-in? Legacy says
-   anyone, and no.
-3. **(Slices 3 and 5) Commission and settlement:** commission is computed, but no payout is recorded
-   anywhere; pier money is never handed over to accounts; van bills have no sent or paid state. Record
-   payouts and settlements, or copy legacy, which does none of these? *Recommend: copy legacy for now.*
-4. **A reschedule fee charged after the invoice was issued is never billed.** It becomes a fee item,
-   and only the booking’s *next* invoice takes it. Legacy shows it on the printed document without
-   changing the total. Bill it by a fee invoice of its own (as a cancellation charge is), or leave it?
-5. **Deposits and refunds** (`SB_DEPOSITS`, the weather outcomes refund and credit): never saved by
+1. **The late reschedule fee and fee items.** If the fee is billed by its own invoice and also stays a
+   fee item, the booking's next invoice (after a void and re-issue) bills it twice. Proposal: a fee
+   billed by its own invoice is not added as a fee item; the reschedule record keeps it.
+2. **Deposits and refunds** (`SB_DEPOSITS`, the weather outcomes refund and credit): never saved by
    legacy, not built here.

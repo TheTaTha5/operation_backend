@@ -64,11 +64,6 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Optionally send `If-Match` on
   amend and cancel.
 
-## Decisions waiting for you
-
-- **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
-  optional: a save without it is last-write-wins).
-
 ## Ask sales
 
 - **Re-enter the agents' rate seasons** once the season screen saves to this API: legacy kept them

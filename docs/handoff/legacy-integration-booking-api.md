@@ -1056,9 +1056,13 @@ work for the session only and save nowhere** (see "The one thing to know first")
 3. **Does `operations.boat_id` follow a charter's `charter_boat_id`?** Legacy forces
    `ops.boatId = charterBoatId` on save (`§chOpsSync` in `bookingV2CommitBooking`), and every screen
    reads `ops.boatId`. Until answered, the client can show `charter_boat_id` when `boat_id` is `null`.
+   *Answer (2026-10-09): yes, the server will copy legacy: a charter trip's boat is its charter boat,
+   and another is refused. Not built yet; until then keep the fallback.*
 4. **A boat's seats on assignment.** Legacy refuses assigning a booking to a boat that would go over
    its cap plus tolerance (`bookingV2AssignBoat`, `§baCapGate`, unlockable with `act-capunlock`).
    `PATCH /operations/trip-ops` checks only that the boat is deployed. Is that rule meant to move?
+   *Answer (2026-10-09): yes, the server will copy legacy (capacity + 2; `act-capunlock` or an admin
+   may override). Not built yet: keep the browser's check until it is.*
 5. **Exact keys of `van_parts[].alt`, `reinstate`, `self_add` and `undone`.** README names them
    (`pick_*`, `drop_*`, `alt_who`, `pick_time`; `undone.why`) but shows them only as `null`. Please
    add one filled example each.
@@ -1080,11 +1084,17 @@ work for the session only and save nowhere** (see "The one thing to know first")
 11. **Rate type writes.** `POST/PATCH/PUT/DELETE /v1/rate-types…` exist, but README says the next
     import run puts legacy's prices back until cutover. With legacy off, this app cannot edit them in
     legacy either. Should the Rate Types screen write to the API now, or stay read-only?
+    *Answer (2026-10-09): rate types move now. This API becomes their master, the import stops
+    overwriting them, and the Rate Types screen writes to the API.*
 12. **Areas not moved yet, with legacy off.** Everything in §7 saves nowhere in this deployment.
     Should the integration run with `LA_LEGACY_SYNC=true` for those areas until they move, or accept
     the loss? (`legacySync` is all-or-nothing in `01-auth-sync.js`.)
+    *Answer (2026-10-09): per area. The integration keeps saving to legacy only what has not moved, and
+    never what has (bookings, seat locks, deployments, day-of-operations, pickup areas, invoices and
+    payments, rate types). The switch has to become per area for an area-by-area cutover.*
 13. **Past dates for admins.** `bop2GuardPast` blocks everyone; the server lets an admin correct
     history. Should the client let admins through? (A screen behaviour change; the developer decides.)
+    *Answer (2026-10-09): yes, admins may; everyone else stays blocked.*
 
 ---
 
