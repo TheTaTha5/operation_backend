@@ -169,6 +169,10 @@ async function main() {
     const legacyTrips = await read('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx');
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
     const legacyAdjustments = await read('SELECT * FROM sb_bookings__adjustments ORDER BY sb_bookings_id, idx');
+    const legacyAreas = await read('SELECT * FROM sb_pickup_areas ORDER BY id');
+    const legacyProfiles = await read('SELECT * FROM sb_pickup_time_profiles ORDER BY id');
+    const legacyProfileTimes = await read('SELECT * FROM sb_pickup_time_profiles__times');
+    const legacyFlatTimes = await read('SELECT * FROM sb_pickup_times');
     const legacyUpgrades = await read('SELECT * FROM sb_bookings__upgrades ORDER BY sb_bookings_id, idx');
     const legacyAddOns = await read('SELECT sb_bookings_id, idx, type, label, amount, qty, note, jad, jchd FROM sb_bookings__addons ORDER BY sb_bookings_id, idx');
     const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
@@ -539,6 +543,42 @@ async function main() {
       }
     };
 
+    // ── Pickup areas and pickup times (migration 043), as legacy has them (decision D3) ──
+    const pickupAreas: Row[] = [];
+    for (const a of legacyAreas) {
+      const zone = str(a.zone);
+      if (!['PK', 'KL', 'RN', 'NoTransfer'].includes(zone) || !str(a.id) || !str(a.name) || !str(a.timegroup)) { note('pickup areas skipped: no id, name, time group, or an unknown zone'); continue; }
+      pickupAreas.push({ id: str(a.id), name: String(a.name), zone, region: a.region === null || a.region === undefined || a.region === '' ? null : String(a.region), time_group: String(a.timegroup), active: true });
+    }
+    const areaIds = new Set(pickupAreas.map((a) => String(a.id)));
+    // Legacy keeps a profile's times as one column per area, its id with '_' for '-'; the older flat table one per time group.
+    const norm = (v: string) => v.toLowerCase().replace(/[^a-z0-9]/g, '_');
+    const areaOfColumn = new Map(pickupAreas.map((a) => [norm(String(a.id)), String(a.id)]));
+    const groupOfColumn = new Map(pickupAreas.map((a) => [norm(String(a.time_group)), String(a.time_group)]));
+    const timeProfiles: Row[] = legacyProfiles.map((pr) => ({
+      id: str(pr.id), name: str(pr.name) || str(pr.id), from_date: str(pr.from) || null, to_date: str(pr.to) || null, notes: str(pr.notes) || null,
+      cloned_from: str(pr.clonedfrom) || null, created_at: instant(pr.createdat) ?? new Date().toISOString(),
+    }));
+    const FLAT = 'prof-legacy-flat';
+    if (legacyFlatTimes.length) timeProfiles.push({ id: FLAT, name: 'Legacy flat table', from_date: null, to_date: null, notes: 'Legacy SB_PICKUP_TIMES: the fallback behind the profiles (decision D4)', cloned_from: null, created_at: '2000-01-01T00:00:00.000Z' });
+    const pickupCells: Row[] = [];
+    const cellsFrom = (rows: Row[], profileOf: (r: Row) => string, targetOf: (column: string) => string | undefined) => {
+      for (const r of rows) {
+        const routeId = str(r.key);
+        if (!routes.has(routeId)) { note('pickup times dropped: route not in catalogue'); continue; }
+        for (const [column, value] of Object.entries(r)) {
+          if (['id', 'key', 'row_pk', 'sb_pickup_time_profiles_id'].includes(column) || value === null || value === '') continue;
+          const target = targetOf(column);
+          if (!target) { note('pickup times dropped: column is not an area or time group'); continue; }
+          const window = pickupWindow(value, 'pickup times');
+          if (!window.pickup_time && !window.pickup_at_pier) continue;
+          pickupCells.push({ profile_id: profileOf(r), route_id: routeId, target, pickup_time: window.pickup_time ?? null, pickup_time_end: window.pickup_time_end ?? null, pickup_at_pier: window.pickup_at_pier === true });
+        }
+      }
+    };
+    cellsFrom(legacyProfileTimes, (r) => str(r.sb_pickup_time_profiles_id), (c) => areaOfColumn.get(c));
+    cellsFrom(legacyFlatTimes, () => FLAT, (c) => groupOfColumn.get(c));
+
     const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [], allergies: Row[] = [], docChecks: Row[] = [], docResults: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
@@ -637,6 +677,10 @@ async function main() {
       const foc = focReason(b, report);
       if (foc) doc.foc_reason = foc;
       const header: Record<string, unknown> = { ...bookingHeader(doc) };
+      // A booking points at the area catalogue (migration 043); an id legacy no longer has is dropped, its name kept.
+      for (const field of ['pickup_area_id', 'dropoff_area_id'] as const) {
+        if (header[field] && !areaIds.has(String(header[field]))) { note(`${field} dropped: not in the area catalogue`); delete header[field]; }
+      }
       for (const column of TIMESTAMP_HEADER) {
         if (header[column] !== undefined && instant(header[column]) === undefined) { delete header[column]; note(`${column} dropped: not a timestamp`); }
       }
@@ -1053,6 +1097,10 @@ async function main() {
       'ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, registered_persons = EXCLUDED.registered_persons');
     await insert('boat_capacity_overrides', overrides, 'ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason');
     await insert('seat_locks', locks);
+    await insert('pickup_areas', pickupAreas, upsert(pickupAreas));
+    await insert('pickup_time_profiles', timeProfiles, upsert(timeProfiles));
+    await target.query('DELETE FROM pickup_times WHERE profile_id = ANY($1::text[])', [timeProfiles.map((pr) => String(pr.id))]);
+    await insert('pickup_times', pickupCells);
     await insert('bookings', bookings);
     await insert('booking_trips', trips);
     await insert('booking_trip_pax', pax);
