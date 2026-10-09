@@ -2,26 +2,33 @@
  * Copies legacy's agent contracts (`operation_schemas.sb_contracts` and `__programperiods`) into
  * this service (todo/contracts-model.md).
  *
- *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts [-- --commit]
+ *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts -- --seed [--commit]
+ *
+ * Seed-only (2026-10-10): this API is the contracts' master since promos and main contracts' rates
+ * and documents are written here, so without `--seed` it writes nothing and says so. `--seed` copies
+ * legacy's, to seed a database that has none: legacy wins for every contract it has (its periods and
+ * prices replaced whole, a rate or document set here overwritten); a contract only this service has
+ * is left alone. Run it once, after `seed:routes` and the agents and rate types imports: a contract
+ * needs its agent, and the routes and rate type it names must exist. What does not fit is skipped or
+ * dropped and listed (`legacy-contracts.ts`).
  *
  * Without `--commit` it is a dry run: the writes happen in one transaction on the target, the result
  * is printed, and the transaction is rolled back. The source is opened read-only either way.
- *
- * Re-runnable: until cutover legacy is the master, so legacy wins for every contract it has (its
- * periods and prices are replaced whole). A contract only this service has is left alone. Run it
- * after `seed:routes` and the agents and rate types imports: a contract needs its agent, and the
- * routes and rate type it names must exist. What does not fit is skipped or dropped and listed (`legacy-contracts.ts`).
  */
 import { Client } from 'pg';
-import { contractFromLegacy } from './legacy-contracts.js';
+import { CONTRACT_SEED_UPSERT, contractFromLegacy, contractImportArgs } from './legacy-contracts.js';
 
 type Row = Record<string, unknown>;
-const commit = process.argv.includes('--commit');
+const { commit, seed } = contractImportArgs(process.argv.slice(2));
 const sourceUrl = process.env.SOURCE_DATABASE_URL;
 const targetUrl = process.env.TARGET_DATABASE_URL;
 if (!sourceUrl || !targetUrl) throw new Error('Set SOURCE_DATABASE_URL and TARGET_DATABASE_URL');
 
 async function main() {
+  if (!seed) {
+    console.log('contracts: not imported (this API is their master since 2026-10-10; --seed seeds a database that has none)');
+    return;
+  }
   const source = new Client({ connectionString: sourceUrl, options: '-c default_transaction_read_only=on -c search_path=operation_schemas' });
   const target = new Client({ connectionString: targetUrl });
   await source.connect();
@@ -43,15 +50,7 @@ async function main() {
       if ('skip' in mapped) { lines.push(`skipped  ${String(row.id).padEnd(28)} ${mapped.skip}`); continue; }
       const { contract: c, notes } = mapped;
       for (const note of notes) lines.push(`note     ${c.id.padEnd(28)} ${note}`);
-      await target.query(
-        `INSERT INTO contracts (id, agent_id, kind, status, rate_type_id, active_from, active_to, priority, version, price_mode, discount_mode, discount_value,
-           bonus_buy, bonus_free, bonus_basis, book_window, created_date, created_by, note, doc_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-         ON CONFLICT (id) DO UPDATE SET agent_id = EXCLUDED.agent_id, kind = EXCLUDED.kind, status = EXCLUDED.status, rate_type_id = EXCLUDED.rate_type_id,
-           active_from = EXCLUDED.active_from, active_to = EXCLUDED.active_to, priority = EXCLUDED.priority, version = EXCLUDED.version,
-           price_mode = EXCLUDED.price_mode, discount_mode = EXCLUDED.discount_mode, discount_value = EXCLUDED.discount_value,
-           bonus_buy = EXCLUDED.bonus_buy, bonus_free = EXCLUDED.bonus_free, bonus_basis = EXCLUDED.bonus_basis, book_window = EXCLUDED.book_window,
-           created_date = EXCLUDED.created_date, created_by = EXCLUDED.created_by, note = EXCLUDED.note, doc_id = EXCLUDED.doc_id`,
+      await target.query(CONTRACT_SEED_UPSERT,
         [c.id, c.agent_id, c.kind, c.status, c.rate_type_id, c.active_from, c.active_to, c.priority, c.version, c.price_mode,
           c.discount?.mode ?? null, c.discount?.value ?? null, c.bonus?.buy ?? null, c.bonus?.free ?? null, c.bonus?.basis ?? null,
           c.book_window, c.created_date, c.created_by, c.note, c.doc_id]);
