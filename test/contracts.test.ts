@@ -13,7 +13,7 @@ after(async () => app.close());
 
 const base: Omit<Contract, 'id' | 'kind' | 'active_from' | 'active_to' | 'program_periods'> = {
   agent_id: 'ctr_a1', status: 'active', rate_type_id: null, priority: 0, version: 'v2025-1', price_mode: null, discount: null, bonus: null,
-  book_window: false, created_date: '2025-10-01', created_by: 'migration', note: null, doc_id: null, seat_prices: [],
+  book_window: false, created_date: '2025-10-01', created_by: 'migration', note: null, doc_id: null, voided_at: null, voided_by: null, seat_prices: [],
 };
 const contracts: Contract[] = [
   { ...base, id: 'ct_main_ctr_a1', kind: 'main', active_from: '2025-10-01', active_to: '2026-09-30',
@@ -61,7 +61,10 @@ test('an agent\'s contracts: main before promo, the newest first, each with its 
 });
 
 test('one contract, with an own-price promo\'s prices in order', async () => {
-  const promo = (await get('/v1/contracts/ctr_promo1')).json() as Contract;
+  const { state, bonus_progress, ...promo } = (await get('/v1/contracts/ctr_promo1')).json() as Contract & { state: string; bonus_progress: unknown };
+  // The badge is legacy's `_ctContractStatus` against today; the promo has no bonus to count.
+  assert.ok(['scheduled', 'active', 'expired'].includes(state), state);
+  assert.equal(bonus_progress, null);
   assert.deepEqual(promo, {
     ...contracts[2],
     seat_prices: [

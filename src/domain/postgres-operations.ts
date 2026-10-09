@@ -1905,7 +1905,7 @@ export class PostgresOperationsStore {
   private async readContracts(filter: ContractListQuery & { id?: string }): Promise<Contract[]> {
     const { rows } = await this.client().query(
       `SELECT id, agent_id, kind, status, rate_type_id, active_from::text, active_to::text, priority, version, price_mode, discount_mode,
-              discount_value, bonus_buy, bonus_free, bonus_basis, book_window, created_date::text, created_by, note, doc_id
+              discount_value, bonus_buy, bonus_free, bonus_basis, book_window, created_date::text, created_by, note, doc_id, voided_at, voided_by
        FROM contracts WHERE ($1::text IS NULL OR id = $1) AND ($2::text IS NULL OR agent_id = $2) AND ($3::text IS NULL OR kind = $3) AND ($4::text IS NULL OR status = $4)`,
       [filter.id ?? null, filter.agentId ?? null, filter.kind ?? null, filter.status ?? null]);
     if (rows.length === 0) return [];
@@ -1929,9 +1929,41 @@ export class PostgresOperationsStore {
       discount: row.discount_mode === null ? null : { mode: row.discount_mode, value: Number(row.discount_value) },
       bonus: row.bonus_buy === null ? null : { buy: Number(row.bonus_buy), free: Number(row.bonus_free), basis: row.bonus_basis ?? null },
       book_window: row.book_window === true, created_date: row.created_date ?? null, created_by: row.created_by ?? null,
-      note: row.note ?? null, doc_id: row.doc_id ?? null,
+      note: row.note ?? null, doc_id: row.doc_id ?? null, voided_at: isoOrNull(row.voided_at), voided_by: row.voided_by ?? null,
       program_periods: periods.get(row.id) ?? [], seat_prices: prices.get(row.id) ?? [],
     }));
+  }
+  /** A promo written here (`contract-writes.ts`): the whole contract, its periods and prices replaced. */
+  async saveContract(c: Contract): Promise<void> {
+    const db = this.client();
+    await db.query(
+      `INSERT INTO contracts (id, agent_id, kind, status, rate_type_id, active_from, active_to, priority, version, price_mode, discount_mode, discount_value,
+         bonus_buy, bonus_free, bonus_basis, book_window, created_date, created_by, note, doc_id, voided_at, voided_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+       ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, rate_type_id = EXCLUDED.rate_type_id, active_from = EXCLUDED.active_from,
+         active_to = EXCLUDED.active_to, priority = EXCLUDED.priority, price_mode = EXCLUDED.price_mode, discount_mode = EXCLUDED.discount_mode,
+         discount_value = EXCLUDED.discount_value, bonus_buy = EXCLUDED.bonus_buy, bonus_free = EXCLUDED.bonus_free, bonus_basis = EXCLUDED.bonus_basis,
+         book_window = EXCLUDED.book_window, note = EXCLUDED.note, voided_at = EXCLUDED.voided_at, voided_by = EXCLUDED.voided_by`,
+      [c.id, c.agent_id, c.kind, c.status, c.rate_type_id, c.active_from, c.active_to, c.priority, c.version, c.price_mode,
+        c.discount?.mode ?? null, c.discount?.value ?? null, c.bonus?.buy ?? null, c.bonus?.free ?? null, c.bonus?.basis ?? null,
+        c.book_window, c.created_date, c.created_by, c.note, c.doc_id, c.voided_at, c.voided_by]);
+    await db.query('DELETE FROM contract_program_periods WHERE contract_id = $1', [c.id]);
+    await db.query('DELETE FROM contract_seat_prices WHERE contract_id = $1', [c.id]);
+    for (const [seq, p] of c.program_periods.entries()) {
+      await db.query('INSERT INTO contract_program_periods (contract_id, seq, route_id, book_from, book_to, travel_from, travel_to, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+        [c.id, seq, p.route_id, p.book_from, p.book_to, p.travel_from, p.travel_to, p.note]);
+    }
+    for (const p of c.seat_prices) {
+      await db.query('INSERT INTO contract_seat_prices (contract_id, route_id, zone, category, residency, price) VALUES ($1,$2,$3,$4,$5,$6)',
+        [c.id, p.route_id, p.zone, p.category, p.residency, p.price]);
+    }
+  }
+  /** Trips priced with this promo (`promo_id`) on bookings that still hold their seats: legacy's "already sold" count. */
+  async promoSoldTrips(id: string): Promise<number> {
+    const { rows: [row] } = await this.client().query(
+      `SELECT count(*)::int AS n FROM booking_trips t JOIN bookings b ON b.id = t.booking_id WHERE t.promo_id = $1 AND NOT (b.status::text = ANY($2::text[]))`,
+      [id, [...SEAT_RELEASING_STATUSES]]);
+    return row.n;
   }
 
   /** The trip, its booking and its dispatch as stored, for a dispatch write; undefined for an unknown trip. */

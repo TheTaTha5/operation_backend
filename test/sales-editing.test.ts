@@ -202,7 +202,7 @@ test('programmes: one row per route, a bare route id keeps its window', async ()
 async function seedContracts(agentId: string, rateTypeId: string): Promise<void> {
   const base: Omit<Contract, 'id' | 'status'> = {
     agent_id: agentId, kind: 'main', rate_type_id: rateTypeId, active_from: '2025-10-01', active_to: '2026-09-30', priority: 0, version: 'v2025-1',
-    price_mode: null, discount: null, bonus: null, book_window: false, created_date: '2025-10-01', created_by: 'migration', note: null, doc_id: null, program_periods: [], seat_prices: [],
+    price_mode: null, discount: null, bonus: null, book_window: false, created_date: '2025-10-01', created_by: 'migration', note: null, doc_id: null, voided_at: null, voided_by: null, program_periods: [], seat_prices: [],
   };
   const rows: Contract[] = [{ ...base, id: `ct_main_${agentId}`, status: 'active' }, { ...base, id: `ct_hist_${agentId}`, status: 'expired' }];
   if (store instanceof OperationsStore) { store.seedContracts([...store.listContracts({}), ...rows]); return; }

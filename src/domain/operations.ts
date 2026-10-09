@@ -1,7 +1,7 @@
 import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, isLegacyB2C, routeCalendar, todayInThailand, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteSeason } from './calendar.js';
 import { byCreated, matchesLock, poolLocks, type GroupRow, type LockEvent, type LockQuery, type LockRow, type NewLockEvent } from './seat-locks.js';
 import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
-import { holdsSeats, type BookingStatus } from './booking-status.js';
+import { holdsSeats, SEAT_RELEASING_STATUSES, type BookingStatus } from './booking-status.js';
 import { assertDayFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
@@ -598,6 +598,21 @@ export class OperationsStore {
   seedContracts(contracts: readonly Contract[]): void { this.contracts = contracts.map(contractView); }
   listContracts(query: ContractListQuery): Contract[] { return selectContracts(this.contracts, query).map(contractView); }
   contract(id: string): Contract | undefined { const found = this.contracts.find((c) => c.id === id); return found && contractView(found); }
+  /** A promo written here (`contract-writes.ts`): the whole contract, its periods and prices replaced. */
+  saveContract(contract: Contract): void {
+    const copy = contractView(contract);
+    const i = this.contracts.findIndex((c) => c.id === contract.id);
+    if (i >= 0) this.contracts[i] = copy; else this.contracts.push(copy);
+  }
+  /** Trips priced with this promo (`promo_id`) on bookings that still hold their seats: legacy's "already sold" count. */
+  promoSoldTrips(id: string): number {
+    let n = 0;
+    for (const b of this.bookings.values()) {
+      if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(b.status)) continue;
+      n += b.trips.filter((t) => t.promo_id === id).length;
+    }
+    return n;
+  }
 
   /** Staff logins (migration 027), held as the rows PostgreSQL holds. Usernames are unique ignoring case. */
   private users: StoredUser[] = [];

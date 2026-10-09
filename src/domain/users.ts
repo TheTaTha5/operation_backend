@@ -127,6 +127,10 @@ export function writeNeed(path: string): WriteNeed {
   // are sales'; salespeople and markets are the Team & Markets screen's, under `config` (decision 2);
   // a nationality is added from the booking form (decision 11).
   if (/^\/v1\/(contract-templates|contract-documents|addon-services)(\/|$)/.test(path)) return { kind: 'area', areas: ['sales'] };
+  // Promo contracts (legacy `sbContractsPersist`), staff and their welfare quotas (`sbStaffPersist`), and a
+  // salesperson's targets and follow-up marks on the Sales Board (`sbSalesPersist`) all guard `sales`.
+  if (path === '/v1/contracts' || path.startsWith('/v1/contracts/') || path === '/v1/staff' || path.startsWith('/v1/staff/')) return { kind: 'area', areas: ['sales'] };
+  if (/^\/v1\/sales\/[^/]+\/(targets|followups)(\/|$)/.test(path)) return { kind: 'area', areas: ['sales'] };
   if (/^\/v1\/(sales|markets)(\/|$)/.test(path)) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/nationalities') return { kind: 'area', areas: ['operations'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.

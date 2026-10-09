@@ -27,7 +27,7 @@ const catalogue = (fields: Partial<PricingCatalogue> = {}): PricingCatalogue => 
 });
 const promo = (fields: Partial<Contract>): Contract => ({
   id: 'ct_p', agent_id: 'a1', kind: 'promo', status: 'active', rate_type_id: null, active_from: '2027-01-01', active_to: '2027-01-31', priority: 10,
-  version: null, price_mode: 'own', discount: null, bonus: null, book_window: false, created_date: null, created_by: null, note: null, doc_id: null,
+  version: null, price_mode: 'own', discount: null, bonus: null, book_window: false, created_date: null, created_by: null, note: null, doc_id: null, voided_at: null, voided_by: null,
   program_periods: [{ route_id: 'r1', book_from: '2026-12-01', book_to: '2027-01-31', travel_from: '2027-01-01', travel_to: '2027-01-31', note: null }],
   seat_prices: [], ...fields,
 });

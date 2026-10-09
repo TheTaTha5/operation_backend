@@ -19,7 +19,7 @@ test('a main contract keeps its fields, and its periods in legacy\'s order', () 
   assert.deepEqual(rest, {
     id: 'ct_main_a13', agent_id: 'a13', kind: 'main', status: 'active', rate_type_id: 'rt1', active_from: '2025-10-01', active_to: '2026-09-30',
     priority: 0, version: 'v2025-1', price_mode: null, discount: null, bonus: null, book_window: false, created_date: '2025-10-01',
-    created_by: 'migration', note: null, doc_id: null, seat_prices: [],
+    created_by: 'migration', note: null, doc_id: null, voided_at: null, voided_by: null, seat_prices: [],
   });
   assert.deepEqual(program_periods.map((p) => p.route_id), ['r4', 'r10']);
 });

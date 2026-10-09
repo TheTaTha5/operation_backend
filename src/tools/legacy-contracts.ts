@@ -94,7 +94,7 @@ export function contractFromLegacy(row: Row, periodRows: readonly Row[], catalog
       id, agent_id: agentId, kind, status, rate_type_id: rateTypeId, active_from: activeFrom, active_to: activeTo,
       priority: Number(row.priority) || 0, version: str(row.version), price_mode: mode as Contract['price_mode'], discount, bonus,
       book_window: Boolean(Number(row.bookwin)), created_date: day(row.createddate, 'created_date'), created_by: str(row.createdby),
-      note: str(row.note), doc_id: str(row.docid), program_periods: periods, seat_prices: seatPrices,
+      note: str(row.note), doc_id: str(row.docid), voided_at: null, voided_by: null, program_periods: periods, seat_prices: seatPrices,
     },
     notes,
   };

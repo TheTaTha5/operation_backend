@@ -1,7 +1,7 @@
 /**
  * Sales editing (todo/sales-editing-model.md, decided 2026-10-09): agents and their programmes, rate,
- * renewal and documents; contract templates; salespeople and markets; the add-on catalogue;
- * nationalities; passengers' insurance fields. Also the agent and contract reads, because a
+ * renewal and documents; promo contracts; contract templates; salespeople and markets; the add-on
+ * catalogue; nationalities; passengers' insurance fields. Also the agent and contract reads, because a
  * sales-bound login sees only its own agents (decision 3).
  *
  * The rules are in `src/domain/` (`agent-writes.ts`, `team.ts`, `contract-templates.ts`,
@@ -24,7 +24,11 @@ import {
 } from '../domain/agent-writes.js';
 import { withoutServerOwned } from '../domain/server-owned.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
-import { parseContractListQuery } from '../domain/contracts.js';
+import { parseContractListQuery, type Contract } from '../domain/contracts.js';
+import {
+  assertEditable, bonusProgress, checkPromo, contractState, newPromoBase, parsePromoBody, planVoid, promoActivityText, promoFormOf, promoFrom,
+  PROMO_SERVER_OWNED, samePromo, type PromoContext, type PromoForm,
+} from '../domain/contract-writes.js';
 import {
   assertMarketDeletable, assertSalesDeletable, planMarketCreate, planMarketOrder, planMarketPatch, planSalesCreate, planSalesPatch,
 } from '../domain/team.js';
@@ -69,16 +73,21 @@ export function registerSalesRoutes(app: FastifyInstance, deps: {
     assertAgentInScope(agent, scope(request));
     return agent;
   };
-  /** `GET /v1/agents/{id}`: the agent, its credit (legacy `agCreditState`), renewals and the template it prints with. */
-  const agentDetail = async (id: string) => {
-    const agent = (await store.agent(id)) ?? notFound('Agent not found');
+  /** Every booking of an agent, all pages. */
+  const agentBookings = async (agentId: string): Promise<Booking[]> => {
     const bookings: Booking[] = [];
     let cursor: string | undefined;
     do {
-      const page = await store.listBookings({ agentId: agent.id, limit: 1000, ...(cursor ? { cursor } : {}) });
+      const page = await store.listBookings({ agentId, limit: 1000, ...(cursor ? { cursor } : {}) });
       bookings.push(...page.bookings);
       cursor = page.next_cursor;
     } while (cursor);
+    return bookings;
+  };
+  /** `GET /v1/agents/{id}`: the agent, its credit (legacy `agCreditState`), renewals and the template it prints with. */
+  const agentDetail = async (id: string) => {
+    const agent = (await store.agent(id)) ?? notFound('Agent not found');
+    const bookings = await agentBookings(agent.id);
     return {
       ...agent, credit: creditOf(agent, bookings), credit_balance: await deps.agentCredit(agent.id), contract_history: await store.contractHistory(id),
       contract_template_effective_id: effectiveTemplateId(agent.contract_template_id, await store.listTemplates()),
@@ -257,22 +266,87 @@ export function registerSalesRoutes(app: FastifyInstance, deps: {
     return reply.code(204).send();
   });
 
-  // ── Contracts: reads, scoped like agents ──
+  // ── Contracts: reads, scoped like agents; promos written here (contract-writes.ts) ──
 
+  /** A contract as the reads answer it: its badge (`state`) and a bonus promo's progress. */
+  const contractViews = async (contracts: readonly Contract[]) => {
+    const today = todayInThailand();
+    const bookingsOf = new Map<string, Booking[]>();
+    for (const agentId of new Set(contracts.filter((c) => c.bonus && c.status !== 'void').map((c) => c.agent_id))) bookingsOf.set(agentId, await agentBookings(agentId));
+    return contracts.map((c) => ({ ...c, state: contractState(c, today), bonus_progress: bonusProgress(c, bookingsOf.get(c.agent_id) ?? []) }));
+  };
   app.get('/v1/contracts', async (request) => {
     const q = parseContractListQuery(query(request));
     const own = scope(request);
     const contracts = await store.listContracts(q);
-    if (own === undefined) return { contracts };
+    if (own === undefined) return { contracts: await contractViews(contracts) };
     const mine = new Set((await store.listAgents({ salesId: own })).map((a) => a.id));
-    return { contracts: contracts.filter((c) => mine.has(c.agent_id)) };
+    return { contracts: await contractViews(contracts.filter((c) => mine.has(c.agent_id))) };
   });
-  app.get('/v1/contracts/:id', async (request) => {
+  const ownContract = async (request: Request): Promise<Contract> => {
     const contract = (await store.contract(param(request))) ?? notFound('Contract not found');
     const agent = await store.agentRecord(contract.agent_id);
     if (agent) assertAgentInScope(agent, scope(request));
     return contract;
+  };
+  app.get('/v1/contracts/:id', async (request) => (await contractViews([await ownContract(request)]))[0]);
+
+  /** What a promo's checks read: the main rate legacy discounts from, the routes the form offers, the rate type named. */
+  const promoContext = async (agent: StoredAgent, form: PromoForm, editing?: Contract): Promise<PromoContext> => {
+    const mains = await mainContracts(agent.id);
+    // Legacy `laPromoMainRt` without a date: the first main contract by id (whatever its status), else the agent's rate.
+    const first = [...mains].sort((a, b) => (a.id < b.id ? -1 : 1))[0];
+    const mainRateId = first?.rate_type_id ?? agent.rate_type_id;
+    const offered = new Set([...agent.programs.map((p) => p.route_id), ...mains.flatMap((c) => c.program_periods.map((p) => p.route_id)),
+      ...(editing?.program_periods.map((p) => p.route_id) ?? [])]);
+    return {
+      mainRate: mainRateId ? await store.rateType(mainRateId) : undefined,
+      rateTypeExists: form.rate_type_id ? (await store.rateType(form.rate_type_id)) !== undefined : false,
+      offeredRoutes: offered, routeName: await routeNames(),
+    };
+  };
+  const contractActivity = (request: Request, c: Contract, what: 'added' | 'edited' | 'void') =>
+    store.addAgentActivity(c.agent_id, [{ at: nowIso(), by: by(request), kind: 'contract', text: promoActivityText(what, c) }]);
+  /** Legacy `ctSaveAddPromo`, adding. */
+  app.post('/v1/contracts', async (request, reply) => {
+    const body = record(request.body);
+    const { fields, flags } = parsePromoBody(body, true);
+    if (typeof body.agent_id !== 'string' || !body.agent_id) bad('agent_id is required');
+    const created = await store.transaction(async () => {
+      const agent = (await store.agentRecord(body.agent_id as string)) ?? bad(`agent_id ${String(body.agent_id)} is not an agent (GET /v1/agents)`);
+      assertAgentInScope(agent, scope(request));
+      const form = { rate_type_id: null, seat_prices: [], discount: null, bonus: null, book_from: null, book_to: null, priority: 10, note: null, ...fields } as PromoForm;
+      const checked = checkPromo(form, fields, await promoContext(agent, form), flags);
+      const promo = promoFrom(checked, newPromoBase(newLegacyStyleId('ct'), agent.id, checked, todayInThailand(), by(request)));
+      await store.saveContract(promo);
+      await contractActivity(request, promo, 'added');
+      return (await contractViews([(await store.contract(promo.id))!]))[0];
+    });
+    return reply.code(201).send(created);
   });
+  /** Legacy `ctSaveAddPromo`, editing: the stored promo with what is sent, checked whole again. */
+  app.patch('/v1/contracts/:id', async (request) => store.transaction(async () => {
+    const stored = await ownContract(request);
+    const [current] = await contractViews([stored]);
+    const { fields, flags } = parsePromoBody(withoutServerOwned(record(request.body), current as unknown as Record<string, unknown>, PROMO_SERVER_OWNED), false);
+    if (stored.kind !== 'promo' || stored.status === 'void') assertEditable(stored, 0, flags);
+    const agent = (await store.agentRecord(stored.agent_id)) ?? notFound('Agent not found');
+    const form = { ...promoFormOf(stored), ...fields };
+    const checked = checkPromo(form, fields, await promoContext(agent, form, stored), flags);
+    const next = promoFrom(checked, stored);
+    if (samePromo(next, stored)) return current;
+    assertEditable(stored, await store.promoSoldTrips(stored.id), flags);
+    await store.saveContract(next);
+    await contractActivity(request, next, 'edited');
+    return (await contractViews([(await store.contract(next.id))!]))[0];
+  }));
+  /** Legacy `ctVoidContract`: pricing skips it from now on; trips already sold keep their price. */
+  app.post('/v1/contracts/:id/void', async (request) => store.transaction(async () => {
+    const voided = planVoid(await ownContract(request), nowIso(), by(request));
+    await store.saveContract(voided);
+    await contractActivity(request, voided, 'void');
+    return (await contractViews([(await store.contract(voided.id))!]))[0];
+  }));
 
   // ── Contract templates (contract-templates.ts) ──
 
