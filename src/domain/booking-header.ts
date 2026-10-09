@@ -35,6 +35,8 @@ export type BookingHeader = {
   price_mode?: string; manual_total?: number; total?: number;
   price_seat?: number; price_addon?: number; price_foc_discount?: number; price_discount?: number; price_extra?: number;
   payment_method?: string; payment_net_days?: number; payment_source?: string; payment_contract_version?: string;
+  /** Love Kingdom's payment state (legacy paymentSnapshot.paid/paidStatus/deposit/balance, migration 111): client facts the pier reads. */
+  payment_paid?: number; payment_paid_status?: string; payment_deposit?: number; payment_balance?: number;
   market?: string; market_sub?: string; market_agent_id?: string; market_at?: string;
   booking_date?: string; booked_at?: string; created_by?: string; updated_by?: string;
   confirmed_at?: string; confirmed_by?: string;
@@ -80,6 +82,7 @@ export const BOOKING_HEADER_COLUMNS = [
   'price_mode', 'manual_total', 'total',
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
   'payment_method', 'payment_net_days', 'payment_source', 'payment_contract_version',
+  'payment_paid', 'payment_paid_status', 'payment_deposit', 'payment_balance',
   'market', 'market_sub', 'market_agent_id', 'market_at',
   'booking_date', 'booked_at', 'created_by', 'updated_by', 'confirmed_at', 'confirmed_by',
   'notes', 'note', 'foc_reason', 'job_note',
@@ -100,6 +103,7 @@ export const BOOKING_HEADER_DATE_COLUMNS = ['market_at', 'booking_date'] as cons
 export const BOOKING_HEADER_NUMERIC_COLUMNS = [
   'lead_age', 'cash_on_tour_amount', 'manual_total', 'total',
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
+  'payment_paid', 'payment_deposit', 'payment_balance',
 ] as const;
 
 export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at', 'special_meals_pier_at', 'lead_insurance_reviewed_at'] as const;
@@ -234,6 +238,10 @@ function fields(document: Record<string, unknown>): readonly Field[] {
     ['payment_net_days', int, inside(payment, 'netDays', 'payment_net_days')],
     ['payment_source', text, inside(payment, 'source', 'payment_source')],
     ['payment_contract_version', text, inside(payment, 'contractVersion', 'payment_contract_version')],
+    ['payment_paid', num, inside(payment, 'paid', 'payment_paid')],
+    ['payment_paid_status', text, inside(payment, 'paidStatus', 'payment_paid_status')],
+    ['payment_deposit', num, inside(payment, 'deposit', 'payment_deposit')],
+    ['payment_balance', num, inside(payment, 'balance', 'payment_balance')],
 
     ['market', text, inside(market, 'market', 'market')],
     ['market_sub', text, inside(market, 'sub', 'market_sub')],

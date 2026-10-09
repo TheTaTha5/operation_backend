@@ -27,10 +27,10 @@ test('an on-tour sale: the server works out commission, fee and what the custome
   assert.notEqual(u.at, '2000-01-01T00:00:00.000Z');
   assert.ok((await historyOf(b.id)).includes('Upgrade · Longtail · Join → เหมา (Charter) · ขาย ฿2,000 · บริษัท ฿1,300 · คอม ฿700 · BEST'));
 
-  const legacy = await send('PATCH', `/v1/bookings/${b.id}`, { upgrades: [{ id: 'up_1', label: sale.label, sellPrice: 1900, toCompany: 1330, method: 'cash', feePct: 5, collected: true, slips: [] }] });
+  const legacy = await send('PATCH', `/v1/bookings/${b.id}`, { upgrades: [{ id: 'up_1', label: sale.label, sellPrice: 1900, toCompany: 1330, method: 'cash', feePct: 5, slips: [] }] });
   assert.equal(legacy.statusCode, 200, legacy.body);
   const edited = legacy.json().upgrades[0] as Up;
-  assert.deepEqual([edited.commission, edited.fee, edited.customer_paid, edited.collected, edited.at], [570, 0, 1900, true, u.at], 'cash pays no fee; the sale keeps its time');
+  assert.deepEqual([edited.commission, edited.fee, edited.customer_paid, edited.collected, edited.at], [570, 0, 1900, null, u.at], 'cash pays no fee; the sale keeps its time');
   assert.equal((await historyOf(b.id)).at(-1), 'Edited upgrade · Longtail · Join → เหมา (Charter) · ขาย ฿1,900 · คอม ฿570');
 
   for (const bad of [
@@ -69,7 +69,12 @@ test('a route upgrade moves the trip at its booked price; a charge is a sale to 
 
   await send('POST', `/v1/bookings/${b.id}/upgrade`, { trip_id: trip, to_route_id: 'r2', reason: 'Again', charge: 800 });
   const withSale = (await send('GET', `/v1/bookings/${b.id}`)).json() as Booking;
-  await send('PATCH', `/v1/bookings/${b.id}`, { upgrades: withSale.upgrades.map((u) => ({ ...u, collected: true })) });
+  const flipped = await send('PATCH', `/v1/bookings/${b.id}`, { upgrades: withSale.upgrades.map((u) => ({ ...u, collected: true })) });
+  assert.equal(flipped.statusCode, 400, 'collecting is a command now (todo/money-model.md slice 3)');
+  assert.match(flipped.json().message, /upgrades\/.+\/collect/);
+  const collected = await send('POST', `/v1/bookings/${b.id}/upgrades/${withSale.upgrades[0].id}/collect`, {});
+  assert.equal(collected.statusCode, 200, collected.body);
+  assert.deepEqual([collected.json().upgrades[0].collected, collected.json().upgrades[0].method], [true, 'cash']);
   const kept = await send('POST', `/v1/bookings/${b.id}/upgrade/undo`, { trip_id: trip });
   assert.equal(kept.json().upgrades.length, 1, 'a collected charge stays on the booking');
 });

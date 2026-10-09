@@ -81,8 +81,14 @@ export function parseUpgrades(value: unknown, label = 'upgrades'): UpgradeInput[
  */
 export function storedUpgrades(input: readonly UpgradeInput[], current: readonly StoredUpgrade[], now: string, by: string | null): { upgrades: StoredUpgrade[]; history: HistoryLine[] } {
   const history: HistoryLine[] = [];
-  const upgrades = input.map((u): StoredUpgrade => {
-    const was = current.find((c) => c.id === u.id);
+  const upgrades = input.map((raw): StoredUpgrade => {
+    const was = current.find((c) => c.id === raw.id);
+    // Collecting is a command (todo/money-model.md slice 3, "the same rule" as on-tour sales): a new
+    // sale may say it was paid, an existing one keeps what it has unless it repeats it.
+    if (was && raw.collected !== null && raw.collected !== !!was.collected && !(raw.collected === false && was.collected === null)) {
+      bad(`upgrades: ${raw.id}'s collected cannot be changed here: use POST /v1/bookings/{id}/upgrades/${raw.id}/collect`);
+    }
+    const u = was && raw.collected === null ? { ...raw, collected: was.collected } : raw;
     const card = u.method === 'card';
     const feePct = u.method === null ? u.fee_pct : card ? u.fee_pct ?? 0 : 0;
     const fee = u.method === null ? null : card ? money(u.sell_price * (feePct ?? 0) / 100) : 0;
@@ -98,6 +104,28 @@ export function storedUpgrades(input: readonly UpgradeInput[], current: readonly
     return next;
   });
   return { upgrades, history };
+}
+
+/**
+ * `POST /v1/bookings/{id}/upgrades/{upgrade_id}/collect`: the money for a sale not yet collected is
+ * taken, as cash unless said otherwise (legacy's collect button, `bkV2ExtraCollect`); a card pays its
+ * fee on top. Slips sent are added to the sale's.
+ */
+export function collectUpgrade(list: readonly StoredUpgrade[], id: string, body: Record<string, unknown>, by: string | null): { upgrades: StoredUpgrade[]; history: HistoryLine } {
+  const sale = list.find((u) => u.id === id) ?? refuse(`Upgrade ${id} is not on this booking`, 404);
+  if (sale.collected) refuse(`Upgrade ${id} is already collected`, 409, 'already_collected');
+  const method = body.method === undefined || body.method === null || body.method === '' ? 'cash' : body.method;
+  if (method !== 'cash' && method !== 'transfer' && method !== 'card') bad('method must be cash, transfer or card');
+  const rawPct = body.fee_pct ?? body.feePct;
+  if (method !== 'card' && rawPct !== undefined && rawPct !== null && rawPct !== 0) bad('only a card pays a fee');
+  const pct = method === 'card' ? (rawPct === undefined || rawPct === null ? sale.fee_pct ?? 0 : typeof rawPct === 'number' && rawPct >= 0 && rawPct <= 100 ? rawPct : bad('fee_pct must be a number from 0 to 100')) : 0;
+  const slips = parseAttachmentIds(body.slip_ids ?? body.slips ?? [], 'slip_ids').map((s) => s.id);
+  const fee = method === 'card' ? money(sale.sell_price * pct / 100) : 0;
+  const next: StoredUpgrade = { ...sale, collected: true, method: method as string, fee_pct: pct, fee, customer_paid: money(sale.sell_price + fee), slips: [...sale.slips, ...slips.filter((s) => !sale.slips.includes(s))] };
+  return {
+    upgrades: list.map((u) => (u.id === id ? next : { ...u })),
+    history: { by, kind: 'extra', tag: 'Extra', text: `Collected on tour · ${sale.label} · ฿${baht(sale.sell_price)} (${method as string})` },
+  };
 }
 
 // ── Route upgrade: a trip moved to another programme (legacy `bkV2UpgApply`, `bkV2UpgUndo`) ──

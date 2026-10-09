@@ -214,6 +214,12 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     out.push({ kind: 'weather_closure', entity_id: id, action: path === '/v1/weather-closures' && r.method === 'POST' ? 'created' : 'updated',
       route_days: [{ route_id: closure.route_id, service_date: closure.service_date }], changed_by: by });
   }
+  // The pier's hand-over at day close and sellers' commission payouts (todo/money-model.md slice 3).
+  for (const [prefix, kind] of [['/v1/pier-handovers', 'pier_handover'], ['/v1/commission-payouts', 'commission_payout']] as const) {
+    if (!path.startsWith(prefix)) continue;
+    const id = params(r).id ?? (result as { id?: string } | undefined)?.id;
+    if (id) out.push({ kind, entity_id: id, action: path === prefix && r.method === 'POST' ? 'created' : 'updated', route_days: null, changed_by: by });
+  }
   // The catalogue (todo/catalogue-editing-model.md).
   if (path === '/v1/routes' && r.method === 'POST') {
     const created = result as { created?: boolean; route?: { id: string } } | undefined;

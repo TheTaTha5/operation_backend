@@ -126,6 +126,8 @@ const HEADER_FROM_LEGACY: Record<string, string> = {
   price_discount: 'pricebreakdown_discount', price_extra: 'pricebreakdown_extra',
   payment_method: 'paymentsnapshot_method', payment_net_days: 'paymentsnapshot_netdays', payment_source: 'paymentsnapshot_source',
   payment_contract_version: 'paymentsnapshot_contractversion',
+  payment_paid: 'paymentsnapshot_paid', payment_paid_status: 'paymentsnapshot_paidstatus', payment_deposit: 'paymentsnapshot_deposit',
+  payment_balance: 'paymentsnapshot_balance',
   market: 'marketsnapshot_market', market_sub: 'marketsnapshot_sub', market_agent_id: 'marketsnapshot_agentid', market_at: 'marketsnapshot_at',
   booking_date: 'bookingdate', booked_at: 'bookedat', created_by: 'createdby', updated_by: 'updatedby',
   confirmed_at: 'confirmedat', confirmed_by: 'confirmedby', notes: 'notes', note: 'note',

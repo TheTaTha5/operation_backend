@@ -34,7 +34,11 @@ export type InvoiceStatus = 'issued' | 'partial' | 'paid' | 'void';
 export type InvoiceLine = {
   seq: number; booking_id: string | null; label: string; amount: number; discount: number | null;
   removed_at: string | null; removed_by: string | null; removed_reason: string | null;
+  /** A cash-on-tour deduction's line (migration 112): the trip date it is for; null or absent on every other line. */
+  cot_date?: string | null;
 };
+/** The label of a cash-on-tour deduction's minus line (`after-trip.ts`). */
+export const cotLineLabel = (date: string): string => `Cash on tour deducted · ${date}`;
 export const NOT_REMOVED = { removed_at: null, removed_by: null, removed_reason: null } as const;
 /** The document's header text: legacy's editor wrote it and lost it on every save. */
 export const HEADER_FIELDS = ['note', 'ref', 'dear', 'accept_at', 'remark'] as const;
@@ -115,6 +119,11 @@ export type InvoiceView = StoredInvoice & {
   refunds: StoredRefund[];
   /** What the document asks to be paid: the total less withholding tax (legacy's "Payment Amount"). */
   payment_amount: number;
+  /**
+   * Paid beyond the total, refunds and credits taken back: a cash-on-tour deduction made after the agent
+   * paid leaves the invoice overpaid (todo/money-model.md slice 4).
+   */
+  overpaid: number;
   booking_ids: string[];
   payments: PaymentView[];
 };
@@ -129,7 +138,8 @@ export function invoiceView(invoice: StoredInvoice, payments: readonly StoredPay
   const paid = paidOf(payments);
   const refunded = returnedOf(refunds.filter((r) => r.kind === 'refund')), credited = returnedOf(refunds.filter((r) => r.kind === 'credit'));
   return {
-    ...invoice, lines: invoice.lines.map((l) => ({ ...l })), ...invoiceState(invoice, cents(paid - refunded - credited)), paid, refunded, credited,
+    ...invoice, lines: invoice.lines.map((l) => ({ ...l, cot_date: l.cot_date ?? null })), ...invoiceState(invoice, cents(paid - refunded - credited)), paid, refunded, credited,
+    overpaid: invoice.voided ? 0 : Math.max(0, cents(paid - refunded - credited - invoice.total)),
     refunds: refunds.map((r) => ({ ...r })),
     payment_amount: cents(invoice.total - (invoice.wht_amount ?? 0)), booking_ids: bookingIdsOf(invoice),
     payments: payments.map((p) => ({ ...p, slips: p.slips.map((id) => fileRef(files, id)) })),
@@ -248,6 +258,8 @@ export function parseNewInvoice(body: Record<string, unknown>): NewInvoiceReques
 export type IssuableBooking = {
   id: string; agent_id?: string; status: BookingStatus; voucher_ref?: string; route_id: string; service_date: string;
   total?: number; fee_items: readonly { label: string | null; amount: number }[]; invoice: BookingInvoice | null;
+  /** Its cash-on-tour decisions' deductions (`after-trip.ts`): each a minus line on the invoice. */
+  cot_deductions?: readonly { service_date: string; deduct: number }[];
 };
 
 /**
@@ -262,6 +274,10 @@ export function invoiceLines(agentId: string, bookings: readonly IssuableBooking
     if (b.invoice) refuse(`Booking ${b.id} is already on invoice ${b.invoice.number}`, 409, 'booking_already_invoiced');
     lines.push({ seq: lines.length, booking_id: b.id, label: [b.voucher_ref ?? b.id, routeName(b.route_id) ?? b.route_id, b.service_date].filter(Boolean).join(' · '), amount: b.total ?? 0, discount: null, ...NOT_REMOVED });
     for (const f of b.fee_items) lines.push({ seq: lines.length, booking_id: b.id, label: f.label || 'Fee', amount: f.amount, discount: null, ...NOT_REMOVED });
+    // Cash on tour already taken off the agent's bill (decided 2026-10-09): legacy billed it in full.
+    for (const d of b.cot_deductions ?? []) {
+      if (d.deduct > 0) lines.push({ seq: lines.length, booking_id: b.id, label: cotLineLabel(d.service_date), amount: -d.deduct, discount: null, ...NOT_REMOVED, cot_date: d.service_date });
+    }
   }
   return lines;
 }
@@ -342,6 +358,7 @@ export function withDiscounts(invoice: StoredInvoice, payments: readonly StoredP
   (raw as unknown[]).forEach((item, i) => {
     const r = item !== null && typeof item === 'object' ? item as Record<string, unknown> : badRequest(`lines[${i}] must be an object`);
     const line = next.get(r.seq as number) ?? badRequest(`lines[${i}].seq must be one of the invoice's lines (${invoice.lines.map((l) => l.seq).join(', ')})`);
+    if (line.cot_date && r.discount !== null && r.discount !== 0) badRequest(`lines[${i}] is a cash-on-tour deduction: it takes no discount (change the decision instead)`);
     const d = r.discount;
     if (d !== null && !(typeof d === 'number' && Number.isFinite(d) && d >= 0)) badRequest(`lines[${i}].discount must be a number, 0 or more`);
     line.discount = d === null || d === 0 ? null : cents(d as number);
