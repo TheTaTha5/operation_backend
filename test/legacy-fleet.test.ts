@@ -97,3 +97,26 @@ test('a planned-ahead note gives its numbers, up to other text', () => {
   assert.equal(plannedOverFromNote('Maintenance Job MJ-008'), null);
   assert.equal(plannedOverFromNote(null), null);
 });
+
+test('pier assignments: legacy id kept, cancelled kept as cancelled, order by the boat\'s list, rows the table cannot take skipped', async () => {
+  const { mapLegacyAssignments } = await import('../src/tools/legacy-fleet.js');
+  const r = report();
+  const row = (fields: Record<string, unknown>) => ({ boats_id: 'b1', idx: '0', row_pk: 'boats__assignments:mv1', id: 'asn_1', type: 'temporary', frompier: 'tublamu', topier: 'panwa',
+    startdate: '2026-05-21', enddate: '2026-08-31', reason: '', cost: '0', status: 'active', createddate: '2026-05-23', ...fields });
+  const out = mapLegacyAssignments([
+    row({ idx: '1', id: 'asn_2', status: 'cancelled', cost: '1200.5', reason: 'charter' }),
+    row({}),
+    row({ id: 'asn_3', boats_id: 'b9' }),
+    row({ id: 'asn_4', topier: 'tublamu' }),
+    row({ id: 'asn_5', enddate: '2026-05-01' }),
+    row({ id: 'asn_6', topier: 'shop' }),
+    row({ id: '', row_pk: 'boats__assignments:mvx', startdate: '' }),
+  ], { boats }, r);
+  assert.deepEqual(out.map((a) => [a.id, a.cancelled, a.cost, a.reason, a.created_date]), [['asn_1', false, 0, null, '2026-05-23'], ['asn_2', true, 1200.5, 'charter', '2026-05-23']]);
+  assert.ok(out[0].created_at < out[1].created_at, 'legacy\'s list order survives the same created day');
+  assert.equal(out[0].created_at, '2026-05-22T17:00:00.000Z');
+  assert.deepEqual(r.skipped, [
+    'assignment asn_4: the same pier at both ends', 'assignment asn_5: it ends before it starts',
+    'assignment asn_6: pier tublamu → shop is not one of tublamu, panwa, ranong', 'assignment asn_mvx: a date is missing', 'assignment asn_3: boat b9 is not here',
+  ]);
+});

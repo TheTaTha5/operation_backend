@@ -11,12 +11,15 @@
 import { ENGINE_STATUSES, PROPELLER_STATUSES, logEntry, type AssetLogEntry, type Engine, type Gearbox, type Propeller } from '../domain/fleet-assets.js';
 import { DAMAGE_TYPES, JOB_BOAT_STATUSES, JOB_TYPES, OUTCOMES, type DamageType, type Incident, type Job, type ProgressLine } from '../domain/fleet-jobs.js';
 import type { Report } from './legacy-records.js';
+import type { Assignment } from '../domain/fleet-assignments.js';
 
 type Row = Record<string, unknown>;
 export type FleetSource = {
   engines: Row[]; engineLog: Row[]; gearboxes: Row[]; gearboxLog: Row[]; propellers: Row[]; propellerLog: Row[];
   incidents: Row[]; incidentAssets: Row[]; incidentLog: Row[]; incidentJobs: Row[];
   jobs: Row[]; jobAssets: Row[]; jobParts: Row[]; jobLog: Row[];
+  /** `boats__assignments` (fleet extras), mapped by `mapLegacyAssignments`. */
+  assignments?: Row[];
 };
 export type FleetRows = { engines: Engine[]; gearboxes: Gearbox[]; propellers: Propeller[]; incidents: Incident[]; jobs: Job[] };
 
@@ -219,4 +222,33 @@ function noteDuplicates(rows: readonly { no: string }[], what: string, report: R
   const counts = new Map<string, number>();
   for (const r of rows) counts.set(r.no, (counts.get(r.no) ?? 0) + 1);
   for (const [no, n] of counts) if (n > 1) report.note(`${what} number ${no} used ${n} times (imported as is)`);
+}
+
+const PIERS = ['tublamu', 'panwa', 'ranong'];
+/**
+ * Legacy's pier assignments (`boats__assignments`, "Design — extras" 1) as `boat_assignments` rows.
+ * Legacy's id is kept; its stored status is not (it is computed here) except `cancelled`. A row the
+ * table cannot take (no boat here, a pier that is not one, the same pier twice, dates missing or
+ * backwards) is skipped with the reason. Legacy kept no creator or time: the row's `createddate` at
+ * midnight in Thailand, plus its place in the boat's list, keeps legacy's order (the first covering
+ * one wins).
+ */
+export function mapLegacyAssignments(rows: readonly Row[], ctx: { boats: ReadonlySet<string> }, report: Report): Assignment[] {
+  const out: Assignment[] = [];
+  for (const r of [...rows].sort((a, b) => str(a.boats_id).localeCompare(str(b.boats_id)) || Number(a.idx) - Number(b.idx))) {
+    const id = str(r.id) || `asn_${str(r.row_pk).split(':').pop()}`;
+    const boat = str(r.boats_id), from = str(r.frompier), to = str(r.topier), start = str(r.startdate).slice(0, 10), end = str(r.enddate).slice(0, 10);
+    const why = !ctx.boats.has(boat) ? `boat ${boat} is not here` : !PIERS.includes(from) || !PIERS.includes(to) ? `pier ${from} → ${to} is not one of ${PIERS.join(', ')}`
+      : from === to ? 'the same pier at both ends' : !isDay(start) || !isDay(end) ? 'a date is missing' : end < start ? 'it ends before it starts' : null;
+    if (why) { report.skip('assignment', id, why); continue; }
+    const created = isDay(str(r.createddate).slice(0, 10)) ? str(r.createddate).slice(0, 10) : start;
+    const type = str(r.type) === 'permanent' ? 'permanent' : 'temporary';
+    if (str(r.type) !== type) report.note(`assignment type "${str(r.type)}" read as temporary`);
+    out.push({
+      id, boat_id: boat, type, from_pier: from, to_pier: to, start_date: start, end_date: end, reason: text(r.reason), cost: money(r.cost) ?? 0,
+      cancelled: str(r.status) === 'cancelled', cancelled_at: null, cancelled_by: null, created_date: created,
+      created_at: new Date(Date.parse(`${created}T00:00:00+07:00`) + Number(r.idx ?? 0) * 1000).toISOString(), created_by: null,
+    });
+  }
+  return out;
 }
