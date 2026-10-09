@@ -29,52 +29,9 @@ project documents. Left behind in legacy: 248 files nobody names, the daily-repo
 Migration 041, `src/domain/allergies.ts`, `PUT /v1/bookings/{id}/meals` for the pier (B1); README → "Allergy
 list and pier meals".
 
-## 3. Document check
+## 3. Document check: built
 
-**Legacy.** `bk.docCheck`, B2B bookings only: staff compare the agent's attached document with the
-booking.
-- **Column:** `doccheck`, since 2026-07-03.
-- **Shape:** `{status, by, at, note, items{route, date, lead, pax, voucher, payment}, pre}`.
-- **Status:** `verified` or `issue` (`docCheckSetStatus`, which logs "Document check · ✅ verified"
-  with tag `DocCheck`). `pending` is only a default.
-- **`pre`:** the browser's own OCR of the image attachments (Tesseract), matched against the
-  booking: per item `{s: match|maybe|mismatch|none, ev, detail}`, a summary, and up to 3,000
-  characters of raw OCR text. It auto-ticks matching items.
-- **Data:** 3,181 bookings; `verified` 3,151, `pending` 29, `issue` never used.
-  - 11 are verified without all six ticks.
-  - 3,131 have a pre-check.
-  - 2,408 history lines.
-
-**Proposed.** A fixed set of fields, so columns, in their own table (one per booking):
-```sql
-CREATE TABLE booking_doc_checks (
-  booking_id TEXT PRIMARY KEY REFERENCES bookings (id) ON DELETE CASCADE,
-  status TEXT CHECK (status IN ('pending', 'verified', 'issue')), by TEXT, at TIMESTAMPTZ, note TEXT,
-  route_ok BOOLEAN NOT NULL DEFAULT false, date_ok BOOLEAN NOT NULL DEFAULT false, lead_ok BOOLEAN NOT NULL DEFAULT false,
-  pax_ok BOOLEAN NOT NULL DEFAULT false, voucher_ok BOOLEAN NOT NULL DEFAULT false, payment_ok BOOLEAN NOT NULL DEFAULT false,
-  pre_at TIMESTAMPTZ, pre_error TEXT, pre_text TEXT        -- pre_text: decision C2
-);
-CREATE TABLE booking_doc_check_results (     -- the pre-check, per item
-  booking_id TEXT NOT NULL REFERENCES booking_doc_checks (booking_id) ON DELETE CASCADE,
-  item TEXT NOT NULL CHECK (item IN ('route', 'date', 'lead', 'pax', 'voucher', 'payment', 'cot')),
-  result TEXT NOT NULL CHECK (result IN ('match', 'maybe', 'mismatch', 'none')), evidence TEXT, detail TEXT,
-  PRIMARY KEY (booking_id, item)
-);
-```
-- `PUT /v1/bookings/{id}/doc-check/items/{item}` `{checked}`: area `operations`.
-- `PUT /v1/bookings/{id}/doc-check/status` `{status, note?}`: the server stamps `by` and `at`, and
-  logs legacy's line.
-- `PUT /v1/bookings/{id}/doc-check/note` `{note}`.
-- `PUT /v1/bookings/{id}/doc-check/pre`: the browser's OCR result, stored as sent (a client fact:
-  the OCR runs in the browser).
-- Every booking read carries `doc_check`, or `null`. The import brings all 3,181.
-
-**Decisions.**
-- **C1.** Must `verified` need all six ticks? Legacy doesn't (11 bookings).
-- **C2.** Keep the raw OCR text (`pre.text`, up to 3,000 characters of a voucher, so names and
-  numbers)? Proposed: no, keep only the per-item results.
-- **C3.** Legacy lets anyone edit the note (no area guard). Require `operations` like the rest
-  (proposed)?
+Migration 042, `src/domain/doc-check.ts`; README → "Document check".
 
 ## 4. Pickup areas and pickup times
 

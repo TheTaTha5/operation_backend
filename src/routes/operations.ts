@@ -23,6 +23,8 @@ import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
+import { assertDocCheckEcho, parseDocItem, withItem, withNote, withPre, withStatus as withDocStatus, type DocCheck } from '../domain/doc-check.js';
+import type { HistoryLine } from '../domain/booking-actions.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
 import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeStored, upgradeUndoneLine } from '../domain/upgrades.js';
 import { assertKnownFiles, documentRows, MAX_ATTACHMENT_BYTES, newAttachmentId, parseAttachmentIds, parseUpload } from '../domain/attachments.js';
@@ -684,6 +686,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       await assertBookingFresh(request);
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
       assertReconfirmEcho(body.reconfirm, stored.reconfirm);
+      assertDocCheckEcho(body.doc_check, stored.doc_check);
       let header = changes.header;
       let warnings: PriceWarning[] = [];
       let priced: Awaited<ReturnType<typeof priceFor>> | undefined;
@@ -749,6 +752,28 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return (await syncAltParts(done)) ? (await store.booking(done.id))! : done;
     });
   });
+  /**
+   * The document check (todo/booking-extras-model.md §3; legacy `docCheck*`): six ticks, a verdict, a
+   * note, and the browser's OCR pre-check. Each answers the booking.
+   */
+  const docCheckWrite = (path: string, apply: (current: Booking['doc_check'], body: Record<string, unknown>, ctx: { by: string | null; params: Record<string, string> }) =>
+    { record: DocCheck; history?: HistoryLine } | DocCheck) =>
+    app.put(`/v1/bookings/:id/doc-check${path}`, async (request) => {
+      const body = record(request.body);
+      return store.transaction(async () => {
+        const booking = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+        const out = apply(booking.doc_check, body, { by: actorOf(request.user) ?? null, params: request.params as Record<string, string> });
+        const next = 'record' in out ? out : { record: out };
+        await store.setDocCheck(booking.id, next.record);
+        if (next.history) await store.addHistory(booking.id, next.history);
+        return (await store.booking(booking.id))!;
+      });
+    });
+  docCheckWrite('/items/:item', (current, body, ctx) => withItem(current, parseDocItem(ctx.params.item), body));
+  docCheckWrite('/status', (current, body, ctx) => withDocStatus(current, body, new Date().toISOString(), ctx.by));
+  docCheckWrite('/note', (current, body) => withNote(current, body));
+  docCheckWrite('/pre', (current, body) => withPre(current, body));
+
   /**
    * The pier's meal editor (legacy `pckMealSave`; todo/booking-extras-model.md §2): changes the meal
    * counts and the allergy text, and the server stamps who changed them at the pier, and when.

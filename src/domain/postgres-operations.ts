@@ -30,6 +30,7 @@ import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from 
 import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
 import type { Allergy } from './allergies.js';
+import { DOC_ITEMS, type DocCheck } from './doc-check.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
 import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
@@ -133,6 +134,8 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     ) ORDER BY t.seq)
     FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips,
   (SELECT to_jsonb(rc) - 'booking_id' FROM booking_reconfirmations rc WHERE rc.booking_id = b.id) AS reconfirm,
+  (SELECT to_jsonb(dc) || jsonb_build_object('results', COALESCE((SELECT jsonb_object_agg(r.item, jsonb_build_object('result', r.result, 'evidence', r.evidence, 'detail', r.detail))
+     FROM booking_doc_check_results r WHERE r.booking_id = dc.booking_id), '{}'::jsonb)) FROM booking_doc_checks dc WHERE dc.booking_id = b.id) AS doc_check,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
     FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers,
@@ -324,7 +327,7 @@ const booking = (row: QueryResultRow): Booking => {
     const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
     return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups),
       checkinsView(((t.checkins as Record<string, unknown>[]) ?? []).map(storedCheckin)), activeUpgrade(((t.upgrades as Record<string, unknown>[]) ?? []).map(tripUpgrade)));
-  }, storedReconfirm(row.reconfirm), new Map(((row.files as AttachmentRef[]) ?? []).map((f) => [f.id, { id: f.id, name: f.name, mime: f.mime, size: Number(f.size) }])));
+  }, storedReconfirm(row.reconfirm), new Map(((row.files as AttachmentRef[]) ?? []).map((f) => [f.id, { id: f.id, name: f.name, mime: f.mime, size: Number(f.size) }])), storedDocCheck(row.doc_check));
 };
 /** A check-in record from `CHECKINS_JSON`: its columns as jsonb, timestamps as ISO text. */
 const storedCheckin = (r: Record<string, unknown>): StoredCheckin => {
@@ -356,6 +359,17 @@ const tripUpgrade = (r: Record<string, unknown>): TripUpgrade => ({
   reason: String(r.reason), charge: Number(r.charge), upgrade_id: (r.upgrade_id as string) ?? null, at: jsonInstant(r.at), by: (r.by as string) ?? null,
   undone_at: r.undone_at ? jsonInstant(r.undone_at) : null, undone_by: (r.undone_by as string) ?? null,
 });
+/** The booking's document check from `BOOKING_SELECT` (migration 042). */
+const storedDocCheck = (r: Record<string, unknown> | null): DocCheck | null => {
+  if (!r) return null;
+  const t = (v: unknown) => (v === null || v === undefined ? null : String(v));
+  const hasPre = r.pre_at || r.pre_error || r.pre_text || Object.keys((r.results as object) ?? {}).length;
+  return {
+    status: (r.status as DocCheck['status']) ?? null, by: t(r.by), at: r.at ? jsonInstant(r.at) : null, note: t(r.note),
+    items: Object.fromEntries(DOC_ITEMS.map((k) => [k, r[`${k}_ok`] === true])) as DocCheck['items'],
+    pre: hasPre ? { at: r.pre_at ? jsonInstant(r.pre_at) : null, lang: t(r.pre_lang), error: t(r.pre_error), text: t(r.pre_text), results: (r.results as NonNullable<DocCheck['pre']>['results']) ?? {} } : null,
+  };
+};
 /** The booking's reconfirmation from `BOOKING_SELECT` (migration 035). */
 const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | null => r && {
   status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
@@ -657,6 +671,20 @@ export class PostgresOperationsStore {
   private async writeAllergies(bookingId: string, list: readonly Allergy[]): Promise<void> {
     await this.client().query('DELETE FROM booking_allergies WHERE booking_id = $1', [bookingId]);
     for (const [seq, a] of list.entries()) await this.client().query('INSERT INTO booking_allergies (booking_id, seq, name, qty) VALUES ($1,$2,$3,$4)', [bookingId, seq, a.name, a.qty]);
+  }
+  /** Writes a booking's document check whole, its pre-check results included. */
+  async setDocCheck(bookingId: string, d: DocCheck): Promise<void> {
+    await this.client().query(`INSERT INTO booking_doc_checks (booking_id, status, by, at, note, route_ok, date_ok, lead_ok, pax_ok, voucher_ok, payment_ok, pre_at, pre_lang, pre_error, pre_text)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (booking_id) DO UPDATE SET status = EXCLUDED.status, by = EXCLUDED.by, at = EXCLUDED.at, note = EXCLUDED.note, route_ok = EXCLUDED.route_ok,
+        date_ok = EXCLUDED.date_ok, lead_ok = EXCLUDED.lead_ok, pax_ok = EXCLUDED.pax_ok, voucher_ok = EXCLUDED.voucher_ok, payment_ok = EXCLUDED.payment_ok,
+        pre_at = EXCLUDED.pre_at, pre_lang = EXCLUDED.pre_lang, pre_error = EXCLUDED.pre_error, pre_text = EXCLUDED.pre_text`,
+      [bookingId, d.status, d.by, d.at, d.note, d.items.route, d.items.date, d.items.lead, d.items.pax, d.items.voucher, d.items.payment,
+        d.pre?.at ?? null, d.pre?.lang ?? null, d.pre?.error ?? null, d.pre?.text ?? null]);
+    await this.client().query('DELETE FROM booking_doc_check_results WHERE booking_id = $1', [bookingId]);
+    for (const [item, r] of Object.entries(d.pre?.results ?? {})) {
+      await this.client().query('INSERT INTO booking_doc_check_results (booking_id, item, result, evidence, detail) VALUES ($1,$2,$3,$4,$5)', [bookingId, item, r.result, r.evidence, r.detail]);
+    }
   }
   /** The pier's meal editor: who changed the meals there, and when (migration 041). */
   async stampPierMeals(id: string, at: string, by: string | null): Promise<void> {

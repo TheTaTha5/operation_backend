@@ -1541,6 +1541,36 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
 
+### Document check
+
+Staff compare the agent's attached document with the booking (legacy's Doc Check screen, B2B
+bookings). Every booking read carries `doc_check` (or `null`) and `doc_check_status`.
+
+```jsonc
+"doc_check": { "status": "verified", "by": "Nok", "at": "2026-09-09T10:02:11.000Z", "note": null,
+  "items": { "route": true, "date": true, "lead": true, "pax": true, "voucher": true, "payment": false },
+  "pre": { "at": "…", "lang": "eng", "error": null, "text": "VOUCHER …",
+           "results": { "lead": { "result": "match", "evidence": "MR SMITH", "detail": null } },
+           "summary": { "match": 1, "maybe": 0, "mismatch": 0, "none": 5 } } },
+"doc_check_status": "verified"
+```
+
+| Method + path | Body | Rule |
+|---|---|---|
+| `PUT /v1/bookings/{id}/doc-check/items/{item}` | `{checked}` | `item`: `route`, `date`, `lead`, `pax`, `voucher`, `payment` |
+| `PUT /v1/bookings/{id}/doc-check/status` | `{status: "verified" \| "issue", note?}` | Stamps `by`/`at` and logs "Document check · ✅ verified[ · note]". Verified doesn't need every tick, as legacy (decision C1) |
+| `PUT /v1/bookings/{id}/doc-check/note` | `{note}` | Any login may edit it, as legacy (decision C3) |
+| `PUT /v1/bookings/{id}/doc-check/pre` | `{at?, lang?, error?, text?, results: {item: {s\|result, ev\|evidence, detail}}, auto_tick?}` | The browser's OCR pre-check, kept as sent, raw text included (up to 3,000 characters; decision C2). Items it matched are ticked unless `auto_tick: false`; it never unticks one |
+
+- Each answers the booking. The first write creates the record as `pending`, as legacy does.
+- Ticks, status and the pre-check need the `operations` edit area.
+- **Computed:**
+  - `pre.summary` counts the six items' results;
+  - **`doc_check_status`** is legacy's `docCheckStatus`: the record's status, else `pending` when
+    the booking has `attachments`, else `nofiles`.
+- `PATCH /v1/bookings/{id}` may echo `doc_check` unchanged; another value is `400`.
+- The import brings every legacy record (3,204 on 2026-10-09).
+
 ### Allergy list and pier meals
 
 **`allergy_list`** is who can't eat what, for the kitchen: `[{name, qty}]`, `qty` being people.

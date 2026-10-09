@@ -539,7 +539,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [], allergies: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [], allergies: Row[] = [], docChecks: Row[] = [], docResults: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -715,6 +715,26 @@ async function main() {
           }));
           if (legacyAddOnRows.some((a) => Number(a.jad) === 0 && Number(a.jchd) === 0 && a.jad !== null)) note('add-ons imported with a join of 0 adults and 0 children: nobody joins');
         } catch (error) { note(`add-ons dropped: ${(error as Error).message}`); }
+      }
+      // The document check (migration 042), as legacy stored it; the pre-check's raw text kept (decision C2).
+      const dc = jsonValue(b.doccheck) as Row | null;
+      if (dc && typeof dc === 'object') {
+        const items = dc.items && typeof dc.items === 'object' ? dc.items as Row : {};
+        if (Object.keys(items).some((k) => !['route', 'date', 'lead', 'pax', 'voucher', 'payment'].includes(k))) note('document check items dropped: not one of the six');
+        const pre = dc.pre && typeof dc.pre === 'object' ? dc.pre as Row : null;
+        const status = str(dc.status);
+        docChecks.push({
+          booking_id: id, status: ['pending', 'verified', 'issue'].includes(status) ? status : null, by: str(dc.by) || null, at: instant(dc.at) ?? null, note: str(dc.note) || null,
+          route_ok: items.route === true, date_ok: items.date === true, lead_ok: items.lead === true, pax_ok: items.pax === true, voucher_ok: items.voucher === true, payment_ok: items.payment === true,
+          pre_at: pre ? instant(pre.at) ?? null : null, pre_lang: pre ? str(pre.lang) || null : null, pre_error: pre ? str(pre.error) || null : null,
+          pre_text: pre && str(pre.text) ? str(pre.text).slice(0, 3000) : null,
+        });
+        const results = pre?.results && typeof pre.results === 'object' ? pre.results as Record<string, Row> : {};
+        for (const [item, r] of Object.entries(results)) {
+          const result = str(r?.s ?? r?.result);
+          if (!['route', 'date', 'lead', 'pax', 'voucher', 'payment', 'cot'].includes(item) || !['match', 'maybe', 'mismatch', 'none'].includes(result)) { note('document check results dropped: unknown item or result'); continue; }
+          docResults.push({ booking_id: id, item, result, evidence: str(r.ev ?? r.evidence) || null, detail: str(r.detail) || null });
+        }
       }
       // The allergy list (migration 041), through the API's own parser: 29 legacy bookings have one.
       const rawAllergies = jsonValue(b.specialmeals_allergylist);
@@ -1045,6 +1065,8 @@ async function main() {
     await insert('booking_upgrade_slips', upgradeSlips);
     await insert('booking_documents', documents);
     await insert('booking_allergies', allergies);
+    await insert('booking_doc_checks', docChecks);
+    await insert('booking_doc_check_results', docResults);
     await insert('booking_addons', bookingAddOns);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);
