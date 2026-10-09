@@ -1,6 +1,6 @@
 /**
  * Legacy fleet part B → this service's rows (todo/fleet-maintenance-model.md, "Design — part B",
- * decision 10). Pure: `import-fleet.ts` reads legacy, hands the rows here, and writes what comes back.
+ * decision 10). Pure: `import-fleet-stock.ts` reads legacy, hands the rows here, and writes what comes back.
  *
  * - The eight spellings of the warehouses map to the three; everything else comes as it is and odd
  *   rows are listed (MO-077 and MO-117 twice, the PRJ-001…007 copies, duplicate stock items).

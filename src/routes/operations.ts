@@ -48,7 +48,7 @@ import {
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { parseJobDate, parsePickupNameTh, sendFor, vanJobsDay } from '../domain/van-jobs.js';
 import { registerSalesRoutes } from './sales-editing.js';
-import { registerFleetRoutes } from './fleet.js';
+import { registerFleetStockRoutes } from './fleet-stock.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
@@ -1649,7 +1649,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       if (!(await store.attachmentFile(id))) notFound(`Attachment ${id} not found`);
       const users = await store.attachmentBookings(id);
       if (users.length) refuseWith(`Attachment ${id} is still on booking ${users.map((b) => b.id).join(', ')}: take it off first`, 409, 'attachment_in_use');
-      const projects = await store.fleet.attachmentProjects(id);
+      const projects = await store.fleetRepo.attachmentProjects(id);
       if (projects.length) refuseWith(`Attachment ${id} is still a document of fleet project ${projects.join(', ')}: take it off first`, 409, 'attachment_in_use');
       await store.deleteAttachment(id);
     });
@@ -1886,7 +1886,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * insurance: `sales-editing.ts` (todo/sales-editing-model.md).
    */
   registerSalesRoutes(app, { store, assertBookingFresh, agentCredit });
-  registerFleetRoutes(app, { store });
+  registerFleetStockRoutes(app, { store });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an

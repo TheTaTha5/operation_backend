@@ -1137,7 +1137,7 @@ erDiagram
 ## 9. Fleet maintenance, part B: stock, memos, projects, Daily Fleet Log, safety
 
 Migrations 140–143 (`todo/fleet-maintenance-model.md`, "Design — part B"). The rules are in
-`src/domain/fleet-*.ts`; both stores reach these tables through `store.fleet` (`fleet-store.ts`,
+`src/domain/fleet-*.ts`; both stores reach these tables through `store.fleetRepo` (`fleet-store.ts`,
 `fleet-postgres.ts`). Part A's jobs and engines are named by text ids (`job_id`, `engine_id`).
 
 ```mermaid

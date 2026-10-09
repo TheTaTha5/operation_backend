@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { legacyWarehouse, mapDaily, mapMemos, mapProjects, mapSafety, mapStock } from '../src/tools/legacy-fleet.js';
+import { legacyWarehouse, mapDaily, mapMemos, mapProjects, mapSafety, mapStock } from '../src/tools/legacy-fleet-stock.js';
 
-// The fleet import's mapping (src/tools/legacy-fleet.ts), on rows shaped as legacy stores them.
+// The fleet import's mapping (src/tools/legacy-fleet-stock.ts), on rows shaped as legacy stores them.
 const NOW = '2026-10-09T03:00:00.000Z';
 
 test('the eight warehouse spellings map to the three', () => {

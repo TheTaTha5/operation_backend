@@ -109,8 +109,8 @@ test('stock: merging duplicates moves their stock and repoints memo lines', asyn
   const a = ok(await call(fleet, 'POST', '/v1/fleet/stock-items', { name: `Anode ${run}`, part_no: 'AN-1', qty: 3, warehouse: 'panwa', cost: 50 }), 201);
   const b = ok(await call(fleet, 'POST', '/v1/fleet/stock-items', { name: `Anode x ${run}`, part_no: 'AN-1', qty: 2, warehouse: 'tublamu', supplier: 'Sup' }), 201);
   // Make b a true duplicate the way legacy data arrives: the API never creates one, so this goes through the store.
-  const stored = await store.fleet.item(b.id);
-  await store.transaction(async () => store.fleet.putItems([{ ...stored!, name: `Anode ${run}` }]));
+  const stored = await store.fleetRepo.item(b.id);
+  await store.transaction(async () => store.fleetRepo.putItems([{ ...stored!, name: `Anode ${run}` }]));
   const memo = ok(await call(fleet, 'POST', '/v1/fleet/memos', { no: `MO-M${run}`, title: 'anodes', lines: [{ name: `Anode ${run}`, qty: 1, price: 50, item_id: b.id }] }), 201);
   const kept = ok(await call(fleet, 'POST', `/v1/fleet/stock-items/${a.id}/merge`, { from_ids: [b.id] }));
   assert.equal(kept.total_qty, 5);

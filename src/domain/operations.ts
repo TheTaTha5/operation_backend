@@ -394,7 +394,7 @@ export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusio
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
 export class OperationsStore {
   /** Fleet part B (todo/fleet-maintenance-model.md): stock, memos, projects, the Daily Fleet Log, safety. */
-  readonly fleet = new MemoryFleetRepo();
+  readonly fleetRepo = new MemoryFleetRepo();
   private deployments: Deployment[] = [];
   private bookings = new Map<string, StoredBooking>();
   private histories = new Map<string, HistoryEntry[]>();

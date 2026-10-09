@@ -1,6 +1,6 @@
 /**
  * Where fleet part B keeps its rows (todo/fleet-maintenance-model.md, "Design — part B"): one
- * interface, two implementations, reached as `store.fleet` on either store. `MemoryFleetRepo` is the
+ * interface, two implementations, reached as `store.fleetRepo` on either store. `MemoryFleetRepo` is the
  * in-process one; `PostgresFleetRepo` (fleet-postgres.ts) runs inside the store's transaction.
  *
  * The repositories only read and write rows. Every decision is in the pure modules (`fleet-stock`,

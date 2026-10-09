@@ -41,9 +41,9 @@ type Request = FastifyRequest;
 const param = (request: Request, name = 'id'): string => (request.params as Record<string, string>)[name];
 const query = (request: Request): Record<string, unknown> => (request.query ?? {}) as Record<string, unknown>;
 
-export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }): void {
+export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: Store }): void {
   const { store } = deps;
-  const fleet = (): FleetRepo => store.fleet as FleetRepo;
+  const fleet = (): FleetRepo => store.fleetRepo as FleetRepo;
   const ctx = (request: Request) => ({ now: new Date().toISOString(), today: todayInThailand(), by: actorOf(request.user) ?? null });
   const boatExists = async (id: string): Promise<boolean> => (await store.boatRecord(id)) !== undefined;
   const assertBoat = async (id: string | null | undefined, field = 'boat_id'): Promise<void> => {

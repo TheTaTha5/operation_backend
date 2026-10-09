@@ -83,7 +83,7 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:boats [-- --commit]` | Seed the boat catalogue the same way: every field of the boat form, its documents and status log. Dry run unless `--commit`; adds what is missing, refreshes a boat never edited here, never touches one edited here, never deletes. Legacy's `totalcap` becomes `registered_persons`, never a selling limit. Run the import afterwards so deployments on a new boat are imported. |
-| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit] [--all]` | Import legacy's fleet stock, memos, projects, Daily Fleet Log and safety equipment (see "Fleet maintenance"). Dry run unless `--commit`; rerunnable; run after `seed:boats` and `import:attachments`. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet-stock [-- --commit] [--all]` | Import legacy's fleet stock, memos, projects, Daily Fleet Log and safety equipment (see "Fleet maintenance"). Dry run unless `--commit`; rerunnable; run after `seed:boats` and `import:attachments`. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
 
 ### Checking an import
@@ -3135,7 +3135,7 @@ after each, the latest pass or needs-work sets `last_inspect` and `next_pm`.
 **Report.** `GET /v1/fleet/reports/memo-spend?from=&to=` → approved, received and paid memos by
 supplier, type, scope, boat and status.
 
-**Import.** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]` (after
+**Import.** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet-stock [-- --commit]` (after
 `seed:boats` and `import:attachments`). Dry run unless `--commit`; rerunnable while legacy is the
 master. The eight warehouse spellings map to the three; where an item's history does not add up to
 legacy's stock, an `import` movement makes it match; duplicates and odd rows come as they are and are

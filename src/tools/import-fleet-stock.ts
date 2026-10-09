@@ -1,9 +1,9 @@
 /**
  * Imports legacy fleet part B (todo/fleet-maintenance-model.md, "Design — part B"): stock items and
  * their history, consumables, purchase memos, projects, the Daily Fleet Log and its extras, safety
- * equipment. The mapping is `legacy-fleet.ts`.
+ * equipment. The mapping is `legacy-fleet-stock.ts`.
  *
- *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]
+ *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet-stock [-- --commit]
  *
  * Run it after `seed:boats` and `import:attachments` (project documents link to the copied files).
  * Without `--commit` it is a dry run: everything is written in one transaction, the report printed,
@@ -18,7 +18,7 @@
 import { Client, type PoolClient } from 'pg';
 import { PostgresFleetRepo } from '../domain/fleet-postgres.js';
 import { todayInThailand } from '../domain/calendar.js';
-import { mapConsumables, mapDaily, mapMemos, mapProjects, mapSafety, mapStock, type Listed } from './legacy-fleet.js';
+import { mapConsumables, mapDaily, mapMemos, mapProjects, mapSafety, mapStock, type Listed } from './legacy-fleet-stock.js';
 
 const commit = process.argv.includes('--commit');
 const sourceUrl = process.env.SOURCE_DATABASE_URL;

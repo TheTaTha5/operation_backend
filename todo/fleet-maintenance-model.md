@@ -433,7 +433,7 @@ The Fleet Deployment planning board can stay a client draft unless shared plans 
 ## Part B: built (branch `feat/fleet-stock-memos-log-projects`)
 
 Stock with append-only movements, consumables, purchase memos, projects, the Daily Fleet Log with the
-enforced day lock, safety equipment, the memo spend report and `npm run import:fleet` (migrations
+enforced day lock, safety equipment, the memo spend report and `npm run import:fleet-stock` (migrations
 140–143). The contract is README → "Fleet maintenance"; the legacy read of these screens is removed
 from this note. Rehearsed 2026-10-09 on a copy: 616 items, 1,267 movements (+7 reconciliation, 522
 receipts linked to their memo), 226 memos / 1,119 lines, 1 consumable, 21 projects (316 log lines,
