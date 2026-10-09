@@ -1,6 +1,7 @@
 # Van job orders, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); not designed yet.
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09; designed below
+("Design"), being built on `feat/van-job-orders` (migration 080).
 
 In short: a job order is the printed sheet a van driver gets for one van, one programme, one day
 (one per round when the van runs the programme twice). Legacy builds it entirely in the browser
@@ -205,3 +206,144 @@ The groups, vans, pickup times and sequence the sheet is built from are booking 
 7. **Template and row highlights:** the client's; `vanjob_th_flag` dropped.
 8. **Permissions:** `operations` for writes, as legacy.
 9. **Change feed:** not now (vans and van jobs stay out of the feed).
+
+## Design (2026-10-09)
+
+### What a job is
+
+- **An outbound job** is a van group that has a van and something to carry that day: a member, a
+  cancelled member still in the group (printed struck through), or a van stop. Its key is the
+  **group's id**. A van with two groups of one route that day runs two rounds, two jobs.
+- **A return-only job** is a van that brings passengers back from a route's pier but takes no group of
+  that route out. Its key is `<van_id>~<route_id>` (legacy's own key shape); the date is in the path.
+- **The return leg** of a van on a route prints on its first round's sheet (legacy §vjRound3), or on
+  its return-only job. A part comes back on `part.return_van_id`, else its group's `return_van_id`,
+  else its group's van (legacy `vanReturnId || vanId`).
+- **Rounds** (legacy `vjRoundAll`/`vjRoundPick`): a van's outbound jobs on one route, ordered by the
+  earliest pickup among their rows (final pickup, else booked; none = last), then group number.
+  `round` is `{no, of, time}`, or `null` when the van runs the route once.
+
+### Fields and authority
+
+| Field | Kind | Rule |
+|---|---|---|
+| the job list, the sheet, every count and row on them | computed | `src/domain/van-jobs.ts`, from bookings, groups, stops, vans, van days, routes, pickup areas, Thai names |
+| `sent.at`, `sent.by` | computed | stamped by `PUT …/sent` (the clock, the login); a `sent_at` in the body is `400` |
+| `sent.changed_since_sent` | computed | the sheet's fingerprint now ≠ the one stored when it was sent; `null` for a mark imported from legacy (no fingerprint) |
+| `bookings.job_note` | client fact | text; `null` = print the notes; `""` = print nothing (legacy's blanked override) |
+| booking read `special_request` | computed | `job_note` when set (`""` → `null`), else `notes` |
+| `pickup_name_th` row | client fact | one Thai name per pickup text; the key (trimmed, lower-cased) is computed |
+| `van_groups.display_order` | validated | `PUT /operations/van-groups/order`: every id a group of that date, route and zone, once each |
+| `van_days.sent_at` | removed | moved to the job; sending it to `PUT /operations/van-days/…` is `400` naming `PUT /operations/van-jobs/{date}/{key}/sent` |
+
+**The fingerprint** is a SHA-256 of what the driver acts on, in print order: the van, the driver of
+the day (name, phone, plate), and per row the booking, trip and parts, the four counts, pickup time,
+pickup, room, zone, drop-off, return van, bags, special request, struck-through, overnight; per stop
+its label, seats, leg, time, place, phone and note. Thai names, row numbers and highlights are
+presentation and left out. A change that is undone reads as unchanged again.
+
+### Migration 080
+
+```sql
+ALTER TABLE bookings ADD COLUMN job_note TEXT;              -- NULL = the notes, '' = blanked
+
+CREATE TABLE van_job_sends (
+  id BIGSERIAL PRIMARY KEY,
+  group_id TEXT UNIQUE REFERENCES van_groups (id) ON DELETE CASCADE,   -- an outbound job
+  service_date DATE, route_id TEXT REFERENCES routes (id),              -- a return-only job
+  van_id TEXT REFERENCES vans (id) ON DELETE CASCADE,
+  sent_at TIMESTAMPTZ NOT NULL, sent_by TEXT,
+  fingerprint TEXT,                                                     -- NULL = imported, unknown
+  CHECK (CASE WHEN group_id IS NULL THEN num_nonnulls(service_date, route_id, van_id) = 3
+              ELSE num_nonnulls(service_date, route_id, van_id) = 0 END)
+);
+CREATE UNIQUE INDEX van_job_sends_return_only ON van_job_sends (service_date, route_id, van_id) WHERE group_id IS NULL;
+-- van_days.sent_at moves to every group that van had that day, then goes.
+INSERT INTO van_job_sends (group_id, sent_at)
+  SELECT g.id, d.sent_at FROM van_days d JOIN van_groups g ON g.van_id = d.van_id AND g.service_date = d.service_date
+  WHERE d.sent_at IS NOT NULL;
+ALTER TABLE van_days DROP COLUMN sent_at;
+DELETE FROM van_days WHERE num_nonnulls(status, zone, driver, driver_phone, plate) = 0;
+
+CREATE TABLE pickup_name_th (
+  name_key TEXT PRIMARY KEY,            -- trim + lower case, computed by pickupNameKey()
+  name TEXT NOT NULL,                   -- as last typed
+  name_th TEXT NOT NULL CHECK (name_th <> ''),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_by TEXT
+);
+
+ALTER TABLE van_groups ADD COLUMN display_order INTEGER CHECK (display_order > 0);
+```
+
+### Contract
+
+Reads open to any login; writes need the `operations` area (writeNeed). Nothing here enters the
+change feed.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /operations/van-jobs?date=[&route_id=]` | — | `{date, jobs, unassigned, return_unarranged, self_arrive, struck}` |
+| `GET /operations/van-jobs/{date}/{key}` | — | `{job, out, ret, ret_on_round_1, unassigned_on_route}`; `404` for no such job that day |
+| `PUT /operations/van-jobs/{date}/{key}/sent` | — | the job, sent now by the login (again = re-sent, the flag clears) |
+| `DELETE /operations/van-jobs/{date}/{key}/sent` | — | the job, not sent |
+| `PUT /operations/van-groups/order` | `{service_date, route_id, zone, group_ids}` | `{service_date, route_id, groups}`; `[]` or `clear: true` resets |
+| `GET /operations/pickup-names-th` | — | `{names: [{name, name_th, updated_at, updated_by}]}` |
+| `PUT /operations/pickup-names-th` | `{name, name_th}` | `{name, name_th}`; empty `name_th` deletes (legacy) |
+| `PATCH /v1/bookings/{id}` | `{job_note, version}` | the booking, with `job_note` and `special_request` |
+
+```jsonc
+// GET /operations/van-jobs?date=2026-10-06 → jobs[]
+{ "key": "vgrp_…", "route_id": "r10", "route_name": "…", "group_id": "vgrp_…", "group_number": 3,
+  "van_id": "veh17", "van": { "name": "Love 2", "plate": "…", "color": "#…", "capacity": 13, "ownership": "own", "partner_name": null },
+  "round": { "no": 1, "of": 2, "time": "07:30" }, "has_out": true, "has_ret": true, "zones": ["PK"],
+  "out_pax": 11, "ret_pax": 12, "stop_seats": 1, "pax": 12, "capacity": 13, "over_capacity": false,
+  "bookings": 6, "struck": 1,
+  "driver": { "name": "Somchai", "phone": "081…", "plate": "…", "override": true, "plate_override": false },
+  "pickups": [ { "name": "Patong Beach Hotel", "name_th": "ป่าตอง บีช" } ],
+  "sent": { "at": "…", "by": "Ploy", "changed_since_sent": false } }
+// GET /operations/van-jobs/2026-10-06/vgrp_… → out.rows[] (ret the same, pickup = the pier)
+{ "no": 1, "kind": "booking", "booking_id": "…", "trip_id": "…", "parts": [0], "merged_parts": 1, "voucher": "…",
+  "lead_pax": "…", "other_names": ["…"], "ad": 2, "chd": 1, "inf": 0, "foc": 0, "pax": 3,
+  "split": null, "pickup_time": "07:30", "pickup": "Patong Beach Hotel", "pickup_th": "ป่าตอง บีช",
+  "room": "512", "zone": "Patong", "zone_th": "ป่าตอง", "drop_off": null, "drop_own": false,
+  "return_van_id": "veh03", "from_van_id": null, "extra": true, "bags": 2, "special_request": "รอด้านล่าง",
+  "struck": null, "ovn": null, "ovn_return_date": null }
+{ "no": 2, "kind": "stop", "stop_id": "vs_…", "stop_kind": "staff", "label": "Guide Nok", "seats": 1, "leg": "out",
+  "time": "06:20", "place": "Office", "phone": "089…", "zone": "Patong", "zone_th": "ป่าตอง", "note": null }
+// out.totals / ret.totals
+{ "ad": 9, "chd": 2, "inf": 0, "foc": 0, "pax": 11, "bookings": 5, "separate_drops": 1, "struck": 1, "stops": 1, "stop_seats": 1 }
+```
+
+Errors: `400` a bad date, a body `sent_at`, a malformed order or Thai name; `404` a key that is no
+job that day; order ids from another date, route or zone, or named twice, are `400`.
+
+### Sheet rules, copied from legacy
+
+- Outbound rows: parts in the job's group. Not a booking that comes on its own (`pickup_self`), not an
+  overnight return leg. Two parts of one booking picked up at the same place print as one row
+  (`merged_parts`, legacy §altDrop). Pickup time: an own-pickup part's own time, else the final, else
+  the booked. Pickup: the part's own hotel or area, else the booking's hotel, else its area.
+- Return rows: parts coming back on this van. Not a self-return (separate drop-off in a NoTransfer
+  area, or named "self-arrive" / "กลับเอง"), not an overnight outbound. Pickup: the route's pier.
+  Rows that came out on another van go last.
+- Order (legacy §vsSeqTime): manual `sequence` first; a row without one goes in by time between
+  them; else by time; untimed last. Van stops are rows too, on their leg.
+- Cancelled bookings still in a group print struck through (`struck: "cancelled"`, `no: null`), and
+  count in no total. Clearing a cancelled trip's `van_parts` takes them off.
+- Job list order (§vjOrder): route's first departure, route name, zone (PK, KL, RN, NoTransfer),
+  the group's `display_order` then number (return-only jobs last), van name.
+- Day summary: `unassigned` (pax with no van, by route), `return_unarranged` (separate drop-off with no
+  return van and not `return_same_van`), `self_arrive` (a `pickup_self` booking still on a van or a
+  transfer zone), `struck`.
+
+### Import
+
+- `vanjob_sent` `date::van~route`: the one imported group of that van, route and day gets the mark;
+  none → a return-only mark when an imported part comes back on that van, else dropped and counted;
+  two or more (the van now runs rounds) → dropped, as legacy shows it unsent (bug 2). `~group` keys
+  (none in the data) map by group number. Fingerprint `NULL`.
+- `vanjob_sreq` → `job_note` of the imported booking, trimmed; `""` stays blank.
+- `vanjob_pickup_th` → `pickup_name_th`, replaced wholesale (legacy is master until cutover); names
+  that fold together keep the first.
+- `app_meta.bkv2_grp_order` → `display_order` on the imported groups (legacy key → group).
+- `van_days.sent_at` is no longer written.
