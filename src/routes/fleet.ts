@@ -23,7 +23,7 @@ import {
   type Incident, type Job, type LinkedMemo,
 } from '../domain/fleet-jobs.js';
 import type { FleetRepo } from '../domain/fleet-store.js';
-import { linkedMemos, meterHours, projectWork } from '../domain/fleet-seams.js';
+import { linkedMemos, meterHours, projectCreatedLines, projectLinkLines, projectSplitLine, projectWork } from '../domain/fleet-seams.js';
 
 type Request = FastifyRequest;
 const bad = (message: string): never => refuse(message, 400);
@@ -54,6 +54,13 @@ export const memosLoader = async (store: Store): Promise<(jobId: string) => Link
 export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }): void {
   const { store } = deps;
   const by = (request: Request): string | null => actorOf(request.user) ?? null;
+  const fleetRepo = (): FleetRepo => store.fleetRepo as FleetRepo;
+  /** The project a job names (`parent_project_id`): it must exist (part B's projects). */
+  const projectNamed = async (id: unknown) => {
+    if (id === undefined || id === null || id === '') return undefined;
+    if (typeof id !== 'string') return bad('parent_project_id must be a project id');
+    return (await fleetRepo().project(id.trim())) ?? bad(`parent_project_id ${id} is not a project (GET /v1/fleet/projects)`);
+  };
 
   // ── Reading into a draft, writing it back ──
 
@@ -385,14 +392,27 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
       const linked = incident?.job_id ? await store.fleetJob(incident.job_id) : undefined;
       const d = await draftOf({ incidents: incident ? [incident] : [], jobs: linked ? [linked] : [] });
       const open = boatId ? (await store.fleetJobs({ boatId })).filter((j) => j.status !== 'done') : [];
+      const project = await projectNamed(b.parent_project_id);
+      if (project) d.projectNoOf = () => project.no;
       const made = newJobs(d, b, newJobId, await store.fleetNumbers('jobs'), open);
       await commit(d);
+      if (project) await fleetRepo().addProjectLog(projectCreatedLines(project.id, made, d.today));
       return made.map((j) => j.id);
     });
     return reply.code(201).send({ jobs: await jobViews(await store.fleetJobs({ ids })) });
   });
   /** The detail's and the board's fields. */
-  jobCommand('', async (d, job, b) => { patchedJob(d, job, b, await store.fleetNumbers('jobs')); }, 'patch');
+  jobCommand('', async (d, job, b) => {
+    const to = b.parent_project_id === undefined ? undefined : await projectNamed(b.parent_project_id);
+    const next = patchedJob(d, job, b, await store.fleetNumbers('jobs'));
+    if (next.parent_project_id === job.parent_project_id) return;
+    // Linking or unlinking a project writes both logs (`flMaintLinkProjectPick`, `flMaintUnlinkProject`).
+    const from = job.parent_project_id ? (await fleetRepo().project(job.parent_project_id)) ?? null : null;
+    const lines = projectLinkLines(next, from, to ?? null, d.today);
+    next.progress_log.push(...lines.job);
+    d.putJob(next);
+    await fleetRepo().addProjectLog(lines.project);
+  }, 'patch');
   /** `flDeleteMaint`: only a job not closed; its incident keeps the link, as in legacy. */
   app.delete('/v1/fleet/jobs/:id', async (request, reply) => {
     await store.transaction(async () => {
@@ -435,7 +455,10 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
   jobCommand('/log', (d, job, b) => { jobLog(d, job, b); });
   /** One job per engine; answers the job and `created`, the new jobs. */
   jobCommand('/split', async (d, job, b) => {
+    const project = job.parent_project_id ? await fleetRepo().project(job.parent_project_id) : undefined;
+    if (project) d.projectNoOf = () => project.no;
     const made = splitJob(d, job, b, newJobId, await store.fleetNumbers('jobs'));
+    if (project && made.length > 1) await fleetRepo().addProjectLog([projectSplitLine(project.id, job.no, made.slice(1).map((j) => j.no), d.today)]);
     return { created: made.slice(1).map((j) => ({ id: j.id, no: j.no, title: j.title })) };
   });
   jobCommand('/steps', (d, job, b, request) => {

@@ -29,8 +29,60 @@ export type DailyRows = {
 export type Ctx = { now: string; today: string; by: string | null };
 export type BoatPier = { id: string; pier: string | null };
 
-/** The pier a boat's row sits under in the log: its home pier on the boat record. */
+/**
+ * The pier a boat's row sits under in the log, and whose day lock it follows: its pier that day
+ * (`fleet-assignments.ts` `dailyPier`, legacy `_drPier`), which the route resolves into `BoatPier`.
+ */
 export const pierOfBoat = (boats: readonly BoatPier[], boatId: string): string | null => boats.find((b) => b.id === boatId)?.pier ?? null;
+
+/** A boat's booked passengers on a day and how they spread over routes (legacy `flBoatBookingsFor`). */
+export type Booked = { pax: number; routes: Record<string, number> };
+type BookedInput = { status: string; trips: readonly { service_date: string; route_id: string; pax_total: number; operations: { boat_id: string | null } }[] };
+const RELEASED = ['cancelled', 'rejected', 'cancelled_weather'];
+/**
+ * Legacy `flBoatBookingsFor` for every boat at once: bookings not cancelled, rejected or weather-cancelled,
+ * their trips that day whose dispatch boat is the boat (a split across boats is not counted, as legacy
+ * reads one boat), `pax_total` (FOC and infants in).
+ */
+export function bookedOn(bookings: readonly BookedInput[], date: string): Map<string, Booked> {
+  const out = new Map<string, Booked>();
+  for (const bk of bookings) {
+    if (RELEASED.includes(bk.status)) continue;
+    for (const t of bk.trips) {
+      if (t.service_date !== date || !t.operations.boat_id) continue;
+      const b = out.get(t.operations.boat_id) ?? { pax: 0, routes: {} };
+      b.pax += t.pax_total;
+      b.routes[t.route_id] = (b.routes[t.route_id] ?? 0) + t.pax_total;
+      out.set(t.operations.boat_id, b);
+    }
+  }
+  return out;
+}
+
+/**
+ * Legacy `flPrevMeter`: an engine's latest reading above 0 on a day before `date`, on any boat or trip
+ * type (0 and below are placeholders). Null when there is none.
+ */
+export function prevMeters(meters: readonly Pick<Meter, 'engine_id' | 'date' | 'reading'>[]): (engineId: string, date: string) => number | null {
+  const by = new Map<string, Map<string, number>>();
+  for (const m of meters) {
+    if (m.reading === null || m.reading <= 0) continue;
+    const days = by.get(m.engine_id) ?? new Map<string, number>();
+    days.set(m.date, Math.max(days.get(m.date) ?? 0, m.reading));
+    by.set(m.engine_id, days);
+  }
+  const sorted = new Map([...by].map(([id, days]) => [id, [...days].sort((a, b) => a[0].localeCompare(b[0]))]));
+  return (engineId, date) => {
+    const list = sorted.get(engineId);
+    if (!list) return null;
+    let hit: number | null = null;
+    for (const [d, v] of list) { if (d >= date) break; hit = v; }
+    return hit;
+  };
+}
+
+/** Legacy's one Daily Log anomaly: more than 20 litres per passenger that day. */
+export const HIGH_FUEL_PER_PAX = 20;
 
 /** `409 day_locked` while the pier's day is locked ("Save day"); "Edit" unlocks it. */
 export function assertDayOpen(locks: readonly DayLock[], date: string, pier: string | null): void {
@@ -189,32 +241,72 @@ export function planIssueItemPatch(items: readonly IssueItem[], id: string, raw:
 
 // ── The read ──
 
-/** `GET /v1/fleet/daily-log?from=&to=`: each day's boats, prices, locks and requests, with what the screen computes. */
-export function dailyLogView(range: { from: string; to: string }, rows: DailyRows, allPrices: readonly FuelPrice[], boats: readonly BoatPier[], issueItems: readonly IssueItem[]) {
+/** What the read needs beyond the rows: each boat's pier that day, its booked pax, the engines' earlier meters. */
+export type DailyContext = {
+  pierOn: (boatId: string, date: string) => string | null;
+  booked: (date: string) => ReadonlyMap<string, Booked>;
+  prevMeter: (engineId: string, date: string) => number | null;
+};
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
+/**
+ * `GET /v1/fleet/daily-log?from=&to=`: each day's boats, prices, locks and requests, with what the screen
+ * computes. A boat's `pier` is its pier that day (its day lock); its `fuel_price` reads its home pier.
+ * The flags are legacy `flRenderDR`'s: `high_fuel_per_pax` (the one anomaly it counts), a meter below
+ * the engine's previous reading, a water meter that ran backwards, fuel with no price that day.
+ */
+export function dailyLogView(range: { from: string; to: string }, rows: DailyRows, allPrices: readonly FuelPrice[], boats: readonly BoatPier[], issueItems: readonly IssueItem[], ctx: DailyContext) {
   const days: unknown[] = [];
   for (let date = range.from; date <= range.to; date = addDays(date, 1)) {
     const ids = new Set<string>();
     for (const r of [...rows.boats, ...rows.meters, ...rows.water, ...rows.issues, ...rows.extras]) if (r.date === date) ids.add(r.boat_id);
+    const booked = ctx.booked(date);
+    const dayPrices = new Map(rows.prices.filter((p) => p.date === date).map((p) => [p.key, p.price]));
+    const anomalies: { boat_id: string; litres_per_pax: number }[] = [];
     const boatsOfDay = [...ids].sort().map((boat_id) => {
       const d = rows.boats.find((r) => r.date === date && r.boat_id === boat_id);
       const meters: Record<string, Record<string, number | null>> = {};
-      for (const m of rows.meters.filter((r) => r.date === date && r.boat_id === boat_id)) (meters[m.trip_type] ??= {})[m.engine_id] = m.reading;
+      const deltas: Record<string, Record<string, number | null>> = {};
+      for (const m of rows.meters.filter((r) => r.date === date && r.boat_id === boat_id)) {
+        (meters[m.trip_type] ??= {})[m.engine_id] = m.reading;
+        const prev = m.reading === null ? null : ctx.prevMeter(m.engine_id, date);
+        (deltas[m.trip_type] ??= {})[m.engine_id] = m.reading === null || prev === null ? null : round1(m.reading - prev);
+      }
       const w = rows.water.find((r) => r.date === date && r.boat_id === boat_id);
       const issues = Object.fromEntries(rows.issues.filter((r) => r.date === date && r.boat_id === boat_id).map((r) => [r.item_id, r.qty]));
       const boat = boats.find((b) => b.id === boat_id) ?? { id: boat_id, pier: null };
+      const fuel = d?.fuel_litres ?? null;
+      const paxBooked = booked.get(boat_id)?.pax ?? 0;
+      const pax = d?.pax_actual ?? paxBooked;
+      const lpp = fuel && pax > 0 ? round1(fuel / pax) : null;
+      const used = w ? waterUsed(w) : null;
+      const flags: string[] = [];
+      if (fuel && pax > 0 && fuel / pax > HIGH_FUEL_PER_PAX) { flags.push('high_fuel_per_pax'); anomalies.push({ boat_id, litres_per_pax: lpp! }); }
+      if (Object.values(deltas).some((e) => Object.values(e).some((x) => x !== null && x < 0))) flags.push('meter_backwards');
+      if (used !== null && used < 0) flags.push('water_negative');
+      if (fuel && !dayPrices.has(boat_id) && !(boat.pier && dayPrices.has(boat.pier))) flags.push('price_missing');
       return {
-        boat_id, pier: boat.pier, fuel_litres: d?.fuel_litres ?? null, pax_actual: d?.pax_actual ?? null, meters,
-        water: w ? { open: w.open_reading, close: w.close_reading, used: waterUsed(w), by: w.by, at: w.at } : null,
+        boat_id, pier: ctx.pierOn(boat_id, date) ?? boat.pier, fuel_litres: fuel, pax_actual: d?.pax_actual ?? null, pax_booked: paxBooked, pax, litres_per_pax: lpp,
+        meters, meter_deltas: deltas,
+        water: w ? { open: w.open_reading, close: w.close_reading, used, by: w.by, at: w.at } : null,
         issues, extras: rows.extras.filter((r) => r.date === date && r.boat_id === boat_id).map(({ date: _d, boat_id: _b, ...x }) => x),
-        fuel_price: effectiveFuelPrice(allPrices, boat, boats, date),
+        fuel_price: effectiveFuelPrice(allPrices, boat, boats, date), flags,
       };
     });
-    const prices = Object.fromEntries(rows.prices.filter((p) => p.date === date).sort((a, b) => a.key.localeCompare(b.key)).map((p) => [p.key, p.price]));
+    const prices = Object.fromEntries([...dayPrices].sort((a, b) => a[0].localeCompare(b[0])));
     const locks = Object.fromEntries(rows.locks.filter((l) => l.date === date).sort((a, b) => a.pier.localeCompare(b.pier))
       .map((l) => [l.pier, { locked_at: l.locked_at, locked_by: l.locked_by }]));
     const requests: Record<string, unknown[]> = {};
     for (const r of rows.requests.filter((x) => x.date === date)) (requests[r.pier] ??= []).push((({ date: _d, pier: _p, ...x }) => x)(r));
-    if (boatsOfDay.length || Object.keys(prices).length || Object.keys(locks).length || Object.keys(requests).length) days.push({ date, boats: boatsOfDay, fuel_prices: prices, locks, requests });
+    if (boatsOfDay.length || Object.keys(prices).length || Object.keys(locks).length || Object.keys(requests).length) {
+      // The footer's sums (legacy): fuel of the boats logged, pax of every boat logged or booked that day.
+      const totalFuel = round2(boatsOfDay.reduce((s, b) => s + (b.fuel_litres ?? 0), 0));
+      const totalPax = boatsOfDay.reduce((s, b) => s + b.pax, 0) + [...booked].filter(([id]) => !ids.has(id)).reduce((s, [, x]) => s + x.pax, 0);
+      days.push({
+        date, boats: boatsOfDay, fuel_prices: prices, locks, requests,
+        totals: { fuel: totalFuel, pax: totalPax, litres_per_pax: totalPax > 0 ? round2(totalFuel / totalPax) : null }, anomalies,
+      });
+    }
   }
   return { from: range.from, to: range.to, days, issue_items: issueItems };
 }

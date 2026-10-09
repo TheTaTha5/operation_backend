@@ -1376,6 +1376,26 @@ README → "Pier office: petty cash", "Pier office lists". Writes need `pier` or
 | `poStaffAdd/Pier/Def/Toggle`, `paNote` | `POST`/`PATCH /v1/pier-office/staff` |
 | `plTypeSet`, `plClassAdd/Set/Del` | `PATCH /v1/pier-office/license-types/{id}`, `/v1/pier-office/license-classes…` |
 
+### 6.9 Fleet extras: assignments, certificates, replace wizard, reports (`05-fleet.js`, `06-engine-assign.js`, `08-app.js`)
+
+README → "Fleet maintenance: assignments, certificates, replace wizard, reports". Boat-side writes
+take `fleet` or `config`; the rest `fleet`; reports are reads.
+
+| Legacy | API |
+|---|---|
+| `flSaveAssignment`, `flCancelAssignment` (patched `localStorage` boats directly) | `POST /v1/boats/{id}/assignments`, `…/{asn_id}/cancel`; stop writing `boats[].assignments` and `.pier` from the browser |
+| `getActiveAssignment`, `getPlannedAssignments`, `getPastAssignments`, `getBoatCurrentPier` | `GET /v1/boats/{id}/assignments` (`active`, `planned`, `past`, `pier_today`); `pier_today`/`at_shop` on `GET /v1/boats` |
+| `flDRRan`'s pier grouping, `_drPier` | each Daily Log row's `pier` (the day's); the day lock follows it |
+| `flDocStatus`, `flDocCurrent`, `flRenderDocsList` counters | `GET /v1/boats/{id}/documents`, `GET /v1/fleet/certificates` |
+| `depSave` (the renewal popup) | `POST /v1/boats/{id}/documents/renew {name, state, expires_on}` |
+| `swapDocExecute` (Replace wizard) | `POST /v1/fleet/safety/{id}/replace`; its two confirms become `allow_negative` (after `409 stock_short`) and `serial_anyway` (after `409 no_serial`); send the INC/MJ/MO numbers |
+| `flRenderDR` anomaly cells, `/px`, meter deltas | each Daily Log row's `flags`, `litres_per_pax`, `meter_deltas`; the day's `totals`, `anomalies` |
+| `fuelSetBudget`, `_fuelBudgetGet` (one browser only) | `PUT`/`GET /v1/fleet/fuel-budgets` |
+| `costAggregate`, `renderConsumables`, `_fuelAgg`/`_fuelWkAgg`, `flRenderDashboard` | `GET /v1/fleet/reports/cost`, `/upkeep`, `/fuel`, `GET /v1/fleet/dashboard` |
+| `flMaintClose`'s `repairHistory` row, boat detail "recent repairs" | `GET /v1/fleet/repair-history?boat_id=` (computed); stop writing `repairHistory` |
+| `flPushLog` from `flSaveMemo`/`moLiveSave`/`flCancelMemo`, `_projCreateForId`, `flMaintLinkProjectPick`, `flMaintUnlinkProject`, `flSplitExistingJob` | written by the server: don't push these lines yourself |
+| `invLostScan`/`invLostFix` | not built (a repair for legacy's colliding ids): use `adjust` and `receive` |
+
 ---
 
 ## 7. Not in the API yet: legacy keeps doing these
@@ -1389,7 +1409,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | Booking payment slips not tied to a payment | `paymentSlips` | `booking-extras-model.md` open 1 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
-| Fleet reports beyond memo spend (cost analytics, upkeep, fuel intelligence, dashboard); the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `fleet-maintenance-model.md` (part A: §3.15; part B: §6.7) |
+| Fleet Insights and the Fleet Report (`flRenderInsights`, `rep-fleet`) | `05-fleet.js`, `08-app.js` | `fleet-maintenance-model.md` "Open (extras)" (the other fleet screens: §3.15, §6.7, §6.9) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
@@ -1512,6 +1532,7 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Travel Summary COT and no-show decisions | `GET /v1/after-trip`, `/cot-decisions/{date}`, `/noshow-charges/{date}` | To do |
 | Pier hand-over, commission payouts (new screens) | `/v1/pier-handovers…`, `/v1/commissions`, `/v1/commission-payouts…` | Not in legacy |
 | Fleet stock, memos, projects, Daily Fleet Log, safety | `/v1/fleet/…` (§6.7) | To do |
+| Fleet pier assignments, certificate renewal, replace wizard, fuel budget, reports | `/v1/boats/{id}/assignments`, `…/documents`, `/v1/fleet/…` (§6.9) | To do |
 | Pier petty cash (ledger, longtail and park sheets, certificate) | `/v1/pier-cash/…` (§6.8) | To do |
 | Pier Office lists (kinds, items, codes, groups, staff, licence types and classes) | `/v1/pier-office…` (§6.8) | To do |
 

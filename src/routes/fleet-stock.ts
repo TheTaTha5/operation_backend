@@ -12,11 +12,11 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Store } from './operations.js';
 import { actorOf } from '../domain/booking-actions.js';
-import { todayInThailand } from '../domain/calendar.js';
+import { eachDate, todayInThailand } from '../domain/calendar.js';
 import { withoutServerOwned } from '../domain/server-owned.js';
 import { addDays, bad, isoDate, notFound, parsePier, record, WAREHOUSES } from '../domain/fleet-common.js';
 import type { Job } from '../domain/fleet-jobs.js';
-import { closedChildJobs, linkedMemos, planJobPartAdd, planJobPartRemove, projectJobs, unlinkedChildJobs } from '../domain/fleet-seams.js';
+import { closedChildJobs, linkedMemos, memoJobLines, memoProjectLine, planJobPartAdd, planJobPartRemove, projectJobs, unlinkedChildJobs } from '../domain/fleet-seams.js';
 import type { FleetRepo } from '../domain/fleet-store.js';
 import {
   balances, ITEM_SERVER_OWNED, matchesItem, parseConsumableQuery, parseItemListQuery, parseMergeIds, planAdjust, planConsumable, planConsumableVoid, planItemCreate,
@@ -32,9 +32,12 @@ import {
   projectView, sortProjects, type Project, type ProjectJobs, type ProjectPlan,
 } from '../domain/fleet-projects.js';
 import {
-  assertDayOpen, dailyLogView, parseBoatDay, parseDate, parseIssues, parsePrices, parseRange, parseWater, pierOfBoat, planExtra, planIssueItemAdd, planIssueItemPatch,
-  planRequest, type BoatPier,
+  assertDayOpen, bookedOn, dailyLogView, parseBoatDay, parseDate, parseIssues, parsePrices, parseRange, parseWater, planExtra, planIssueItemAdd, planIssueItemPatch,
+  planRequest, prevMeters, type BoatPier, type Booked, type DailyContext,
 } from '../domain/fleet-daily.js';
+import { availability } from '../domain/fleet-availability.js';
+import { dailyPier, shopOf } from '../domain/fleet-assignments.js';
+import { openWork } from './fleet.js';
 import {
   planInspectionAdd, planInspectionDelete, planInspectionPatch, planSafetyCreate, planSafetyPatch, SAFETY_CATEGORIES, safetyView,
 } from '../domain/fleet-safety.js';
@@ -52,6 +55,28 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     if (id && !(await boatExists(id))) bad(`${field} ${id} is not a boat (GET /v1/boats)`);
   };
   const boatPiers = async (): Promise<BoatPier[]> => (await store.listBoats()).map((b) => ({ id: b.id, pier: b.pier ?? null }));
+  /**
+   * A boat's pier on a day for the Daily Log (`dailyPier`, legacy `_drPier`): its assignment, else the
+   * pier its status entry names, else home; at the shop, home.
+   */
+  const dayPiers = async (): Promise<(boatId: string, date: string) => string | null> => {
+    const boats = new Map((await store.boatRecords()).map((b) => [b.id, b]));
+    const assignments = await fleet().assignments();
+    const work = await openWork(store);
+    const started = await store.fleetJobs({ status: 'inprogress' });
+    return (boatId, date) => {
+      const boat = boats.get(boatId);
+      if (!boat) return null;
+      const held = availability(boat, date, work).status !== 'available';
+      return dailyPier(boat, date, assignments, shopOf(started, boatId, held) !== null);
+    };
+  };
+  /** The Daily Log read's context: piers that day, booked pax per boat and day, the engines' earlier meters. */
+  const dailyContext = async (from: string, to: string): Promise<DailyContext> => {
+    const booked = new Map<string, Map<string, Booked>>();
+    for (const date of eachDate(from, to)) booked.set(date, bookedOn(await store.bookingsOnDate(date), date));
+    return { pierOn: await dayPiers(), booked: (date) => booked.get(date) ?? new Map(), prevMeter: prevMeters(await fleet().engineMeters()) };
+  };
 
   // ── Stock ──
 
@@ -210,6 +235,20 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     if (plan.receipt) await fleet().addMemoReceipt(plan.receipt);
   };
 
+  /**
+   * Legacy's `flPushLog` for a memo on a job: its incident gets the line (create, edit, cancel), and on
+   * create the job gets one too. A job named by text that no longer exists gets nothing.
+   */
+  const memoLines = async (memo: Memo, event: Parameters<typeof memoJobLines>[1]): Promise<void> => {
+    const job = memo.job_id ? await store.fleetJob(memo.job_id) : undefined;
+    if (!job) return;
+    const lines = memoJobLines(memo, event);
+    const today = todayInThailand();
+    if (lines.job) await store.putFleetJob({ ...job, progress_log: [...job.progress_log, lines.job] });
+    const incident = (await store.fleetIncidents({ jobId: job.id }))[0] ?? (job.incident_id ? await store.fleetIncident(job.incident_id) : undefined);
+    if (incident) await store.putFleetIncident({ ...incident, progress_log: [...incident.progress_log, { date: today, text: lines.incident, by: 'ระบบ', created_on: null }] });
+  };
+
   app.get('/v1/fleet/memos', async (request) => {
     const q = parseMemoListQuery(query(request));
     const all = await fleet().memos();
@@ -223,6 +262,8 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     const plan = planMemoCreate(record(request.body), { ...ctx(request), items: await fleet().items(), noTaken: (no) => memos.some((m) => m.no === no) });
     await assertMemoLinks(plan);
     await saveMemo(plan);
+    await memoLines(plan.memo, { kind: 'create' });
+    if (plan.memo.project_id) await fleet().addProjectLog([memoProjectLine(plan.memo)]);
     return memoDetail(plan.memo.id);
   })));
   app.patch('/v1/fleet/memos/:id', async (request) => store.transaction(async () => {
@@ -231,12 +272,14 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     const plan = planMemoPatch(await memoOf(id), body, ctx(request));
     await assertMemoLinks(plan);
     await saveMemo(plan);
+    await memoLines(plan.memo, { kind: 'edit' });
     return memoDetail(id);
   }));
   const memoCommand = (name: string, run: (memo: Memo, request: Request) => Promise<MemoPlan> | MemoPlan) =>
     app.post(`/v1/fleet/memos/:id/${name}`, async (request) => store.transaction(async () => {
       const plan = await run(await memoOf(param(request)), request);
       await saveMemo(plan);
+      if (name === 'cancel') await memoLines(plan.memo, { kind: 'cancel', reason: plan.memo.cancel_reason });
       return memoDetail(plan.memo.id);
     }));
   memoCommand('approve', (m, r) => planApprove(m, r.body ?? {}, ctx(r)));
@@ -370,7 +413,7 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
   /** One day as `GET /v1/fleet/daily-log` shows it. */
   const dayRead = async (date: string) => {
     const boats = await boatPiers();
-    const view = dailyLogView({ from: date, to: date }, await fleet().daily(date, date), await fleet().fuelPrices(addDays(date, -31), date), boats, await fleet().issueItems());
+    const view = dailyLogView({ from: date, to: date }, await fleet().daily(date, date), await fleet().fuelPrices(addDays(date, -31), date), boats, await fleet().issueItems(), await dailyContext(date, date));
     return (view.days[0] as object | undefined) ?? { date, boats: [], fuel_prices: {}, locks: {}, requests: {} };
   };
   const openDay = async (date: string, pier: string | null): Promise<void> => assertDayOpen((await fleet().daily(date, date)).locks, date, pier);
@@ -379,7 +422,7 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     const date = parseDate(param(request, 'date'));
     const boatId = param(request, 'boat_id');
     if (!(await boatExists(boatId))) notFound(`Boat ${boatId} not found`);
-    await openDay(date, pierOfBoat(await boatPiers(), boatId));
+    await openDay(date, (await dayPiers())(boatId, date));
     return { date, boatId };
   };
   const pierDay = async (request: Request): Promise<{ date: string; pier: string }> => {
@@ -390,7 +433,8 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
 
   app.get('/v1/fleet/daily-log', async (request) => {
     const range = parseRange(query(request));
-    return dailyLogView(range, await fleet().daily(range.from, range.to), await fleet().fuelPrices(addDays(range.from, -31), range.to), await boatPiers(), await fleet().issueItems());
+    return dailyLogView(range, await fleet().daily(range.from, range.to), await fleet().fuelPrices(addDays(range.from, -31), range.to), await boatPiers(), await fleet().issueItems(),
+      await dailyContext(range.from, range.to));
   });
   app.patch('/v1/fleet/daily-log/:date/boats/:boat_id', async (request) => store.transaction(async () => {
     const input = parseBoatDay(request.body);
@@ -468,7 +512,8 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     const boats = await boatPiers();
     const prices = parsePrices(request.body, new Set(boats.map((b) => b.id)));
     const locks = (await fleet().daily(date, date)).locks;
-    for (const p of prices) assertDayOpen(locks, date, boats.some((b) => b.id === p.key) ? pierOfBoat(boats, p.key) : p.key);
+    const pierOn = await dayPiers();
+    for (const p of prices) assertDayOpen(locks, date, boats.some((b) => b.id === p.key) ? pierOn(p.key, date) : p.key);
     for (const p of prices) await fleet().putFuelPrice(date, p.key, p.price);
     return dayRead(date);
   }));

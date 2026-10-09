@@ -12,6 +12,10 @@ import type { Memo, MemoHistory, MemoReceipt } from './fleet-memos.js';
 import type { Project, ProjectLog } from './fleet-projects.js';
 import type { DailyBoat, DailyRequest, DailyRows, DayLock, Extra, FuelPrice, Issue, IssueItem, Meter, Water } from './fleet-daily.js';
 import type { SafetyItem, SafetyLog } from './fleet-safety.js';
+import type { Assignment } from './fleet-assignments.js';
+
+/** The month's fuel budget for the fleet (migration 190). */
+export type FuelBudget = { month: string; amount: number; set_at: string; set_by: string | null };
 
 type Maybe<T> = T | Promise<T>;
 export interface FleetRepo {
@@ -76,6 +80,14 @@ export interface FleetRepo {
   deleteSafety(id: string): Maybe<void>;
   safetyLog(id: string): Maybe<SafetyLog[]>;
   addSafetyLog(rows: readonly SafetyLog[]): Maybe<void>;
+
+  /** Pier assignments, of one boat or all (migration 190). */
+  assignments(boatId?: string): Maybe<Assignment[]>;
+  assignment(id: string): Maybe<Assignment | undefined>;
+  putAssignment(a: Assignment): Maybe<void>;
+  fuelBudgets(): Maybe<FuelBudget[]>;
+  /** A month's budget; null removes it. */
+  putFuelBudget(month: string, budget: FuelBudget | null): Maybe<void>;
 }
 
 const clone = <T>(v: T): T => structuredClone(v);
@@ -102,6 +114,8 @@ export class MemoryFleetRepo implements FleetRepo {
   private catalogue = new Map<string, IssueItem>();
   private safety = new Map<string, SafetyItem>();
   private safetyLogRows: SafetyLog[] = [];
+  private assignmentRows = new Map<string, Assignment>();
+  private budgets = new Map<string, FuelBudget>();
 
   items(): StockItem[] { return [...this.itemRows.values()].map(clone); }
   item(id: string): StockItem | undefined { const i = this.itemRows.get(id); return i && clone(i); }
@@ -181,4 +195,10 @@ export class MemoryFleetRepo implements FleetRepo {
   deleteSafety(id: string): void { this.safety.delete(id); this.safetyLogRows = this.safetyLogRows.filter((l) => l.item_id !== id); }
   safetyLog(id: string): SafetyLog[] { return this.safetyLogRows.filter((l) => l.item_id === id).map(clone); }
   addSafetyLog(rows: readonly SafetyLog[]): void { this.safetyLogRows.push(...rows.map(clone)); }
+
+  assignments(boatId?: string): Assignment[] { return [...this.assignmentRows.values()].filter((a) => boatId === undefined || a.boat_id === boatId).map(clone); }
+  assignment(id: string): Assignment | undefined { const a = this.assignmentRows.get(id); return a && clone(a); }
+  putAssignment(a: Assignment): void { this.assignmentRows.set(a.id, clone(a)); }
+  fuelBudgets(): FuelBudget[] { return [...this.budgets.values()].map(clone); }
+  putFuelBudget(month: string, budget: FuelBudget | null): void { if (budget) this.budgets.set(month, clone(budget)); else this.budgets.delete(month); }
 }

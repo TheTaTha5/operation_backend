@@ -1,6 +1,7 @@
 /**
  * Seeds fleet maintenance, part A (todo/fleet-maintenance-model.md; migration 130) from legacy:
- * engines, gearboxes, propellers and their histories, incidents and maintenance jobs.
+ * engines, gearboxes, propellers and their histories, incidents and maintenance jobs; and the boats'
+ * pier assignments (fleet extras, migration 190).
  *
  *   SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]
  *
@@ -16,7 +17,7 @@
  */
 import { Client } from 'pg';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
-import { mapLegacyFleet } from './legacy-fleet.js';
+import { mapLegacyAssignments, mapLegacyFleet } from './legacy-fleet.js';
 
 type Row = Record<string, unknown>;
 const commit = process.argv.includes('--commit');
@@ -40,6 +41,7 @@ async function main() {
       incidentLog: await rows('fleet_incidents__progresslog'), incidentJobs: await rows('fleet_incidents__relatedmaintids'),
       jobs: await rows('fleet_maintenance'), jobAssets: await rows('fleet_maintenance__assets'),
       jobParts: await rows('fleet_maintenance__parts'), jobLog: await rows('fleet_maintenance__progresslog'),
+      assignments: await rows('boats__assignments'),
     };
   } finally { await source.end(); }
 
@@ -51,7 +53,9 @@ async function main() {
     const boats = new Set((await store.boatRecords()).map((b) => b.id));
     if (!boats.size) throw new Error('Target has no boats: run seed:boats first');
     const out = mapLegacyFleet(src, { boats }, report);
+    const assignments = mapLegacyAssignments(src.assignments ?? [], { boats }, report);
     const counts = await store.transaction(async () => {
+      for (const a of assignments) await store.fleetRepo.putAssignment(a);
       for (const e of out.engines) await store.putFleetAsset('engine', e);
       for (const g of out.gearboxes) await store.putFleetAsset('gearbox', g);
       for (const p of out.propellers) await store.putFleetAsset('propeller', p);
@@ -62,6 +66,7 @@ async function main() {
         gearboxes: `${out.gearboxes.length} (history ${out.gearboxes.reduce((s, e) => s + e.log.length, 0)})`,
         propellers: `${out.propellers.length} (history ${out.propellers.reduce((s, e) => s + e.log.length, 0)})`,
         incidents: `${out.incidents.length} (damaged assets ${out.incidents.reduce((s, i) => s + i.damaged_assets.length, 0)}, progress ${out.incidents.reduce((s, i) => s + i.progress_log.length, 0)})`,
+        assignments: `${assignments.length} of ${src.assignments?.length ?? 0} (cancelled ${assignments.filter((a) => a.cancelled).length})`,
         jobs: `${out.jobs.length} (assets ${out.jobs.reduce((s, j) => s + j.assets.length, 0)}, parts ${out.jobs.reduce((s, j) => s + j.parts.length, 0)}, progress ${out.jobs.reduce((s, j) => s + j.progress_log.length, 0)}, legacy cost ฿${out.jobs.reduce((s, j) => s + (j.legacy_cost ?? 0), 0).toLocaleString('en-US')})`,
       };
       if (!commit) throw Object.assign(new DryRun('dry run'), { lines });

@@ -384,7 +384,8 @@ const BOAT_OWNED: Record<string, string> = {
   id: 'a boat id is assigned by the server', retired: 'use POST /v1/boats/{id}/retire or /restore', retired_on: 'use POST /v1/boats/{id}/retire',
   retired_reason: 'use POST /v1/boats/{id}/retire', unretired_on: 'use POST /v1/boats/{id}/restore', status_log: 'use POST /v1/boats/{id}/status-log',
   log: 'use POST /v1/boats/{id}/status-log', status_today: 'it is computed from the status log', charter_ceiling: 'it is computed from the licence',
-  updated_at: 'it is the server\'s',
+  updated_at: 'it is the server\'s', pier_today: 'it is computed from the pier assignments (POST /v1/boats/{id}/assignments)',
+  at_shop: 'it is computed from the started jobs',
 };
 
 /** A positive whole number. */

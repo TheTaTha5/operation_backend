@@ -1585,6 +1585,34 @@ erDiagram
   the import replaces the lists whole.
 - **`changes.kind`** also takes `pier_cash` and `pier_office` (170, 171).
 
+## 13. Fleet maintenance, the extras: pier assignments, fuel budget
+
+Migration 190 (`todo/fleet-maintenance-model.md`, "Design — extras"). Certificates' state, the replace
+wizard, the reports and the Daily Log flags add no table: they compute from what is stored or write
+part A's and part B's rows. Both stores reach these through `store.fleetRepo`.
+
+```mermaid
+erDiagram
+  boats ||--o{ boat_assignments : "moved by"
+  boat_assignments {
+    text id PK "legacy's asn_…"
+    text boat_id FK
+    text type "temporary, permanent"
+    text from_pier "tublamu, panwa, ranong; not to_pier"
+    text to_pier
+    date start_date
+    date end_date "not before start_date"
+    numeric cost "0 or more"
+    boolean cancelled "kept, never deleted"
+    timestamptz created_at "orders two that cover one day"
+  }
+  fleet_fuel_budgets { text month PK "YYYY-MM" numeric amount "more than 0" timestamptz set_at text set_by }
+```
+
+- **An assignment's status** (planned, active, completed) is computed from its dates, never stored.
+- **A boat's pier on a day** (`pierOn` in `src/domain/fleet-assignments.ts`) reads the assignments,
+  the boat's status log and its home `pier`; the Daily Log's day lock follows it.
+
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration

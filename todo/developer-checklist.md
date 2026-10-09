@@ -35,8 +35,10 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - Rehearsal: 5,377 bookings, 1,455 seat locks, 473 invoices, 5 weather closures, 158 pier
      payments, 143 cash-on-tour decisions, 26 van bills, 453 van-job sent marks and 836 agents.
 6. **Fleet:** `npm run import:fleet -- --commit`, then `npm run import:fleet-stock -- --commit`.
-   - Rehearsal: 54 engines, 122 jobs, 616 stock items, 226 memos and 21 projects; every item's
-     stock equals legacy's.
+   - Rehearsal: 54 engines, 122 jobs, 6 pier assignments (1 cancelled; migration 190), 616 stock
+     items, 226 memos and 21 projects; every item's stock equals legacy's.
+   - Legacy must also stop writing pier assignments, certificate renewals, `repairHistory` and the
+     fuel budget (`fleet-maintenance-model.md` "Open (extras)" 2).
    - Legacy must stop editing assets, incidents, jobs, stock, memos, projects and the Daily Log at
      the same moment.
 6b. **Pier office:** `npm run import:pier-office -- --commit`, after step 4 (the sheets name boats).
@@ -177,6 +179,8 @@ So, in this order:
 - **Whole-boat holds:** a hold's "เหมาลำ" now refuses a quote and a booking without the held boat's
   charter (legacy saved it and left the hold); a boat not yet on the route no longer counts as
   taking seats from it (`seat-lock-extras-model.md`, "Flagged"). Confirm with ops.
+- **Fleet Insights and the Fleet Report:** which cost, date and "service due" rule should they use?
+  Legacy's screens use five and three different ones (`fleet-maintenance-model.md` "Open (extras)" 1).
 - **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
   pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
   invoice left overpaid by a cash-on-tour deduction.
