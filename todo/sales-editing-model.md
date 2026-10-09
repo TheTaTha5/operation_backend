@@ -6,175 +6,26 @@ templates and issued documents; salespeople and markets; the add-on catalogue; n
 passengers' insurance age and review; the import's cutover. Migrations 090–093; README "Agents" to
 "Nationalities" and "Insurance"; `src/routes/sales-editing.ts` and the `src/domain/` modules it names.
 
+**Built** on `feat/sales-extras` (2026-10-10, same legacy read): promo contracts
+(`contracts-model.md`), `import:contracts` seed-only, the Sales Board's targets and follow-up marks
+(`sales-board.ts`), staff and their welfare quotas with the booking form's staff guard (`staff.ts`).
+Migrations 200–202; README "Contracts", "Sales Board", "Staff and welfare quotas".
+
 ## Open
 
-1. **Staff and welfare quotas** (decision 13): later, with the staff-welfare pricing. Legacy keeps a
-   quota for 2026 only (`sb_staff.quota_2026`, bug 14); keep one per year when it comes. 24 staff.
-2. **Sales targets and follow-up marks** (Sales Board, `sbEditTarget`, `salesSetTarget`): stored on
-   the salesperson in legacy (`sb_sales.targets`, `followup`), not modelled here and not decided.
-   Legacy keeps them until the Sales Board moves.
-3. **Promo contracts** (add, edit, void): with the quote (`contracts-model.md`).
-4. **Merge the custom nationalities** (decision 11): 66 in legacy today (four Nigerias, ISO-3 copies
+1. **Merge the custom nationalities** (decision 11): 66 in legacy today (four Nigerias, ISO-3 copies
    of built-ins, lower-case junk); merging rewrites the bookings that use them.
-5. **The add-on catalogue's contents** come from sales (checklist). Not modelled: per-agent add-on
+2. **The add-on catalogue's contents** come from sales (checklist). Not modelled: per-agent add-on
    prices (`a.addonServices`) and custom add-on kinds (`SB_ADDON_TYPES`); legacy never saved either.
-6. **Agent codes:** add the unique constraint once sales renames the 21 shared ones (`agents.md`).
-7. **`import:contracts`** still mirrors legacy's contracts and would overwrite a main contract's
-   `rate_type_id` and `doc_id`, now set here: make it seed-only like the agents import.
-8. **Scoping beyond agents** was not decided: a sales-bound login still lists and books for any
+3. **Agent codes:** add the unique constraint once sales renames the 21 shared ones (`agents.md`).
+4. **Scoping beyond agents** was not decided: a sales-bound login still lists and books for any
    agent through `/v1/bookings`, and sees every rate type (legacy hid other salespeople's rate types
    too, `_rtInScope`).
-
-## Design — extras (feat/sales-extras, 2026-10-10)
-
-The developer said build, copying legacy (wt-lk-inbox@658298d). Promo contracts are designed in
-`contracts-model.md` ("Design — promo writes"). This covers open items 1, 2 and 7. Item 6 waits.
-
-### Sales targets and follow-up marks (open item 2)
-
-Legacy (`04-data-core.js` `salesSetTarget`, `salesToggleFollow`, `salesPaxAgg`, `salesStreak`;
-`08-app.js` `sbEditTarget`, `renderSalesBoard`): a target is pax per salesperson per month, kept on
-the salesperson (`sb_sales.targets = {"2026-07": 120}`; 0 deletes it). A follow-up mark is a tick per
-salesperson, month and agent, two kinds (followed; FOC feedback collected), kept as
-`sb_sales.followup = {"2026-07::a56": true, "foc:2026-07::a56": true}`. Persist guards `sales`; the
-target's edit shows only to a login not bound to a salesperson; a bound login sees only its own
-board. Legacy data: 0 targets, 1 follow-up mark.
-
-The Sales Board counts **pax by trip month** (a trip counts in its own month, every passenger
-including infants and FOC), cancelled/rejected/weather-cancelled bookings out, by the agent's
-*current* salesperson. Trend per agent against last month: no pax last month → `new`; none this
-month → `gone`; last month < 5 → `flat` with the difference; else +25 % or more `up`, −20 % or less
-`down`, between `flat`. Streak: months in a row, back from this one (24 at most), with a target met.
-
-| Field | Authority |
-|---|---|
-| target `pax` | client fact (whole number ≥ 0; 0 clears) |
-| follow-up mark | client fact (set or cleared) |
-| `set_at`/`set_by`, `marked_at`/`marked_by` | computed (the write's time and login) |
-| board: pax, FOC, bookings, `target_pct`, `reached`, `streak`, `rank`, `previous_rank`, agent `trend` | computed |
-
-```sql
--- 201_sales_targets.sql
-CREATE TABLE sales_targets (
-  sales_id TEXT NOT NULL REFERENCES sales_people (id) ON DELETE CASCADE,
-  month    TEXT NOT NULL CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-  pax      INTEGER NOT NULL CHECK (pax > 0),
-  set_at   TIMESTAMPTZ NOT NULL,
-  set_by   TEXT,
-  PRIMARY KEY (sales_id, month)
-);
-CREATE TABLE sales_followups (
-  sales_id  TEXT NOT NULL REFERENCES sales_people (id) ON DELETE CASCADE,
-  month     TEXT NOT NULL CHECK (month ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'),
-  agent_id  TEXT NOT NULL REFERENCES agents (id) ON DELETE CASCADE,
-  kind      TEXT NOT NULL CHECK (kind IN ('agent', 'foc')),
-  marked_at TIMESTAMPTZ NOT NULL,
-  marked_by TEXT,
-  PRIMARY KEY (sales_id, month, agent_id, kind)
-);
-```
-
-Contract (area `sales`; a sales-bound login: no target writes, follow-ups on its own board only):
-
-- `PUT /v1/sales/{id}/targets/{month}` `{ "pax": 120 }` → `{ "sales_id": "s01", "month": "2026-10", "pax": 120 }`.
-  `0` or `null` clears (`pax: 0` answered). `400` for a month not `YYYY-MM` or pax not a whole number
-  ≥ 0; `403` for a sales-bound login; `404` unknown salesperson.
-- `PUT /v1/sales/{id}/followups` `{ "month": "2026-10", "agent_id": "a56", "kind": "agent" | "foc", "marked": true }`
-  → `{ …, "marked": true }`. Legacy toggles; here the mark is set or cleared as sent, so a retry
-  cannot undo it. `400` for an agent that is not this salesperson's; `403` for another
-  salesperson's board.
-- `GET /v1/sales-board?month=YYYY-MM` (default this month, Thailand), any login:
-
-```jsonc
-{ "month": "2026-10", "previous_month": "2026-09", "total_pax": 1234,
-  "sales": [ { "sales_id": "s01", "name": "IRIS", "code": "IR", "color": "#0F6E56", "pax": 412, "foc": 6,
-               "target": 400, "target_pct": 103, "reached": true, "streak": 2, "rank": 1, "previous_rank": 2,
-               "bookings": 97, "agents": 140, "agents_with_sales": 38 } ],
-  "agents": [ { "agent_id": "a56", "name": "…", "sales_id": "s01", "pax": 40, "previous_pax": 25, "foc": 2,
-                "trend": { "category": "up", "pct": 60, "change": 15 }, "followed": true, "feedback_collected": false } ] }
-```
-
-`sales` is every active salesperson, most pax first (ties in id order, legacy's load order); a
-sales-bound login sees the whole leaderboard (legacy did) but only its own `agents`.
-
-### Staff and welfare quotas (open item 1): built
-
-It can be built without designing staff pricing anew: the price is already the server's
-(`enforcedPriceMode` — welfare at the staff rate, inspection free; FOC seats are free in
-`priceBooking`). What was missing is the registry, the quota and the booking-form guard.
-
-Legacy (`08-app.js` `SB_STAFF`, `staffAdd`, `staffSetField`, `staffSetQuota`, `staffDelete`,
-`staffWelfareUsed`, `staffTripsFor`, the guard in `bkV2Save`): staff `{id st01…, code EMP-001…, name,
-dept, active, quota: {"2026": 3}}`; persist guards `sales`. Used = FOC passengers (`foc`, `foc_fr`,
-`foc_th`) on trips in that year, of the staff member's bookings that are not cancelled/rejected/
-weather-cancelled and not an inspection. Remaining = quota − used. Saving a staff booking needs a
-staff member; a welfare one whose FOC seats exceed what is left asks "Free welfare seats exceed the
-quota … Save anyway?". Legacy data: 24 staff (3 code clashes: EMP-010, EMP-020, EMP-021), quotas for
-2026 only, 41 bookings naming one, none unknown.
-
-| Field | Authority |
-|---|---|
-| `code`, `name`, `dept`, `active` | client fact |
-| a year's `free_seats` | client fact (whole number ≥ 0) |
-| `id` | computed (`st` + next number, legacy) |
-| `used`, `remaining` | computed |
-| booking `staff_id` | validated: required on a staff booking, must be a staff member when set |
-| booking FOC over the quota | validated: `409 over_quota` until `quota_anyway: true` |
-
-```sql
--- 202_staff.sql
-CREATE TABLE staff (
-  id         TEXT PRIMARY KEY,
-  code       TEXT,                         -- not unique: legacy's own 24 have 3 clashes
-  name       TEXT NOT NULL DEFAULT '',     -- legacy adds a blank row and names it in place
-  dept       TEXT,
-  active     BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE TABLE staff_quotas (
-  staff_id   TEXT NOT NULL REFERENCES staff (id) ON DELETE CASCADE,
-  year       INTEGER NOT NULL CHECK (year BETWEEN 2000 AND 2100),
-  free_seats INTEGER NOT NULL CHECK (free_seats >= 0),
-  PRIMARY KEY (staff_id, year)
-);
-```
-
-`bookings.staff_id` gets no foreign key: the import mirrors legacy's bookings, and legacy deletes
-staff freely. The write path checks it instead.
-
-Contract (writes area `sales`, reads any login):
-
-- `GET /v1/staff?year=2026` (default this year) → `{ "year": 2026, "staff": [{ id, code, name, dept,
-  active, quotas: {"2026": 3}, quota, used, remaining }], "totals": { active, all, quota, used } }` in
-  id order.
-- `GET /v1/staff/trips?year=2026` → `{ "trips": [{ booking_id, staff_id, service_date, route_id,
-  purpose: "welfare" | "inspection", foc, head, paid }] }` by date (legacy's "trips" tab).
-- `POST /v1/staff` → `201`: `name`, `code`, `dept`, `active` optional; defaults legacy's `staffAdd`:
-  id `st<n+1>`, code `EMP-<n+1>`, name `""`, a quota of 3 for this year.
-- `PATCH /v1/staff/{id}`: `name`, `code`, `dept`, `active`. Unknown fields `400`.
-- `PUT /v1/staff/{id}/quotas/{year}` `{ "free_seats": 3 }` → the staff row.
-- `DELETE /v1/staff/{id}` → `204`; `409 in_use` while a booking names them (make them inactive).
-- Bookings (`POST /v1/bookings`, `PATCH /v1/bookings/{id}` when trips, pax, `staff_id` or
-  `staff_purpose` change): on the staff agent (`a_staff`/`STAFF`) `staff_id` is required (`400`);
-  any `staff_id` sent must be a staff member (`400`); a welfare booking whose FOC seats in a year
-  exceed that year's remaining (this booking excluded) is `409 over_quota` until `"quota_anyway": true`:
-
-```json
-{ "statusCode": 409, "code": "over_quota", "error": "Conflict",
-  "message": "Free welfare seats exceed the quota: 2026: 1 free seat left, 3 requested, over by 2. The over-quota people should be Adult (charged at the staff rate), not FOC. Send quota_anyway: true to save anyway." }
-```
-
-### `import:contracts` seed-only (open item 7)
-
-`npm run import:contracts` writes nothing without `--seed` (it says so); `--seed` upserts legacy's
-contracts as today (legacy wins for each id it has; one only here is left). Run it once, to seed.
-
-### Import (`import-legacy.ts --sales`)
-
-Seeds staff (`sb_staff`, `quota_2026` → year 2026), targets (`sb_sales.targets`, months that are not
-`YYYY-MM` or pax ≤ 0 listed and skipped) and follow-up marks (`sb_sales.followup`; a key that does
-not parse, or an agent not here, listed and skipped). Upsert by key; without `--sales` none of them.
+5. **A company booking's reason** (`companyPurpose`, legacy `bkV2Save`, beside the staff guard): legacy
+   refuses a booking on `a_company` without one. Not built: the booking has no such field here yet
+   (`purpose` holds the staff ones), so it needs its own small design.
+6. **The Sales Board reads bookings on every request** (two months, more when targets run back):
+   fine at legacy's volume (about 5,000 bookings); a summary table if it gets slow.
 
 ## Flagged
 
@@ -229,6 +80,35 @@ legacy had a rule):
   `contract_template_effective_id` on the agent detail (`test/agents.test.ts` changed for them).
 - **Routes** live in `src/routes/sales-editing.ts`, registered from `operations.ts`; the agent,
   contract, salesperson and market reads moved there too.
+
+Extras (`feat/sales-extras`, 2026-10-10; promos are flagged in `contracts-model.md`):
+
+- **Staff quotas were built now**, not "later" (decision 13): staff pricing already exists
+  (`enforcedPriceMode`: welfare at the staff rate, FOC free, inspection 0), so only the registry, the
+  quota and the guard were missing. One quota per year (legacy: 2026 only, bug 14).
+- **The over-quota guard** counts what was used without inspection bookings, as legacy's roster does
+  (`staffWelfareUsed`); legacy's save guard counted inspections too. One rule here. Like legacy, a
+  year already over its quota asks even when the booking adds no free seat.
+- **The guard runs** on create, and on a `PATCH` only when trips, pax, `staff_id`, `staff_purpose` or
+  `purpose` change (legacy asked on every save); not on a cancelled booking. "Save anyway" is
+  `quota_anyway: true`.
+- **A `staff_id` sent must be a staff member** on any booking (`400`; legacy's picker only offered
+  them). `bookings.staff_id` has no foreign key: imported bookings mirror legacy, which deletes staff.
+- **Deleting a staff member** is refused while a booking names them (`409 in_use`; legacy deleted
+  and left the bookings naming nobody).
+- **A new staff member's quota** is for this year (legacy: the year on screen). Ids and codes are
+  legacy's (`st` and `EMP-` + the highest number + 1); codes are not unique (legacy has 3 clashes).
+- **Targets:** a pax that is not a whole number ≥ 0 is `400` (legacy read it as 0, which cleared the
+  target); a sales-bound login cannot set one (`403`; legacy hid the button). `set_at`/`set_by` are
+  new; imported targets carry the import's time.
+- **Follow-up marks** are set or cleared as sent (legacy toggled, so a retry undid it); the agent must
+  be the salesperson's (`400`; legacy only listed their own). Imported marks carry the import's time.
+- **The Sales Board is computed here** (`GET /v1/sales-board`), legacy's numbers: ties in rank by
+  salesperson id (legacy's load order).
+- **Import:** `--sales` also seeds staff (legacy's 2026 quota replaced, a year set here kept),
+  targets and follow-up marks. Rehearsed 2026-10-10 on a throwaway import: 24 staff, 24 quotas
+  (58 seats), 0 targets, 1 follow-up mark; a rerun without `--sales` kept a rename, a 2027 quota and
+  a target set here.
 
 Import (`import-legacy.ts`):
 

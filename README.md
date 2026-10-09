@@ -181,7 +181,7 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 |---|---|
 | `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities, the daily report's settings; the Daily Fleet Log's water meters, issued and extra items and outside requests (as `fleet` does) |
 | `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat; van rates; engines, gearboxes, propellers, incidents and maintenance jobs; stock, consumables, purchase memos, projects, the Daily Fleet Log, safety equipment (`/v1/fleet/…`); uploading files |
-| `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
+| `sales` | rate types, agents, promo contracts, contract templates and documents, the add-on catalogue, staff and their welfare quotas, sales targets and follow-up marks |
 | `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
 | `accounting` | invoices, their discounts and payments; accepting the pier's hand-over; commission payouts; also the Daily PFM decisions, pier payments and collecting an upgrade (legacy saves bookings for accounting too); partner van bills; van rates; the daily report's settings |
 | `pier` | pier payments (`/v1/bookings/{id}/pier-payments`), handing the pier's cash over, check-ins |
@@ -620,11 +620,11 @@ A rate type a season uses is in use: `DELETE /v1/rate-types/{id}` refuses it (`4
 
 ### Contracts
 
-An agent's contracts, from legacy (`sb_contracts`): one `main` contract (its rate type and the
-routes it covers), and time-boxed `promo` overlays. No write endpoint yet (promos come with the
-quote, `todo/contracts-model.md`), but two agent commands change them: a rate type change or a
-renewal with a new rate sets the rate of the agent's main contracts that are not expired or void,
-and issuing a document stamps `doc_id`. Any login may read them; a sales-bound login, only its own
+An agent's contracts: one `main` contract (its rate type and the routes it covers), imported once
+from legacy, and time-boxed `promo` overlays, written here (legacy's promo form). Two agent commands
+change a main contract: a rate type change or a renewal with a new rate sets the rate of the agent's
+main contracts that are not expired or void, and issuing a document stamps `doc_id`. The quote
+prices from them ([Quote](#quote)). Any login may read them; a sales-bound login, only its own
 agents' (see [Agents](#agents)).
 
 - `GET /v1/contracts?agent_id=&kind=&status=` → `{ "contracts": [...] }`, by agent, then main
@@ -637,6 +637,7 @@ agents' (see [Agents](#agents)).
   "rate_type_id": null, "active_from": "2026-10-08", "active_to": "2026-10-15", "priority": 10,
   "version": "promo-2026-10-08", "price_mode": "own", "discount": null, "bonus": null, "book_window": true,
   "created_date": "2026-10-08", "created_by": "SALES.MAM", "note": null, "doc_id": null,
+  "voided_at": null, "voided_by": null, "state": "active", "bonus_progress": null,
   "program_periods": [{ "route_id": "r10", "book_from": "2026-10-08", "book_to": "2026-10-15",
                         "travel_from": "2026-10-08", "travel_to": "2026-10-15", "note": null }],
   "seat_prices": [{ "route_id": "r10", "zone": "PK", "category": "ad", "residency": "thai", "price": 1500 }] }
@@ -654,14 +655,62 @@ agents' (see [Agents](#agents)).
 | `book_window` | The promo also checks the booking date against each period's `book_from`..`book_to` |
 | `program_periods` | The routes covered, with their booking and travel windows, in legacy's order. A `null` travel bound is open |
 | `seat_prices` | An own-price promo's prices, in rate types' vocabulary (`ad`/`chd` × `thai`/`foreign`) |
+| `voided_at`, `voided_by` | When and by whom a promo was voided here; `null` otherwise (and on legacy's two) |
+| `state` | Computed, legacy's badge: `void`, `expired` (past `active_to`), `scheduled` (before `active_from`), else `active` |
+| `bonus_progress` | Computed for a promo with a bonus that is not void (legacy `laPromoStat`), else `null`: see below |
 
-**Importing them:** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts [-- --commit]`,
-a dry run unless `--commit`, after `seed:routes` and the agents and rate types imports. Rerunnable:
-legacy wins for every contract it has (its periods and prices are replaced whole); one only this
-service has is left alone. What does not fit is listed: a contract whose agent is gone is skipped, a
-rate type that no longer exists becomes `null`, a period whose window runs backwards is dropped
-(legacy could never match it). Since agents are edited here, a rerun also overwrites a main
-contract's rate and `doc_id` set here: run it only to seed (see todo/sales-editing-model.md, Flagged).
+**Promotions** (legacy's "+ เพิ่ม Promotion" form, `ctSaveAddPromo`; area `sales`, a sales-bound
+login only for its own agents):
+
+- `POST /v1/contracts` → `201` and the contract:
+
+```jsonc
+{ "agent_id": "a06", "price_mode": "discount", "discount": { "mode": "pct", "value": 10 },
+  "active_from": "2026-11-01", "active_to": "2027-03-31", "book_from": "2026-10-10", "book_to": "2026-10-31",
+  "route_ids": ["r10", "r12"], "bonus": { "buy": 10, "basis": "adchd" }, "priority": 10, "note": "Xmas Promo" }
+```
+
+  `price_mode` is `rate` (with `rate_type_id`), `own` (with `seat_prices`, the read's shape, zones
+  `PK`, `KL`, `NoTransfer`) or `discount` (with `discount`). `active_from`/`active_to` are the travel
+  dates; `book_from`/`book_to` are optional, and either one turns on the booking window (a missing
+  bound is the travel date). Each route becomes a period with those windows. `bonus` is "buy N, get
+  one free" (`basis` `adchd` adults and children, or `ad`). `priority` defaults to 10. The server sets
+  `version` (`promo-<active_from>`), `status`, `created_date`, `created_by`.
+- `PATCH /v1/contracts/{id}`: any of those fields but `agent_id`; the rest is the stored promo's,
+  and the whole promo is checked again. Fields the server sets may be echoed, not changed (`400`).
+  Unchanged → `200`, nothing written.
+- `POST /v1/contracts/{id}/void` → the contract, `status: "void"`, `voided_at`, `voided_by`. The quote
+  skips it from then on; trips already sold keep their price.
+
+Legacy's checks: travel dates required and in order; a booking window in order; at least one route,
+each one of the agent's programmes or its main contracts' routes (or the edited promo's own); a
+mode's fields only with that mode. `own` keeps only zones with an adult price above 0, and needs
+one; `discount` needs a value above 0, a percentage below 100 and an amount below the cheapest adult
+price above 0 the main rate has on those routes (it would read as not sold); `rate` needs a rate
+type that exists. All `400`. Then legacy's confirms, as flags:
+
+| Refusal | When | Send to go ahead |
+|---|---|---|
+| `409 routes_unpriced` | a route has no own price, or no main-contract price to discount: it sells at the standard rate | `unpriced_anyway: true` |
+| `409 promo_sold` | editing a promo trips were already priced with (bookings that hold seats) | `sold_anyway: true` |
+| `409 contract_void` | editing or voiding a void promo | — |
+
+A main contract is `400` on `PATCH` and void: it follows its agent. Each write adds a line to the
+agent's activity (`Promotion added · Xmas Promo · ลด 10%`).
+
+`bonus_progress` counts the agent's bookings that hold seats, on the promo's routes and travel
+dates (and booking window): `sold` (adults, plus children when `basis` is `adchd`), `bookings`,
+`earned` (`sold` ÷ `buy`), `used` (the FOC seats on those trips, whatever the reason), `left`,
+`over`, `to_next`, `pct`. It counts only; nothing is added or blocked.
+
+**Importing them:** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts -- --seed [--commit]`,
+a dry run unless `--commit`, after `seed:routes` and the agents and rate types imports. Without
+`--seed` it writes nothing: contracts are this API's. `--seed` seeds a database that has none: legacy
+wins for every contract it has (its periods and prices replaced whole, a rate or `doc_id` set here
+overwritten; a void made here stays only while legacy's row is void too); one only this service has
+is left alone. What does not fit is listed: a contract whose agent is gone is skipped, a rate type
+that no longer exists becomes `null`, a period whose window runs backwards is dropped (legacy could
+never match it).
 
 ### Contract templates and documents
 
@@ -723,6 +772,68 @@ Legacy's Team & Markets screen; writes need the `config` area. Any login reads.
 - `DELETE /v1/markets/{id}` → `204`; `409 in_use` while an agent is in it.
 
 An agent's `sub_market` is free text; a new one joins its market's `subs` when the agent is saved.
+
+### Sales Board
+
+Legacy's Sales Board: each salesperson's monthly pax target, their follow-up ticks on their agents,
+and the leaderboard drawn from bookings. Writes need the `sales` area.
+
+- `PUT /v1/sales/{id}/targets/{month}` `{ "pax": 120 }` → `{ "sales_id", "month", "pax" }`. A whole
+  number ≥ 0; `0` or `null` clears it. A sales-bound login cannot set targets (`403`, as legacy showed
+  the edit only to others).
+- `PUT /v1/sales/{id}/followups` `{ "month": "2026-10", "agent_id": "a56", "kind": "agent" | "foc", "marked": true }`:
+  sets or clears one tick (`agent`: followed up; `foc`: FOC feedback collected). The agent must be
+  this salesperson's (`400`); a sales-bound login marks only its own board (`403`).
+- `GET /v1/sales-board?month=YYYY-MM` (default this month), any login:
+
+```jsonc
+{ "month": "2026-10", "previous_month": "2026-09", "total_pax": 1234,
+  "sales": [ { "sales_id": "s01", "name": "IRIS", "code": "IR", "color": "#0F6E56", "pax": 412, "foc": 6,
+               "target": 400, "target_pct": 103, "reached": true, "streak": 2, "rank": 1, "previous_rank": 2,
+               "bookings": 97, "agents": 140, "agents_with_sales": 38 } ],
+  "agents": [ { "agent_id": "a56", "name": "…", "sales_id": "s01", "pax": 40, "previous_pax": 25, "foc": 2,
+                "trend": { "category": "up", "pct": 60, "change": 15 }, "followed": true, "feedback_collected": false } ] }
+```
+
+Everything here is computed, as legacy computes it. Pax count by **trip month** (each passenger,
+infants and FOC included), on bookings that hold seats, for the agent's salesperson today. `sales` is
+every active salesperson, most pax first (`rank`; ties in id order). `streak` is the months in a row,
+back from this one, whose target was met (24 at most). `agents` lists agents with pax this month or
+last: `trend` is `new` (none last month), `gone` (none now), `flat` with only `change` when last month
+was under 5, else `up` (+25 % or more), `down` (−20 % or less) or `flat`. A sales-bound login sees the
+whole leaderboard and only its own agents.
+
+### Staff and welfare quotas
+
+Legacy's Staff & Welfare screen: staff, the free (FOC) welfare seats each may take in a year, and
+what bookings used. Writes need the `sales` area; any login reads.
+
+- `GET /v1/staff?year=2026` (default this year) → `{ "year", "staff": [{ id, code, name, dept, active,
+  quotas: { "2026": 3 }, quota, used, remaining }], "totals": { active, all, quota, used } }`, by id.
+  `used` is the FOC seats on that year's trips of the member's bookings that hold seats and are not
+  an inspection.
+- `GET /v1/staff/{id}?year=`, `GET /v1/staff/trips?year=` → `{ "trips": [{ booking_id, staff_id,
+  service_date, route_id, purpose: "welfare" | "inspection", foc, head, paid }] }` by date.
+- `POST /v1/staff` → `201`: `name`, `code`, `dept`, `active`, all optional. The id is `st<n+1>`, the
+  code `EMP-<n+1>`, a quota of 3 for this year (legacy `staffAdd`). Codes need not be unique.
+- `PATCH /v1/staff/{id}`: `name`, `code`, `dept`, `active`; `quotas`, `used` and the rest may be echoed,
+  not changed (`400`).
+- `PUT /v1/staff/{id}/quotas/{year}` `{ "free_seats": 3 }` → the member, viewed for that year.
+- `DELETE /v1/staff/{id}` → `204`; `409 in_use` while a booking names them (make them inactive).
+
+**On a booking** (`POST /v1/bookings`, and `PATCH` when trips, pax, `staff_id`, `staff_purpose` or
+`purpose` change): a booking on the staff account (`a_staff`) needs `staff_id` (`400`); a `staff_id`
+sent must be a staff member (`400`); a welfare booking (not `staff_purpose: inspection`) whose FOC
+seats in a year exceed what that year has left, this booking aside, is refused until the body says
+`"quota_anyway": true`:
+
+```json
+{ "statusCode": 409, "code": "over_quota", "error": "Conflict",
+  "message": "Free welfare seats exceed the quota: 2026: 1 free seat left, 3 requested, over by 2. The over-quota people should be Adult (charged at the staff rate), not FOC. Send quota_anyway: true to save anyway." }
+```
+
+The price is unchanged by this: welfare is priced at the staff rate, FOC seats free, an inspection at
+0 ([Prices](#prices)).
 
 ### Add-on services
 
@@ -1601,7 +1712,7 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | Group | Fields |
 | --- | --- |
 | identity | `schema_ver`, `external_id`, `voucher_ref` |
-| commercial | `agent_id` (an inactive agent is `409 agent_inactive` on create), `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` |
+| commercial | `agent_id` (an inactive agent is `409 agent_inactive` on create), `rate_type_ref`, `sold_by`, `purpose`, `staff_id`, `staff_purpose` (`staff_id` is required on a staff booking and checked: see [Staff and welfare quotas](#staff-and-welfare-quotas)) |
 | lead | `lead_pax`, `lead_nationality`, `lead_type`, `lead_foc`, `lead_phone`, `lead_email`; `lead_age`, `lead_insurance_reviewed_at`, `lead_insurance_reviewed_by` (read-only here: see [Insurance](#insurance)) |
 | pickup | `pickup_area_id`, `pickup_self`, `pickup_area`, `pickup_zone`, `hotel_name`, `room_number` |
 | dropoff | `dropoff_same`, `dropoff_area_id`, `dropoff_area`, `dropoff_hotel_name` |

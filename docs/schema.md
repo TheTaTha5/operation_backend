@@ -857,6 +857,89 @@ The `agents` box shows the structural columns. The rest describe the agent:
 | Booking channel | `booking_method` `booking_cutoff` `booking_cancel_policy` `booking_email` `booking_phone` |
 | Audit | `created_at` `updated_at` |
 
+### Contracts, the Sales Board and staff
+
+```mermaid
+erDiagram
+  contracts {
+    text id PK "legacy's, or ct... made here"
+    text agent_id FK
+    text kind "main or promo"
+    text status "active, expired, void"
+    text rate_type_id FK "a main's rate; a rate promo's"
+    date active_from "travel dates"
+    date active_to
+    integer priority
+    text price_mode "promo: rate, own, discount"
+    text discount_mode "pct or amt"
+    numeric discount_value
+    integer bonus_buy "buy N get one free"
+    boolean book_window
+    text doc_id "the last document issued"
+    timestamptz voided_at "200"
+    text voided_by "200"
+  }
+  contract_program_periods {
+    text contract_id PK, FK
+    integer seq PK
+    text route_id FK
+    date book_from
+    date book_to
+    date travel_from
+    date travel_to
+  }
+  contract_seat_prices {
+    text contract_id PK, FK
+    text route_id PK, FK
+    text zone PK
+    text category PK "ad, chd"
+    text residency PK "thai, foreign"
+    numeric price
+  }
+  sales_targets {
+    text sales_id PK, FK
+    text month PK "YYYY-MM"
+    integer pax "above 0"
+    timestamptz set_at
+    text set_by
+  }
+  sales_followups {
+    text sales_id PK, FK
+    text month PK
+    text agent_id PK, FK
+    text kind PK "agent, foc"
+    timestamptz marked_at
+    text marked_by
+  }
+  staff {
+    text id PK "st01..."
+    text code "EMP-001, not unique"
+    text name
+    text dept
+    boolean active
+  }
+  staff_quotas {
+    text staff_id PK, FK
+    integer year PK
+    integer free_seats
+  }
+  agents ||--o{ contracts : "signed"
+  contracts ||--o{ contract_program_periods : "covers"
+  contracts ||--o{ contract_seat_prices : "own prices"
+  sales_people ||--o{ sales_targets : "aims for"
+  sales_people ||--o{ sales_followups : "marked"
+  agents ||--o{ sales_followups : "followed up"
+  staff ||--o{ staff_quotas : "may take free"
+```
+
+- **`contracts`** (029): one `main` per agent, imported once from legacy (`import:contracts -- --seed`),
+  and `promo` overlays written here (200: `POST /v1/contracts`). `voided_at` is set only on a void one.
+  `booking_trips.promo_id` names the promo a trip was priced with.
+- **`sales_targets`, `sales_followups`** (201): the Sales Board's monthly pax target per salesperson
+  (no row = no target) and its follow-up ticks. Both go with their salesperson; a mark goes with its agent.
+- **`staff`, `staff_quotas`** (202): staff and their free welfare seats per year. Used and remaining are
+  counted from bookings (`bookings.staff_id`, no key: see below).
+
 ### Add-on services and nationalities
 
 `addon_services` (`id`, `name`, `type` boat/van/guide/other, `description`, `active`, `sort`) and
@@ -1535,6 +1618,7 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
 | `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
+| `bookings.staff_id` | `staff` | The import mirrors legacy's bookings and legacy deletes staff freely (202). A booking write checks a staff id it is sent. |
 | `fleet_memos.job_id`, `fleet_stock_movements.job_id` | part A's maintenance jobs | Built in parallel with `fleet_jobs` (140); legacy's are imported as they are. Legacy names one deleted job (`mjmtsfprvltstem`). |
 | `fleet_daily_meters.engine_id`, `fleet_consumables.engine_id` | part A's engines | Same. |
 | `fleet_fuel_prices.key`, `fleet_daily_locks.pier`, `fleet_daily_requests.pier` | piers or `boats` | A price key is a pier or a boat; piers have no table. |

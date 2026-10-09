@@ -6,7 +6,7 @@ stores has a home here, behind a domain endpoint. This replaces the *data* its g
 routes. What exists is in `README.md`; this lists only what is still to build. Paths are proposals,
 settled when built.
 
-**Next:** bookings priced by the server (`pricing-model.md`, step 5), booking extras (4), the rest of sales (6), vans (8), money (7).
+**Next:** bookings priced by the server (`pricing-model.md`, step 5), booking extras (4), what is open in sales (6), vans (8), money (7).
 
 **This list was derived from `operation_frontend`, which is not production.** Re-derive it from
 wt-lk-inbox's `server.js` and `os-backend/src/mapping/os_repo.js`.
@@ -36,13 +36,11 @@ whole-boat holds, their own design (not written yet; the pool side is migration 
 
 ## 6. Sales: agents, prices, contracts
 
-```
-POST   /v1/contracts, PATCH /v1/contracts/{id}           (contracts-model.md)
-staff and welfare quotas; sales targets                 (sales-editing-model.md)
-```
-
 Built: agents, programmes, rate type, renewal, (de)activate, templates, issued documents, salespeople,
-markets, the add-on catalogue, nationalities, insurance (README → "Agents" to "Nationalities").
+markets, the add-on catalogue, nationalities, insurance (README → "Agents" to "Nationalities"); promo
+contracts, the Sales Board's targets and follow-up marks, staff and their welfare quotas (README →
+"Contracts", "Sales Board", "Staff and welfare quotas"). Left: the items open in
+`sales-editing-model.md`.
 
 ## 7. Money
 

@@ -30,8 +30,10 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
      them.
 5. **The main import:** `npx tsx src/tools/import-legacy.ts --commit --sales`.
    - Add `--rate-types` if Railway has no rate types yet (`SELECT count(*) FROM rate_types`).
-   - `--sales` is needed the first time only: from then on agents, markets, salespeople, templates and
-     documents are edited here. Legacy must stop editing them at the same moment.
+   - `--sales` is needed the first time only: from then on agents, markets, salespeople, templates,
+     documents, staff and their quotas, sales targets and follow-up marks are edited here. Legacy must
+     stop editing them at the same moment (Staff & Welfare and the Sales Board's target and ticks too).
+     Rehearsal: 24 staff with their 2026 quotas (58 seats), 0 targets, 1 follow-up mark.
    - Rehearsal: 5,377 bookings, 1,455 seat locks, 473 invoices, 5 weather closures, 158 pier
      payments, 143 cash-on-tour decisions, 26 van bills, 453 van-job sent marks and 836 agents.
 6. **Fleet:** `npm run import:fleet -- --commit`, then `npm run import:fleet-stock -- --commit`.
@@ -61,8 +63,12 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
     - set `B2C_API_KEY` to legacy's value.
 11. **Import the users. Nobody can log in until you do:** `npm run import:users -- --commit`, after
     step 5, so the sales staff's `sales_id` connects. Re-run it until cutover.
-12. **Import the contracts once:** `npm run import:contracts -- --commit`, after steps 4 and 5. Don't
-    re-run it after that: it would overwrite a main contract's rate and `doc_id` set here.
+12. **Import the contracts once:** `npm run import:contracts -- --seed --commit`, after steps 4 and 5.
+    - Without `--seed` it writes nothing (contracts are this API's now). Re-running `--seed` would
+      overwrite a main contract's rate and `doc_id`, and a promo, set here.
+    - Rehearsal (2026-10-10, throwaway import): 918 contracts, 3,242 periods, 16 own prices; one
+      skipped (`ct_main_amrsvysas2dymj`, its agent is gone).
+    - Legacy's promo form (`ctSaveAddPromo`, `ctVoidContract`) must stop saving at the same moment.
 13. **Create Love Kingdom's service user:** `POST /v1/users` with `agent_id: "a_b2c"` and
     `edit_areas: ["operations"]`. Send them the username and password.
 14. **Give `act-approve`** to the staff who approve over the allotment and FOC

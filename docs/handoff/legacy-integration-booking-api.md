@@ -144,7 +144,7 @@ curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
 |---|---|
 | `operations` | bookings and their commands, seat locks, deployments, and the day-of-operations writes |
 | `fleet` | deployments; stock, consumables, memos, projects, the Daily Fleet Log, safety (`/v1/fleet/…`, §6.7); file uploads |
-| `sales` | rate types, agents (rate seasons) |
+| `sales` | rate types, agents (rate seasons), promo contracts, staff and their quotas, sales targets and follow-ups |
 | `config` | the route calendar |
 
 - Check-in also takes `pier`; attachments take `operations`, `pier`, `accounting` or `fleet`; a doc-check note
@@ -304,6 +304,8 @@ does):
 |---|---|---|
 | `400` | — | a field or rule, named (`trips[0] …`, `addOns[2].amount must be a number`, `adjustments[1].value must be a number above 0`, unknown pickup area, a `price_mode` that contradicts the agent) |
 | `400` | — | `foc_reason is required to confirm FOC (free) passengers` |
+| `400` | — | `staff_id is required: a staff booking names the staff member` (the guard `bkV2Save` had: drop its alert), or a `staff_id` that is no staff member |
+| `409` | `over_quota` | a welfare booking's free seats over the staff member's quota: legacy's "Save anyway?" confirm; resend with `quota_anyway: true` |
 | `409` | `route_closed` | a new or moved trip on a closed day: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` |
 | `409` | — | no seats: locks in the way, or past the boats' registered seats |
 | `409` | `booking_closed` | editing a `cancelled`, `rejected`, `cancelled_weather` or `completed` booking |
@@ -1259,11 +1261,12 @@ POST /v1/seat-lock-groups { "route_id": "r5", "date_from": "2026-11-01", "date_t
 - `GET /v1/rate-types?active=&q=`, `GET /v1/rate-types/{id}` replace the seed `SB_RATE_TYPES` for
   display (Rate Types screen, agent detail). Seat prices are keyed `ad_fr`, `chd_fr`, `inf_fr`,
   `ad_th`, `chd_th`, `inf_th`; tiers `net`, `sell`, `min_sell`.
-- `GET /v1/contracts?agent_id=&kind=&status=`, `GET /v1/contracts/{id}` fill `SB_CONTRACTS` for
-  display. Read-only.
+- `GET /v1/contracts?agent_id=&kind=&status=`, `GET /v1/contracts/{id}` fill `SB_CONTRACTS`. Promos
+  are written on the API (§6.5). Each contract carries `state` (the badge `_ctContractStatus` drew)
+  and `bonus_progress` (what `laPromoStat` counted): show those instead of computing them.
 - Writes to rate types exist on the API, but see "Questions" before wiring them.
 
-### 6.5 Agents, contracts' documents, templates, salespeople, markets (sales editing)
+### 6.5 Agents, contracts (promos too), documents, templates, salespeople, markets, the Sales Board, staff (sales editing)
 
 **Change: the Agent List, agent detail, Contract Templates and Team & Markets screens save on the API.**
 The API is the master for these since 2026-10-09; the legacy import no longer writes them. README
@@ -1284,10 +1287,20 @@ The API is the master for these since 2026-10-09; the legacy import no longer wr
 | `tmSaveModal` (market), `tmApplyMarketOrder`, `tmDeleteMarket` | `POST`/`PATCH`/`DELETE /v1/markets[/{id}]`, `PUT /v1/markets/order` |
 | `agSubMarketRemember` | nothing: saving the agent adds the sub-market |
 | `agLog` | nothing: the server writes every activity line, signed with the login |
+| `ctSaveAddPromo` (add) | `POST /v1/contracts` `{agent_id, price_mode, rate_type_id \| seat_prices \| discount, active_from, active_to, book_from?, book_to?, route_ids, bonus?, priority?, note?}`. The own-price table's cells go as `seat_prices: [{route_id, zone, category: ad\|chd, residency: thai\|foreign, price}]` (legacy's `adult-thai` → `ad`/`thai`, `child-fr` → `chd`/`foreign`) |
+| `ctSaveAddPromo` (edit) | `PATCH /v1/contracts/{id}` with the form's fields |
+| its confirms | `409 routes_unpriced` (no own price / no main price for a route): show legacy's confirm, resend with `unpriced_anyway: true`; `409 promo_sold` (already sold): resend with `sold_anyway: true` |
+| `ctVoidContract` | `POST /v1/contracts/{id}/void` |
+| `sbEditTarget` (`salesSetTarget`) | `PUT /v1/sales/{id}/targets/{YYYY-MM}` `{pax}` (0 clears) |
+| `salesToggleFollow` | `PUT /v1/sales/{id}/followups` `{month, agent_id, kind: "agent" \| "foc", marked}`: send the new state, not a toggle |
+| `renderSalesBoard`'s numbers (`salesPaxAgg`, `salesStreak`, `agentTrend`) | `GET /v1/sales-board?month=` |
+| `staffAdd`, `staffSetField`, `staffSetQuota`, `staffDelete` | `POST /v1/staff`, `PATCH /v1/staff/{id}`, `PUT /v1/staff/{id}/quotas/{year}` `{free_seats}`, `DELETE /v1/staff/{id}` (`409 in_use` while bookings name them) |
+| `renderStaff`'s numbers (`staffWelfareUsed`, `staffTripsFor`) | `GET /v1/staff?year=`, `GET /v1/staff/trips?year=` |
 
-- **Stop writing** `sb_agents`, `sb_markets`, `sb_sales`, `contract_templates`, `agent_artifacts` and
-  `sb_contracts`' `rateTypeId`/`docId` from the browser (`sbAgentsPersist`, `sbMarketsPersist`,
-  `sbSalesPersist`, `ctTmplPersist`, `ctArtifactsPersist`, `sbContractsPersist` for those two fields).
+- **Stop writing** `sb_agents`, `sb_markets`, `sb_sales` (targets and follow-ups included),
+  `contract_templates`, `agent_artifacts`, `sb_contracts` and `sb_staff` from the browser
+  (`sbAgentsPersist`, `sbMarketsPersist`, `sbSalesPersist`, `ctTmplPersist`, `ctArtifactsPersist`,
+  `sbContractsPersist`, `sbStaffPersist`).
 - **A sales-bound login** (`LA_ME.salesId`, not admin) gets only its agents from `GET /v1/agents` and
   `403` for another's: `laScopeAgents` can stay as display, but the server is the gate.
 - **`creditBalance`** is not accepted (the agent's `credit` block is worked out); drop the field from
@@ -1344,7 +1357,6 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | Deposits, refunds, money reports (invoices, PFM, pier money and Travel Summary decisions moved: 2.7, 2.9) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, the Travel Summary totals | `todo/money-model.md` slices 5–6, open 1 |
 | Booking payment slips not tied to a payment | `paymentSlips` | `booking-extras-model.md` open 1 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
-| Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
 | Fleet reports beyond memo spend (cost analytics, upkeep, fuel intelligence, dashboard); the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `fleet-maintenance-model.md` (part A: §3.15; part B: §6.7) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
