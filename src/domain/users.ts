@@ -15,6 +15,8 @@ export type Area = typeof AREAS[number];
 export const ACTIONS = ['act-approve', 'act-capunlock', 'act-tmpl'] as const;
 export type Action = typeof ACTIONS[number];
 export type Role = 'admin' | 'staff';
+/** Love Kingdom's agent: its service login books for it and creates its products as routes. */
+export const LOVE_KINGDOM_AGENT = 'a_b2c';
 
 export type StoredUser = {
   id: number; username: string; pass_hash: string | null; name: string | null; role: Role;
@@ -90,7 +92,14 @@ export function writeNeed(path: string): WriteNeed {
   // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`).
   if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
-  if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
+  // The catalogue (todo/catalogue-editing-model.md): a boat's seats for one day are legacy's
+  // `operations` (`boatCapModalOpen`); retire and restore its `fleet` (`flSave`); everything else
+  // on routes, families and boats its `config` (`save('config')`, decision 2).
+  if (/^\/v1\/boats\/[^/]+\/capacity-overrides(\/|$)/.test(path)) return { kind: 'area', areas: ['operations'] };
+  if (/^\/v1\/boats\/[^/]+\/(retire|restore)$/.test(path)) return { kind: 'area', areas: ['fleet'] };
+  if (path === '/v1/boats' || path.startsWith('/v1/boats/')) return { kind: 'area', areas: ['config'] };
+  if (path === '/v1/route-families' || path.startsWith('/v1/route-families/')) return { kind: 'area', areas: ['config'] };
+  if (path === '/v1/routes' || path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
   if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
   return { kind: 'admin' };
@@ -100,6 +109,9 @@ export function writeNeed(path: string): WriteNeed {
 export function assertMayWrite(user: StoredUser, path: string): void {
   const need = writeNeed(path);
   if (need.kind === 'self') return;
+  // Love Kingdom's service login also creates its products as routes (decision 9 of
+  // todo/catalogue-editing-model.md; legacy's `POST /api/b2c/routes`), without the config area.
+  if (user.agent_id === LOVE_KINGDOM_AGENT && path === '/v1/routes') return;
   // A login tied to one agent books for it and does nothing else (Love Kingdom's service user).
   if (user.agent_id !== null && !(path === '/v1/bookings' || path.startsWith('/v1/bookings/'))) {
     refuse(`This login books for agent ${user.agent_id} and may change nothing else`, 403, 'forbidden');

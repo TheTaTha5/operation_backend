@@ -5,10 +5,10 @@ import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { Authenticator } from '../auth.js';
 import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserPatch, password, userView, verifyPassword, type StoredUser } from '../domain/users.js';
-import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind } from '../domain/calendar.js';
+import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind, type Route, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
-import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
+import { capacityNumbers } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns, type BookingAddOnInput } from '../domain/booking-addons.js';
@@ -53,6 +53,12 @@ import {
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
+import {
+  addStatusEntry, assertFamily, assertFamilyUnused, assertNotPast, assertRouteUnused, blankBoat, boatView, boatWarnings, capacityChange, copyBoat, deploymentNumbers,
+  duplicateNameWarnings, editStatusEntry, extIdTaken, guessFamily, newRoute, nextCatalogueId, overrideDay, parseBoatInput, parseFamilyPatch, parseNewFamily,
+  parseNewRoute, parseOverrideRequest, parseRoutePatch, parseStatusEntry, patchedRoute, planOverride, realDate, restoredBoat, retiredBoat, routeOrder, seatsDrop,
+  withFormStatus, type BoatRecord, type DeploymentDay, type OversoldWarning,
+} from '../domain/catalogue.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -70,6 +76,7 @@ const withoutVersion = (body: unknown, required = false): Record<string, unknown
   return rest;
 };
 const lockId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+const paramId = (request: { params: unknown }): string => (request.params as { id: string }).id;
 /** A trip's price inputs a booking does not store yet (todo/pricing-model.md, step 5). Legacy's spellings too. */
 function quoteTripPrices(raw: unknown, index: number): Pick<QuoteTrip, 'ovn_charge' | 'charter_price_mode' | 'charter_price_manual' | 'charter_price_note'> {
   const trip = isRecord(raw) ? raw : {};
@@ -349,6 +356,22 @@ const calendarDate = (value: unknown, name: string): string => {
   const day = typeof value === 'string' && isIsoDate(value) ? new Date(`${value}T00:00:00Z`) : undefined;
   return day && !Number.isNaN(day.getTime()) && day.toISOString().startsWith(value as string) ? value as string : badRequest(`${name} must be a YYYY-MM-DD date`);
 };
+/** A route with its calendar as stored, with ids, for the screen that edits it. */
+const withCalendar = (route: Route, seasons: readonly RouteSeason[], overrides: readonly RouteDayOverride[]) => ({
+  ...route,
+  seasons: seasons.filter((s) => s.route_id === route.id)
+    .sort((a, b) => a.from_date.localeCompare(b.from_date) || a.id.localeCompare(b.id))
+    .map(({ id, kind: k, from_date, to_date }) => ({ id, kind: k, from_date, to_date })),
+  overrides: overrides.filter((o) => o.route_id === route.id)
+    .sort((a, b) => a.service_date.localeCompare(b.service_date))
+    .map(({ service_date, kind: k }) => ({ service_date, kind: k })),
+});
+/** A `*_anyway` flag in a body (a boolean) or a query string (`true`/`false`). Absent is false. */
+const anywayFlag = (value: unknown, name: string): boolean => {
+  if (value === undefined || value === false || value === 'false') return false;
+  if (value === true || value === 'true') return true;
+  return badRequest(`${name} must be true or false`);
+};
 /** `close_anyway` in a body (a boolean) or a query string (`true`/`false`). Absent is false. */
 function closeAnyway(value: unknown): boolean {
   if (value === undefined || value === false || value === 'false') return false;
@@ -521,15 +544,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     // Each route carries its calendar as stored, with ids, for the screen that edits it; `days` below
     // is the same calendar resolved.
     const seasons = await store.listSeasons(), overrides = await store.listDayOverrides();
-    const routes = (await store.listRoutes()).filter((route) => kind === undefined || route.kind === kind).map((route) => ({
-      ...route,
-      seasons: seasons.filter((s) => s.route_id === route.id)
-        .sort((a, b) => a.from_date.localeCompare(b.from_date) || a.id.localeCompare(b.id))
-        .map(({ id, kind: k, from_date, to_date }) => ({ id, kind: k, from_date, to_date })),
-      overrides: overrides.filter((o) => o.route_id === route.id)
-        .sort((a, b) => a.service_date.localeCompare(b.service_date))
-        .map(({ service_date, kind: k }) => ({ service_date, kind: k })),
-    }));
+    const routes = (await store.listRoutes()).filter((route) => kind === undefined || route.kind === kind).map((route) => withCalendar(route, seasons, overrides));
     if (from === undefined || to === undefined) return { routes };
 
     if (!isIsoDate(from) || !isIsoDate(to)) badRequest('from and to must be YYYY-MM-DD dates');
@@ -587,9 +602,216 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * licence on file: claiming a registration the vessel does not hold would be worse than saying
    * there is none, and a missing licence is not a licence of zero.
    */
-  app.get('/v1/boats', async () => ({
-    boats: (await store.listBoats()).map((boat) => ({ ...boat, license_pax: boat.license_pax ?? null, charter_ceiling: charterCeiling(boat) })),
+  app.get('/v1/boats', async () => {
+    const today = todayInThailand();
+    return { boats: (await store.boatRecords()).map((boat) => boatView(boat, today)) };
+  });
+  app.get('/v1/boats/:id', async (request) => boatView((await store.boatRecord(paramId(request))) ?? notFound('Boat not found'), todayInThailand()));
+
+  // ── Editing the catalogue (todo/catalogue-editing-model.md, decided 2026-10-09). The rules are
+  //    `src/domain/catalogue.ts`'s; these gather rows and write what it answers. ──
+
+  /** Programme families: an editable table (decision 8), `config`. */
+  app.get('/v1/route-families', async () => ({ families: await store.listRouteFamilies() }));
+  app.post('/v1/route-families', async (request, reply) => reply.code(201).send(await store.transaction(async () => {
+    const family = parseNewFamily(record(request.body), new Set((await store.listRouteFamilies()).map((f) => f.id)));
+    await store.insertRouteFamily(family);
+    return family;
+  })));
+  app.patch('/v1/route-families/:id', async (request) => {
+    const patch = parseFamilyPatch(record(request.body));
+    return (await store.transaction(async () => store.updateRouteFamily(paramId(request), patch))) ?? notFound('Family not found');
+  });
+  app.delete('/v1/route-families/:id', async (request, reply) => {
+    await store.transaction(async () => {
+      const id = paramId(request);
+      if (!(await store.listRouteFamilies()).some((f) => f.id === id)) notFound('Family not found');
+      assertFamilyUnused(id, await store.familyUsage(id));
+      await store.deleteRouteFamily(id);
+    });
+    return reply.code(204).send();
+  });
+
+  /** One route with its calendar as stored, as the list shows it. */
+  const routeView = async (route: Route) => withCalendar(route, await store.listSeasons(), await store.listDayOverrides());
+  const familyIds = async () => new Set((await store.listRouteFamilies()).map((f) => f.id));
+  app.get('/v1/routes/:id', async (request) => routeView((await store.route(paramId(request))) ?? notFound('Route not found')));
+  /**
+   * Settings → Programs' "add" (`saveRoute`) and Love Kingdom's create (`POST /api/b2c/routes`):
+   * a route whose `ext_id` is already here answers `200` with it, `created: false`, and changes nothing.
+   */
+  app.post('/v1/routes', async (request, reply) => {
+    const { fields, seasons } = parseNewRoute(record(request.body));
+    const result = await store.transaction(async () => {
+      if (fields.ext_id) {
+        const existing = await store.routeByExtId(fields.ext_id);
+        if (existing) return { created: false, route: existing, warnings: [] as { code: string; message: string }[] };
+      }
+      const routes = await store.listRoutes();
+      const family = fields.family_id !== undefined ? fields.family_id : guessFamily(fields.name, fields.kind)
+        ?? badRequest('family_id is required: it could not be told from the name. GET /v1/route-families lists them; null means no family (not shown on the Booking calendar)');
+      assertFamily(family, await familyIds());
+      const route = newRoute(fields, family, routes, Date.now());
+      await store.insertRoute(route, seasons.map((s) => ({ ...s, id: store.newSeasonId(), route_id: route.id })));
+      return { created: true, route: (await store.route(route.id))!, warnings: duplicateNameWarnings(route.name, routes) };
+    });
+    return reply.code(result.created ? 201 : 200).send({ ...result, route: await routeView(result.route) });
+  });
+  /** Settings → Programs' "edit": client facts only (`sort` and the calendar have their own endpoints). */
+  app.patch('/v1/routes/:id', async (request) => {
+    const patch = parseRoutePatch(record(request.body));
+    const id = paramId(request);
+    const route = await store.transaction(async () => {
+      const current = (await store.route(id)) ?? notFound('Route not found');
+      const next = patchedRoute(current, patch);
+      assertFamily(next.family_id, await familyIds());
+      if (next.ext_id) {
+        const owner = await store.routeByExtId(next.ext_id);
+        if (owner && owner.id !== id) extIdTaken(next.ext_id, owner.id);
+      }
+      await store.updateRoute(id, next);
+      return (await store.route(id))!;
+    });
+    return routeView(route);
+  });
+  /** Refused while anything refers to the route (decision 6); its calendar goes with it. */
+  app.delete('/v1/routes/:id', async (request, reply) => {
+    await store.transaction(async () => {
+      const route = (await store.route(paramId(request))) ?? notFound('Route not found');
+      assertRouteUnused(route, await store.routeUsage(route.id));
+      await store.deleteRoute(route.id);
+    });
+    return reply.code(204).send();
+  });
+  /** Legacy's drag within one pier (`stApplyRouteOrder`): every route is renumbered. */
+  app.post('/v1/routes/order', async (request) => store.transaction(async () => {
+    const sorts = routeOrder(await store.listRoutes(), record(request.body));
+    await store.setRouteSorts(sorts);
+    return { routes: [...sorts].map(([id, sort]) => ({ id, sort })) };
   }));
+
+  /** The boat form (`saveBoat`, decision 3), `config`. */
+  app.post('/v1/boats', async (request, reply) => {
+    const input = parseBoatInput(record(request.body), 'create');
+    const saved = await store.transaction(async () => {
+      const now = Date.now();
+      const id = nextCatalogueId('b', new Set((await store.boatRecords()).map((b) => b.id)), now);
+      const boat: BoatRecord = { ...blankBoat({ id, name: input.fields.name!, capacity: input.fields.capacity! }), ...input.fields, documents: input.documents ?? [] };
+      boat.status_log = withFormStatus([], boat.ownership, boat.pier, input.status ?? 'available', todayInThailand(), now, true);
+      return store.writeBoat(boat, new Date(now).toISOString());
+    });
+    return reply.code(201).send({ ...boatView(saved, todayInThailand()), warnings: boatWarnings(saved) });
+  });
+  /**
+   * The boat form's edit. A change of seats, licence or persons aboard reaches every deployment of the
+   * boat from today on (decision 5); a day that would carry more passengers than its new seats needs
+   * `capacity_anyway` (`409 seats_sold`).
+   */
+  app.patch('/v1/boats/:id', async (request) => {
+    const { capacity_anyway: anywayRaw, ...body } = record(request.body);
+    const anyway = anywayFlag(anywayRaw, 'capacity_anyway');
+    const input = parseBoatInput(body, 'patch');
+    const id = paramId(request);
+    return store.transaction(async () => {
+      const current = (await store.boatRecord(id)) ?? notFound('Boat not found');
+      const now = Date.now(), today = todayInThailand();
+      const next: BoatRecord = { ...copyBoat(current), ...input.fields, ...(input.documents ? { documents: input.documents } : {}) };
+      if (input.status) next.status_log = withFormStatus(current.status_log, next.ownership, next.pier, input.status, today, now);
+      let oversold: OversoldWarning[] = [], updated = 0;
+      if (next.capacity !== current.capacity || next.license_pax !== current.license_pax || next.registered_persons !== current.registered_persons) {
+        const overrides = new Map((await store.boatCapacityOverrides(id, today)).map((o) => [o.service_date, o.capacity]));
+        const days: DeploymentDay[] = [];
+        for (const d of await store.boatDeploymentsFrom(id, today)) {
+          const override = overrides.get(d.service_date);
+          // Only a day that loses seats needs its passengers weighed.
+          if (!seatsDrop(current, next, override)) continue;
+          days.push({ deployment: d, override_capacity: override, placed: placedOn(await store.bookingsOn(d.service_date, d.route_id), id, d.route_id, d.service_date) });
+        }
+        oversold = capacityChange(next.name, current, next, days, anyway);
+        updated = (await store.updateBoatDeployments(id, today, deploymentNumbers(next))).length;
+      }
+      const saved = await store.writeBoat(next, new Date(now).toISOString());
+      return { ...boatView(saved, today), deployments_updated: updated, warnings: [...boatWarnings(saved), ...oversold] };
+    });
+  });
+  /** Retire and restore (decision 13; legacy `flRetireBoat`, `flUnretireBoat`), `fleet`. */
+  app.post('/v1/boats/:id/retire', async (request) => {
+    const body = request.body === undefined || request.body === null ? {} : record(request.body);
+    const reason = typeof body.reason === 'string' && body.reason.trim() ? body.reason.trim() : body.reason === undefined || body.reason === null || body.reason === '' ? null : badRequest('reason must be a string');
+    return store.transaction(async () => {
+      const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      const today = todayInThailand();
+      const next = retiredBoat(current, await store.boatDeploymentsFrom(current.id, today), reason, today, Date.now());
+      return boatView(await store.writeBoat(next, new Date().toISOString()), today);
+    });
+  });
+  app.post('/v1/boats/:id/restore', async (request) => store.transaction(async () => {
+    const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+    const today = todayInThailand();
+    return boatView(await store.writeBoat(restoredBoat(current, today, Date.now()), new Date().toISOString()), today);
+  }));
+  /** The status timeline (legacy `saveStatus`, `editStatus`, `delStatus`), `config`. */
+  const entryId = (request: { params: unknown }): string => (request.params as { entry_id: string }).entry_id;
+  app.post('/v1/boats/:id/status-log', async (request, reply) => {
+    const fields = parseStatusEntry(record(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      const { log, entry } = addStatusEntry(current.status_log, fields, Date.now());
+      await store.writeBoat({ ...current, status_log: log }, new Date().toISOString());
+      return entry;
+    }));
+  });
+  app.patch('/v1/boats/:id/status-log/:entry_id', async (request) => {
+    const fields = parseStatusEntry(record(request.body));
+    return store.transaction(async () => {
+      const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      const { log, entry } = editStatusEntry(current.status_log, entryId(request), fields);
+      await store.writeBoat({ ...current, status_log: log }, new Date().toISOString());
+      return entry;
+    });
+  });
+  app.delete('/v1/boats/:id/status-log/:entry_id', async (request, reply) => {
+    await store.transaction(async () => {
+      const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      if (!current.status_log.some((e) => e.id === entryId(request))) notFound('Status entry not found');
+      await store.writeBoat({ ...current, status_log: current.status_log.filter((e) => e.id !== entryId(request)) }, new Date().toISOString());
+    });
+    return reply.code(204).send();
+  });
+
+  /** A boat's seats for one day (decision 10; legacy `boatCapSet`), `operations`. */
+  const overrideDate = (request: { params: unknown }): string => realDate((request.params as { date: string }).date, 'date');
+  app.get('/v1/boats/:id/capacity-overrides', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const from = query.from === undefined ? undefined : realDate(query.from, 'from'), to = query.to === undefined ? undefined : realDate(query.to, 'to');
+    const boat = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+    const deployed = new Map((await store.listDeployments(from, to)).filter((d) => d.boat_id === boat.id).map((d) => [d.service_date, d]));
+    return { overrides: (await store.boatCapacityOverrides(boat.id, from, to)).map((o) => overrideDay(boat, o.service_date, deployed.get(o.service_date), o)) };
+  });
+  app.put('/v1/boats/:id/capacity-overrides/:date', async (request) => {
+    const date = overrideDate(request);
+    const req = parseOverrideRequest(record(request.body));
+    return store.transaction(async () => {
+      const boat = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      assertNotPast(boat.name, date, todayInThailand());
+      const deployment = (await store.listDeployments(date, date)).find((d) => d.boat_id === boat.id);
+      const day = overrideDay(boat, date, deployment, (await store.boatCapacityOverrides(boat.id, date, date))[0]);
+      const user = request.user?.user;
+      const plan = planOverride(req, day, { boatName: boat.name, mayRaise: !user || user.role === 'admin' || user.actions.includes('act-capunlock') });
+      if (plan.remove) await store.deleteBoatCapacityOverride(boat.id, date);
+      else await store.putBoatCapacityOverride({ boat_id: boat.id, service_date: date, capacity: plan.capacity, reason: plan.reason, set_by: actorOf(request.user) ?? null, set_at: new Date().toISOString() });
+      return overrideDay(boat, date, deployment, (await store.boatCapacityOverrides(boat.id, date, date))[0]);
+    });
+  });
+  app.delete('/v1/boats/:id/capacity-overrides/:date', async (request, reply) => {
+    const date = overrideDate(request);
+    await store.transaction(async () => {
+      const boat = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
+      assertNotPast(boat.name, date, todayInThailand());
+      if (!(await store.deleteBoatCapacityOverride(boat.id, date))) notFound(`${boat.name} has no seats set for ${date}`);
+    });
+    return reply.code(204).send();
+  });
 
   /**
    * One route on one day (`route_id` + `date`), or a list of route-days over `from..to` for one route
@@ -1335,6 +1557,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   const guardDeployment = async (request: { user?: { user?: StoredUser } }, date: string, boatId: string, after: Deployment | undefined, anyway: boolean) => {
     const before = (await store.listDeployments(date, date)).find((d) => d.boat_id === boatId);
     const boat = (await store.listBoats()).find((b) => b.id === boatId);
+    // A retired boat is hidden from legacy's Boat Operation, so it can't be put on a route (catalogue decision 13).
+    if (after && (await store.boatRecord(boatId))?.retired) refuseWith(`${boat?.name ?? boatId} is retired: restore it before deploying it`, 409, 'boat_retired');
     const user = request.user?.user;
     return {
       before,

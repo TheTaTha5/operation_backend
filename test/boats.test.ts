@@ -49,6 +49,10 @@ test('GET /v1/boats returns the catalogue with a resolved charter ceiling', asyn
     assert.equal(typeof boat.capacity, 'number', `${boat.id} has a capacity`);
     assert.ok(boat.license_pax === null || typeof boat.license_pax === 'number', `${boat.id} states its licence or explicitly has none`);
     assert.equal(boat.charter_ceiling, boat.license_pax ?? boat.capacity, `${boat.id} resolves its own ceiling`);
-    assert.ok((boat.charter_ceiling as number) >= (boat.capacity as number), `${boat.id} may not sell more seats than it may carry passengers`);
+    // Capacity above the licence is accepted since 2026-10-09, as legacy accepts it (migration 070);
+    // what is sold stays capped at the licence by `deploymentSeats`, tested above.
+  }
+  for (const limits of [{ capacity: 50, license_pax: 45 }]) {
+    assert.equal(deploymentSeats(limits).sellable, 45, 'a boat above its licence sells only the licence');
   }
 });

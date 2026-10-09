@@ -43,6 +43,10 @@ import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type Sto
 import { copyStop, type VanStop } from './van-stops.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
+import {
+  blankBoat, boatOf, compactRoute, copyBoat, LEGACY_FAMILIES, sortFamilies,
+  type BoatRecord, type RouteFamily, type RouteFields, type RouteUsage, type StoredOverride,
+} from './catalogue.js';
 
 export type Deployment = {
   boat_id: string;
@@ -393,9 +397,12 @@ export class OperationsStore {
   private histories = new Map<string, HistoryEntry[]>();
   private locks = new Map<string, SeatLock>();
   private tail: Promise<void> = Promise.resolve();
-  /** Reference data. Empty unless seeded: with no database there is no catalogue to read. */
-  private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: Boat[]; boatOverrides: BoatCapacityOverride[] } =
-    { routes: [], seasons: [], overrides: [], boats: [], boatOverrides: [] };
+  /**
+   * Reference data. Empty unless seeded or written through the catalogue endpoints: with no database
+   * there is no catalogue to read. The families start as migration 070 seeds them.
+   */
+  private catalogue: { routes: Route[]; seasons: RouteSeason[]; overrides: RouteDayOverride[]; boats: BoatRecord[]; boatOverrides: BoatCapacityOverride[]; families: RouteFamily[] } =
+    { routes: [], seasons: [], overrides: [], boats: [], boatOverrides: [], families: LEGACY_FAMILIES.map((f) => ({ ...f })) };
 
   /** Agents and what they point at. Empty unless seeded: a PostgreSQL deployment gets these from the import. */
   private directory: { markets: Market[]; sales: SalesPerson[]; agents: StoredAgent[]; activity: Map<string, StoredActivity[]> } =
@@ -544,15 +551,112 @@ export class OperationsStore {
     if (catalogue.routes) this.catalogue.routes = catalogue.routes.map((route) => ({ ...route, kind: route.kind ?? 'marine' }));
     if (catalogue.seasons) this.catalogue.seasons = catalogue.seasons.map((season) => ({ ...season }));
     if (catalogue.overrides) this.catalogue.overrides = catalogue.overrides.map((override) => ({ ...override }));
-    if (catalogue.boats) this.catalogue.boats = catalogue.boats.map((boat) => ({ ...boat }));
+    if (catalogue.boats) this.catalogue.boats = catalogue.boats.map((boat) => blankBoat(boat));
     if (catalogue.boatOverrides) this.catalogue.boatOverrides = catalogue.boatOverrides.map((override) => ({ ...override }));
   }
   private boatOverride(boatId: string, serviceDate: string): number | undefined {
     return this.catalogue.boatOverrides.find((o) => o.boat_id === boatId && o.service_date === serviceDate)?.capacity;
   }
-  listRoutes(): Route[] { return this.catalogue.routes.map((route) => ({ ...route })); }
+  /** By `sort`, unsorted last, as PostgreSQL lists them; otherwise in the order they came (a sort is stable). */
+  listRoutes(): Route[] {
+    return [...this.catalogue.routes].sort((a, b) => (a.sort ?? Infinity) - (b.sort ?? Infinity) || 0)
+      .map((route) => ({ ...route, ...(route.times ? { times: [...route.times] } : {}) }));
+  }
   /** Empty unless seeded, like the rest of the catalogue: with no database there is nothing to read. */
-  listBoats(): Boat[] { return this.catalogue.boats.map((boat) => ({ ...boat })); }
+  listBoats(): Boat[] { return this.boatRecords().map(boatOf); }
+
+  // ── Editing the catalogue (todo/catalogue-editing-model.md; the rules are `catalogue.ts`'s) ──
+  listRouteFamilies(): RouteFamily[] { return sortFamilies(this.catalogue.families); }
+  insertRouteFamily(family: RouteFamily): void { this.catalogue.families.push({ ...family }); }
+  updateRouteFamily(id: string, patch: Partial<Omit<RouteFamily, 'id'>>): RouteFamily | undefined {
+    const found = this.catalogue.families.find((f) => f.id === id);
+    if (!found) return undefined;
+    Object.assign(found, patch);
+    return { ...found };
+  }
+  familyUsage(id: string): number { return this.catalogue.routes.filter((r) => r.family_id === id).length; }
+  deleteRouteFamily(id: string): boolean {
+    const before = this.catalogue.families.length;
+    this.catalogue.families = this.catalogue.families.filter((f) => f.id !== id);
+    return this.catalogue.families.length < before;
+  }
+  route(id: string): Route | undefined { return this.listRoutes().find((r) => r.id === id); }
+  routeByExtId(extId: string): Route | undefined { return this.listRoutes().find((r) => r.ext_id === extId); }
+  /** A new route and the seasons it starts with. The `sort` and colour are `newRoute`'s. */
+  insertRoute(route: Route, seasons: readonly RouteSeason[]): void {
+    this.catalogue.routes.push({ ...route, times: [...(route.times ?? [])] });
+    this.catalogue.seasons.push(...seasons.map((s) => ({ ...s })));
+  }
+  updateRoute(id: string, fields: RouteFields): void {
+    const index = this.catalogue.routes.findIndex((r) => r.id === id);
+    if (index >= 0) this.catalogue.routes[index] = compactRoute({ ...fields, id, sort: this.catalogue.routes[index].sort });
+  }
+  setRouteSorts(sorts: ReadonlyMap<string, number>): void {
+    this.catalogue.routes = this.catalogue.routes.map((r) => (sorts.has(r.id) ? { ...r, sort: sorts.get(r.id) } : r));
+  }
+  /** Its times, seasons and day overrides go with it, as PostgreSQL's ON DELETE CASCADE takes them. */
+  deleteRoute(id: string): boolean {
+    const before = this.catalogue.routes.length;
+    this.catalogue.routes = this.catalogue.routes.filter((r) => r.id !== id);
+    this.catalogue.seasons = this.catalogue.seasons.filter((s) => s.route_id !== id);
+    this.catalogue.overrides = this.catalogue.overrides.filter((o) => o.route_id !== id);
+    return this.catalogue.routes.length < before;
+  }
+  routeUsage(id: string): RouteUsage {
+    const bookings = [...this.bookings.values()];
+    const rateRows = [...this.rateTypes.values()];
+    return {
+      bookings: bookings.filter((b) => b.trips.some((t) => t.route_id === id)).length,
+      deployments: this.deployments.filter((d) => d.route_id === id).length,
+      seat_locks: [...this.locks.values()].filter((l) => l.route_id === id).length,
+      rate_types: rateRows.filter((r) => r.routes.some((x) => x.route_id === id)).length,
+      agents: this.directory.agents.filter((a) => a.programs.some((p) => p.route_id === id)).length,
+      contracts: this.contracts.filter((c) => c.program_periods.some((p) => p.route_id === id) || c.seat_prices.some((p) => p.route_id === id)).length,
+      van_days: [...this.vanDayRows.values()].filter((d) => d.route_ids.includes(id)).length,
+      van_groups: [...this.vanGroups.values()].filter((g) => g.route_id === id).length,
+      van_stops: [...this.vanStops.values()].filter((s) => s.route_id === id).length,
+      upgrades: this.tripUpgrades.filter((u) => u.from_route_id === id || u.to_route_id === id).length,
+      pickup_times: this.pickupCells.filter((c) => c.route_id === id).length,
+    };
+  }
+
+  /** Every field of every boat, by name then id as PostgreSQL lists them. */
+  boatRecords(): BoatRecord[] {
+    return [...this.catalogue.boats].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map(copyBoat);
+  }
+  boatRecord(id: string): BoatRecord | undefined { const b = this.catalogue.boats.find((x) => x.id === id); return b && copyBoat(b); }
+  /** Creates or replaces the boat with its documents and status log, stamped as edited here. */
+  writeBoat(boat: BoatRecord, now: string): BoatRecord {
+    const saved = { ...copyBoat(boat), updated_at: now };
+    const index = this.catalogue.boats.findIndex((b) => b.id === boat.id);
+    if (index >= 0) this.catalogue.boats[index] = saved; else this.catalogue.boats.push(saved);
+    return copyBoat(saved);
+  }
+  /** The boat's numbers onto each of its deployments from `from` on; answers the days changed. */
+  updateBoatDeployments(boatId: string, from: string, numbers: Pick<Deployment, 'capacity' | 'license_pax' | 'registered_persons'>): Deployment[] {
+    const changed: Deployment[] = [];
+    this.deployments = this.deployments.map((d) => {
+      if (d.boat_id !== boatId || d.service_date < from) return d;
+      const next = { ...d, ...numbers };
+      changed.push({ ...next });
+      return next;
+    });
+    return changed;
+  }
+  boatDeploymentsFrom(boatId: string, from: string): Deployment[] {
+    return this.deployments.filter((d) => d.boat_id === boatId && d.service_date >= from)
+      .sort((a, b) => (a.service_date < b.service_date ? -1 : a.service_date > b.service_date ? 1 : 0)).map((d) => ({ ...d }));
+  }
+  boatCapacityOverrides(boatId: string, from?: string, to?: string): StoredOverride[] {
+    return this.catalogue.boatOverrides.filter((o) => o.boat_id === boatId && (!from || o.service_date >= from) && (!to || o.service_date <= to))
+      .sort((a, b) => (a.service_date < b.service_date ? -1 : 1))
+      .map((o) => ({ boat_id: o.boat_id, service_date: o.service_date, capacity: o.capacity, reason: o.reason ?? null, set_by: o.set_by ?? null, set_at: o.set_at ?? null }));
+  }
+  deleteBoatCapacityOverride(boatId: string, date: string): boolean {
+    const before = this.catalogue.boatOverrides.length;
+    this.catalogue.boatOverrides = this.catalogue.boatOverrides.filter((o) => !(o.boat_id === boatId && o.service_date === date));
+    return this.catalogue.boatOverrides.length < before;
+  }
   listSeasons(): RouteSeason[] { return this.catalogue.seasons.map((season) => ({ ...season })); }
   listDayOverrides(from?: string, to?: string): RouteDayOverride[] {
     return this.catalogue.overrides.filter((o) => (!from || o.service_date >= from) && (!to || o.service_date <= to)).map((o) => ({ ...o }));
@@ -948,7 +1052,7 @@ export class OperationsStore {
    */
   createDeployment(input: Deployment): Deployment {
     const boat = this.catalogue.boats.find((b) => b.id === input.boat_id);
-    const deployment: Deployment = { ...input, license_pax: input.license_pax ?? boat?.license_pax };
+    const deployment: Deployment = { ...input, license_pax: input.license_pax ?? boat?.license_pax ?? undefined };
     const existing = this.deployments.findIndex((d) => d.boat_id === input.boat_id && d.service_date === input.service_date);
     if (existing >= 0) this.deployments[existing] = deployment;
     else this.deployments.push(deployment);
@@ -962,8 +1066,10 @@ export class OperationsStore {
     return true;
   }
 
+  /** By date, as PostgreSQL lists them. */
   listDeployments(from?: string, to?: string, routeId?: string): Deployment[] {
-    return this.deployments.filter((d) => (!from || d.service_date >= from) && (!to || d.service_date <= to) && (!routeId || d.route_id === routeId));
+    return this.deployments.filter((d) => (!from || d.service_date >= from) && (!to || d.service_date <= to) && (!routeId || d.route_id === routeId))
+      .sort((a, b) => (a.service_date < b.service_date ? -1 : a.service_date > b.service_date ? 1 : 0));
   }
 
   /**
