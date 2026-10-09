@@ -67,3 +67,22 @@ Nothing is in progress.
 - `seed:routes` and `seed:boats` after 070;
 - `--sales` before deploying 090;
 - the `--b2c` switch-over timing.
+
+## 2026-10-10
+
+Merged into `main`: the deploy runbook (rehearsed end to end on a copy of the import), the
+`isIsoDate` fix, `todo/legacy-browser-rules.md` (823 legacy browser rules: 308 still missing), the
+pier office (petty cash and the office lists, migrations 170–171) and whole-boat hold commands
+(migration 180). 526 tests pass on both stores.
+
+Still on branches in agent worktrees, not merged (check `git log main..<branch>`; finish or merge):
+
+| Task | Branch | Migrations |
+|---|---|---|
+| Trip P&L, cost model, refund payouts, deposits | `feat/money-remainder` | 160–169 |
+| Fleet extras | `feat/fleet-extras` | 190–199 |
+| Promo contracts, sales targets, staff quotas, seed-only contracts | `feat/sales-extras` | 200–209 |
+| Reschedule fee tops up the invoice; the charter-split seat bug; 8 booking differences written up | `fix/booking-rules` | 210–219 |
+
+Next: the second wave from `todo/legacy-browser-rules.md` "Missing" (pier operations, check-in
+counting, required booking fields, deployment checks).

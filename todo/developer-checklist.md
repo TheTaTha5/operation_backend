@@ -19,7 +19,7 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - 070 drops the `capacity <= license_pax` check;
    - 080 drops `van_days.sent_at` (each mark moves onto that van's groups);
    - 048 turns a lock naming no agent into an office lock.
-2. **Push `main`.** Deploying applies migrations 039–143 (`preDeployCommand`).
+2. **Push `main`.** Deploying applies migrations 039–180 (`preDeployCommand`).
 3. **Copy the files:** `npm run import:attachments -- --commit` (about 6,000 files, about 660 MB, about
    18 min; re-runnable). Run it before the imports, so slips, documents and project photos link.
 4. **Seed the catalogue once:** `npm run seed:routes -- --commit`, then `npm run seed:boats -- --commit`.
