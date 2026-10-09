@@ -952,13 +952,14 @@ on input, since that is what legacy sends, and stored as `registered_persons`.
 Legacy's Fleet screens (`05-fleet.js`), part A (todo/fleet-maintenance-model.md, decided
 2026-10-09): whether a boat can sail, its engines, gearboxes and propellers, incidents and
 maintenance jobs. Writes need the `fleet` area. Stock, purchase memos, the Daily Fleet Log, projects,
-safety equipment and consumables are part B.
+safety equipment and consumables are part B ("Fleet maintenance: stock, memos, projects…"); where the
+two meet is `src/domain/fleet-seams.ts`.
 
 **Availability** (legacy `boatEffStatus`, `boatJobBlock`):
 
 - `GET /v1/fleet/availability?from=&to=&boat_id=` (default today; at most 62 days) →
   `{ days: [{ boat_id, service_date, status, stored_status, reason, not_chartered, blocked_by, planned_over }] }`.
-- `stored_status` is the status log's; `blocked_by` the started jobs holding the boat that day
+- `stored_status` is the status log's; `blocked_by` the started jobs, and the projects in progress or on hold (`kind: project`, status `unavailable`, from their actual else planned start), holding the boat that day
   (`{kind, id, no, status, reason}`): a job `inprogress` whose `boat_status` is not `available`, from
   its `start_date`. `status` is the stricter of the two, but a log already saying fixing, unavailable or
   retired is kept as written. Work an entry is planned ahead of (`planned_over`) holds nothing on that
@@ -989,8 +990,8 @@ safety equipment and consumables are part B.
   propeller `cost` 0, and `size` is `diameter×pitch` when both are sent (the forms').
 - **Statuses:** engines and gearboxes `ready, fixing, broken, spare` (`limited` only by closing a job);
   propellers `active, fixing, broken, spare` (`damaged` only by a quick swap, `limited` by a job).
-- **Computed:** an engine's `hours` (`base_hours` plus its Daily Fleet Log meter: part B, so today
-  `base_hours`) and `service` (`{current_hours, interval, base, since, next, left, pct, overdue}`); a
+- **Computed:** an engine's `hours` (`base_hours` plus what its Daily Fleet Log meter ran: the latest
+  reading less the first above 0, every trip type) and `service` (`{current_hours, interval, base, since, next, left, pct, overdue}`); a
   gearbox's `lifetime_hours` and `service` (interval 200 when none). Decommissioned engines carry
   `retired`, `retired_on`, `retired_reason`.
 
@@ -1053,8 +1054,8 @@ safety equipment and consumables are part B.
   A job that reads like a service (scheduled, or "oil/service/gear…" in its words) with engines or
   gearboxes needs `reset_service` true or false (legacy's confirm). The incident closes with its last
   job (not on a cancel).
-- **Computed:** `cost` (parts not already in a parts memo, plus approved/received/paid memos: part B,
-  so today parts only), `parts_cost`, `memo_cost`, `parts_covered`, `lane` (the board's
+- **Computed:** `cost` (parts not already in a parts memo, plus the job's approved/received/paid
+  memos, those whose `job_id` is the job), `parts_cost`, `memo_cost`, `parts_covered`, `lane` (the board's
   `flBoardLane`), `silent_days`, `blocks_boat`. `legacy_cost` is legacy's stored cost, read-only.
   `status`, `end_date`, `outcome`, `set_fixing`, `pinned_on`, `parked_on`, the logs and steps are the
   server's; sending them to `PATCH` is `400` naming the command.
@@ -3310,6 +3311,15 @@ consumable_id, changes, created_at, created_by}`. Types: legacy's `register`, `r
 draw or a job part put back), `reverse` (a cancelled memo's receipt), `import`. `409 stock_short`
 carries `short: [{item_id, warehouse, have, asked}]`.
 
+**A job's parts from stock** (legacy `flMaintAddPart`, `flMaintRemovePart`):
+
+| Method + path | Body | Rule |
+|---|---|---|
+| `POST /v1/fleet/jobs/{id}/parts` | `{item_id, warehouse, qty?, late_anyway?, date?}` | `201 {job, item}`. A `withdraw` movement with the job's id; the job gets the part (`name`, `unit`, the item's `cost`, `location` as the warehouse's label), added to one taken the same day from the same warehouse. Beyond the warehouse's stock is `409 stock_short` (a job part never goes below zero). On a closed job it is a late edit: `409 job_closed` unless `late_anyway: true`, and the part is marked `late` |
+| `DELETE /v1/fleet/jobs/{id}/parts/{idx}` | `?late_anyway=true` on a closed job | `{job, item}`. The part goes back to the warehouse it came from (a `return` movement); a part with no stock item only comes off |
+
+Both write legacy's progress line. Refetch `GET /v1/fleet/jobs/{id}` for the job's cost.
+
 **Consumables** (legacy "เบิกของใช้/น้ำมัน"): `POST /v1/fleet/consumables` `{item_id, warehouse, qty,
 boat_id, engine_id?, engine_label?, date?, by?, note?, allow_negative?}` → `201`. `qty` whole, at
 least 1; a boat is required. More than the warehouse holds is `409 stock_short` unless
@@ -3354,11 +3364,11 @@ the client's; `original_plan_to` keeps the plan end as the baseline. `PATCH` tak
 | `…/start` | planned | — | `inprogress`; the boat's status log gets `unavailable` (`dry_dock`/`overhaul`, `project_id`) |
 | `…/hold` | inprogress | `{reason}` | `on_hold` |
 | `…/resume` | on_hold | — | `inprogress` |
-| `…/cancel` | not completed/cancelled | `{reason}` | `cancelled`; a running project's boat entry ends and the boat is `available` |
+| `…/cancel` | not completed/cancelled | `{reason, unlink_jobs?}` | `cancelled`; a running project's boat entry ends and the boat is `available`. `unlink_jobs: true` (legacy's confirm) lets the open child jobs go on alone |
 | `…/reopen` | cancelled | — | `planned` |
-| `…/work-done` | inprogress | `{note?}` | `awaiting_bill`; the boat back to `available` |
+| `…/work-done` | inprogress | `{note?}` | `awaiting_bill`; the boat back to `available`; open child jobs closed (`done`, a line, no outcome: legacy's cascade) |
 | `…/bill-back` | awaiting_bill | — | `inprogress`; the boat `unavailable` again |
-| `…/complete` | inprogress, awaiting_bill | `{no_cost_reason?}` | `completed` when the **bill gate** passes: an invoice-like document and `cost > 0`; else `409 bill_gate` with `missing` (legacy's messages). `no_cost_reason` closes with no cost |
+| `…/complete` | inprogress, awaiting_bill | `{no_cost_reason?}` | `completed` when the **bill gate** passes: an invoice-like document and `cost > 0`; else `409 bill_gate` with `missing` (legacy's messages). `no_cost_reason` closes with no cost. From in progress, open child jobs are closed as above |
 
 Plan items: `POST …/plan {text}`, `PATCH …/plan/{item_id} {done?, text?}`, `DELETE …`. Documents:
 `POST …/documents {name, attachment_id? | url?, note?, type? (photo), phase?, status?}` (a file from
@@ -3366,7 +3376,7 @@ Plan items: `POST …/plan {text}`, `PATCH …/plan/{item_id} {done?, text?}`, `
 attachment_id?, name?, note?}` (`required`/`pending`/`received`/`verified`), `DELETE` (also deletes
 the file when nothing else names it). Vendor visits: `POST …/vendor-visits {vendor, role?}`,
 `DELETE …/vendor-visits/{id}`. These answer the project. Computed: `cost` (the child jobs' cost,
-legacy `flProjCalcCost`; jobs are part A's and count nothing until wired), `cost_breakdown`,
+legacy `flProjCalcCost`: jobs whose `parent_project_id` is the project, memos included), `cost_breakdown`,
 `bill_gate`, `health` (legacy's score), `phase_index`, `required_documents` still missing,
 `bill_days`.
 

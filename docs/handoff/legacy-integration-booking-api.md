@@ -1038,8 +1038,9 @@ reference. Seed once with `npm run import:fleet -- --commit`.
 - **Behaviour changes:** see todo/fleet-maintenance-model.md "Flagged" (closing a job run alongside
   the boat no longer cuts the boat's status entry; the per-asset choice really makes one job per
   asset; the board fields, engine `retired` and gearbox service hours are kept).
-- **Not yet (part B):** parts from stock (`flMaintAddPart`, `flMaintRemovePart`), memos, Daily Fleet
-  Log meters (so `hours` is `base_hours` until then), projects.
+- **Part B (§6.7):** parts from stock are `POST /v1/fleet/jobs/{id}/parts` and `DELETE …/parts/{idx}`
+  (`flMaintAddPart`, `flMaintRemovePart`); `hours` counts the Daily Log meters; a job's `cost` its memos;
+  a project in progress holds its boat.
 
 ---
 

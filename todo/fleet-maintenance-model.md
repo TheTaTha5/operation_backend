@@ -313,17 +313,10 @@ and `deploy_anyway`.
 
 ## Open (part A)
 
-1. **Seams to part B, wired at merge** (`src/routes/fleet.ts`):
-   - `openWork`: add projects `inprogress`/`on_hold` from `actual_from ?? plan_from`, status
-     `unavailable`, reason `dry_dock`/`overhaul` (legacy `boatJobBlock`), so a project holds its boat;
-   - `hoursOf`: the Daily Fleet Log's meter readings per engine (`engineHours(e, meters)`), so `hours`,
-     `service` and the gearbox lifetime count real running hours (today `base_hours`);
-   - `memosOf`: the job's memos (`{status, memo_type, amount, item_names}`), so `cost` includes them
-     (today parts only; `legacy_cost` shows legacy's figure);
-   - job parts from stock (`flMaintAddPart`, `flMaintRemovePart`, the "late edit"): a stock movement,
-     part B's. Parts are imported and shown; no command adds or removes one yet;
-   - a job made under a project writes onto the project's log (`_projCreateForId`); here it only
-     writes its own line naming the project id.
+1. **The seams to part B are wired** (`src/domain/fleet-seams.ts`): projects hold their boat,
+   engine hours read the Daily Log meters, a job's cost counts its memos, job parts come from stock.
+   Still open: a job made under a project does not write onto the project's log (`_projCreateForId`);
+   it writes its own line naming the project.
 2. **Pier assignments and certificate expiry/renewal** (catalogue open item 4) are not built.
 3. **Repair history** (`boats.repairHistory`, 60 legacy rows) is not stored: it is the boat's done
    jobs (`GET /v1/fleet/jobs?boat_id=&status=done`). Legacy's rows snapshot the cost at close; not
@@ -422,16 +415,8 @@ item's stock equal to legacy's.
 
 ## Open (part B)
 
-1. **Wire part A** after both merge:
-   - `projectJobs` (both stores answer none): a project's child jobs, their cost and whether open.
-     Until then a project's cost is ฿0, so the bill gate always asks for "no cost".
-   - Job parts take and return stock through `planWithdraw` / `planReturn` (`fleet-stock.ts`):
-     refused beyond stock, `job_id` on the movement.
-   - The project cascade legacy does to child jobs: close them on complete or work done, offer to
-     unlink them on cancel. Not done here.
-   - Legacy writes a job log line when a memo on the job is created, edited or cancelled. Not done.
-   - `job_id` and `engine_id` gain foreign keys.
-   - Part A's effective boat status should count this branch's `inprogress`/`on_hold` projects.
+1. **Legacy writes a job log line** when a memo on the job is created, edited or cancelled
+   (`flPushLog`); not done. `job_id` and `engine_id` have no foreign keys yet.
 2. **Bill gate bugs copied from legacy** (bug 8): a pending "Final Invoice" entry with no file passes,
    and the cost leaves out project memos although the message says to add one. Ask whether to fix.
 3. **Not built:** the safety replace wizard (it creates an incident, a job and a memo: part A);
@@ -483,6 +468,28 @@ My own decisions (legacy copied where it has an answer):
 - A fuel of 0 is no fuel (legacy `parseFloat(v)||null`).
 - Merge folds only exact name + part number duplicates (legacy's key); the dropped item's history
   is read with the kept one rather than copied.
+
+Wiring part A and part B (after both merged; `fleet-seams.ts`):
+
+- **A project holds its boat** in `openWork` while `inprogress` or `on_hold`, from its actual
+  (else planned) start, as `unavailable` with reason `dry_dock` (a drydock) or `overhaul` (any other
+  type), legacy `boatJobBlock`. A general project (no boat) holds nothing.
+- **Engine hours** count every trip type's meter readings for the engine (latest − first above 0),
+  across boats (the meter travels with the engine, part A's rule).
+- **A job's cost** counts memos whose `job_id` is the job, any scope; a cancelled or pending memo
+  counts nothing (part A's `jobCost`).
+- **Job parts from stock** are `POST /v1/fleet/jobs/{id}/parts` and `DELETE …/parts/{idx}` in part B's
+  route file. A part's `location` is written as the warehouse's label, as legacy's and part A's
+  imported parts are. A closed job needs `late_anyway` (legacy's confirm), and the part is marked
+  late. Taking a part off a job returns it with a `return` movement (legacy wrote `receive`). A part
+  imported with no stock item only comes off. The answer is `{job, item}` with the job as stored; its
+  cost is on `GET /v1/fleet/jobs/{id}`.
+- **Project cost** is its child jobs' cost (`parent_project_id`), memos included.
+- **Project cascade:** completing from in progress and "work done" close the open child jobs as
+  legacy does: `done`, end date, a line, no outcome, no asset or boat status change (part A's
+  `/close` is not run). Cancelling takes `unlink_jobs: true` for legacy's "unlink them?" confirm.
+- **Renamed apart from part A:** part B's routes are `src/routes/fleet-stock.ts`, its import
+  `import:fleet-stock` (run after part A's `import:fleet`), its store field `store.fleetRepo`.
 
 Import:
 
