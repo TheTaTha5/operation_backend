@@ -55,6 +55,7 @@ import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 import { mapLegacyMoney } from './legacy-invoices.js';
+import { mapLegacyWeather } from './legacy-weather.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -187,6 +188,7 @@ async function main() {
       invoices: await read('SELECT * FROM sb_invoices'), bookingIds: await read('SELECT * FROM sb_invoices__bookingids'),
       lineItems: await read('SELECT * FROM sb_invoices__lineitems'), payments: await read('SELECT * FROM sb_payments'),
     };
+    const legacyWeather = await read('SELECT * FROM sb_weather');
     const legacyVans = await read('SELECT * FROM sb_vehicles');
     const vanDayRoutes = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__dayroute');
     const vanDayStatus = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__daystatus');
@@ -1052,6 +1054,8 @@ async function main() {
         route_id: String(firstTrips.get(String(b.id))?.route_id ?? ''), service_date: String(firstTrips.get(String(b.id))?.service_date ?? ''),
       }])),
     }, report);
+    // ── Weather closures and their follow-ups (migration 060, `legacy-weather.ts`): after the bookings they name ──
+    const weather = mapLegacyWeather({ closures: legacyWeather, bookings: legacyBookings }, { prefix: PREFIX, routes, bookings: new Set(bookings.map((b) => String(b.id))) }, report);
 
     // ── Write, in one transaction ──
     await target.query('BEGIN');
@@ -1067,7 +1071,11 @@ async function main() {
     // invoice made here on a booking that is replaced goes with it, and is listed below.
     const madeHere = (await target.query(`SELECT DISTINCT invoice_id FROM invoice_lines WHERE invoice_id NOT LIKE '${PREFIX}%'
       AND (booking_id LIKE '${PREFIX}%' OR booking_id = ANY($1::text[])) ORDER BY invoice_id`, [remove])).rows.map((r) => String(r.invoice_id));
+    // Refunds and credits (migration 061) go with their invoice; legacy kept none of its own.
+    const replacedRefunds = (await target.query(`DELETE FROM refunds WHERE invoice_id LIKE '${PREFIX}%' OR invoice_id = ANY($1::text[])`, [madeHere])).rowCount;
     const replacedPayments = (await target.query(`DELETE FROM payments WHERE invoice_id LIKE '${PREFIX}%' OR invoice_id = ANY($1::text[])`, [madeHere])).rowCount;
+    // Imported weather closures are replaced; their follow-ups go with them, and with the bookings below.
+    const replacedClosures = (await target.query(`DELETE FROM weather_closures WHERE id LIKE '${PREFIX}%'`)).rowCount;
     const replacedInvoices = (await target.query(`DELETE FROM invoices WHERE id LIKE '${PREFIX}%' OR id = ANY($1::text[])`, [madeHere])).rowCount;
     const removed = remove.length ? (await target.query('DELETE FROM bookings WHERE id = ANY($1::text[])', [remove])).rowCount : 0;
     const replacedBookings = (await target.query(`DELETE FROM bookings WHERE id LIKE '${PREFIX}%'`)).rowCount;
@@ -1162,6 +1170,8 @@ async function main() {
     await insert('invoice_lines', money.lines);
     await insert('payments', money.payments);
     await insert('payment_slips', money.slips);
+    await insert('weather_closures', weather.closures);
+    await insert('weather_cases', weather.cases);
     await insert('booking_approvals', approvals);
     // Each imported booking has at most one approval of each kind, so (booking, kind) finds its id.
     if (approvalDays.length) {
@@ -1201,6 +1211,9 @@ async function main() {
     console.log(`money: ${money.invoices.length} invoices (${money.lines.length} lines), ${money.payments.length} payments, ${money.slips.length} slips; replaced ${replacedInvoices} invoices, ${replacedPayments} payments`);
     if (madeHere.length) console.log(`  removed with the bookings they named, made here: invoices ${madeHere.join(', ')}`);
     for (const [change, count] of money.statusDiffers) console.log(`  invoice status legacy stored → worked out here: ${change} (${count})`);
+    if (replacedRefunds) console.log(`  replaced ${replacedRefunds} refunds and credits made here on those invoices`);
+    const byStatus = (s: string) => weather.cases.filter((c) => c.status === s).length;
+    console.log(`weather: ${weather.closures.length} closures, ${weather.cases.length} follow-ups (${byStatus('awaiting')} awaiting, ${byStatus('notified')} notified, ${byStatus('resolved')} resolved); replaced ${replacedClosures} closures`);
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
