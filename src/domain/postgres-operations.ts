@@ -29,6 +29,7 @@ import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
+import type { Allergy } from './allergies.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
 import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
@@ -146,6 +147,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', x.seq, 'who', x.who, 'ad', x.ad, 'chd', x.chd, 'inf', x.inf, 'foc', x.foc, 'area_id', x.area_id, 'area', x.area, 'zone', x.zone, 'place', x.place,
       'drop_same', x.drop_same, 'drop_area_id', x.drop_area_id, 'drop_area', x.drop_area, 'drop_zone', x.drop_zone, 'drop_place', x.drop_place) ORDER BY x.seq)
     FROM booking_alt_pickups x WHERE x.booking_id = b.id), '[]'::jsonb) AS alt_pickups,
+  COALESCE((SELECT jsonb_agg(jsonb_build_object('name', al.name, 'qty', al.qty) ORDER BY al.seq) FROM booking_allergies al WHERE al.booking_id = b.id), '[]'::jsonb) AS allergy_list,
   COALESCE((
     SELECT jsonb_agg(to_jsonb(u) - 'booking_id' || jsonb_build_object('slips', COALESCE((SELECT jsonb_agg(s.attachment_id ORDER BY s.seq)
       FROM booking_upgrade_slips s WHERE s.booking_id = u.booking_id AND s.upgrade_id = u.id), '[]'::jsonb)) ORDER BY u.seq)
@@ -242,6 +244,7 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
     ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
   })),
+  allergy_list: ((row.allergy_list as Allergy[]) ?? []).map((a) => ({ name: String(a.name), qty: Number(a.qty) })),
   attachments: ((row.attachments as Record<string, unknown>[]) ?? []).map((d): DocumentRow => ({
     attachment_id: String(d.attachment_id), kind: (d.kind as DocumentRow['kind']) ?? null, by: (d.by as string) ?? null, at: d.at ? jsonInstant(d.at) : null,
   })),
@@ -651,6 +654,14 @@ export class PostgresOperationsStore {
       }
     }
   }
+  private async writeAllergies(bookingId: string, list: readonly Allergy[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_allergies WHERE booking_id = $1', [bookingId]);
+    for (const [seq, a] of list.entries()) await this.client().query('INSERT INTO booking_allergies (booking_id, seq, name, qty) VALUES ($1,$2,$3,$4)', [bookingId, seq, a.name, a.qty]);
+  }
+  /** The pier's meal editor: who changed the meals there, and when (migration 041). */
+  async stampPierMeals(id: string, at: string, by: string | null): Promise<void> {
+    await this.client().query('UPDATE bookings SET special_meals_pier_at = $2, special_meals_pier_by = $3 WHERE id = $1', [id, at, by]);
+  }
   private async writeDocuments(bookingId: string, rows: readonly DocumentRow[]): Promise<void> {
     await this.client().query('DELETE FROM booking_documents WHERE booking_id = $1', [bookingId]);
     for (const [seq, d] of rows.entries()) {
@@ -817,6 +828,7 @@ export class PostgresOperationsStore {
     await this.writeAdjustments(id, input.adjustments ?? []);
     await this.writeAltPickups(id, input.alt_pickups ?? []);
     await this.writeDocuments(id, input.attachments ?? []);
+    await this.writeAllergies(id, input.allergy_list ?? []);
     const sold = storedUpgrades(input.upgrades ?? [], [], new Date().toISOString(), actor ?? null);
     await this.writeUpgrades(id, sold.upgrades);
     await this.requestApprovals(id, decision.approvals);
@@ -892,6 +904,7 @@ export class PostgresOperationsStore {
     if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
     if (changes.alt_pickups) await this.writeAltPickups(id, changes.alt_pickups);
     if (changes.attachments) await this.writeDocuments(id, changes.attachments);
+    if (changes.allergy_list) await this.writeAllergies(id, changes.allergy_list);
     if (changes.upgrades) {
       const sold = storedUpgrades(changes.upgrades, current.upgrades, new Date().toISOString(), actor ?? null);
       await this.writeUpgrades(id, sold.upgrades);

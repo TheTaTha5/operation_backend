@@ -22,6 +22,7 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
 import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeStored, upgradeUndoneLine } from '../domain/upgrades.js';
 import { assertKnownFiles, documentRows, MAX_ATTACHMENT_BYTES, newAttachmentId, parseAttachmentIds, parseUpload } from '../domain/attachments.js';
@@ -254,6 +255,7 @@ function bookingInput(body: unknown): BookingInput & { viaStatus: boolean } {
     adjustments: parseBookingAdjustments(input.adjustments),
     alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups ?? []),
     upgrades: parseUpgrades(input.upgrades ?? []),
+    allergy_list: parseAllergyList(allergyListOf(input) ?? []),
     // booking_data: input,
   };
 }
@@ -321,6 +323,7 @@ function bookingChanges(body: unknown): BookingChanges {
     ...(input.adjustments === undefined ? {} : { adjustments: parseBookingAdjustments(input.adjustments) }),
     ...((input.alt_pickups ?? input.altPickups) === undefined ? {} : { alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups) }),
     ...(input.upgrades === undefined ? {} : { upgrades: parseUpgrades(input.upgrades) }),
+    ...(allergyListOf(input) === undefined ? {} : { allergy_list: parseAllergyList(allergyListOf(input)) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
@@ -746,6 +749,28 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return (await syncAltParts(done)) ? (await store.booking(done.id))! : done;
     });
   });
+  /**
+   * The pier's meal editor (legacy `pckMealSave`; todo/booking-extras-model.md §2): changes the meal
+   * counts and the allergy text, and the server stamps who changed them at the pier, and when.
+   */
+  app.put('/v1/bookings/:id/meals', async (request) => {
+    const body = record(request.body);
+    const meals: Record<string, unknown> = {};
+    for (const [key, column] of [['veg', 'special_meals_veg'], ['vegan', 'special_meals_vegan'], ['halal', 'special_meals_halal'], ['allergies', 'special_meals_allergies']] as const) {
+      const v = body[key] ?? body[column];
+      if (v !== undefined) meals[column] = v;
+    }
+    if (Object.keys(meals).length === 0) badRequest('Send veg, vegan, halal or allergies');
+    const header = bookingChanges(meals).header ?? {};
+    const actor = actorOf(request.user);
+    return store.transaction(async () => {
+      await assertBookingFresh(request);
+      const done = (await store.amendBooking(bookingId(request), { header: stampActor(header, actor) }, actor)) ?? notFound('Booking not found');
+      await store.stampPierMeals(done.id, new Date().toISOString(), actor ?? null);
+      return (await store.booking(done.id))!;
+    });
+  });
+
   /**
    * Attachments (todo/booking-extras-model.md §1): a file uploaded once, then named by a booking's
    * `attachments` or an upgrade's `slips`. Legacy's JSON upload, its 6 MB limit, JPEG, PNG or PDF.
