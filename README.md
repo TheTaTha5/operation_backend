@@ -1171,6 +1171,7 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | market | `market`, `market_sub`, `market_agent_id`, `market_at` |
 | lifecycle | `booking_date` |
 | free text | `notes`, `note` |
+| van job order | `job_note` (`jobNote`) — the special request the job order prints; see "Van job orders" |
 | FOC | `foc_reason` (`focReason`) — why passengers travel free; required to confirm FOC passengers |
 | **set by the server** (read-only) | `status`, `approvals`, `booked_at`, `created_by`, `updated_by`, `confirmed_at`, `confirmed_by`, `cancellation_reason` |
 
@@ -1561,6 +1562,8 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
       changing or clearing it is `409 event_undone_is_final`;
     - new events and tries go at the end.
 - **A trip moved** to another route or day loses its check-ins, as legacy's `bkOpsClear` does.
+- **The special request** the van and pier screens print is the booking's `special_request`
+  (computed: its `job_note`, else its notes; see "Van job orders").
 - **The import** brings every legacy record of an imported booking, cancelled ones included: an
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
@@ -1969,7 +1972,8 @@ edit area. Every write answers the group as `GET` shows it, except `DELETE` (`20
 
 | Method + path | Body | Rule |
 |---|---|---|
-| `GET /operations/van-groups?service_date=&route_id=` | — | `{service_date, route_id, groups}`, by number |
+| `GET /operations/van-groups?service_date=&route_id=` | — | `{service_date, route_id, groups}`: by zone (PK, KL, RN, NoTransfer, others), then the zone's `display_order`, then number |
+| `PUT /operations/van-groups/order` | `{service_date, route_id, zone, group_ids}` or `{…, clear: true}` | The order staff dragged one zone's groups into (legacy `bkv2_grp_order`): those named get `display_order` 1..n, the zone's others `null` and follow by number. `[]` or `clear: true` resets. Answers the day's groups |
 | `POST /operations/van-groups` | `{service_date, route_id, zone, members: [{trip_id, idx?}], van_id?, allow_second_round?}` | `201`. Number: one more than the highest that route and day, across zones. Members get `sequence` 1..n in the order sent |
 | `POST /operations/van-groups/{id}/members` | `{members: [...]}` | Moves the parts in from any other group, numbered after the last member |
 | `PATCH /operations/van-groups/{id}` | `{van_id?, return_van_id?, pickup_time?, allow_second_round?}` | See below. `null` clears |
@@ -2008,6 +2012,9 @@ edit area. Every write answers the group as `GET` shows it, except `DELETE` (`20
 - **Cancelled bookings** take no part: not in `members`, `pax` or a second-round check.
 - **A group with nobody riding and no stop** (its members moved, removed or cancelled) is kept, with its van and
   number, and left out of `GET` until a member joins again. A new group never reuses its number.
+- **`display_order`** (validated) is the group's place among its zone's groups, `null` when not
+  dragged. Every id in `group_ids` must be a group of that date, route and zone, named once (`400`).
+  The board and the van job orders both follow it; group numbers do not change.
 
 ### Vans and the month matrix
 
@@ -2030,7 +2037,7 @@ server checks shapes, works out what each day comes to, and keeps each van's log
 | `PATCH /operations/vans/{id}/zone-ranges/{range_id}` | any of the same | the range |
 | `DELETE /operations/vans/{id}/zone-ranges/{range_id}` | — | `204` |
 | `GET /operations/van-days?from=&to=` | — | the matrix, at most 93 days |
-| `PUT /operations/van-days/{date}/{van_id}` | `{route_ids?, status?, zone?, driver?, driver_phone?, plate?, sent_at?}` | the day |
+| `PUT /operations/van-days/{date}/{van_id}` | `{route_ids?, status?, zone?, driver?, driver_phone?, plate?}` | the day |
 
 ```jsonc
 // Van
@@ -2040,7 +2047,7 @@ server checks shapes, works out what each day comes to, and keeps each van's log
 // GET /operations/van-days?from=2026-10-01&to=2026-10-31
 { "from": "2026-10-01", "to": "2026-10-31", "vans": [ … ],
   "days": [ { "van_id": "veh07", "service_date": "2026-10-01", "route_ids": ["r1", "r5"], "status": null, "zone": null,
-              "driver": null, "driver_phone": null, "plate": null, "sent_at": null,
+              "driver": null, "driver_phone": null, "plate": null,
               "status_on": "maintenance", "usable": false, "zone_on": "KL" } ],
   "status_ranges": [ { "id": 3, "van_id": "veh07", "status": "maintenance", "from_date": "2026-09-28", "to_date": null, "note": "gearbox" } ],
   "zone_ranges": [ { "id": 1, "van_id": "veh07", "zone": "KL", "from_date": "2026-10-05", "to_date": "2026-10-20" } ] }
@@ -2077,6 +2084,8 @@ server checks shapes, works out what each day comes to, and keeps each van's log
   For example "ย้ายโซนหลัก PK → KL" or "2026-10-05 · เพิ่มเส้นทาง Phi Phi Bamboo". `kind` is
   `created`, `edit`, `status`, `zone` or `driver`; `by` is the login (`null` on imported lines).
   Every line is kept.
+- **"Sent to the driver"** is per job now, not per van and day: a `sent_at` sent here is `400`,
+  naming `PUT /operations/van-jobs/{date}/{key}/sent` (see "Van job orders").
 
 ### Van stops
 
@@ -2117,6 +2126,96 @@ pick up (`cargo`). A stop rides its group's van. Writes need the `operations` ed
 - **A disbanded group** leaves its stops on the day with `group_id: null`; a `PATCH` with a
   `group_id` puts one on another group. `area_id` is a plain id, not checked against the
   pickup-area catalogue.
+
+### Van job orders
+
+Legacy's Van Job Orders page: the sheet each van driver gets, one per van, programme and day, one
+per round when the van runs the programme twice. The server builds the job list and every sheet
+(`src/domain/van-jobs.ts`); the layout, fonts, colours and row highlights stay in the client.
+Reads are open to any login; writes need the `operations` area. Nothing here enters the change feed.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /operations/van-jobs?date=[&route_id=]` | — | the day's jobs and its warnings (below) |
+| `GET /operations/van-jobs/{date}/{key}` | — | one sheet: `{job, out, ret, ret_on_round_1, unassigned_on_route}` |
+| `PUT /operations/van-jobs/{date}/{key}/sent` | — | the job, sent to the driver now, by the login |
+| `DELETE /operations/van-jobs/{date}/{key}/sent` | — | the job, not sent |
+| `GET /operations/pickup-names-th` | — | `{names: [{name, name_th, updated_at, updated_by}]}` |
+| `PUT /operations/pickup-names-th` | `{name, name_th}` | `{name, name_th}`; an empty `name_th` deletes it |
+
+```jsonc
+// GET /operations/van-jobs?date=2026-10-06
+{ "date": "2026-10-06",
+  "jobs": [ { "key": "vgrp_…", "service_date": "2026-10-06", "route_id": "r10", "route_name": "Phi Phi Bamboo by Speedboat",
+              "group_id": "vgrp_…", "group_number": 1, "van_id": "veh03",
+              "van": { "name": "Love3", "plate": "31-6675", "color": "#8b5cf6", "capacity": 13, "ownership": "own", "partner_name": null, "zone_base": "PK" },
+              "round": null, "has_out": true, "has_ret": true, "zones": ["PK"],
+              "out_pax": 7, "ret_pax": 7, "stop_seats": 0, "pax": 7, "capacity": 13, "over_capacity": false, "bookings": 3, "struck": 0,
+              "driver": { "name": "บังญัติ", "phone": "080…", "plate": "31-6675", "override": false, "plate_override": false },
+              "pickups": [ { "name": "Park 38", "name_th": "ปาร์ค 38" } ],
+              "sent": { "at": "2026-10-05T11:45:22.092Z", "by": "Ploy", "changed_since_sent": false } } ],
+  "unassigned": { "pax": 4, "by_route": [ { "route_id": "r10", "pax": 4 } ] },
+  "return_unarranged": [ { "booking_id": "…", "trip_id": "…", "route_id": "r10", "lead_pax": "…", "drop": "Old Town Hostel", "pax": 2 } ],
+  "self_arrive": [ { "booking_id": "…", "trip_id": "…", "voucher": "…", "lead_pax": "…", "hotel": "…", "has_van": true } ],
+  "struck": 0 }
+// a sheet's out.rows[] (ret.rows the same; on the return leg the pickup is the pier)
+{ "no": 1, "kind": "booking", "booking_id": "…", "trip_id": "…", "parts": [0], "merged_parts": 1, "voucher": "…", "lead_pax": "…",
+  "other_names": ["…"], "ad": 2, "chd": 1, "inf": 0, "foc": 0, "pax": 3, "split": null,
+  "pickup_time": "07:30", "pickup": "Park 38", "pickup_th": "ปาร์ค 38", "room": "512", "zone": "Patong", "zone_th": "ป่าตอง",
+  "drop_off": null, "drop_own": false, "return_van_id": null, "from_van_id": null, "extra": false, "bags": 2,
+  "special_request": "รอด้านล่าง", "struck": null, "ovn": null, "ovn_return_date": null }
+{ "no": 2, "kind": "stop", "stop_id": "vs_…", "stop_kind": "staff", "label": "Guide Nok", "seats": 1, "leg": "out",
+  "time": "06:20", "place": "Office", "phone": "089…", "zone": "Patong", "zone_th": "ป่าตอง", "note": null }
+// out.totals, ret.totals
+{ "ad": 9, "chd": 2, "inf": 0, "foc": 0, "pax": 11, "bookings": 5, "separate_drops": 1, "struck": 1, "stops": 1, "stop_seats": 1 }
+```
+
+- **A job** is a van group with a van and something to carry (key: the group's id), or a van that
+  only brings people back on a route (key `<van_id>~<route_id>`). A van with two groups of one
+  route that day runs two **rounds**: `round` is `{no, of, time}`, numbered by each group's earliest
+  pickup (legacy `vjRoundPick`), `null` when it runs once. The return leg prints once, on round 1's
+  sheet (`ret_on_round_1` on the others). Unknown key that day: `404`; a bad date: `400`.
+- **Outbound rows** are the group's parts, less bookings that come on their own (`pickup_self`) and
+  overnight return legs. Two parts of one booking picked up at the same place are one row
+  (`merged_parts`). **Return rows** are every part coming back on this van: its own return van,
+  else its group's, else its group's van; less self-returns (a separate drop-off in a NoTransfer
+  area, or named "self-arrive" / "กลับเอง") and overnight outbound legs. Rows from another van go last.
+- **Order** (legacy §vsSeqTime): a group's manual order first; a row without one goes in by time
+  before the first ordered row that is later; untimed last. Van stops are rows on their leg.
+- **A cancelled booking still in a group** prints struck through (`struck: "cancelled"`, `no:
+  null`) and counts in no total, so the driver can hold the new sheet against the old one.
+  `PATCH /operations/trip-ops/{trip_id}` with `{van_parts: null}` takes it off (legacy "ล้างออก");
+  that is the one dispatch change a cancelled booking still takes.
+- **Job list order** (legacy §vjOrder): the programme's first departure, its name, the zone, the
+  group's `display_order` then number (return-only jobs last), the van's name.
+- **`pax`** is the outbound load (customers plus guides riding along), else the return's;
+  `over_capacity` compares it with the van's seats.
+- **The driver** is the day's override (`PUT /operations/van-days`), else the van's own; `override`
+  says one is set.
+- **Sent to the driver** (computed): `PUT …/sent` stamps the time and the login, with a fingerprint
+  of the sheet; a `sent_at` in the body is `400`. Ticking again re-sends. **`changed_since_sent`**
+  is `true` when what the driver acts on has changed since (rows, counts, times, places, special
+  requests, stops, van, driver); undo the change and it reads `false` again. Legacy kept the tick
+  and showed nothing; the flag is new. A mark imported from legacy has no fingerprint: `null`.
+  The mark is on the group: it survives a renumbering or a second round, and goes when the group
+  is disbanded.
+- **The special request** is the booking's `job_note` when set, else its `notes`. `job_note` is a
+  booking field (`PATCH /v1/bookings/{id}`, with `version` when logged in): text, `""` to print
+  nothing (legacy's blanked override), `null` back to the notes. Every booking read carries the
+  result as **`special_request`** (computed; `null` = none), so van check-in and the pier print
+  the same.
+- **Thai pickup names** (`pickup_name_th`): typed once per place and printed under it on every
+  sheet (`pickup_th`). The place is matched trimmed and lower-cased, so "Book a Bed Poshtel" and
+  "Book A Bed Poshtel" share one. `name` is required (`400`). `zone_th` comes from legacy's fixed
+  list of area names.
+- **Warnings**: `unassigned` (passengers with no van yet, by route), `return_unarranged` (a
+  separate drop-off with no return van and not `return_same_van`), `self_arrive` (a `pickup_self`
+  booking still in a van group or a transfer zone), and per sheet `unassigned_on_route` (bookings
+  on its route with no van, not on the sheet: it may be missing someone).
+- **The import** brings legacy's 449 marks as 438 (on the van's one group that day, or its
+  return-only run; a van that now runs the route twice, or a van the import left off its group,
+  keeps none), the 10 special requests (5 blanked), the 762 Thai names as 760 (two pairs differ only
+  in case), and the group order of 13 days (63 groups).
 
 ### Live updates (the change feed)
 
