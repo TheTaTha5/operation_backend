@@ -1935,6 +1935,52 @@ pick up (`cargo`). A stop rides its group's van. Writes need the `operations` ed
   `group_id` puts one on another group. `area_id` is a plain id, not checked against the
   pickup-area catalogue.
 
+### Live updates (the change feed)
+
+How a screen learns that someone else changed something, without reloading everything. Every write
+records **which** records it changed, in a numbered list (`changes`, migration 044). A client keeps
+the last number it saw and refetches only the records named.
+
+| Method + path | Answers |
+|---|---|
+| `GET /v1/changes` | `{ version, health }`: the starting point |
+| `GET /v1/changes?since=N[&limit=500]` | `{ version, changes: [Change], health }`, oldest first (`limit` up to 1,000) |
+| `GET /v1/changes/stream[?since=N]` | Server-sent events (see below) |
+
+```jsonc
+// Change
+{ "version": 4521, "kind": "booking", "entity_id": "BK-…", "action": "updated",
+  "route_days": [ { "route_id": "r1", "service_date": "2026-10-02" }, { "route_id": "r1", "service_date": "2026-10-03" } ],
+  "changed_by": "ops1", "changed_at": "2026-10-01T09:12:44.000Z" }
+```
+
+- **Kinds:**
+  - `booking`: any write to it: an edit, a command, dispatch, check-in, van parts and groups,
+    reconfirm, upgrades, its document check;
+  - `seat_lock`;
+  - `deployment`, with `entity_id` `<date>:<boat>`;
+  - `route`: its calendar.
+
+  `action` is `created`, `updated` or `deleted`.
+- **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking
+  names the day it left and the day it went to. An availability grid refetches only those cells.
+  `null` for a route calendar (refetch it).
+- **Recorded with the write:** a write that fails leaves no change, and one that commits always has
+  one. Changes are numbered as they commit, so a client reading up to N never misses an earlier one.
+  They are kept forever (no `410`).
+- **The stream:**
+  - It starts after `Last-Event-ID` (a reconnecting client sends it), else `?since=`, else now. It
+    sends anything missed, then each change as it commits:
+    `id: 4521`, `event: change`, `data: {Change}`.
+  - A heartbeat `event: hb` with `data: {version, health}` comes every 25 s; `retry: 5000`.
+  - Send the Bearer header: use a fetch-based reader, as the browser's `EventSource` can't send
+    one. Any login may read; the Love Kingdom API key can't.
+  - It works with any number of server instances (PostgreSQL `LISTEN`/`NOTIFY`).
+- **`health`** carries what bumps no version, as legacy's `/api/version` did: today
+  `migrations_pending`.
+- **Not in the feed yet:** vans, van stops, pickup areas, attachments, users, agents and rate types.
+  The legacy import writes no changes either: reload after an import.
+
 ### Agent seat locks
 
 - `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).

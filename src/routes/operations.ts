@@ -22,6 +22,8 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { changeContext, trackChanges } from './change-tracking.js';
+import { parseSince } from '../domain/changes.js';
 import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
 import { areaId, inheritedCells, lookupPickupTime, parseAreaPatch, parseCell, parseNewArea, parseProfile, sortAreas, type PickupArea } from '../domain/pickup-areas.js';
 import { assertDocCheckEcho, parseDocItem, withItem, withNote, withPre, withStatus as withDocStatus, type DocCheck } from '../domain/doc-check.js';
@@ -359,7 +361,9 @@ export type Store = OperationsStore | PostgresOperationsStore;
 export const createStore = (): Store => process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
 
 export function registerOperationsRoutes(app: FastifyInstance, options: { store?: Store }, done: () => void): void {
-  const store = options.store ?? createStore();
+  // Every write records what it changed (`change-tracking.ts`, todo/change-feed-model.md).
+  const store = trackChanges(options.store ?? createStore());
+  app.addHook('onRequest', (request, _reply, next) => { changeContext.enterWith({ request, depth: 0 }); next(); });
   const authenticator = new Authenticator();
   if (store instanceof PostgresOperationsStore) app.addHook('onClose', async () => store.close());
   // Route schemas in this plugin are documentation only (see `openapi.ts`): the hand-written parsers
@@ -956,6 +960,52 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       await store.deleteAttachment(id);
     });
     return reply.code(204).send();
+  });
+
+  /**
+   * The change feed (todo/change-feed-model.md): what changed since a version, by asking or by push. Any
+   * login may read it. `health` carries what bumps no version (legacy's /api/version): pending migrations.
+   */
+  const feedHealth = async () => ({ migrations_pending: await store.migrationsPending() });
+  app.get('/v1/changes', async (request) => {
+    const { since, limit } = parseSince(request.query as Record<string, unknown>);
+    const version = await store.latestChangeVersion();
+    return since === undefined ? { version, health: await feedHealth() } : { version, changes: await store.changesSince(since, limit), health: await feedHealth() };
+  });
+  /**
+   * Server-sent events: everything after `Last-Event-ID` (sent by a reconnecting client) or `?since=`,
+   * else from now; then each change as it commits, and a heartbeat `hb` every 25 s. Clients send the
+   * Bearer header with a fetch-based reader (decided 2026-10-09; the browser's EventSource can't).
+   */
+  app.get('/v1/changes/stream', async (request, reply) => {
+    const { since } = parseSince(request.query as Record<string, unknown>);
+    const lastId = request.headers['last-event-id'];
+    let cursor = lastId !== undefined && /^\d+$/.test(String(lastId)) ? Number(lastId) : since ?? await store.latestChangeVersion();
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, { ...(reply.getHeaders() as Record<string, string>), 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    res.write('retry: 5000\n\n');
+    let sending = false, again = false, open = true;
+    const flush = async (): Promise<void> => {
+      if (sending) { again = true; return; }
+      sending = true;
+      try {
+        do {
+          again = false;
+          for (;;) {
+            const rows = await store.changesSince(cursor, 500);
+            for (const c of rows) { if (open) res.write(`id: ${c.version}\nevent: change\ndata: ${JSON.stringify(c)}\n\n`); cursor = c.version; }
+            if (rows.length < 500) break;
+          }
+        } while (again && open);
+      } finally { sending = false; }
+    };
+    const unsubscribe = await store.subscribeChanges(() => { void flush().catch((error) => request.log.error(error)); });
+    await flush();
+    const heartbeat = setInterval(() => {
+      void (async () => { if (open) res.write(`event: hb\ndata: ${JSON.stringify({ version: await store.latestChangeVersion(), health: await feedHealth() })}\n\n`); })().catch((error) => request.log.error(error));
+    }, 25_000);
+    request.raw.on('close', () => { open = false; clearInterval(heartbeat); unsubscribe(); });
   });
 
   /**

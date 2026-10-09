@@ -4,8 +4,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 ## Deploy what is on `main`
 
-1. **Push `main`** again: deploying applies migrations 039–043 (add-on checks, attachments,
-   allergies, document check, pickup areas).
+1. **Push `main`** again: deploying applies migrations 039–044 (add-on checks, attachments,
+   allergies, document check, pickup areas, the change feed).
 1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
    the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas.
@@ -46,6 +46,8 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     upgrades `slips`, `allergy_list`, `doc_check` (its screen writes `/doc-check/…`); the pier's meal
     editor saves through `PUT /v1/bookings/{id}/meals`; the Pickup time setup screen through
     `/v1/pickup-areas` and `/v1/pickup-time-profiles`. A booking's pickup area must be in the catalogue.
+  - live updates: stop reloading the whole state on a version bump; follow `GET /v1/changes/stream`
+    (fetch-based, Bearer header) and refetch only the records and `route_days` it names.
   - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`): the
     server now prices every non-B2C booking on save and replaces a sent price (`price_warnings`). Its
     "use today's rate" button sends `rate: "agent"`; it sends `ovnCharge` and the charter price fields.

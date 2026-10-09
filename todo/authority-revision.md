@@ -10,7 +10,7 @@ its own note:
 | `POST /v1/quote` and server-priced bookings | `pricing-model.md`, `rate-types-model.md` |
 | Agent writes | `agents.md` |
 | Day-of-operations: boats, vans, check-in, reconfirm | built; open items in `trip-ops-and-vans-model.md` |
-| Live updates | `change-feed-model.md` |
+| Live updates | built; open items in `change-feed-model.md` |
 | Money, fleet maintenance | not designed yet |
 
 Owned by no other note:
