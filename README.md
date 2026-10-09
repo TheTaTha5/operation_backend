@@ -83,6 +83,7 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:boats [-- --commit]` | Seed the boat catalogue the same way: every field of the boat form, its documents and status log. Dry run unless `--commit`; adds what is missing, refreshes a boat never edited here, never touches one edited here, never deletes. Legacy's `totalcap` becomes `registered_persons`, never a selling limit. Run the import afterwards so deployments on a new boat are imported. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit] [--all]` | Import legacy's fleet stock, memos, projects, Daily Fleet Log and safety equipment (see "Fleet maintenance"). Dry run unless `--commit`; rerunnable; run after `seed:boats` and `import:attachments`. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
 
 ### Checking an import
@@ -177,8 +178,8 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 
 | Area | Writes |
 |---|---|
-| `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities |
-| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat |
+| `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities; the Daily Fleet Log's water meters, issued and extra items and outside requests (as `fleet` does) |
+| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat; stock, consumables, purchase memos, projects, the Daily Fleet Log, safety equipment (`/v1/fleet/…`); uploading files |
 | `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
 | `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
 | `accounting` | invoices, their discounts and payments |
@@ -2005,11 +2006,12 @@ keeps them (`attachments`, migration 040).
   - a type other than `image/jpeg`, `image/png` or `application/pdf`;
   - data that isn't base64.
 
-  Ids look like legacy's, `att_<time>_<hex>`. Upload and delete need the `operations`, `pier` or
-  `accounting` edit area.
+  Ids look like legacy's, `att_<time>_<hex>`. Upload and delete need the `operations`, `pier`,
+  `accounting` or `fleet` edit area (`fleet` for project documents).
 - **Download:** any login may download (decided 2026-10-09). A login tied to an agent may download
   only its own bookings' files (others answer `404`).
-- **Delete:** a file still named by a booking or an upgrade sale is `409 attachment_in_use`.
+- **Delete:** a file still named by a booking, an upgrade sale or a fleet project's documents is
+  `409 attachment_in_use`.
 - **A booking's `attachments`** (on `POST`/`PATCH /v1/bookings`, every read):
   `[{id, kind?}]`, where `kind` is `upload`, `capture` or `paste`. The list replaces outright.
   - Each id must be an uploaded file (`400`).
@@ -3001,6 +3003,143 @@ an agent who has not confirmed numbers; `pax` is the minimum seats promised.
 - **On a boat not deployed that day,** it holds its `pax` as a plain lock.
 - **Who creates them:** only the legacy import, for now; only a full release applies to one here
   (`400 boat_hold` for the other commands). Creating and converting holds is their own design.
+
+### Fleet maintenance: stock, memos, projects, Daily Fleet Log, safety
+
+Legacy's Fleet pages, part B (todo/fleet-maintenance-model.md, "Design — part B", migrations
+140–143): stock in three warehouses, consumables, purchase memos, projects, the Daily Fleet Log and
+safety equipment. Writes need the `fleet` area; the Daily Log's water meters, issued and extra
+items, outside requests and the issue-item list also take `operations`, as legacy does. Any login
+reads. Boats, engines, incidents and maintenance jobs are part A's: a job or an engine is named here
+by its id as plain text (`job_id`, `engine_id`).
+
+**Warehouses.** `GET /v1/fleet/warehouses` → `tublamu` (คลัง Tub Lamu), `panwa` (คลัง Visit Panwa),
+`ranong` (คลัง Ranong). A request may name one by key or by legacy's label.
+
+**Stock items.** A quantity is never a stored number: it is the sum of the item's **movements**,
+which are append-only (a database trigger refuses to change or delete one). Undoing anything
+appends the opposite movement.
+
+| Method + path | Body | Rule |
+|---|---|---|
+| `GET /v1/fleet/stock-items` | `?q=&category=&warehouse=&low=true&deleted=true` | live items; each with `stocks[{warehouse, warehouse_name, qty}]`, `total_qty`, `primary_warehouse` (most stock), `below_min` (`total_qty <= min_qty`, legacy) |
+| `GET /v1/fleet/stock-items/{id}` | — | the item and its `movements` (those of items merged into it too) |
+| `POST /v1/fleet/stock-items` | `{name, part_no?, category?, supplier?, unit?, min_qty?, cost?, note?, qty?, warehouse?}` | `201`. An opening `qty` needs `warehouse` and is a `register` movement. `409 stock_item_exists` (same name and part number), `409 part_no_required` (a name already used, with no part number) |
+| `PATCH /v1/fleet/stock-items/{id}` | the client facts above | an `edit` movement lists what changed. A new `part_no` needs `part_no_anyway: true` (legacy's confirm), else `409 part_no_change`. `qty`, `stocks`, `total_qty`, `location` are `400` naming the command |
+| `POST …/{id}/receive` | `{warehouse, qty > 0, date?, note?}` | stock in |
+| `POST …/{id}/transfer` | `{from, to, qty > 0, date?, note?}` | `400` same warehouse; `409 stock_short` beyond what `from` holds |
+| `POST …/{id}/adjust` | `{warehouse, qty, note?, date?}` | `qty` is the count (0 or more); the movement is the difference. A hand count is always this |
+| `POST …/{id}/merge` | `{from_ids}` | duplicates (same name and part number) fold in: their stock moves over, blank `part_no`/`cost`/`supplier` filled, memo lines repointed, the duplicates marked `merged_into` |
+| `DELETE …/{id}` | — | `204`; the item is marked deleted, its history stays. `409 stock_not_empty` while it holds stock |
+| `GET /v1/fleet/suppliers` | — | names from memos and items, for suggestions |
+
+A movement: `{id, seq, item_id, date, type, warehouse, delta, note, by, memo_id, job_id,
+consumable_id, changes, created_at, created_by}`. Types: legacy's `register`, `receive`, `withdraw`,
+`transfer-out`, `transfer-in`, `edit`, `merge`, `adjust`, `adjust_out`, `in`, and `return` (a voided
+draw or a job part put back), `reverse` (a cancelled memo's receipt), `import`. `409 stock_short`
+carries `short: [{item_id, warehouse, have, asked}]`.
+
+**Consumables** (legacy "เบิกของใช้/น้ำมัน"): `POST /v1/fleet/consumables` `{item_id, warehouse, qty,
+boat_id, engine_id?, engine_label?, date?, by?, note?, allow_negative?}` → `201`. `qty` whole, at
+least 1; a boat is required. More than the warehouse holds is `409 stock_short` unless
+`allow_negative: true` (legacy's confirm): a consumable may go below zero, a job part may not.
+`item_name`, `unit_cost` (the item's cost now) and `cost` are computed. `GET
+/v1/fleet/consumables?month=YYYY-MM&boat_id=&voided=true` → `{consumables, total_cost}`. `DELETE
+/v1/fleet/consumables/{id}` voids a draw: the stock comes back with a `return` movement and the
+record stays (`voided_at`, `voided_by`); legacy erased it.
+
+**Purchase memos.** `GET /v1/fleet/memos?status=&boat_id=&job_id=&project_id=&q=&from=&to=`,
+`GET /v1/fleet/memos/{id}` (with `history`, `receipts`, `default_warehouse`). The number `no` is the
+client's, as legacy numbers in the browser; a number already used is `409 memo_no_taken`. Legacy's
+`MO-077` and `MO-117` exist twice and read `duplicate_no: true`.
+
+| Command | From | Body | Result |
+|---|---|---|---|
+| `POST /v1/fleet/memos` | — | `{no, title, memo_type (parts/labor/mixed), scope (vessel/general), general_category, boat_id, job_id, project_id, proposer, from, to, cc, ref_note, supplier, note, memo_date, vat_enabled, vat_rate, discount_pct, discount_amt, lines[{name, qty, price, discount_pct, category, part_no, unit, item_id, snapshot, auto_register}]}` | `201`, `pending_approval`. A parts line with no `item_id` links to the one live item of its name, else registers a new item (not when `auto_register: false`) |
+| `PATCH /v1/fleet/memos/{id}` | not `paid` (`409 memo_paid`) | the same fields; a line keeps its `id` | totals recomputed; removing a line that received stock is `409 line_received` |
+| `…/approve` | `pending_approval` | `{approved_by (typed, required), approved_date?, note?}` | `approved`; the login is kept as `approved_login` |
+| `…/order` | `approved` (not labor only) | `{ordered_date?, ordered_by?}` | `ordered` |
+| `…/receive` | `ordered` | `{warehouse?, date?, note?, lines: [{line_id, qty}]}` | stock in (default warehouse: the boat's pier, else Tub Lamu); all in → `received`, else stays `ordered` |
+| `…/short-close` | `ordered`, part received | — | totals from what came; `ordered_amount` keeps the old amount → `received` |
+| `…/pay` | `received`; `approved` for labor only | `{paid_date?, paid_by?, paid_via?}` | `paid` |
+| `…/cancel` | not `paid` or `cancelled` | `{reason, allow_negative?}` | stock received comes back out (`reverse`); `409 stock_short` if it was used, unless `allow_negative: true` |
+
+Totals are computed, never taken (legacy `memoCalcTotal`): line gross = qty × price (an empty or 0
+qty counts as 1 on the form), less the line's discount %; the memo discount is round(after-line ×
+`discount_pct` / 100) + `discount_amt`; VAT at `vat_rate` to the satang when `vat_enabled`. A short
+close counts the received quantity (a 0-qty labor line counts 0 there, as legacy). Lines read
+`left` and `price_mismatch` (price differs from the item's cost by more than ฿0.50). Every command
+writes a history line; a `status`, total or approval field sent to `PATCH` is `400` naming the
+command.
+
+**Projects** (drydock, overhaul). `GET /v1/fleet/projects?status=&boat_id=`, `GET
+/v1/fleet/projects/{id}` (with `log`, `memos`). `POST /v1/fleet/projects` `{no, name, boat_id (null =
+General), type, vendor, plan_from, plan_to?, planned_budget?, notes?}` → `201`, `planned`; `no` is
+the client's; `original_plan_to` keeps the plan end as the baseline. `PATCH` takes the same fields,
+`phase` (one of the type's `phases`) and `bill_note`.
+
+| Command | From | Body | Effect |
+|---|---|---|---|
+| `…/start` | planned | — | `inprogress`; the boat's status log gets `unavailable` (`dry_dock`/`overhaul`, `project_id`) |
+| `…/hold` | inprogress | `{reason}` | `on_hold` |
+| `…/resume` | on_hold | — | `inprogress` |
+| `…/cancel` | not completed/cancelled | `{reason}` | `cancelled`; a running project's boat entry ends and the boat is `available` |
+| `…/reopen` | cancelled | — | `planned` |
+| `…/work-done` | inprogress | `{note?}` | `awaiting_bill`; the boat back to `available` |
+| `…/bill-back` | awaiting_bill | — | `inprogress`; the boat `unavailable` again |
+| `…/complete` | inprogress, awaiting_bill | `{no_cost_reason?}` | `completed` when the **bill gate** passes: an invoice-like document and `cost > 0`; else `409 bill_gate` with `missing` (legacy's messages). `no_cost_reason` closes with no cost |
+
+Plan items: `POST …/plan {text}`, `PATCH …/plan/{item_id} {done?, text?}`, `DELETE …`. Documents:
+`POST …/documents {name, attachment_id? | url?, note?, type? (photo), phase?, status?}` (a file from
+`POST /v1/attachments`, which `fleet` may now upload), `PATCH …/documents/{doc_id} {status?,
+attachment_id?, name?, note?}` (`required`/`pending`/`received`/`verified`), `DELETE` (also deletes
+the file when nothing else names it). Vendor visits: `POST …/vendor-visits {vendor, role?}`,
+`DELETE …/vendor-visits/{id}`. These answer the project. Computed: `cost` (the child jobs' cost,
+legacy `flProjCalcCost`; jobs are part A's and count nothing until wired), `cost_breakdown`,
+`bill_gate`, `health` (legacy's score), `phase_index`, `required_documents` still missing,
+`bill_days`.
+
+**Daily Fleet Log.** `GET /v1/fleet/daily-log?from=&to=` (at most 93 days) → `{days: [{date,
+boats: [{boat_id, pier, fuel_litres, pax_actual, meters: {normal: {engine_id: reading}}, water:
+{open, close, used, by, at}, issues: {item_id: qty}, extras, fuel_price: {price, src, from}}],
+fuel_prices, locks, requests}], issue_items}`. `fuel_price` is legacy's effective price: the boat's,
+else its pier's, else another boat's at the pier that day, else the latest within 30 days (`src`:
+`boat`, `pier`, `sib`, `back`), else 0.
+
+| Method + path | Body | Area |
+|---|---|---|
+| `PATCH /v1/fleet/daily-log/{date}/boats/{boat_id}` | `{fuel_litres?, pax_actual?, meters?: {trip_type: {engine_id: reading or null}}}` | fleet |
+| `PUT …/boats/{boat_id}/water` | `{open, close}` | fleet or operations |
+| `PUT …/boats/{boat_id}/issues` | `{item_id: qty or null}` | fleet or operations |
+| `POST …/boats/{boat_id}/extras`, `PUT`/`DELETE …/extras/{id}` | `{name, qty?, unit?}` | fleet or operations |
+| `POST /v1/fleet/daily-log/{date}/piers/{pier}/requests`, `PUT`/`DELETE …/{id}` | `{name, pax, fuel, price, engine_hours, water_open, water_close, issues}` | fleet or operations |
+| `PUT /v1/fleet/daily-log/{date}/fuel-prices` | `{pier or boat id: ฿/L or null}` | fleet |
+| `POST …/{date}/piers/{pier}/lock`, `…/unlock` | — | fleet |
+| `GET`/`POST /v1/fleet/issue-items`, `PATCH /v1/fleet/issue-items/{id}` | `{name, unit?, pier?, off?}` | fleet or operations |
+
+Writes answer the day. **The day lock is enforced:** "Save day" (`lock`) locks a pier's day and
+every write to it — a boat whose pier it is, a request at that pier, its price — is `409
+day_locked` until "Edit" (`unlock`). A boat's pier is its `pier` on the boat record. A fuel of 0 is
+no fuel (legacy); a meter that goes backwards is not refused. An issue item is turned `off`, never
+deleted; adding a name that exists turns it back on. Nothing is deleted after 120 days (legacy did).
+
+**Safety equipment.** `GET /v1/fleet/safety?boat_id=&category=`, `GET /v1/fleet/safety/{id}` (with
+`log`), `GET /v1/fleet/safety-categories`. `POST /v1/fleet/safety {boat_id, category, name, brand,
+model, serial, qty, install_date, expiry_date, next_pm, last_inspect, status (active/expired/replaced/
+missing), location, note}` → `201`; `PATCH`; `DELETE` (`204`, a real delete as legacy's). `state` is
+computed: `REPLACED`, `MISSING`, else the nearer of expiry and next PM: `EXPIRED`, `DUE` (≤ 30 days),
+`SOON` (≤ 90), `OK`, `OK_NO_PM`. Inspections: `POST …/{id}/inspections {date, inspector?, result
+(pass/needs_work/fail/observation), findings?, next_due?}`, `PATCH`/`DELETE …/inspections/{insp_id}`;
+after each, the latest pass or needs-work sets `last_inspect` and `next_pm`.
+
+**Report.** `GET /v1/fleet/reports/memo-spend?from=&to=` → approved, received and paid memos by
+supplier, type, scope, boat and status.
+
+**Import.** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]` (after
+`seed:boats` and `import:attachments`). Dry run unless `--commit`; rerunnable while legacy is the
+master. The eight warehouse spellings map to the three; where an item's history does not add up to
+legacy's stock, an `import` movement makes it match; duplicates and odd rows come as they are and are
+listed (`--all` lists every row).
 
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 

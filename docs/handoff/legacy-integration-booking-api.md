@@ -143,11 +143,11 @@ curl -X POST https://<host>/v1/login -H 'Content-Type: application/json' \
 | Edit area | Writes (README → "What each login may do") |
 |---|---|
 | `operations` | bookings and their commands, seat locks, deployments, and the day-of-operations writes |
-| `fleet` | deployments |
+| `fleet` | deployments; stock, consumables, memos, projects, the Daily Fleet Log, safety (`/v1/fleet/…`, §6.7); file uploads |
 | `sales` | rate types, agents (rate seasons) |
 | `config` | the route calendar |
 
-- Check-in also takes `pier`; attachments take `operations`, `pier` or `accounting`; a doc-check note
+- Check-in also takes `pier`; attachments take `operations`, `pier`, `accounting` or `fleet`; a doc-check note
   takes any login. `role: admin` may do everything.
 - A refusal is `403` naming what is missing: `Needs the operations area`. Show it as it is.
 - **Keep** the local guards (`laGuardEdit`, `laCanEditArea`) as hints that hide buttons. The server's
@@ -1199,6 +1199,29 @@ The API is the master for these since 2026-10-09; the legacy import no longer wr
   `"lead"` and a passenger by its `seq`. Name and nationality overrides are gone (none was ever
   used). Stop `insPersist`.
 
+### 6.7 Fleet, part B: stock, memos, projects, Daily Fleet Log, safety (`05-fleet.js`)
+
+README → "Fleet maintenance". Every write is `fleet`, except the Daily Log's water, issued and extra
+items, outside requests and issue-item list (`fleet` or `operations`). `flSave` refused silently; the
+API answers `403`, so show it. Numbers (`MO-…`, `PRJ-…`) are still computed by the screen and sent.
+
+| Legacy | API |
+|---|---|
+| `flSaveAddStock`, `flSaveInvEdit` | `POST`/`PATCH /v1/fleet/stock-items`; the edit form's quantity becomes `POST …/adjust {warehouse, qty}` (sending `qty` to `PATCH` is `400`); a new part number needs `part_no_anyway: true` after the confirm |
+| `flSaveReceive` (one item), `flSaveTransfer`, `invDupMerge` | `POST …/receive`, `…/transfer`, `…/merge` |
+| `invLostFix`, `invDupScan` | not built: fix a wrong line with `adjust`; duplicates read from the import report |
+| `flConsumeSubmit`, `flConsumeDelete` | `POST /v1/fleet/consumables` (the below-zero confirm becomes `allow_negative: true` after a `409 stock_short`), `DELETE …/{id}` |
+| `flSaveMemo` | `POST /v1/fleet/memos` (send `no`; totals come back computed), `PATCH …/{id}` with each line's `id` |
+| `flAdvanceMemo`, `flSaveApprove`, `flSaveReceive` (memo), `memoShortClose`, `flCancelMemo` | `…/approve`, `…/order`, `…/receive {lines: [{line_id, qty}]}`, `…/short-close`, `…/pay`, `…/cancel {reason}` (a `409 stock_short` asks to confirm with `allow_negative: true`) |
+| `flProjSaveModal`, `flProjSetPhase` | `POST`/`PATCH /v1/fleet/projects` |
+| `flProjStart`, `Hold`, `Resume`, `Cancel`, `Reopen`, `WorkDone`, `BillBack`, `MarkComplete`, `BillClose`, `BillGo` | `…/start`, `/hold`, `/resume`, `/cancel`, `/reopen`, `/work-done`, `/bill-back`, `/complete` (`no_cost_reason` for the "no cost" choice; `409 bill_gate` lists what is missing) |
+| `flProjAddPlanItem…`, `flProjAddDoc…`, `flProjAttach*`, `flProjAddPhoto`, `flProjAddVendorVisit` | `…/plan`, `…/documents` (upload first with `POST /v1/attachments`, then send `attachment_id`), `…/vendor-visits`. Stop the `bookingId:'proj_…'` upload |
+| `flSaveFuel`, `flSavePaxActual`, `flSaveMeter` | `PATCH /v1/fleet/daily-log/{date}/boats/{boat_id}` |
+| `flSaveFuelPrice`, `flSaveDayLog`, `flDREdit` | `PUT …/{date}/fuel-prices`, `POST …/piers/{pier}/lock`, `…/unlock`. A locked day's writes are `409 day_locked` |
+| `flWaterSet`, `flIssueSet`, `flExtraSet`/`Del`, `flReqSet`/`Del`, `flIssueAddItem`/`SetItem` | `PUT …/water`, `PUT …/issues`, `…/extras`, `…/requests`, `/v1/fleet/issue-items`. Stop writing `fl_*` in `app_meta` |
+| `flSaveSafety`, `flSafetyDelete`, `flSaveInspection`, `flDeleteInspection` | `/v1/fleet/safety…`, `…/inspections` |
+| Inventory, memo, project, Daily Log, safety reads | the matching `GET`s; computed fields (`stocks`, `below_min`, memo totals, `receive_state`, `bill_gate`, `health`, `fuel_price`, `state`) replace the screen's own |
+
 ---
 
 ## 7. Not in the API yet: legacy keeps doing these
@@ -1213,7 +1236,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
-| Fleet maintenance | `05-fleet.js` | `legacy-replacement.md` §9 (scope undecided) |
+| Fleet maintenance, part A (boat availability, engines and other assets, incidents, jobs); fleet reports beyond memo spend; the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `todo/fleet-maintenance-model.md` (part B is built: §6.7) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
@@ -1328,7 +1351,8 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Agent rate seasons | `GET/PUT /v1/agents/{id}/rate-seasons`, `GET …/rate-type?date=` | To do |
 | Rate types, contracts (display) | `GET /v1/rate-types…`, `GET /v1/contracts…` | To do |
 | Invoices and payments (Accounting, Daily PFM payments) | `/v1/invoices…`, `GET /v1/payments` | To do |
-| Pier money, on-tour extras, weather closures, fleet maintenance | — | Not in API (§7) |
+| Fleet stock, memos, projects, Daily Fleet Log, safety | `/v1/fleet/…` (§6.7) | To do |
+| Pier money, on-tour extras, weather closures, fleet part A | — | Not in API (§7) |
 
 ## Rules and gotchas
 
