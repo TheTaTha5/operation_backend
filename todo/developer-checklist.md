@@ -7,7 +7,11 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 1. **Push `main`** again: deploying applies migrations 039–044 (add-on checks, attachments,
    allergies, document check, pickup areas, the change feed). Once `feat/invoices` is merged, 045
    (invoices and payments), 046 (who raised a boat's day capacity) and 047 (whole-boat holds) come
-   with it.
+   with it, and with `feat/seat-lock-extras` 048 (bulk locks, sub-groups, pending seats, expiry,
+   holders, the lock log). 048 turns a lock whose `agent_id` names no agent into an office lock with
+   the name in its reason, then adds the agent key; rehearsed on the local full import (2 locks).
+   Re-run `import-legacy` after it: sub-groups, bulk groups, pending seats and the 4,000-odd log
+   lines only arrive with the import.
 1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
    the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas,
@@ -64,6 +68,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     Cancel and restore now issue and void the fee invoice on the server: stop calling
     `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
     legacy's "Save anyway?" and resend with `overpay_anyway: true`.
+- **Legacy integration client, seat locks (`feat/seat-lock-extras`, handoff §6.1):** save bulk
+  locks to `/v1/seat-lock-groups` (not N day locks), sub-groups, pending seats (`409 seats_short` →
+  the "ที่นั่งว่างไม่พอ" dialog, resend with `pending`), expiry and reason; office holds as
+  `holder_type: "office"`, never a typed name; read `held_pax`, `remaining_pax`, `pending_pax`,
+  `state`, `overdue` and the log from the API and stop the browser expiry sweep and the lock log.
+  `pax` is what was asked; legacy's `qty` is `pax − released_pax`.
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.
@@ -90,6 +100,6 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 - Docker Desktop is stopped; tests ran on the native PostgreSQL 18 (port 5433).
 - Not committed anywhere: `docs/performance/` and the `todo-status` and `railway-deploy-triage`
   skills under `.claude/skills/`. Commit or delete them.
-- Unmerged branches to merge or delete: `feat/bulk-seat-locks`, `chore/load-testing`,
+- Unmerged branches to merge or delete: `feat/bulk-seat-locks` (superseded by `feat/seat-lock-extras`: delete it), `chore/load-testing`,
   `chore/docker-legacy`, `docs/cleanup` (already in `main` by other commits),
   `docs/login-decisions` (already in `main` through `feat/login`).

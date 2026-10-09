@@ -43,7 +43,7 @@ flowchart LR
   ops -. "boat_id" .-> catalogue
   sales -- "agent_programs.route_id" --> catalogue
   bookings -. "agent_id" .-> sales
-  catalogue -. "seat_locks.agent_id" .-> sales
+  catalogue -- "seat_locks.agent_id" --> sales
   rates -- "rate_type_routes.route_id" --> catalogue
   rates -- "owner_sales_id" --> sales
   sales -. "agents.rate_type_id" .-> rates
@@ -116,13 +116,49 @@ erDiagram
     text id PK
     text route_id "no FK"
     date service_date
-    integer pax
-    text agent_id "no FK"
+    integer pax "seats asked; a release never lowers it"
+    integer pending_pax "asked, not free yet (048)"
+    integer released_pax "given back (048)"
+    text holder_type "agent, office or global (048)"
+    text agent_id FK "set for, and only for, agent"
     text boat_id "a whole-boat hold (047); no FK"
     text status "active or released"
+    date expiry "past it, holds nothing (048)"
+    text reason
+    text group_id FK "a bulk lock's departure"
+    text parent_id FK "a sub-group's parent"
+    text sub_name "set with parent_id"
     timestamptz created_at
+    text created_by
     timestamptz updated_at
     timestamptz released_at
+  }
+  seat_lock_groups {
+    text id PK
+    text route_id FK
+    text holder_type
+    text agent_id FK
+    date date_from
+    date date_to
+    smallint_array weekdays "0 = Sunday; empty = every day"
+    integer pax "per departure"
+    integer release_days_before "the cutoff: a warning only"
+    text release_time "HH:MM"
+    text reason
+  }
+  seat_lock_events {
+    bigint id PK
+    text lock_id FK
+    text group_id FK
+    text type "create, add, edit, release, draw, return, ..."
+    integer qty
+    date trip_date
+    text booking_id "no FK"
+    text note
+    date day
+    timestamptz at "null on many legacy lines"
+    text by
+    boolean imported
   }
 
   routes ||--o{ route_times : "departs at"
@@ -133,7 +169,17 @@ erDiagram
   boats ||..o{ deployments : "deployed as"
   deployments |o..o| boat_capacity_overrides : "same boat and day"
   routes ||..o{ seat_locks : "held on"
+  seat_lock_groups ||--|{ seat_locks : "one per departure"
+  seat_locks |o--o{ seat_locks : "sub-groups"
+  seat_locks ||--o{ seat_lock_events : "log"
+  seat_lock_groups ||--o{ seat_lock_events : "log"
 ```
+
+- **Seat locks (048).** A lock is one route and day. A bulk lock is a `seat_lock_groups` row plus one
+  lock per departure (`group_id`); a sub-group is a lock with `parent_id`, on its parent's route and
+  day, one level deep. Only a top-level lock holds seats in the pool: `pax − released_pax − drawn −
+  pending_pax`, its sub-groups dividing that. Expiry, the release cutoff and `overdue` are worked out
+  on read (`src/domain/seat-locks.ts`), never written into `status`.
 
 - **A boat sails one route per day.** `deployments` is keyed on `(service_date, boat_id)`, so
   deploying the same boat again that day *moves* it rather than adding a second row.
@@ -631,7 +677,7 @@ erDiagram
   }
   seat_locks {
     text id PK
-    text agent_id "no FK"
+    text agent_id FK "048"
   }
 
   markets ||--o{ market_subs : "divided into"
@@ -657,7 +703,7 @@ erDiagram
   sales_people ||--o{ users : "is"
   agents ||--o{ users : "service login"
   agents |o..o{ bookings : "sold"
-  agents |o..o{ seat_locks : "holds"
+  agents |o--o{ seat_locks : "holds"
 ```
 
 - **`agent_programs`** lists the routes an agent may sell, with the booking window sales entered.
@@ -868,7 +914,6 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `seat_locks.route_id` | `routes` | Same as `deployments.route_id`. |
 | `booking_trip_operations.boat_id` | `boats` | Created without one (013). No API writes the column yet. |
 | `bookings.agent_id` | `agents` | Created (002) before the agents table (017). No key was added when it arrived. |
-| `seat_locks.agent_id` | `agents` | Same as `bookings.agent_id`. |
 | `seat_locks.boat_id` | `boats` | A whole-boat hold's boat (047), keyless like `deployments.boat_id`. |
 | `booking_partial_cancels.booking_trip_id` | `booking_trips` | Deliberate: the record must outlive a trip a later edit removes (020). |
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |

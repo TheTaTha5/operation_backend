@@ -266,7 +266,7 @@ is: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` (several, joined
 | `PATCH /v1/bookings/{id}` | only trips it adds, or moves to another route or day |
 | `POST /v1/bookings/{id}/reschedule` | the trips it moves |
 | `POST /v1/bookings/{id}/restore` | every trip |
-| `POST /v1/seat-locks` | its day |
+| `POST /v1/seat-locks`, `PATCH` moving one, `POST /v1/seat-lock-groups` | its day (a bulk lock: only the days the route runs become departures) |
 | `/confirm`, `/approve`, `/reject`, `/cancel`, partial cancel | nothing: they do not choose a day |
 
 A trip a `PATCH` leaves where it is was sold already, so a booking whose day closed after the sale
@@ -658,8 +658,10 @@ carries a `trips` array and one booking may span several days.
   not strand passengers already booked on it.
 - **`lock_draws`** (`lockDraws`) is `{ lock_id: seats }`: the part of a seat trip sold from an
   agent's lock. The draws may not add up to more than the trip's `pax` and do not apply to a
-  charter (`400`). Each lock must be active on the same route and day (`400`) and have that many
-  seats left (`409`); a lock id that does not exist is a `400`. Only `pax − drawn` needs general
+  charter (`400`). Each lock must be holding on the same route and day (`400`: not released, not
+  past its expiry) and have that many seats left (`409`); a lock id that does not exist is a `400`.
+  An agent's lock serves that agent's bookings only (`400 lock_other_agent`); a draw may name a
+  sub-group (see "Agent seat locks"). Only `pax − drawn` needs general
   seats. Responses return `lock_draws` in the same map shape, `{}` when there are none.
 - Moving a single-departure booking to another route or day (`PATCH` with `route_id`/
   `service_date`, or `reschedule`) **drops its lock draws**, because a lock belongs to one departure,
@@ -2140,7 +2142,8 @@ the last number it saw and refetches only the records named.
 - **Kinds:**
   - `booking`: any write to it: an edit, a command, dispatch, check-in, van parts and groups,
     reconfirm, upgrades, its document check;
-  - `seat_lock`;
+  - `seat_lock`: any write to it, every departure a bulk-lock write touches, and each lock a
+    booking write draws on or returns seats to;
   - `deployment`, with `entity_id` `<date>:<boat>`;
   - `route`: its calendar;
   - `invoice`: issued, changed, voided, or a payment recorded or corrected. Its bookings are in the
@@ -2168,32 +2171,178 @@ the last number it saw and refetches only the records named.
 
 ### Agent seat locks
 
-- `GET /v1/seat-locks` — optionally filter by `route_id` and `service_date` (or `date`).
-- `POST /v1/seat-locks` — `{ route_id, service_date, pax, agent_id? }`.
-- `PATCH /v1/seat-locks/{id}` — change `pax` and/or `agent_id`; a larger allocation is capacity
-  checked, and a lock cannot shrink below `drawn_pax` (`409`) — those seats are sold.
-- `POST /v1/seat-locks/{id}/release` — idempotently releases a lock. Seats already drawn from it stay
-  with their bookings; only the undrawn remainder goes back to the pool.
+Legacy's Seat Locks tab, as an API (`todo/seat-lock-extras-model.md`, decided 2026-10-09). A lock is
+one route, one day and `pax` seats kept off general sale for a holder. On top of that: **bulk locks**
+(a date range, one lock per departure), **sub-groups** (named slices of a lock, legacy "A / B / C"),
+**pending seats** (asked for but not free yet), an **expiry**, a **reason**, released seats kept apart
+from what was asked, and a **log** the server writes. Every write needs the `operations` edit area.
 
-A lock carries a `version` and an `ETag` as a booking does; `PATCH` and `release` need `If-Match` (or
-`version`) from a login (`428 version_required` without), and answer `409 stale_version` when the
-lock has moved on. A `PATCH` changes `pax` and
-`agent_id` only; any other field in its body is ignored.
+Nothing runs on a timer: what a lock holds, may give, has pending, and whether it is expired or
+overdue are worked out on every read (`src/domain/seat-locks.ts`), the same in both stores.
 
-Every lock response carries `drawn_pax`: the seats bookings that hold seats have drawn from it. The
-lock itself holds `pax − drawn_pax`, and that is what a new draw may take.
+#### A lock
+
+| Field | Who decides | Meaning |
+|---|---|---|
+| `id`, `version`, `created_at`, `created_by`, `updated_at`, `released_at` | server | `created_by` is the login |
+| `route_id`, `service_date` | client, checked | The route must run that day (`409 route_closed`). Frozen once a seat is drawn (`409 lock_drawn`). |
+| `pax` | client, checked | Seats **asked for**. A release never lowers it (see `released_pax`). Weighed against free seats (see "Pending seats"). |
+| `holder_type` | client, checked | `agent`, `office` or `global`. Absent: `agent` when `agent_id` is sent, else `office`. |
+| `agent_id` | client, checked | Required for `agent`, refused for the others (`400`); must be an agent (`400`, `GET /v1/agents`). |
+| `reason` | client | Free text, up to 500 characters (legacy's "Love Boom", "Fam Trip 11 + 1 guide"). |
+| `expiry` | client | A date. Past it (Asia/Bangkok) the lock stops holding; a lock expiring today holds all day. |
+| `status` | server | `active` or `released`, moved only by the commands below. |
+| `pending_pax` | server | Of `pax`, seats waiting for room: they hold nothing and cannot be drawn. |
+| `released_pax` | server | Of `pax`, seats given back by a release. |
+| `group_id` | server | The bulk lock this is one departure of. |
+| `parent_id`, `sub_name` | server / client | Set on a sub-group: the lock it is carved from, and its name. |
+| `boat_id` | import | A whole-boat hold (below). `null` on an ordinary lock. |
+| `drawn_pax` | server | Seats bookings that hold seats have drawn from it. |
+| `remaining_pax` | server | What a booking may draw from it now. A parent's are its seats in no sub-group. |
+| `held_pax` | server | What it keeps off general sale now. A sub-group `0` (its parent holds); a whole-boat hold `null`. |
+| `allocated_pax`, `sub_group_room` | server | A top-level lock: seats split into sub-groups, and seats a new sub-group may still take. |
+| `holding` | server | Active, not past `expiry`, and for a sub-group its parent holding. |
+| `state` | server | Legacy's label: `active`, `depleted` (nothing left, something drawn), `expired`, `released`. |
+| `release_at`, `overdue` | server | A bulk departure's release cutoff as an instant, and whether it has passed while the lock still holds. A whole-boat hold is `overdue` past its expiry. |
+
+A lock with no sub-groups and nothing pending holds `pax − released_pax − drawn_pax`, and that is
+what a new draw may take. A screen that shows legacy's single "seats" number shows
+`pax − released_pax` (legacy lowered `qty` on every release), and sends `pax` = that number +
+`released_pax` when it edits it.
+
+#### Endpoints
+
+- `GET /v1/seat-locks` — every lock; filter by `route_id`, `service_date` (or `date`), `from`/`to`,
+  `group_id`, `parent_id`, `agent_id`. Oldest first. `400` for a bad date.
+- `GET /v1/seat-locks/{id}`; `GET /v1/seat-locks/{id}/log` → `{ events: [...] }`, oldest first. `404` if unknown.
+- `POST /v1/seat-locks` — `{ route_id, service_date, pax, holder_type?, agent_id?, reason?, expiry?, pending? }` → `201`.
+- `PATCH /v1/seat-locks/{id}` — client facts only: `pax`, `holder_type`, `agent_id`, `reason`,
+  `expiry`, `route_id`, `service_date` (moves it, with its sub-groups), a sub-group's `sub_name`, and
+  `pending: "split"` when a raise or a move is short. A server-owned field (`status`, `pending_pax`,
+  `released_pax`, `group_id`, `parent_id`, `boat_id`, the numbers) with a **different** value is
+  `400 server_owned`, naming the command that sets it; echoed unchanged it is ignored, as a booking's.
+  `pax` cannot go below `released_pax` + drawn + split into sub-groups (`409 below_floor`).
+- `POST /v1/seat-locks/{id}/add` — `{ pax, note?, pending? }`: legacy "+ seats". A released lock is
+  active again. A sub-group grows only into its parent's room (`409 no_room`).
+- `POST /v1/seat-locks/{id}/release` — `{ pax? }`: legacy Release. That many undrawn seats back
+  (absent: all that can be); pending seats go first. A parent releases only its seats in no
+  sub-group; a sub-group's go back to its parent, not to the pool. With nothing left the lock is
+  `released`. More than can be released is `409 below_floor`. Idempotent.
+- `POST /v1/seat-locks/{id}/release-departure` — legacy "ปล่อย n ที่" on an overdue departure:
+  everything the lock holds that day, sub-groups and pending seats included, back to the pool now.
+  `400` on a sub-group. Idempotent.
+- `POST /v1/seat-locks/release-overdue` — `{ service_date, route_id? }`: every overdue lock of that
+  day still holding seats, released as above → `{ service_date, route_id, released: [locks], seats }`.
+- `POST /v1/seat-locks/{id}/confirm-pending` — `{ pax? }`: pending seats become held ones, as far as
+  seats are free now. `409 no_free_seats` ("No free seats on this trip yet - the lock stays
+  pending"), `409 nothing_pending`, `409 not_holding`; `400` on a sub-group (its pending seats are its
+  parent's).
+- `POST /v1/seat-locks/{id}/sub-groups` — `{ sub_name, pax, reason? }` → `201` with the sub-group.
+
+A lock carries a `version` and an `ETag` as a booking does; every write to one lock (`PATCH` and
+the commands, `sub-groups` included) needs `If-Match` (or `version`) from a login (`428
+version_required` without), and answers `409 stale_version` when the lock has moved on. Creating a
+sub-group raises its parent's version.
+
+#### Pending seats (legacy §lkPend)
+
+Create, a `pax` raise, a move and `add` compare what the lock still needs (`pax − released − drawn`)
+with the seats free that day (available, plus what the lock already holds). A day sold ungated (a
+land route, a marine day with no boat yet) never falls short, and neither does a day already past.
+When short, and no choice is sent, the answer is legacy's "ที่นั่งว่างไม่พอ" dialog:
+
+```json
+{ "statusCode": 409, "code": "seats_short", "error": "Conflict",
+  "message": "Not enough free seats on r1 2061-01-06: 3 free of 5 asked. Send pending: \"split\" to lock what is free and keep the rest pending, or \"all\" to keep it all pending",
+  "short": [{ "service_date": "2061-01-06", "free": 3, "want": 5, "short": 2 }] }
+```
+
+Send the same request again with `pending: "split"` (lock what is free, the rest pending) or
+`pending: "all"` (the short days entirely pending; a new lock only, `400` otherwise). An edit asks
+only when the shortfall is more than what is already pending. Lowering `pax` or releasing takes
+pending seats off first. Nothing confirms pending seats by itself: `confirm-pending` does.
+
+#### Sub-groups
+
+A sub-group is a named slice of a lock's seats, usually a salesperson or a LINE contact of the
+agent. One level only (`400` for a sub-group of a sub-group). It lives on its parent's route, day,
+holder and expiry (changing those on it is `400`), and has its own `reason`.
+
+- Only the parent holds seats in the pool: `pax − released − drawn from it and from every sub-group −
+  pending`. Sub-groups divide that hold, they do not add to it.
+- A booking draws from a sub-group's own seats, or from the parent's seats in no sub-group, never
+  past what the parent holds. A new or bigger sub-group must fit the parent's `sub_group_room`
+  (`409 no_room`: "Only n seats are left to put in a sub-group").
+- While the parent has pending seats, what it holds goes to its sub-groups in creation order, then
+  to its unsplit seats; a sub-group not reached shows `pending_pax` itself (legacy §lkPendSub).
+
+#### Bulk locks
+
+A bulk lock holds the same seats on every departure in a date range: a group plus one ordinary lock
+per day in the range, on the weekdays chosen, that the route runs. Each departure is a lock with
+`group_id`; draw on it, release it or confirm its pending seats through `/v1/seat-locks`. Its holder
+and expiry are the group's (a departure has none; `400` if sent), and it cannot move.
+
+- `GET /v1/seat-lock-groups` — `?route_id&agent_id` → `{ seat_lock_groups: [...] }`, each with
+  `departures`, `departures_past`, `state` (`active`, `expired` once `date_to` is past, `released`
+  when every departure is) and the sums `held_pax`, `drawn_pax`, `pending_pax`.
+- `GET /v1/seat-lock-groups/{id}` — the group with `seat_locks`: every departure and its sub-groups,
+  by date. `GET /v1/seat-lock-groups/{id}/log` — the group's own lines and every departure's.
+- `POST /v1/seat-lock-groups` — `{ route_id, date_from, date_to, weekdays?, pax, holder_type?,
+  agent_id?, reason?, release_days_before?, release_time?, pending? }` → `201`. `weekdays` (or `dow`)
+  is 0 = Sunday … 6 = Saturday, empty for every day. `date_to` is required ("Pick the last day of the
+  range"), not before `date_from`, at most 800 days on. A range with no departure is `400
+  no_departure` ("This lock covers no departure at all - check the date range and the weekdays you
+  ticked"). Short days answer `409 seats_short` listing every one.
+- `PATCH /v1/seat-lock-groups/{id}` — `{ pax?, holder_type?, agent_id?, reason?, release_days_before?,
+  release_time?, pending? }`: `pax` for every departure not released, as a lock's edit; the holder
+  only while nothing is drawn (`409 lock_drawn`). `date_from`, `date_to`, `weekdays` and `route_id`
+  cannot change here (`400 server_owned`): release it and make a new one.
+- `POST /v1/seat-lock-groups/{id}/add` `{ pax, note?, pending? }`, `/release` `{ pax? }` (the same
+  seats off every departure, at most what the busiest one can give), `/sub-groups` `{ sub_name, pax,
+  reason? }` (on every departure from today on that still holds; all or none, `409 no_room` naming
+  the days). Each answers the group with its `seat_locks`.
+
+Group writes need the group's `version` from a login, as a lock's do.
+
+**The release cutoff is a warning only** (legacy §lkNoAuto, 2026-09-29). `release_days_before` +
+`release_time` (`HH:MM`, Asia/Bangkok; both or neither) on a 5 March departure with `{ 1, "18:00" }`
+make its `release_at` 4 March 18:00. Past it the departure reads `overdue: true` and **still holds
+its seats** until staff release it (`release-departure`, or `release-overdue` for the whole day).
+
+#### Expiry
+
+A day lock past its `expiry` (Asia/Bangkok day, legacy's `expiry < today`) stops holding: it reads
+`holding: false`, `state: "expired"`, holds nothing in availability and takes no draws (`400`).
+`status` stays `active`: nothing is rewritten, so no job has to run at midnight. Draws already made
+stay with their bookings. A whole-boat hold ignores its expiry (it reads `overdue` instead).
+
+#### Holders and draws
+
+An `agent` lock serves that agent's bookings only: a draw on it from a booking of another agent, or
+of none, is `400 lock_other_agent` ("Seat lock … holds seats for agent a10, not a07"). `office`
+and `global` locks serve any booking (legacy `bkV2LocksForAgent`).
+
+#### The log
+
+`GET /v1/seat-locks/{id}/log` and `GET /v1/seat-lock-groups/{id}/log` →
+`{ events: [{ id, lock_id, group_id, type, qty, trip_date, booking_id, note, day, at, by, imported }] }`.
+The server writes a line, in the same transaction, for `create`, `add`, `edit` (`pax: 4 → 6 ·
+reason: — → Love Boom`, legacy's form), `release`, `release-round`, `pend` (`free 0 of 2`),
+`pend-confirm`, and from booking writes `draw`, `return` (with the command as its note: `edit`,
+`cancel`, …) and `resched-return`. Legacy's lines are imported with `imported: true`; many of them
+(`release`, `expire`) have no `at` or `by`, and none is made up.
 
 **Whole-boat holds** (legacy §bkLock, migration 047). A lock with a `boat_id` holds a whole boat for
-an agent who has not confirmed numbers; `pax` is the minimum seats promised. Ordinary locks read
-`boat_id: null`.
+an agent who has not confirmed numbers; `pax` is the minimum seats promised.
 - **On a boat deployed that day,** a hold counts exactly as a charter does:
   - the boat's sellable and licensed seats leave the pool, whatever number was promised;
   - the boat reads `chartered` in `/v1/availability`;
   - a seat booking can't be put on it (`409 boat_chartered`), and neither can another charter;
   - the hold holds nothing more, and nothing draws from it.
 - **On a boat not deployed that day,** it holds its `pax` as a plain lock.
-- **Who creates them:** only the legacy import, for now. Legacy creates holds, and turns them into a
-  charter, until seat locks move here (`todo/seat-lock-extras-model.md`).
+- **Who creates them:** only the legacy import, for now; only a full release applies to one here
+  (`400 boat_hold` for the other commands). Creating and converting holds is their own design.
 
 Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 

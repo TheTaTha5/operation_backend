@@ -148,17 +148,20 @@ The order is: hold the seats, take payment, then book from the hold.
 1. **Customer clicks "Pay"** → `POST /v1/seat-locks`
    `{ "route_id": "r10", "service_date": "2030-01-04", "pax": 3, "agent_id": "a_b2c" }`.
    - `201` gives a lock `id`. Keep it with the PayPal order.
-   - `409` means sold out, or (`code: "route_closed"`) the trip does not run that day. Don't send
-     them to PayPal.
+   - `409` means sold out (`code: "seats_short"`, with the free seats in `short`), or
+     (`code: "route_closed"`) the trip does not run that day. Don't send them to PayPal. (Don't send
+     `pending`: a pending seat is a staff tool and holds nothing.)
 2. **Payment captured** → `POST /v1/bookings`, with the trip drawing on the lock:
    `"trips": [{ "routeId": "r10", "date": "2030-01-04", "pax": { "ad_fr": 2, "chd_fr": 1 }, "lockDraws": { "<lock id>": 3 } }]`.
    Then `POST /v1/seat-locks/{lockId}/release` to free anything left over. That is a no-op when
    every seat was drawn.
 3. **Payment failed, cancelled or abandoned** → `POST /v1/seat-locks/{lockId}/release`.
 
-**Locks do not expire.** A lock you never release holds its seats forever, and ops will see a
+**Locks expire by the day only.** An `expiry` date (optional) stops a lock holding after that day,
+but nothing shorter: a lock you never release holds its seats until then, and ops will see a
 sold-out day that isn't. You need a sweeper that releases locks whose payment never completed,
-for example after 30 minutes.
+for example after 30 minutes. A lock for `a_b2c` serves only `a_b2c` bookings (`400
+lock_other_agent` otherwise), which yours are.
 
 ## 6. Errors
 

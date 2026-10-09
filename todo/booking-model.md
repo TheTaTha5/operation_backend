@@ -33,8 +33,6 @@ it is the signal that it needs modelling. The blob is no longer written (since 2
   `deployments.boat_id`.
 - **Historical charters on multi-boat days have `charter_boat_id` NULL**; they subtract their
   passengers from the pool instead. Count them on production before repairing by hand.
-- **A lock draw does not check the lock's agent against the booking's** (legacy's
-  `holderType`/`holderId` suggests it should).
 - **No `UNIQUE (booking_id, route_id, service_date)`**: the API and the import enforce it. Count the
   violations on production first (the import's dry run lists them as skipped bookings).
 - **Unbuilt fields:** `ovn_charge`, `subtotal`, the charter pricing fields,
