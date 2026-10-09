@@ -53,24 +53,16 @@ export function boatShare(t: BookingTrip, boatId: string): number {
 /** Legacy `pckVoidInfo`: everyone booked was lost (no-show or cancelled at the pier). */
 export const isVoid = (t: BookingTrip): boolean => t.pax_total > 0 && PAX_CATEGORIES.every((k) => aboardCounts(t)[k] === 0);
 
-const slotsOf = (t: BookingTrip): { idx: number; booked: number }[] => {
-  const parts = t.operations.van_parts;
-  if (parts.length <= 1) return [{ idx: parts[0]?.idx ?? 0, booked: t.pax_total }];
-  return parts.map((p) => ({ idx: p.idx, booked: partPax(p) }));
-};
 /**
  * Legacy `pckOnBoard`: once the pier has counted (`actual_pax`), its count; otherwise booked less
- * everyone lost on the van and at the pier. A trip with several van parts adds its slots.
+ * everyone lost on the van and at the pier.
  */
 export function onBoard(t: BookingTrip): number {
-  const { van, pier } = t.operations.checkins;
-  if (!pier.some((r) => r.actual_pax !== null)) return Math.max(0, t.pax_total - lostByType(t.operations.checkins).total);
-  let n = 0;
-  for (const s of slotsOf(t)) {
-    const p = pier.find((r) => r.slot === s.idx && r.actual_pax !== null);
-    n += p ? Math.max(0, p.actual_pax!) : Math.max(0, s.booked - lostByType({ van: van.filter((r) => r.slot === s.idx), pier: pier.filter((r) => r.slot === s.idx) }).total);
-  }
-  return n;
+  const counted = t.operations.checkins.pier.filter((r) => r.actual_pax !== null);
+  if (!counted.length) return Math.max(0, t.pax_total - lostByType(t.operations.checkins).total);
+  // The pier's counts. Legacy read the main record only; the pier often counts a split booking whole
+  // on it, so a part with no count of its own adds nothing.
+  return counted.reduce((s, r) => s + Math.max(0, r.actual_pax!), 0);
 }
 
 /** The bookings on a boat that day (not cancelled), each with its trip and the boat's share of it. */
@@ -325,7 +317,9 @@ export function tripPL(boatId: string, day: PlDay): TripPL {
   const fuelPr = FP.price || 0;
   const LT = tripLongtail(date, boatId, day.bookings, day.sales, day.bundle);
   const eng: Engines = (boat.engine_count || 3) >= 4 ? '4EN' : '3EN';
-  const pl = plan ?? EMPTY_PLAN;
+  // Legacy `pxPlanFor` hands on the plan's overrides and groups only: its heads, prices and on-demand
+  // expectations are for playing on the design sheet, and must not move yesterday's profit.
+  const pl = plan ? { overrides: plan.overrides, groups: plan.groups, on_demand: {} } : EMPTY_PLAN;
   const ctx: CalcCtx = {
     eng, boats: 1, fuel: fuelPr, boat_id: boatId, date, od_qty: { ltj: LT.join, ltc: LT.charter },
     // §ctChd: infants count with children; no infant eats like an adult.
