@@ -5,8 +5,9 @@ import { buildApp } from '../src/app.js';
 import { createStore } from '../src/routes/operations.js';
 import { SeatLockService } from '../src/domain/seat-lock-service.js';
 
-// Whole-boat holds (todo/boat-holds-model.md, approved 2026-10-09), on whichever store DATABASE_URL
-// selects. The API creates no holds yet (the import does), so the test makes one through the store.
+// Whole-boat holds in the seat pool (migration 047), on whichever store DATABASE_URL selects. The
+// holds are made through the store, rules unchecked, as the import makes them (one on a boat not
+// deployed that day included); the API's commands are test/boat-hold-commands.test.ts.
 const store = createStore();
 const hold = (service_date: string, pax: number, boat_id: string) =>
   store.transaction(async () => new SeatLockService(store).create({ route_id: 'r1', service_date, pax, holder_type: 'office', agent_id: null, reason: null, expiry: null, boat_id }));
