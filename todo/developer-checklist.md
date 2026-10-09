@@ -4,7 +4,7 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 ## Deploy what is on `main`
 
-1. **Push `main`.** It is 56 commits ahead of GitHub; Railway runs none of it until then. Deploying
+1. **Push `main`.** It is about 60 commits ahead of GitHub; Railway runs none of it until then. Deploying
    applies migrations 024–038; the day-of-operations import (vans, check-ins, reconfirm, upgrades)
    needs a fresh legacy import run afterwards.
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -47,6 +47,9 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 - **Live updates** (`change-feed-model.md`): the 5 questions at the end.
 - **Day-of-operations leftovers** (`trip-ops-and-vans-model.md` → "Needs a decision"): 5 items.
+- **Booking extras** (`booking-extras-model.md`): attachments, allergy list, document check, pickup
+  areas; 12 questions (A1–A3, B1, C1–C3, D1–D4).
+- **Add-on constraints** (`addons-model.md` Open 1): all hold on legacy data; add them?
 - **Next slice:** pricing (`pricing-model.md`, decided: contracts first) or deployment guards
   (`deployment-guards-model.md`, has questions to answer).
 - **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
