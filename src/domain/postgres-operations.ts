@@ -46,6 +46,7 @@ import type { PickupNameTh, VanJobSend } from './van-jobs.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
+import { sortHeld, type HeldOrder, type HeldStatus } from './b2c.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -402,6 +403,11 @@ const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | n
   status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
   at: r.at ? jsonInstant(r.at) : null, by: (r.by as string) ?? null, sent_at: r.sent_at ? jsonInstant(r.sent_at) : null, sent_by: (r.sent_by as string) ?? null,
 };
+const heldOrderRow = (r: QueryResultRow): HeldOrder => ({
+  id: String(r.id), action: r.action, external_id: r.external_id ?? null, booking_id: r.booking_id ?? null, request: r.request, problem: String(r.problem),
+  attempts: Number(r.attempts), status: r.status, received_at: asIso(r.received_at), last_received_at: asIso(r.last_received_at), received_by: r.received_by ?? null,
+  decided_at: r.decided_at ? asIso(r.decided_at) : null, decided_by: r.decided_by ?? null, note: r.note ?? null, resolved_booking_id: r.resolved_booking_id ?? null,
+});
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, boat_id: row.boat_id ?? null, drawn_pax: Number(row.drawn_pax ?? 0) });
 
 const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
@@ -742,6 +748,28 @@ export class PostgresOperationsStore {
     await this.client().query('DELETE FROM booking_allergies WHERE booking_id = $1', [bookingId]);
     for (const [seq, a] of list.entries()) await this.client().query('INSERT INTO booking_allergies (booking_id, seq, name, qty) VALUES ($1,$2,$3,$4)', [bookingId, seq, a.name, a.qty]);
   }
+  // ── Love Kingdom's held orders (migration 100, `b2c.ts`) ──
+  /** Newest first (`sortHeld`, as the in-process store). `status` absent lists every one. */
+  async listHeldOrders(query: { status?: HeldStatus; externalId?: string } = {}): Promise<HeldOrder[]> {
+    const { rows } = await this.client().query(`SELECT * FROM b2c_held_orders WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR external_id = $2)`,
+      [query.status ?? null, query.externalId ?? null]);
+    return sortHeld(rows.map(heldOrderRow));
+  }
+  async heldOrder(id: string): Promise<HeldOrder | undefined> {
+    const { rows: [row] } = await this.client().query('SELECT * FROM b2c_held_orders WHERE id = $1', [id]);
+    return row && heldOrderRow(row);
+  }
+  /** Inserts or replaces one, whole: what to write is `holdOrder`'s and `decideHeld`'s decision. */
+  async putHeldOrder(h: HeldOrder): Promise<void> {
+    await this.client().query(`INSERT INTO b2c_held_orders (id, action, external_id, booking_id, request, problem, attempts, status, received_at, last_received_at,
+        received_by, decided_at, decided_by, note, resolved_booking_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET request = EXCLUDED.request, problem = EXCLUDED.problem, attempts = EXCLUDED.attempts, status = EXCLUDED.status,
+        last_received_at = EXCLUDED.last_received_at, received_by = EXCLUDED.received_by, decided_at = EXCLUDED.decided_at, decided_by = EXCLUDED.decided_by,
+        note = EXCLUDED.note, resolved_booking_id = EXCLUDED.resolved_booking_id`,
+      [h.id, h.action, h.external_id, h.booking_id, JSON.stringify(h.request ?? null), h.problem, h.attempts, h.status, h.received_at, h.last_received_at,
+        h.received_by, h.decided_at, h.decided_by, h.note, h.resolved_booking_id]);
+  }
+
   // ── Pickup areas and pickup times (migration 043) ──
   async listPickupAreas(): Promise<PickupArea[]> {
     return (await this.client().query('SELECT id, name, zone, region, time_group, active FROM pickup_areas ORDER BY id')).rows
@@ -986,14 +1014,15 @@ export class PostgresOperationsStore {
         AND ($5::text IS NULL OR b.agent_id = $5)
         AND ($6::text[] IS NULL OR b.status = ANY($6))
         AND ($7::text IS NULL OR lower(b.voucher_ref) = $7)
-        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)`;
-    const params = [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, query.agentId ?? null, query.statuses ?? null, query.voucherRef ?? null, query.q ?? null];
+        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)
+        AND ($9::timestamptz IS NULL OR b.updated_at >= $9)`;
+    const params = [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, query.agentId ?? null, query.statuses ?? null, query.voucherRef ?? null, query.q ?? null, query.updatedSince ?? null];
     const [{ rows }, { rows: [{ total }] }] = await Promise.all([
       this.client().query(`${BOOKING_SELECT}
       WHERE ${filters}
-        AND ($9::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($9::timestamptz, $10::text))
+        AND ($10::timestamptz IS NULL OR (b.created_at, b.id) ${after} ($10::timestamptz, $11::text))
       ORDER BY b.created_at ${order}, b.id ${order}
-      LIMIT $11`, [...params, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]),
+      LIMIT $12`, [...params, cursor?.created_at ?? null, cursor?.id ?? null, query.limit + 1]),
       this.client().query(`SELECT count(*)::int AS total FROM bookings b WHERE ${filters}`, params),
     ]);
     const page = rows.slice(0, query.limit);

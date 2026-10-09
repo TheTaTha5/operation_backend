@@ -22,6 +22,8 @@ type Snapshot = {
   /** The van parts of every booking on a van group's route and day, to see which a group write changed. */
   vanDay?: { date: string; routeId: string; parts: Map<string, string> };
   deployment?: { route_id: string } | undefined;
+  /** Love Kingdom's open held orders a create may settle, by id, with their status. */
+  held: Map<string, string>;
 };
 
 const params = (r: FastifyRequest) => (r.params ?? {}) as Record<string, string>;
@@ -78,12 +80,25 @@ async function snapshot(store: Store, r: FastifyRequest): Promise<Snapshot> {
     const date = String(params(r).service_date ?? body(r).service_date ?? ''), boat = String(params(r).boat_id ?? body(r).boat_id ?? '');
     deployment = (await store.listDeployments(date, date)).find((d) => d.boat_id === boat);
   }
-  return { bookings, invoices, vanDay, deployment };
+  // A create may settle the orders Love Kingdom had held under its `external_id`.
+  const held = new Map<string, string>();
+  const externalId = url(r) === '/v1/bookings' && r.method === 'POST' ? body(r).external_id ?? body(r).id : undefined;
+  if (typeof externalId === 'string' && externalId) for (const h of await store.listHeldOrders({ status: 'open', externalId })) held.set(h.id, h.status);
+  return { bookings, invoices, vanDay, deployment, held };
 }
 
 async function describe(store: Store, r: FastifyRequest, before: Snapshot, result: unknown): Promise<ChangeInput[]> {
   const path = url(r), by = actorOf(r.user as Parameters<typeof actorOf>[0]) ?? null;
+  // A write from Love Kingdom's login that was held for review (`b2c.ts`): an order waits, and no
+  // booking changed.
+  const held = (result as { held_order?: { id: string; attempts: number } } | undefined)?.held_order;
+  if (held) return [{ kind: 'b2c_held_order', entity_id: held.id, action: held.attempts === 1 ? 'created' : 'updated', route_days: null, changed_by: by }];
   const out: ChangeInput[] = [];
+  // Ops resolved or dismissed a held order, or Love Kingdom's create settled the ones it had held.
+  if (path.startsWith('/v1/b2c/held-orders/:id/')) out.push({ kind: 'b2c_held_order', entity_id: params(r).id, action: 'updated', route_days: null, changed_by: by });
+  for (const [id, status] of before.held) {
+    if ((await store.heldOrder(id))?.status !== status) out.push({ kind: 'b2c_held_order', entity_id: id, action: 'updated', route_days: null, changed_by: by });
+  }
   const booking = async (id: string, created = false) => {
     const after = await store.booking(id);
     if (after || before.bookings.get(id)) out.push({ kind: 'booking', entity_id: id, action: created ? 'created' : 'updated', route_days: bookingDays(before.bookings.get(id), after), changed_by: by });

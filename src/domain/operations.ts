@@ -44,6 +44,7 @@ import { copyStop, type VanStop } from './van-stops.js';
 import { specialRequest, type PickupNameTh, type VanJobSend } from './van-jobs.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
+import { sortHeld, type HeldOrder, type HeldStatus } from './b2c.js';
 
 export type Deployment = {
   boat_id: string;
@@ -263,6 +264,8 @@ export type BookingListQuery = {
   q?: string;
   /** Already lower-cased: the whole `voucher_ref`, compared lower-cased. */
   voucherRef?: string;
+  /** An ISO instant: bookings whose `updated_at` is at or after it (Love Kingdom's reconciliation read). */
+  updatedSince?: string;
 };
 
 /** `total` counts every booking the filters match, regardless of `cursor` and `limit`. */
@@ -635,6 +638,17 @@ export class OperationsStore {
   subscribeChanges(onChange: () => void): () => void { this.changeListeners.add(onChange); return () => { this.changeListeners.delete(onChange); }; }
   /** No database, so nothing to migrate. */
   migrationsPending(): number { return 0; }
+
+  // ── Love Kingdom's held orders (migration 100, `b2c.ts`) ──
+  private heldOrders = new Map<string, HeldOrder>();
+  /** Newest first (`sortHeld`). `status` absent lists every one. */
+  listHeldOrders(query: { status?: HeldStatus; externalId?: string } = {}): HeldOrder[] {
+    return sortHeld([...this.heldOrders.values()].filter((h) => (!query.status || h.status === query.status) && (query.externalId === undefined || h.external_id === query.externalId)))
+      .map((h) => structuredClone(h));
+  }
+  heldOrder(id: string): HeldOrder | undefined { const found = this.heldOrders.get(id); return found && structuredClone(found); }
+  /** Inserts or replaces one, whole: what to write is `holdOrder`'s and `decideHeld`'s decision. */
+  putHeldOrder(order: HeldOrder): void { this.heldOrders.set(order.id, structuredClone(order)); }
 
   // ── Pickup areas and pickup times (migration 043) ──
   private pickupAreas = new Map<string, PickupArea>();
@@ -1110,6 +1124,7 @@ export class OperationsStore {
       .filter((b) => !query.agentId || b.agent_id === query.agentId)
       .filter((b) => !query.statuses || query.statuses.includes(b.status))
       .filter((b) => query.voucherRef === undefined || lower(b.voucher_ref) === query.voucherRef)
+      .filter((b) => query.updatedSince === undefined || b.updated_at >= query.updatedSince)
       .filter((b) => query.q === undefined || [b.id, b.voucher_ref, b.lead_pax].some((field) => lower(field).includes(query.q!)))
       .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
         && (!query.serviceDate || t.service_date === query.serviceDate)

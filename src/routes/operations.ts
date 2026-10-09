@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
@@ -7,7 +7,7 @@ import { Authenticator } from '../auth.js';
 import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserPatch, password, userView, verifyPassword, type StoredUser } from '../domain/users.js';
 import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
-import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
+import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, holdsSeats, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
 import { capacityNumbers, charterCeiling } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
@@ -54,6 +54,10 @@ import {
 import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
+import {
+  B2C_AGENT, bookingIssues, decideHeld, heldResponse, holdOrder, isB2CPush, issuesSignature, parseHeldDecision, parseHeldStatus, parseUpdatedSince, sameHeldCreate,
+  type HeldAction, type HeldInput, type PanelIssue,
+} from '../domain/b2c.js';
 
 /** A little over a year, so a client may sweep a full season but not walk the calendar forever. */
 const MAX_CALENDAR_DAYS = 400;
@@ -295,9 +299,12 @@ function bookingListQuery(query: Record<string, unknown>): BookingListQuery {
   // Lower-cased here, once, so the two stores compare the same text the same way.
   const q = optionalString(typeof query.q === 'string' ? query.q.trim() : undefined)?.toLowerCase();
   const voucherRef = optionalString(typeof query.voucher_ref === 'string' ? query.voucher_ref.trim() : undefined)?.toLowerCase();
+  // Love Kingdom's reconciliation read (todo/b2c-sync-model.md): bookings changed at or after an instant.
+  const updatedSince = parseUpdatedSince(query.updated_since);
   return {
     routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id), serviceDate, from, to, limit: rawLimit, cursor,
     ...(order ? { order } : {}), ...(statuses ? { statuses } : {}), ...(q === undefined ? {} : { q }), ...(voucherRef === undefined ? {} : { voucherRef }),
+    ...(updatedSince === undefined ? {} : { updatedSince }),
   };
 }
 
@@ -647,6 +654,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * below. See `booking-actions.ts`.
    */
   app.post('/v1/bookings', { schema: docs.createBooking }, async (request, reply) => {
+    const outcome = await holdOnBadInput(request, 'create', () => createBooking(request));
+    return 'held' in outcome ? reply.code(202).send(outcome.held) : reply.code(201).send(outcome.done);
+  });
+  async function createBooking(request: FastifyRequest) {
     const actor = actorOf(request.user);
     const { viaStatus, ...input } = bookingInput(request.body);
     const agent = request.user?.user?.agent_id;
@@ -675,13 +686,54 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
         ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
       }, actor);
       await syncAltParts(booking);
+      // Love Kingdom resent an order it had held, and now it books: the held one is settled.
+      if (isB2CPush(request.user?.user) && booking.external_id) await resolveHeldCreates(booking.external_id, booking.id, actor);
       if (!q) return (await store.booking(booking.id))!;
       await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
       return (await store.booking(booking.id))!;
     });
     const warnings = priced ? [...replacedPrices(input.header, priced.header), ...priced.quote.warnings] : [];
-    return reply.code(201).send(warnings.length ? { ...created, price_warnings: warnings } : created);
-  });
+    return withIssues(request, warnings.length ? { ...created, price_warnings: warnings } : created);
+  }
+
+  /**
+   * Love Kingdom's push (todo/b2c-sync-model.md, decided 2026-10-09). A write from its login that is
+   * refused as bad input (`400`) is held for ops instead of lost: the raw body is kept with the
+   * refusal's message and the answer is `202 held_for_review`. Nothing of the booking changes. Any
+   * other refusal, and every other caller, gets the refusal as before: a person can fix the field.
+   */
+  async function holdOnBadInput<T>(request: FastifyRequest, action: HeldAction, work: () => Promise<T>): Promise<{ done: T } | { held: ReturnType<typeof heldResponse> }> {
+    try {
+      return { done: await work() };
+    } catch (error) {
+      if (!isB2CPush(request.user?.user) || (error as { statusCode?: number }).statusCode !== 400) throw error;
+      const body = request.body ?? null;
+      const target = action === 'create' ? undefined : await store.booking(bookingId(request));
+      const input: HeldInput = {
+        action, booking_id: target?.id ?? null, request: body, problem: (error as Error).message, received_by: actorOf(request.user) ?? null,
+        external_id: action === 'create' ? optionalString(isRecord(body) ? body.external_id ?? body.id : undefined) ?? null : target?.external_id ?? null,
+      };
+      const held = await store.transaction(async () => {
+        const open = input.action === 'create' && input.external_id ? await store.listHeldOrders({ status: 'open', externalId: input.external_id }) : [];
+        const row = holdOrder(input, open.find((h) => sameHeldCreate(h, input)), `held_${randomUUID()}`, new Date().toISOString());
+        await store.putHeldOrder(row);
+        // `held_order` tells the change feed this write held an order and changed no booking.
+        return { held_order: row };
+      });
+      request.log.warn({ held_order: held.held_order.id, action, problem: held.held_order.problem }, 'Love Kingdom write held for review');
+      return { held: heldResponse(held.held_order) };
+    }
+  }
+  /** Settles the open held create of an order Love Kingdom has now booked. */
+  async function resolveHeldCreates(externalId: string, bookingIdNow: string, actor: string | undefined): Promise<void> {
+    for (const held of await store.listHeldOrders({ status: 'open', externalId })) {
+      if (held.action !== 'create') continue;
+      await store.putHeldOrder(decideHeld(held, { status: 'resolved', note: `Booked as ${bookingIdNow}`, resolved_booking_id: bookingIdNow }, actor ?? null, new Date().toISOString()));
+    }
+  }
+  /** Love Kingdom's login is told what is wrong in what it stored (`bookingIssues`); nobody else's response changes. */
+  const withIssues = <B extends Booking>(request: FastifyRequest, booking: B): B | (B & { issues: ReturnType<typeof bookingIssues> }) =>
+    isB2CPush(request.user?.user) ? { ...booking, issues: bookingIssues(booking) } : booking;
   /**
    * A booking's documents (`attachments`) and its upgrades' payment slips name uploaded files: each must
    * exist (`400`). Answers the documents to store, a kept one keeping who added it and when, or
@@ -693,7 +745,11 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     if (ids.length) assertKnownFiles(ids, new Set((await store.attachmentRefs(ids)).keys()), 'attachments');
     return docs && documentRows(docs, current, new Date().toISOString(), actor ?? null);
   }
-  app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
+  app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request, reply) => {
+    const outcome = await holdOnBadInput(request, 'amend', () => amendBooking(request));
+    return 'held' in outcome ? reply.code(202).send(outcome.held) : withIssues(request, outcome.done);
+  });
+  async function amendBooking(request: FastifyRequest) {
     const actor = actorOf(request.user);
     const { version: _version, rate, ...body } = record(request.body);
     const changes = bookingChanges(body);
@@ -738,7 +794,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const booking = (await store.booking(amended.id))!;
       return warnings.length ? { ...booking, price_warnings: warnings } : booking;
     });
-  });
+  }
   for (const command of STATUS_COMMANDS) {
     app.post(`/v1/bookings/:id/${command}`, { schema: docs.statusCommand(command) }, async (request) => {
       const body = parseStatusCommandRequest(withoutVersion(request.body));
@@ -751,14 +807,54 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return { ...changed.booking, warnings: changed.warnings };
     });
   }
-  app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request) => {
-    const cancel = parseCancelRequest(withoutVersion(request.body));
-    return store.transaction(async () => {
-      await assertBookingFresh(request);
-      const done = (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found');
-      return (await invoicesOnCancel(done, actorOf(request.user) ?? null)) ? (await store.booking(done.id))! : done;
+  app.post('/v1/bookings/:id/cancel', { schema: docs.cancelBooking }, async (request, reply) => {
+    const outcome = await holdOnBadInput(request, 'cancel', async () => {
+      const cancel = parseCancelRequest(withoutVersion(request.body));
+      return store.transaction(async () => {
+        await assertBookingFresh(request);
+        const done = (await store.cancelBooking(bookingId(request), cancel, actorOf(request.user))) ?? notFound('Booking not found');
+        return (await invoicesOnCancel(done, actorOf(request.user) ?? null)) ? (await store.booking(done.id))! : done;
+      });
     });
+    return 'held' in outcome ? reply.code(202).send(outcome.held) : outcome.done;
   });
+
+  /**
+   * Love Kingdom's issues panel (legacy's orange "ใบ B2C ที่ต้องเช็ค" panel, todo/b2c-sync-model.md):
+   * every open held order, and what is wrong in the B2C bookings still to travel.
+   */
+  app.get('/v1/b2c/issues', async () => {
+    const held = await store.listHeldOrders({ status: 'open' });
+    const issues: PanelIssue[] = [];
+    const statuses = BOOKING_STATUSES.filter(holdsSeats);
+    let cursor: string | undefined;
+    do {
+      const page = await store.listBookings({ agentId: B2C_AGENT, from: todayInThailand(), to: '9999-12-31', statuses, limit: 100, ...(cursor ? { cursor } : {}) });
+      for (const b of page.bookings) {
+        for (const issue of bookingIssues(b)) issues.push({ booking_id: b.id, external_id: b.external_id ?? null, service_date: b.service_date, lead_pax: b.lead_pax ?? null, ...issue });
+      }
+      cursor = page.next_cursor;
+    } while (cursor);
+    issues.sort((a, b) => a.service_date.localeCompare(b.service_date) || a.booking_id.localeCompare(b.booking_id));
+    const count = (severity: string) => issues.filter((i) => i.severity === severity).length;
+    return { held_orders: held, issues, counts: { held: held.length, warn: count('warn'), info: count('info') }, signature: issuesSignature(held, issues) };
+  });
+  app.get('/v1/b2c/held-orders', async (request) => ({ held_orders: await store.listHeldOrders({ status: parseHeldStatus((request.query as Record<string, unknown>).status) }) }));
+  const heldId = (request: { params: unknown }): string => (request.params as { id: string }).id;
+  app.get('/v1/b2c/held-orders/:id', async (request) => (await store.heldOrder(heldId(request))) ?? notFound(`Held order ${heldId(request)} not found`));
+  /** Ops close a held order: `resolve` (handled; optionally the booking that settled it) or `dismiss` (nothing to do). */
+  for (const command of ['resolve', 'dismiss'] as const) {
+    app.post(`/v1/b2c/held-orders/:id/${command}`, async (request) => {
+      const decision = parseHeldDecision(command, request.body);
+      return store.transaction(async () => {
+        const held = (await store.heldOrder(heldId(request))) ?? notFound(`Held order ${heldId(request)} not found`);
+        const decided = decideHeld(held, decision, actorOf(request.user) ?? null, new Date().toISOString());
+        if (decided.resolved_booking_id && !(await store.booking(decided.resolved_booking_id))) badRequest(`booking_id ${decided.resolved_booking_id} is not a booking`);
+        await store.putHeldOrder(decided);
+        return decided;
+      });
+    });
+  }
   app.post('/v1/bookings/:id/restore', async (request) => {
     const restored = await store.transaction(async () => {
       await assertBookingFresh(request);

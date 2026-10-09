@@ -25,6 +25,13 @@ const error = {
 };
 const err = (description: string) => ({ ...error, description });
 const UNAUTHORIZED = { 401: err('Missing or invalid Bearer token'), 403: err('Token lacks the required scope') };
+/** Love Kingdom's login only: a write refused as bad input is held for ops instead (todo/b2c-sync-model.md). */
+const HELD = {
+  202: {
+    type: 'object', description: 'Love Kingdom\'s login only: what would have been a `400` is held for ops to review (`code: held_for_review`). Nothing was booked or changed.',
+    properties: { code: { type: 'string', enum: ['held_for_review'] }, message: { type: 'string' }, held_order: { type: 'object', additionalProperties: true } },
+  },
+};
 
 const paxGrid = {
   type: 'object',
@@ -304,6 +311,7 @@ export const docs = {
         status: { type: 'string', description: 'Comma-separated statuses' },
         voucher_ref: { type: 'string' }, q: { type: 'string', description: 'Matches id, voucher_ref or lead passenger name' },
         limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string' }, order: { type: 'string', enum: ['asc', 'desc'] },
+        updated_since: { type: 'string', format: 'date-time', description: 'Bookings changed at or after this instant (Love Kingdom\'s reconciliation read)' },
       },
     },
     response: { 200: { type: 'object', properties: { bookings: { type: 'array', items: booking }, next_cursor: { type: 'string', description: 'Pass as `cursor` for the next page; absent on the last page' }, total: { type: 'integer' } } }, 400: err('Bad filter'), ...UNAUTHORIZED },
@@ -319,7 +327,7 @@ export const docs = {
       + 'or past the registered seats, are `409` and nothing is written. Read `status` from the response; it is the server\'s.',
     body: bookingIn,
     response: {
-      201: booking, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
+      201: booking, ...HELD, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
       409: err('A trip on a day its route does not run (`route_closed`), seats held by seat locks, the registered seats full, lock short, boat already chartered, or `external_id` already used (`duplicate_external_id`)'), ...UNAUTHORIZED,
     },
   },
@@ -331,7 +339,7 @@ export const docs = {
       + 'The status is not changed here: use the commands. A cancelled, rejected, weather-cancelled or completed booking cannot be edited (`409 booking_closed`).',
     body: bookingPatchIn,
     response: {
-      200: booking, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
+      200: booking, ...HELD, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
       404: err('Booking not found'), 409: err('An added or moved trip on a day its route does not run (`route_closed`), over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
     },
   },
@@ -366,7 +374,7 @@ export const docs = {
         charge_amount: { type: 'number', exclusiveMinimum: 0, description: 'Required, and above 0, when `charge_type` is `partial`' },
       },
     },
-    response: { 200: booking, 400: err('Invalid category or charge'), 404: err('Booking not found'), 409: err('Already cancelled (`already_cancelled`) or not cancellable (`booking_closed`)'), ...UNAUTHORIZED },
+    response: { 200: booking, ...HELD, 400: err('Invalid category or charge'), 404: err('Booking not found'), 409: err('Already cancelled (`already_cancelled`) or not cancellable (`booking_closed`)'), ...UNAUTHORIZED },
   },
   listLocks: {
     tags: ['Seat locks'], summary: 'List seat locks', security: BEARER,
