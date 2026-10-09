@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { PostgresFleetRepo } from './fleet-postgres.js';
+import { PostgresPierOfficeRepo } from './pier-office-postgres.js';
 import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -576,6 +577,8 @@ export class PostgresOperationsStore {
   private readonly context = new AsyncLocalStorage<PoolClient>();
   /** Fleet part B (todo/fleet-maintenance-model.md), in the same transaction as everything else. */
   readonly fleetRepo = new PostgresFleetRepo(() => this.client());
+  /** The pier office (todo/pier-office-model.md), in the same transaction as everything else. */
+  readonly pierOfficeRepo = new PostgresPierOfficeRepo(() => this.client());
   constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
   private client(): Pool | PoolClient { return this.context.getStore() ?? this.pool; }
   async close(): Promise<void> {

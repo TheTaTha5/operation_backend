@@ -63,6 +63,8 @@ flowchart LR
   daymoney["Proforma, pier money, after the trip<br/>booking_pfm_events, booking_pier_payments, booking_tour_sales,<br/>booking_cot_decisions, booking_noshow_charges, pier_handovers, commission_payouts"]
   daymoney -- "booking_id" --> bookings
   daymoney -. "a COT deduct is a minus line" .-> money
+  pieroffice["Pier office<br/>pier_cash_rows, pier_cash_longtail, pier_cash_park,<br/>pier_cash_settings, pier_item_kinds, pier_items,<br/>pier_attendance_codes, pier_sections, pier_staff,<br/>pier_license_types, pier_license_classes"]
+  pieroffice -- "boat_id" --> catalogue
 ```
 
 ## 1. Catalogue and seat pool
@@ -1517,6 +1519,65 @@ erDiagram
 - **`fleet_daily_locks`:** a row means the pier's day is locked; every Daily Log write to it is
   refused (`409 day_locked`).
 - **A project's boat entries** are rows of the boat's status log with `project_id` set.
+
+## 12. Pier office: petty cash and the office lists
+
+Migrations 170–171 (`todo/pier-office-model.md`). The rules are in `src/domain/pier-cash.ts` and
+`pier-office.ts`; both stores reach the rows through `pierOfficeRepo`.
+
+```mermaid
+erDiagram
+  pier_cash_rows {
+    text id PK "legacy's pc…, or pc_<uuid>"
+    text pier "tublamu, panwa or ranong"
+    date cash_date
+    text kind "in or out"
+    text description
+    numeric amount "above 0"
+    text time "HH:MM"
+    text source "longtail, park or dock: pulled; one live per day and pier"
+    timestamptz created_at
+    timestamptz deleted_at "kept, out of every total"
+  }
+  pier_cash_longtail {
+    text pier PK
+    date cash_date PK
+    text boat_id PK, FK
+    int join_boats
+    int charter_boats
+    numeric amount
+    text note
+  }
+  pier_cash_park {
+    text pier PK
+    date cash_date PK
+    text boat_id PK, FK
+    int ad_th "and chd_th, inf_th, foc_th, ad_fr, chd_fr, inf_fr, foc_fr"
+    numeric amount "park fee paid"
+    numeric dock "dock fee"
+    text filled_from "nat or price"
+  }
+  pier_cash_settings { boolean id PK "one row" text company_name }
+  pier_item_kinds { text id PK text name text name_en text unit text color int sort }
+  pier_items { text id PK text pier text kind_id FK text label int total boolean active }
+  pier_attendance_codes { text id PK text code "unique, any case" text color text bg "tint of color" text kind int sort }
+  pier_sections { text id PK text pier text name int sort }
+  pier_staff { text id PK text pier text nick text name text role text default_code text section_id FK int sort boolean active }
+  pier_license_types { text id PK text side "deck or eng" text short int per_boat }
+  pier_license_classes { text id PK text type_id FK text name numeric max_gt numeric max_bhp int sort }
+  boats { text id PK }
+  boats ||--o{ pier_cash_longtail : "longtail paid"
+  boats ||--o{ pier_cash_park : "park fees"
+  pier_item_kinds ||--o{ pier_items : "kind"
+  pier_sections |o--o{ pier_staff : "group (set null on delete)"
+  pier_license_types ||--o{ pier_license_classes : "class"
+```
+
+- **The balance is not stored:** a day's opening is every earlier live row's in − out at the pier.
+- **Migration 171 seeds** legacy's browser defaults (3 kinds, 11 codes, 2 licence types, 4 classes);
+  the import replaces the lists whole.
+- **`changes.kind`** also takes `pier_cash` and `pier_office` (170, 171).
+
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration
@@ -1542,6 +1603,7 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `fleet_jobs.parent_project_id` | `fleet_projects` | The two were built in parallel (130, 141); legacy's are imported as they are. |
 | `commission_payout_items.booking_id`, `item_id` | `booking_tour_sales`, `booking_upgrades` | An upgrade list is rewritten whole on every save, and an import replaces bookings (111). |
 | `pier_handovers.pier` | `routes.pier` | A pier is a route's text field, `other` when none (111). |
+| `pier_staff.default_code` | `pier_attendance_codes.code` | Typed free in legacy, matched by code; a code may be renamed (171). |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer

@@ -1168,6 +1168,8 @@ whole availability cache after any write. Legacy's `_laStartSSE` (`EventSource('
 | `deployment` | `<date>:<boat>` | `GET /operations/deployments?from=<date>&to=<date>` |
 | `route` (created, edited, deleted, reordered, its calendar) | the route id | `GET /v1/routes?from=&to=`, and take that route (as `refreshCalendar` in `ops/10-ops-catalogue.js` does); a deleted one is gone |
 | `boat` (created, edited, status timeline, retire, restore, day seats) | the boat id | `GET /v1/boats/{id}`; its `route_days` are the availability cells whose seats moved |
+| `pier_cash` (a petty cash row, pull, sheet cell) | `<pier>:<date>`, or `settings` | `GET /v1/pier-cash/{pier}/days/{date}` (and the sheet open), or `GET /v1/pier-cash/settings` |
+| `pier_office` (an office list) | the list's name (`staff`, `sections`, …) | `GET /v1/pier-office` |
 
 - **`route_days`** name the cells whose seats moved, before and after. Refetch availability only for
   those (`GET /v1/availability?route_id=&date=`); `null` on a route calendar.
@@ -1332,6 +1334,28 @@ API answers `403`, so show it. Numbers (`MO-…`, `PRJ-…`) are still computed 
 | `flSaveSafety`, `flSafetyDelete`, `flSaveInspection`, `flDeleteInspection` | `/v1/fleet/safety…`, `…/inspections` |
 | Inventory, memo, project, Daily Log, safety reads | the matching `GET`s; computed fields (`stocks`, `below_min`, memo totals, `receive_state`, `bill_gate`, `health`, `fuel_price`, `state`) replace the screen's own |
 
+### 6.8 Pier office: petty cash and the office lists (`08-app.js` §poCash, §pierOffice, §pierAtt, §pierLic)
+
+README → "Pier office: petty cash", "Pier office lists". Writes need `pier` or `operations`, as
+`poCanEdit`; `pcGuard`'s alert becomes the API's `403`. Stop writing `po_cash_rows`, `po_cash_lt`,
+`po_cash_pk`, `po_cash_co` and the seven `pier_*` lists through the blob (`laBlobSave`, `poPersist`).
+
+| Legacy | API |
+|---|---|
+| `pcSync`, `pcPier`, `pcDay`, `pcTotals`, `pcOpening` (the ledger, the four cards) | `GET /v1/pier-cash/{pier}/days/{date}`: `opening`, `in`, `out`, `closing`, `negative`, rows with `balance`. Stop summing in the browser |
+| `pcRowSave`, `pcRowDel` | `POST …/days/{date}/rows {kind, description, amount, time}`; `DELETE /v1/pier-cash/rows/{id}` after the confirm (the row is kept, out of the totals) |
+| `pcPull` | `POST …/days/{date}/pull`; `409 nothing_to_pull` carries legacy's alert |
+| `pcMonthTable`, `pcMonthDays` | `GET /v1/pier-cash/{pier}/months/{yyyy-mm}` |
+| `pcSheetLT`, `pcSetLT`, `pcSetLTNote` | `GET …/months/{m}/longtail[?date=]`; `PATCH …/days/{date}/longtail/{boat_id}` with the field changed. Stop writing `n` (the read gives `used_boats`) |
+| `pcSheetPK`, `pcSetPK`, `pcFillPK` | `GET …/months/{m}/park[?date=]`; `PATCH …/days/{date}/park/{boat_id}`; the fill sends the 8 counts with `filled_from: nat\|price`. The booked side (`pcPax`, `pxLongtail`, `pcParkRate`) stays the screen's for now |
+| `pcCoName`, `pcCoNameSet` | `GET/PUT /v1/pier-cash/settings {company_name}` |
+| `pcPrintCert` (`pcBahtText`, `pcThDate`) | `GET …/days/{date}/certificate[?ids=…]`: rows, `total`, `total_text_th`, `date_th`; `409 company_name_missing` opens the name dialog |
+| `poKindAdd/Set/Move/Del`, `poItemAdd/Kind/Off`, `poItemsSave` | `/v1/pier-office/item-kinds…`, `/v1/pier-office/items…`; ▲▼ is `POST /v1/pier-office/item-kinds/order {ids}` |
+| `paCodeAdd/Set/Color/Del` | `/v1/pier-office/attendance-codes…`; send `color`, the server sets `bg` |
+| `paSectAdd/Set/Move/Del`, `paStaffSect`, `paStaffOrder` | `/v1/pier-office/sections…` (delete with people: `?unassign_anyway=true` after the confirm), `PATCH /v1/pier-office/staff/{id} {section_id}`, `POST /v1/pier-office/staff/order {pier, ids}` |
+| `poStaffAdd/Pier/Def/Toggle`, `paNote` | `POST`/`PATCH /v1/pier-office/staff` |
+| `plTypeSet`, `plClassAdd/Set/Del` | `PATCH /v1/pier-office/license-types/{id}`, `/v1/pier-office/license-classes…` |
+
 ---
 
 ## 7. Not in the API yet: legacy keeps doing these
@@ -1349,6 +1373,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
+| The rest of the Pier Office: stock moves and sign-out sheets, the roster, duty and job sheets, crews, licences, its settings (pay rates, park ticket types); petty cash's booked side | `PIER_MOVES`, `PIER_SHEET`, `PIER_SHIFT`, `PIER_DUTY`, `PIER_JOB`, `PIER_TEAM`, `PIER_LICENSES`, `PIER_CFG`; `pcPax`, `pxLongtail`, `pcParkRate` | `pier-office-model.md` open 1–3 (petty cash and the lists moved: §6.8) |
 
 ---
 
@@ -1467,6 +1492,8 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Travel Summary COT and no-show decisions | `GET /v1/after-trip`, `/cot-decisions/{date}`, `/noshow-charges/{date}` | To do |
 | Pier hand-over, commission payouts (new screens) | `/v1/pier-handovers…`, `/v1/commissions`, `/v1/commission-payouts…` | Not in legacy |
 | Fleet stock, memos, projects, Daily Fleet Log, safety | `/v1/fleet/…` (§6.7) | To do |
+| Pier petty cash (ledger, longtail and park sheets, certificate) | `/v1/pier-cash/…` (§6.8) | To do |
+| Pier Office lists (kinds, items, codes, groups, staff, licence types and classes) | `/v1/pier-office…` (§6.8) | To do |
 
 ## Rules and gotchas
 
