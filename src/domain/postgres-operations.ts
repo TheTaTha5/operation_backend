@@ -30,6 +30,7 @@ import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from 
 import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
 import type { Allergy } from './allergies.js';
+import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import { DOC_ITEMS, type DocCheck } from './doc-check.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
 import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
@@ -672,6 +673,40 @@ export class PostgresOperationsStore {
     await this.client().query('DELETE FROM booking_allergies WHERE booking_id = $1', [bookingId]);
     for (const [seq, a] of list.entries()) await this.client().query('INSERT INTO booking_allergies (booking_id, seq, name, qty) VALUES ($1,$2,$3,$4)', [bookingId, seq, a.name, a.qty]);
   }
+  // ── Pickup areas and pickup times (migration 043) ──
+  async listPickupAreas(): Promise<PickupArea[]> {
+    return (await this.client().query('SELECT id, name, zone, region, time_group, active FROM pickup_areas ORDER BY id')).rows
+      .map((r) => ({ id: r.id, name: r.name, zone: r.zone, region: r.region ?? null, time_group: r.time_group, active: r.active === true }));
+  }
+  async putPickupArea(a: PickupArea): Promise<void> {
+    await this.client().query(`INSERT INTO pickup_areas (id, name, zone, region, time_group, active) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, zone = EXCLUDED.zone, region = EXCLUDED.region, time_group = EXCLUDED.time_group, active = EXCLUDED.active`,
+      [a.id, a.name, a.zone, a.region, a.time_group, a.active]);
+  }
+  async listTimeProfiles(): Promise<TimeProfile[]> {
+    return (await this.client().query('SELECT id, name, from_date::text AS from_date, to_date::text AS to_date, notes, cloned_from, created_at FROM pickup_time_profiles ORDER BY id')).rows
+      .map((r) => ({ id: r.id, name: r.name, from_date: r.from_date ?? null, to_date: r.to_date ?? null, notes: r.notes ?? null, cloned_from: r.cloned_from ?? null, created_at: (r.created_at as Date).toISOString() }));
+  }
+  async putTimeProfile(p: TimeProfile): Promise<void> {
+    await this.client().query(`INSERT INTO pickup_time_profiles (id, name, from_date, to_date, notes, cloned_from, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, from_date = EXCLUDED.from_date, to_date = EXCLUDED.to_date, notes = EXCLUDED.notes`,
+      [p.id, p.name, p.from_date, p.to_date, p.notes, p.cloned_from, p.created_at]);
+  }
+  async deleteTimeProfile(id: string): Promise<boolean> { return (await this.client().query('DELETE FROM pickup_time_profiles WHERE id = $1', [id])).rowCount === 1; }
+  async listPickupTimes(profileId?: string): Promise<PickupCell[]> {
+    const { rows } = await this.client().query('SELECT * FROM pickup_times WHERE $1::text IS NULL OR profile_id = $1 ORDER BY profile_id, route_id, target', [profileId ?? null]);
+    return rows.map((r) => ({ profile_id: r.profile_id, route_id: r.route_id, target: r.target,
+      ...(r.pickup_time ? { pickup_time: r.pickup_time } : {}), ...(r.pickup_time_end ? { pickup_time_end: r.pickup_time_end } : {}), ...(r.pickup_at_pier ? { pickup_at_pier: true } : {}) }));
+  }
+  async putPickupTime(c: PickupCell): Promise<void> {
+    await this.client().query(`INSERT INTO pickup_times (profile_id, route_id, target, pickup_time, pickup_time_end, pickup_at_pier) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (profile_id, route_id, target) DO UPDATE SET pickup_time = EXCLUDED.pickup_time, pickup_time_end = EXCLUDED.pickup_time_end, pickup_at_pier = EXCLUDED.pickup_at_pier`,
+      [c.profile_id, c.route_id, c.target, c.pickup_time ?? null, c.pickup_time_end ?? null, c.pickup_at_pier === true]);
+  }
+  async deletePickupTime(profileId: string, routeId: string, target: string): Promise<boolean> {
+    return (await this.client().query('DELETE FROM pickup_times WHERE profile_id = $1 AND route_id = $2 AND target = $3', [profileId, routeId, target])).rowCount === 1;
+  }
+
   /** Writes a booking's document check whole, its pre-check results included. */
   async setDocCheck(bookingId: string, d: DocCheck): Promise<void> {
     await this.client().query(`INSERT INTO booking_doc_checks (booking_id, status, by, at, note, route_ok, date_ok, lead_ok, pax_ok, voucher_ok, payment_ok, pre_at, pre_lang, pre_error, pre_text)

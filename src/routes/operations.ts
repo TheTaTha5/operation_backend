@@ -23,6 +23,7 @@ import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import { allergyListOf, parseAllergyList } from '../domain/allergies.js';
+import { areaId, inheritedCells, lookupPickupTime, parseAreaPatch, parseCell, parseNewArea, parseProfile, sortAreas, type PickupArea } from '../domain/pickup-areas.js';
 import { assertDocCheckEcho, parseDocItem, withItem, withNote, withPre, withStatus as withDocStatus, type DocCheck } from '../domain/doc-check.js';
 import type { HistoryLine } from '../domain/booking-actions.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
@@ -641,6 +642,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     // log says who still sends it.
     if (viaStatus) request.log.warn({ status: (request.body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
     // The server prices the booking (README "Prices"); a B2C booking keeps the price sent.
+    await fillPickups(input.header?.pickup_area_id, input.header?.dropoff_area_id, input.trips);
     const priced = isB2C(input) ? undefined : await priceFor({ agentId: input.agent_id, header: input.header ?? {}, trips: input.trips,
       add_ons: input.add_ons ?? [], adjustments: input.adjustments ?? [], rateTypeRef: input.rate_type_ref, rate: 'agent' });
     // A manual total is kept only when the booking is priced by hand (legacy).
@@ -687,6 +689,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
       assertReconfirmEcho(body.reconfirm, stored.reconfirm);
       assertDocCheckEcho(body.doc_check, stored.doc_check);
+      await fillPickups(changes.header?.pickup_area_id === undefined ? stored.pickup_area_id : changes.header.pickup_area_id ?? undefined,
+        changes.header?.dropoff_area_id ?? undefined, changes.trips, changes.header?.pickup_area_id !== undefined);
       let header = changes.header;
       let warnings: PriceWarning[] = [];
       let priced: Awaited<ReturnType<typeof priceFor>> | undefined;
@@ -752,6 +756,134 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return (await syncAltParts(done)) ? (await store.booking(done.id))! : done;
     });
   });
+  /**
+   * A booking's pickup and drop-off areas must be in the catalogue (`400`). A trip sent with no pickup
+   * time gets the area's (`lookupPickupTime`), and one with no zone the area's zone (decision D1: filled
+   * only when not sent, never overwritten). `checkPickup` false: the area is the stored one, not re-checked.
+   */
+  async function fillPickups(pickupId: string | undefined, dropoffId: string | undefined, trips: BookingTripInput[] | undefined, checkPickup = true): Promise<void> {
+    if (!pickupId && !dropoffId) return;
+    const areas = new Map((await store.listPickupAreas()).map((a) => [a.id, a]));
+    for (const [field, id] of [['pickup_area_id', checkPickup ? pickupId : undefined], ['dropoff_area_id', dropoffId]] as const) {
+      if (id && !areas.has(id)) badRequest(`${field} ${id} is not a pickup area (GET /v1/pickup-areas)`);
+    }
+    const area = pickupId ? areas.get(pickupId) : undefined;
+    if (!area || !trips?.length) return;
+    const [profiles, cells] = [await store.listTimeProfiles(), await store.listPickupTimes()];
+    for (const trip of trips) {
+      if (!trip.zone) trip.zone = area.zone;
+      if (trip.pickup_time || trip.pickup_time_end || trip.pickup_at_pier) continue;
+      const found = lookupPickupTime(profiles, cells, area, trip.route_id, trip.service_date);
+      if (found) Object.assign(trip, { pickup_time: found.pickup_time, pickup_time_end: found.pickup_time_end, pickup_at_pier: found.pickup_at_pier });
+    }
+  }
+
+  /**
+   * Pickup areas and pickup times (todo/booking-extras-model.md §4; legacy's "Pickup time setup").
+   */
+  const areaNotFound = (id: string): never => notFound(`Pickup area ${id} not found`);
+  /** Legacy `_psuInheritTimesForArea`: an area saved gets its time group's times where it has none. */
+  const inherit = async (area: PickupArea) => {
+    for (const cell of inheritedCells(area, await store.listPickupAreas(), await store.listPickupTimes())) await store.putPickupTime(cell);
+  };
+  app.get('/v1/pickup-areas', async (request) => {
+    const active = (request.query as Record<string, unknown>).active;
+    const areas = sortAreas(await store.listPickupAreas());
+    return { areas: active === 'true' ? areas.filter((a) => a.active) : areas };
+  });
+  app.post('/v1/pickup-areas', async (request, reply) => {
+    const input = parseNewArea(record(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      const area = { id: areaId(input.name, input.zone, new Set((await store.listPickupAreas()).map((a) => a.id))), ...input };
+      await store.putPickupArea(area);
+      await inherit(area);
+      return area;
+    }));
+  });
+  app.patch('/v1/pickup-areas/:id', async (request) => {
+    const id = (request.params as { id: string }).id;
+    const patch = parseAreaPatch(record(request.body));
+    return store.transaction(async () => {
+      const area = { ...((await store.listPickupAreas()).find((a) => a.id === id) ?? areaNotFound(id)), ...patch };
+      await store.putPickupArea(area);
+      await inherit(area);
+      return area;
+    });
+  });
+  /** Legacy deletes an area outright; here it becomes inactive, as bookings point at it (decision D2). */
+  app.delete('/v1/pickup-areas/:id', async (request) => {
+    const id = (request.params as { id: string }).id;
+    return store.transaction(async () => {
+      const area = { ...((await store.listPickupAreas()).find((a) => a.id === id) ?? areaNotFound(id)), active: false };
+      await store.putPickupArea(area);
+      return area;
+    });
+  });
+  const profileOf = async (id: string) => (await store.listTimeProfiles()).find((p) => p.id === id) ?? notFound(`Pickup time profile ${id} not found`);
+  app.get('/v1/pickup-time-profiles', async () => ({ profiles: await store.listTimeProfiles() }));
+  app.get('/v1/pickup-time-profiles/:id', async (request) => {
+    const profile = await profileOf((request.params as { id: string }).id);
+    return { ...profile, times: await store.listPickupTimes(profile!.id) };
+  });
+  app.post('/v1/pickup-time-profiles', async (request, reply) => {
+    const body = record(request.body);
+    const input = parseProfile(body);
+    const cloneFrom = typeof body.clone_from === 'string' && body.clone_from ? body.clone_from : null;
+    return reply.code(201).send(await store.transaction(async () => {
+      const taken = new Set((await store.listTimeProfiles()).map((p) => p.id));
+      const base = `prof-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 30) || 'profile'}`;
+      let id = base;
+      for (let n = 2; taken.has(id); n += 1) id = `${base}-${n}`;
+      if (cloneFrom) await profileOf(cloneFrom);
+      const profile = { id, ...input, cloned_from: cloneFrom, created_at: new Date().toISOString() };
+      await store.putTimeProfile(profile);
+      if (cloneFrom) for (const cell of await store.listPickupTimes(cloneFrom)) await store.putPickupTime({ ...cell, profile_id: id });
+      return { ...profile, times: await store.listPickupTimes(id) };
+    }));
+  });
+  app.patch('/v1/pickup-time-profiles/:id', async (request) => {
+    const body = record(request.body);
+    return store.transaction(async () => {
+      const current = await profileOf((request.params as { id: string }).id);
+      const profile = { ...current!, ...parseProfile(body, current!) };
+      await store.putTimeProfile(profile);
+      return profile;
+    });
+  });
+  app.delete('/v1/pickup-time-profiles/:id', async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    if (!(await store.transaction(async () => store.deleteTimeProfile(id)))) notFound(`Pickup time profile ${id} not found`);
+    return reply.code(204).send();
+  });
+  /** One cell: a route and an area id, or a time group (as legacy's older table keys them). */
+  app.put('/v1/pickup-time-profiles/:id/times/:route_id/:target', async (request) => {
+    const { id, route_id: routeId, target } = request.params as { id: string; route_id: string; target: string };
+    const window = parseCell(record(request.body));
+    return store.transaction(async () => {
+      await profileOf(id);
+      if (!(await store.listRoutes()).some((r) => r.id === routeId)) badRequest(`route ${routeId} does not exist`);
+      const areas = await store.listPickupAreas();
+      if (!areas.some((a) => a.id === target || a.time_group === target)) badRequest(`${target} is not a pickup area or time group`);
+      const cell = { profile_id: id, route_id: routeId, target, ...window };
+      await store.putPickupTime(cell);
+      return cell;
+    });
+  });
+  app.delete('/v1/pickup-time-profiles/:id/times/:route_id/:target', async (request, reply) => {
+    const { id, route_id: routeId, target } = request.params as { id: string; route_id: string; target: string };
+    if (!(await store.transaction(async () => store.deletePickupTime(id, routeId, target)))) notFound('No such pickup time');
+    return reply.code(204).send();
+  });
+  /** Legacy `bkV2GetPickupTime`: what a trip on that route, from that area, on that date is told. */
+  app.get('/v1/pickup-time', async (request) => {
+    const q = request.query as Record<string, unknown>;
+    const [routeId, id, date] = [q.route_id, q.area_id, q.date ?? q.service_date];
+    if (typeof routeId !== 'string' || typeof id !== 'string' || typeof date !== 'string' || !isIsoDate(date)) badRequest('route_id, area_id and date (YYYY-MM-DD) are required');
+    const area = (await store.listPickupAreas()).find((a) => a.id === id) ?? areaNotFound(id as string);
+    return lookupPickupTime(await store.listTimeProfiles(), await store.listPickupTimes(), area!, routeId as string, date as string)
+      ?? notFound(`No pickup time for ${id} on route ${routeId} on ${date}`);
+  });
+
   /**
    * The document check (todo/booking-extras-model.md §3; legacy `docCheck*`): six ticks, a verdict, a
    * note, and the browser's OCR pre-check. Each answers the booking.

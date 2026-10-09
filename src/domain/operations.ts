@@ -8,6 +8,7 @@ import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
 import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjustments.js';
 import type { AltPickup } from './alt-pickups.js';
 import { allergyCount, type Allergy } from './allergies.js';
+import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
@@ -601,6 +602,28 @@ export class OperationsStore {
     const after = before.filter((r) => !(r.kind === kind && r.slot === slot));
     this.checkins.set(tripId, after);
     return after.length < before.length;
+  }
+
+  // ── Pickup areas and pickup times (migration 043) ──
+  private pickupAreas = new Map<string, PickupArea>();
+  private timeProfiles = new Map<string, TimeProfile>();
+  private pickupCells: PickupCell[] = [];
+  listPickupAreas(): PickupArea[] { return [...this.pickupAreas.values()].map((a) => ({ ...a })); }
+  putPickupArea(area: PickupArea): void { this.pickupAreas.set(area.id, { ...area }); }
+  listTimeProfiles(): TimeProfile[] { return [...this.timeProfiles.values()].map((p) => ({ ...p })); }
+  putTimeProfile(profile: TimeProfile): void { this.timeProfiles.set(profile.id, { ...profile }); }
+  deleteTimeProfile(id: string): boolean {
+    this.pickupCells = this.pickupCells.filter((c) => c.profile_id !== id);
+    return this.timeProfiles.delete(id);
+  }
+  listPickupTimes(profileId?: string): PickupCell[] { return this.pickupCells.filter((c) => profileId === undefined || c.profile_id === profileId).map((c) => ({ ...c })); }
+  putPickupTime(cell: PickupCell): void {
+    this.pickupCells = [...this.pickupCells.filter((c) => !(c.profile_id === cell.profile_id && c.route_id === cell.route_id && c.target === cell.target)), { ...cell }];
+  }
+  deletePickupTime(profileId: string, routeId: string, target: string): boolean {
+    const before = this.pickupCells.length;
+    this.pickupCells = this.pickupCells.filter((c) => !(c.profile_id === profileId && c.route_id === routeId && c.target === target));
+    return this.pickupCells.length < before;
   }
 
   /** Each booking's document check (migration 042). */

@@ -1465,7 +1465,7 @@ counts as that many adults.
 
 ```jsonc
 "alt_pickups": [ { "who": "Mr B", "ad": 1, "chd": 0, "inf": 0, "foc": 0,
-                   "area_id": "pa_kata", "area": "Kata", "zone": "PK", "place": "Kata Palm",
+                   "area_id": "pk-kata", "area": "Kata", "zone": "PK", "place": "Kata Palm",
                    "drop_same": true, "drop_area_id": null, "drop_area": null, "drop_zone": null, "drop_place": null } ]
 ```
 
@@ -1540,6 +1540,49 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
 - **The import** brings every legacy record of an imported booking, cancelled ones included: an
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
+
+### Pickup areas and pickup times
+
+Legacy's "Pickup time setup": the areas guests are picked up from, and the time each programme's
+van comes for each area, by season. Writes need the `operations` edit area.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /v1/pickup-areas[?active=true]` | — | `{ areas: [{id, name, zone, region, time_group, active}] }` |
+| `POST /v1/pickup-areas` | `{name, zone, time_group, region?}` | `201` the area |
+| `PATCH /v1/pickup-areas/{id}` | any of `name`, `zone`, `region`, `time_group`, `active` | the area |
+| `DELETE /v1/pickup-areas/{id}` | — | the area, now `active: false` |
+| `GET /v1/pickup-time-profiles` | — | `{ profiles }` |
+| `GET /v1/pickup-time-profiles/{id}` | — | the profile and its `times` |
+| `POST /v1/pickup-time-profiles` | `{name, from_date, to_date, notes?, clone_from?}` | `201` the profile, with the clone's times copied |
+| `PATCH /v1/pickup-time-profiles/{id}` | any of the same | the profile |
+| `DELETE /v1/pickup-time-profiles/{id}` | — | `204` |
+| `PUT /v1/pickup-time-profiles/{id}/times/{route_id}/{target}` | `{pickup_time, pickup_time_end?}` or `{pickup_time_end, pickup_at_pier: true}` | the cell |
+| `DELETE /v1/pickup-time-profiles/{id}/times/{route_id}/{target}` | — | `204` |
+| `GET /v1/pickup-time?route_id=&area_id=&date=` | — | `{pickup_time, pickup_time_end?, pickup_at_pier?, profile_id, target}`, or `404` |
+
+- **Areas:**
+  - `zone` is `PK`, `KL`, `RN` or `NoTransfer`;
+  - the id is legacy's, `<zone>-<name slug>` with `-2`, `-3` on a clash, and never changes;
+  - deleting makes an area inactive (legacy deletes it): bookings point at it (decision D2).
+- **A new or edited area takes its time group's times** wherever it has none: copied from another
+  area of the group, as legacy's `_psuInheritTimesForArea` does.
+- **A cell** is a route and a `target`: an area id, or a time group. Its window follows the trip
+  pickup fields: a time, a window, or a pier deadline.
+- **The lookup** (legacy `bkV2GetPickupTime`):
+  1. of the profiles covering the date, the narrowest range wins, then the newest;
+  2. in it, the area's own cell, else its time group's;
+  3. else the fallback profile (no dates; legacy's older flat table, imported as
+     `prof-legacy-flat`, decision D4).
+- **Bookings:**
+  - `pickup_area_id` and `dropoff_area_id` must be areas in the catalogue (`400`).
+  - A trip sent with no pickup time gets the lookup's, and one with no `zone` gets the area's
+    zone. A value sent is never overwritten (decision D1).
+  - An edit fills only the trips it sends; changing a booking's area doesn't redo the times
+    already there.
+- **The import** brings the areas as legacy has them (decision D3), its profile with all 390 cells,
+  and the old flat table. Run it before validating the booking foreign keys (migration 043 adds them
+  `NOT VALID`).
 
 ### Document check
 
@@ -1868,7 +1911,7 @@ pick up (`cargo`). A stop rides its group's van. Writes need the `operations` ed
 
 ```jsonc
 { "id": "vs_…", "service_date": "2026-10-02", "route_id": "r1", "group_id": "vgrp_…", "kind": "staff",
-  "label": "Guide Nok", "pax": 1, "time": "06:20", "place": "Office", "area_id": "pa_patong", "area": "Patong",
+  "label": "Guide Nok", "pax": 1, "time": "06:20", "place": "Office", "area_id": "pk-patong", "area": "Patong",
   "leg": "out", "phone": "089…", "note": null, "sequence": null,
   "checked_in": { "at": "2026-10-02T23:15:00.000Z", "by": "Ploy", "seats": 1 },
   "created_at": "…", "created_by": "Ploy", "updated_at": null, "updated_by": null }
@@ -1889,8 +1932,8 @@ pick up (`cargo`). A stop rides its group's van. Writes need the `operations` ed
   these seats in every check, and show them as `stop_seats` (see "Van groups").
 - **Check-in** records when, by whom, and the seats taken then (a `staff` stop's `pax`, 0 for cargo).
 - **A disbanded group** leaves its stops on the day with `group_id: null`; a `PATCH` with a
-  `group_id` puts one on another group. `area_id` is not checked yet: the pickup-area catalogue has
-  no home here.
+  `group_id` puts one on another group. `area_id` is a plain id, not checked against the
+  pickup-area catalogue.
 
 ### Agent seat locks
 

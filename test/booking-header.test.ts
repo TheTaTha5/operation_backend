@@ -72,11 +72,14 @@ test('unrecognised fields are dropped rather than kept in an overflow column', (
 test('a booking round-trips its header through storage', async () => {
   const date = '2030-06-11';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-header', route_id: 'r6', service_date: date, capacity: 20 } });
+  // A booking's pickup area must be in the catalogue (migration 043).
+  const area = await app.inject({ method: 'POST', url: '/v1/pickup-areas', payload: { name: 'Patong header', zone: 'PK', time_group: 'PK-W1' } });
+  assert.equal(area.statusCode, 201, area.body);
   const created = await app.inject({
     method: 'POST', url: '/v1/bookings', payload: {
       id: 'BK-header-1', agentId: 'a_b2c', voucherRef: 'V-1',
       leadPax: 'Somchai R.', leadPhone: '0812345678', leadFoc: false,
-      pickupAreaId: 'pa_patong', pickupArea: 'Patong', pickupZone: 'PK', hotelName: 'Example Resort',
+      pickupAreaId: area.json().id, pickupArea: 'Patong', pickupZone: 'PK', hotelName: 'Example Resort',
       guides: { english: true, russian: false, chinese: false, otherLang: 'German' },
       specialMeals: { veg: 2, vegan: 0, halal: 1, allergies: 'peanuts' },
       priceBreakdown: { seat: 12000, addOn: 800, focDiscount: -500, discount: -200, extra: 0 },

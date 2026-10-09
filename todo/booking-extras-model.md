@@ -1,110 +1,18 @@
-# Booking extras, modelled: attachments, allergy list, document check, pickup areas
+# Booking extras: what is still open
 
-**Approved 2026-10-09**, with these answers:
-- **A1:** files in PostgreSQL (`bytea`);
-- **A2:** import the 5,890 referenced files;
-- **A3:** any login may download;
-- **B1:** keep the pier meal editor's `pierAt`/`pierBy`;
-- **C1:** `verified` doesn't need all ticks;
-- **C2:** keep the raw OCR text;
-- **C3:** anyone may edit the note, as legacy;
-- **D1:** the server fills a trip's pickup time and zone only when the client sends none;
-- **D2:** deleting an area makes it inactive;
-- **D3:** import the areas exactly as legacy has them;
-- **D4:** import the old flat time table as an open-ended fallback profile.
+All four parts are built (migrations 040–043; README → "Attachments", "Allergy list and pier meals",
+"Document check", "Pickup areas and pickup times"). Git history has the design.
 
-The rest of the booking area. Each part is independent. Source: wt-lk-inbox@`658298d`, `allotment_v2/js/08-app.js` and `server.js`; counts
-from legacy production, read-only, 2026-10-09.
+## Open
 
-## 1. Attachments: built
-
-Migration 040, `src/domain/attachments.ts`, `npm run import:attachments`; README → "Attachments".
-Still to come with their owners: the other payment slips (booking `paymentSlips`, pier payments,
-on-tour extras, invoice payments, cash-on-tour: their files are already copied) and the fleet
-project documents. Left behind in legacy: 248 files nobody names, the daily-report chart images, and
-9 files legacy's records name but lost.
-
-## 2. Allergy list: built
-
-Migration 041, `src/domain/allergies.ts`, `PUT /v1/bookings/{id}/meals` for the pier (B1); README → "Allergy
-list and pier meals".
-
-## 3. Document check: built
-
-Migration 042, `src/domain/doc-check.ts`; README → "Document check".
-
-## 4. Pickup areas and pickup times
-
-**Legacy.** `SB_PICKUP_AREAS` (`sb_pickup_areas`).
-- **Area:** `{id, name, zone PK|KL|RN|NoTransfer, region, timeGroup}`.
-- **Edited on "Pickup time setup"** (area `operations`; `psuSaveArea`, `psuDeleteArea`):
-  - The id is `<zone>-<name slug>` and never changes.
-  - Delete is a hard delete; bookings keep their name and zone copies.
-- **Pickup-time profiles** (`SB_PICKUP_TIME_PROFILES`): `{id, name, from, to, notes, clonedFrom,
-  times[route][area or time group] = "HH:MM-HH:MM" | "Before HH:MM at pier"}`.
-- **A trip's pickup time comes from** `bkV2GetPickupTime(route, area, date)`:
-  1. the profile covering the date (the narrowest range wins, then the newest);
-  2. in it, the area's own time, else its time group's;
-  3. else legacy's older flat table.
-
-  It's re-derived whenever the area or route changes, unless edited by hand. The "edited" flag is
-  never saved.
-- **The trip's price zone comes from the area's zone** (except a private van on a NoTransfer seat).
-- **Data:**
-  - **Catalogue:** 54 areas (PK 35, KL 12, RN 4, NoTransfer 3), 28 time groups.
-  - **Profiles:** one, `prof-default-2026`, valid to 2027-05-15. It holds 390 time cells over 13 routes.
-  - **Bookings:** 5,268 have an area id, and **none points outside the catalogue**. The README's
-    examples (`pa_kata`) don't match legacy's ids (`pk-kata`).
-  - **Replaying the time lookup on B2B trips:** 4,660 match what was stored, 63 differ (hand
-    edits), and 46 stored nothing.
-- **Legacy flaws found:**
-  - Legacy's database has no time column for 6 areas (the four RN areas, `pk-bangnon`,
-    `nt-grand-andaman-pier-s`), so their times can't be saved.
-  - `pk-bangnon` duplicates `rn-bangnon`.
-  - Love Kingdom's area matcher strips the letter "s" instead of spaces (`/s+/g`; their repo).
-
-**Proposed.**
-```sql
-CREATE TABLE pickup_areas (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL CHECK (zone IN ('PK', 'KL', 'RN', 'NoTransfer')),
-  region TEXT, time_group TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT true
-);
-CREATE TABLE pickup_time_profiles (
-  id TEXT PRIMARY KEY, name TEXT NOT NULL, from_date DATE NOT NULL, to_date DATE NOT NULL CHECK (to_date >= from_date),
-  notes TEXT, cloned_from TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE TABLE pickup_times (                  -- one cell: a route and an area, or a time group
-  profile_id TEXT NOT NULL REFERENCES pickup_time_profiles (id) ON DELETE CASCADE,
-  route_id TEXT NOT NULL REFERENCES routes (id), target TEXT NOT NULL,   -- an area id or a time group
-  pickup_time TEXT, pickup_time_end TEXT, pickup_at_pier BOOLEAN NOT NULL DEFAULT false,  -- the 024 window
-  PRIMARY KEY (profile_id, route_id, target)
-);
--- Bookings, trips' alternate pickups and van stops then point at pickup_areas (0 orphans today).
-```
-
-**Contract.**
-- `GET`, `POST` and `PATCH /v1/pickup-areas`, with legacy's id rule.
-- `GET`, `POST` and `PATCH /v1/pickup-time-profiles`, plus `PUT …/{id}/times/{route}/{target}` for
-  one cell.
-- `GET /v1/pickup-time?route_id=&area_id=&date=` answers legacy's lookup.
-- On a booking save, a trip sent without a pickup time gets the derived one, and its zone from the
-  area.
-
-**Decisions.**
-- **D1. Should the server derive pickup times and trip zones** (the rule moves out of the
-  browsers), or keep them client facts with only the lookup endpoint?
-  - Proposed: derive when the client sends none; never overwrite a sent time, as the "edited by
-    hand" flag is lost.
-- **D2. Deleting an area:** legacy hard-deletes. Proposed: `active: false`, as there would be
-  foreign keys from bookings. Changes legacy's delete button.
-- **D3. Clean-ups on import:**
-  - keep `pk-bangnon` (2 bookings?) or merge it into `rn-bangnon`;
-  - trim the trailing spaces;
-  - store the 6 areas' times, which legacy couldn't.
-- **D4. The flat legacy table** (3 routes) behind the profile. Import it as an open-ended
-  fallback profile, or drop it now that a profile covers to 2027-05-15?
-
-## Corrections to earlier notes
-
-- `todo/booking-model.md` said `docCheck` is "dropped on every save". That's true here, not in
-  legacy: legacy has stored it since 2026-07-03, and `allergyList` since 2026-08-15.
+1. **The other payment slips** (booking `paymentSlips`, pier payments, on-tour extras, invoice
+   payments, cash-on-tour) and the fleet project documents come with their owners; their files are
+   already copied by `import:attachments`.
+2. **Validate the booking area foreign keys** on Railway once the import has loaded the areas:
+   `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk` (and `bookings_dropoff_area_fk`).
+3. **Alternate pickups and van stops** keep plain area ids, not checked against the catalogue.
+4. **Changing a booking's area** doesn't redo its trips' pickup times already set; legacy re-derives
+   unless a time was edited by hand, a flag it never saved.
+5. **Legacy flaws kept as-is** (decision D3): `pk-bangnon` duplicates `rn-bangnon`; trailing spaces in
+   one region and one time group. Love Kingdom's area matcher strips the letter "s" (`/s+/g`), in
+   their repo.
