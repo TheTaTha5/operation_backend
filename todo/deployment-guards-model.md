@@ -39,7 +39,14 @@ Checks, as one pure function `planDeploymentChange(day before, day after)` both 
    `warnings: [{code: 'oversold', route_id, service_date, over_by}]`.
 4. Moving a boat to another route is a remove on the old route-day plus an add on the new.
 
-## Questions
+## Decided 2026-10-09 (approved, not built)
+
+1. Count only the bookings **placed on that boat**, as legacy (not the whole route-day).
+2. `remove_anyway: true` overrides, as legacy's dialog.
+3. Past dates: blocked for staff; **an admin may correct** them.
+4. `available_seats` stays negative on an oversold day.
+
+## The questions as asked
 
 1. **Count the whole route-day, not just bookings placed on that boat** (recommended — legacy's way
    misses oversells), knowing this asks for `remove_anyway` more often than legacy's dialog appeared?

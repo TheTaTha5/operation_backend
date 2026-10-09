@@ -1,7 +1,19 @@
 # Booking extras, modelled: attachments, allergy list, document check, pickup areas
 
-**Waiting for approval.** The rest of the booking area. Each part is independent and can be
-approved alone. Source: wt-lk-inbox@`658298d`, `allotment_v2/js/08-app.js` and `server.js`; counts
+**Approved 2026-10-09**, with these answers:
+- **A1:** files in PostgreSQL (`bytea`);
+- **A2:** import the 5,890 referenced files;
+- **A3:** any login may download;
+- **B1:** keep the pier meal editor's `pierAt`/`pierBy`;
+- **C1:** `verified` doesn't need all ticks;
+- **C2:** keep the raw OCR text;
+- **C3:** anyone may edit the note, as legacy;
+- **D1:** the server fills a trip's pickup time and zone only when the client sends none;
+- **D2:** deleting an area makes it inactive;
+- **D3:** import the areas exactly as legacy has them;
+- **D4:** import the old flat time table as an open-ended fallback profile.
+
+The rest of the booking area. Each part is independent. Source: wt-lk-inbox@`658298d`, `allotment_v2/js/08-app.js` and `server.js`; counts
 from legacy production, read-only, 2026-10-09.
 
 ## 1. Attachments

@@ -4,26 +4,17 @@ Everything this note designed is built (migrations 033–038; README → "Dispat
 "Vans and the month matrix", "Van stops", "Alternate pickups", "Check-in", "Upgrades",
 "Reconfirm"). Git history has the design. What is left:
 
-## Needs a decision
+## Decided 2026-10-09, to build
 
-1. **Payment-slip attachments.** On-tour upgrade sales carry payment-slip pictures
-   (`slips`, `/api/attach/{id}` in legacy; 7 of 11 legacy sales). Attachments have no home here,
-   so the API refuses a non-empty `slips` and the import doesn't keep them. Legacy's upgrade screen
-   attaches a slip to every card payment, so this blocks that screen at cutover. It belongs with the
-   booking attachments design.
-2. **A deployment deleted under bookings assigned to that boat.** The deployment-delete endpoint
-   and the import's mirror delete leave `boat_id` pointing at a boat that no longer sails that day
-   (the read shows `boat_pulled: true`). Clear it, or refuse the delete?
-3. **Alternate pickups follow two legacy rules that may be bugs** (copied 2026-10-09):
-   - parts are built on the booking's **first day only** (legacy writes `b.ops`), so a two-day
-     booking's second day has none;
-   - when the entries take **every passenger**, nothing is split: BK-26100284-2D4T (3 passengers,
-     3 entries at 3 hotels) has one part, at the booking's own pickup.
-4. **The check-in event-tries table** (`booking_trip_checkin_event_tries`, migration 036) was added
-   without a separate approval: legacy's live check-in screen writes `events[].tries` ("tried again,
-   not found"), and without it they'd be lost. No legacy row has one yet.
-5. **Reconfirm on the ops board** keeps the "sent to agent" mark when a booking is marked confirmed
-   by list or phone, or cleared. Legacy's board buttons wipe it (its own Re-confirm page keeps it).
+1. **Payment slips** go with attachments (`booking-extras-model.md`, approved): upgrade sales take
+   `slips` again, and the import keeps them.
+2. **Alternate pickups:** build their van parts on **every** trip of the booking, not day 1 only; and
+   split even when the entries take every passenger (the main part, left with nobody, goes).
+3. **Reconfirm from the ops board wipes the "sent to agent" mark**, as legacy's board buttons do:
+   marking confirmed by list or phone, and the board's clear. The Re-confirm page keeps it.
+
+Also decided: a deleted deployment keeps the trips' boat and shows `boat_pulled` (as built); the
+check-in tries table stays.
 
 ## Later
 

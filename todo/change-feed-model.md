@@ -1,6 +1,11 @@
 # Live updates: a change feed, pushed over SSE
 
-**Proposed 2026-10-08, waiting for approval.** Nothing is built.
+**Approved 2026-10-09.** Nothing is built. Answers:
+1. ordering by an advisory lock at commit;
+2. the stream logs in with the Bearer header (a fetch-based reader);
+3. changes are **kept forever**: no `410`, and the list doubles as an audit trail;
+4. the heartbeat's `health` holds `migrations_pending` at first;
+5. first kinds: booking, seat lock, deployment, route calendar, boat capacity override.
 
 How a screen learns that someone else changed something, without reloading everything.
 
