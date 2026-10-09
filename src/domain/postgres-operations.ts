@@ -28,6 +28,7 @@ import { pickupFields } from './pickup.js';
 import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import type { StoredReconfirm } from './reconfirm.js';
+import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
@@ -91,6 +92,13 @@ const dateOnly = (value: unknown): string => value instanceof Date ? `${value.ge
  */
 const HEADER_DATE_SELECT = BOOKING_HEADER_DATE_COLUMNS.map((column) => `b.${column}::text AS ${column}_text`).join(', ');
 
+// A trip's (`t`) check-in records with their events and tries (migration 036), as jsonb.
+const CHECKINS_JSON = `COALESCE((SELECT jsonb_agg(to_jsonb(ck) || jsonb_build_object(
+    'events', COALESCE((SELECT jsonb_agg(to_jsonb(ev) || jsonb_build_object(
+        'tries', COALESCE((SELECT jsonb_agg(to_jsonb(tr) ORDER BY tr.seq) FROM booking_trip_checkin_event_tries tr
+          WHERE tr.booking_trip_id = ev.booking_trip_id AND tr.kind = ev.kind AND tr.slot = ev.slot AND tr.event_seq = ev.seq), '[]'::jsonb)) ORDER BY ev.seq)
+      FROM booking_trip_checkin_events ev WHERE ev.booking_trip_id = ck.booking_trip_id AND ev.kind = ck.kind AND ev.slot = ck.slot), '[]'::jsonb)))
+  FROM booking_trip_checkins ck WHERE ck.booking_trip_id = t.id), '[]'::jsonb)`;
 // A van part (`a`, booking_trip_van_allocations) and its group (`g`, van_groups), as jsonb fields.
 const VAN_PART_FIELDS = `'idx', a.idx, 'source', a.source, 'ad', a.ad, 'chd', a.chd, 'inf', a.inf, 'foc', a.foc, 'group_id', a.van_group_id,
   'sequence', a.sequence, 'return_van_id', a.return_van_id, 'pick_area_id', a.pick_area_id, 'pick_hotel', a.pick_hotel, 'pick_zone', a.pick_zone,
@@ -112,6 +120,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'deployed', COALESCE((SELECT jsonb_agg(d.boat_id) FROM deployments d WHERE d.route_id = t.route_id AND d.service_date = t.service_date), '[]'::jsonb),
       'van_parts', COALESCE((SELECT jsonb_agg(jsonb_build_object(${VAN_PART_FIELDS}, 'group', ${VAN_GROUP_JSON}) ORDER BY a.idx)
         FROM booking_trip_van_allocations a LEFT JOIN van_groups g ON g.id = a.van_group_id WHERE a.booking_trip_id = t.id), '[]'::jsonb),
+      'checkins', ${CHECKINS_JSON},
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -279,8 +288,33 @@ const booking = (row: QueryResultRow): Booking => {
     const t = raw.get(trip.id)!;
     const parts = (t.van_parts as Record<string, unknown>[]) ?? [];
     const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
-    return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups));
+    return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups),
+      checkinsView(((t.checkins as Record<string, unknown>[]) ?? []).map(storedCheckin)));
   }, storedReconfirm(row.reconfirm));
+};
+/** A check-in record from `CHECKINS_JSON`: its columns as jsonb, timestamps as ISO text. */
+const storedCheckin = (r: Record<string, unknown>): StoredCheckin => {
+  const t = (v: unknown): string | null => (v === null || v === undefined ? null : String(v));
+  const at = (v: unknown): string | null => (v === null || v === undefined ? null : jsonInstant(v));
+  const n = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+  return {
+    kind: r.kind as CheckinKind, slot: Number(r.slot), expected: n(r.expected), actual_pax: n(r.actual_pax),
+    checked_in_at: at(r.checked_in_at), checked_in_by: t(r.checked_in_by), reason_code: t(r.reason_code), reason_note: t(r.reason_note), reason_at: t(r.reason_at),
+    arrived_at: at(r.arrived_at), arrived_by: t(r.arrived_by), cleared_at: at(r.cleared_at), cleared_by: t(r.cleared_by),
+    flow: (r.flow as StoredCheckin['flow']) ?? null, flow_at: t(r.flow_at), flow_by: t(r.flow_by), flow_note: t(r.flow_note),
+    reinstate: r.reinstate_at || r.reinstate_by || r.reinstate_ts ? { at: t(r.reinstate_at), by: t(r.reinstate_by), ts: at(r.reinstate_ts) } : null,
+    self_add: r.self_add_pax === null || r.self_add_pax === undefined ? null : {
+      pax: Number(r.self_add_pax), ad: n(r.self_add_ad), chd: n(r.self_add_chd), inf: n(r.self_add_inf), foc: n(r.self_add_foc),
+      at: t(r.self_add_at), by: t(r.self_add_by), ts: at(r.self_add_ts), note: t(r.self_add_note),
+    },
+    events: ((r.events as Record<string, unknown>[]) ?? []).map((e) => ({
+      type: e.type as 'no_show' | 'cxl', pax: Number(e.pax), ad: n(e.ad), chd: n(e.chd), inf: n(e.inf), foc: n(e.foc),
+      reason_code: t(e.reason_code), note: t(e.note), at: t(e.at), by: t(e.by), ts: at(e.ts),
+      undone: e.undone_why ? { why: e.undone_why as 'found' | 'mistake', at: t(e.undone_at), by: t(e.undone_by), ts: at(e.undone_ts), note: t(e.undone_note) } : null,
+      tries: ((e.tries as Record<string, unknown>[]) ?? []).map((x) => ({ at: t(x.at), by: t(x.by), note: t(x.note), ts: at(x.ts) })),
+    })),
+    updated_at: jsonInstant(r.updated_at), updated_by: t(r.updated_by),
+  };
 };
 /** The booking's reconfirmation from `BOOKING_SELECT` (migration 035). */
 const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | null => r && {
@@ -513,6 +547,7 @@ export class PostgresOperationsStore {
     if (moved.length > 0) {
       // Legacy `bkOpsClear`: the dispatch was arranged for the old departure, so it goes; the pier note stays.
       await this.client().query('DELETE FROM booking_trip_van_allocations WHERE booking_trip_id = ANY($1::text[])', [moved]);
+      await this.client().query('DELETE FROM booking_trip_checkins WHERE booking_trip_id = ANY($1::text[])', [moved]);
       await this.client().query('DELETE FROM booking_trip_boat_splits WHERE booking_trip_id = ANY($1::text[])', [moved]);
       await this.client().query(`UPDATE booking_trip_operations SET boat_id = NULL, pickup_time_final = NULL, pickup_time_final_end = NULL,
         pickup_final_at_pier = false, return_same_van = false WHERE booking_trip_id = ANY($1::text[])`, [moved]);
@@ -1348,6 +1383,34 @@ export class PostgresOperationsStore {
         x.checked_in?.at ?? null, x.checked_in?.by ?? null, x.checked_in?.seats ?? null, x.created_at, x.created_by, x.updated_at, x.updated_by]);
   }
   async deleteVanStop(id: string): Promise<boolean> { return (await this.client().query('DELETE FROM van_stops WHERE id = $1', [id])).rowCount === 1; }
+
+  /** Replaces one check-in record, its events and their tries. */
+  async setCheckin(tripId: string, r: StoredCheckin): Promise<void> {
+    await this.deleteCheckin(tripId, r.kind, r.slot);
+    const key = [tripId, r.kind, r.slot];
+    await this.client().query(`INSERT INTO booking_trip_checkins (booking_trip_id, kind, slot, expected, actual_pax, checked_in_at, checked_in_by,
+        reason_code, reason_note, reason_at, arrived_at, arrived_by, cleared_at, cleared_by, flow, flow_at, flow_by, flow_note,
+        reinstate_at, reinstate_by, reinstate_ts, self_add_pax, self_add_ad, self_add_chd, self_add_inf, self_add_foc, self_add_at, self_add_by, self_add_ts, self_add_note,
+        updated_at, updated_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32)`,
+      [...key, r.expected, r.actual_pax, r.checked_in_at, r.checked_in_by, r.reason_code, r.reason_note, r.reason_at, r.arrived_at, r.arrived_by,
+        r.cleared_at, r.cleared_by, r.flow, r.flow_at, r.flow_by, r.flow_note, r.reinstate?.at ?? null, r.reinstate?.by ?? null, r.reinstate?.ts ?? null,
+        r.self_add?.pax ?? null, r.self_add?.ad ?? null, r.self_add?.chd ?? null, r.self_add?.inf ?? null, r.self_add?.foc ?? null,
+        r.self_add?.at ?? null, r.self_add?.by ?? null, r.self_add?.ts ?? null, r.self_add?.note ?? null, r.updated_at, r.updated_by]);
+    for (const [seq, e] of r.events.entries()) {
+      await this.client().query(`INSERT INTO booking_trip_checkin_events (booking_trip_id, kind, slot, seq, type, pax, ad, chd, inf, foc, reason_code, note, at, by, ts,
+          undone_why, undone_at, undone_by, undone_ts, undone_note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        [...key, seq, e.type, e.pax, e.ad, e.chd, e.inf, e.foc, e.reason_code, e.note, e.at, e.by, e.ts,
+          e.undone?.why ?? null, e.undone?.at ?? null, e.undone?.by ?? null, e.undone?.ts ?? null, e.undone?.note ?? null]);
+      for (const [trySeq, x] of e.tries.entries()) {
+        await this.client().query('INSERT INTO booking_trip_checkin_event_tries (booking_trip_id, kind, slot, event_seq, seq, at, by, note, ts) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+          [...key, seq, trySeq, x.at, x.by, x.note, x.ts]);
+      }
+    }
+  }
+  async deleteCheckin(tripId: string, kind: CheckinKind, slot: number): Promise<boolean> {
+    return (await this.client().query('DELETE FROM booking_trip_checkins WHERE booking_trip_id = $1 AND kind = $2 AND slot = $3', [tripId, kind, slot])).rowCount === 1;
+  }
 
   /** `null` removes it. */
   async setReconfirm(bookingId: string, r: StoredReconfirm | null): Promise<void> {

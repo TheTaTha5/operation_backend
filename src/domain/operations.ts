@@ -30,6 +30,7 @@ import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './
 import { clearedOnMove, dispatchView, EMPTY_DISPATCH, type StoredDispatch, type TripDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import { reconfirmView, type Reconfirm, type StoredReconfirm } from './reconfirm.js';
+import { checkinsView, copyCheckin, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import { copyStop, type VanStop } from './van-stops.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
@@ -546,10 +547,24 @@ export class OperationsStore {
 
   private view(stored: StoredBooking): Booking {
     return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
-      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups)), this.reconfirms.get(stored.id) ?? null);
+      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups), checkinsView(this.checkins.get(trip.id) ?? [])), this.reconfirms.get(stored.id) ?? null);
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
+  }
+
+  /** Each trip's check-in records (migration 036), by trip id. */
+  private checkins = new Map<string, StoredCheckin[]>();
+  /** Replaces one record. */
+  setCheckin(tripId: string, record: StoredCheckin): void {
+    const others = (this.checkins.get(tripId) ?? []).filter((r) => !(r.kind === record.kind && r.slot === record.slot));
+    this.checkins.set(tripId, [...others, copyCheckin(record)]);
+  }
+  deleteCheckin(tripId: string, kind: CheckinKind, slot: number): boolean {
+    const before = this.checkins.get(tripId) ?? [];
+    const after = before.filter((r) => !(r.kind === kind && r.slot === slot));
+    this.checkins.set(tripId, after);
+    return after.length < before.length;
   }
 
   /** Each booking's reconfirmation (migration 035), by booking id. */
@@ -570,8 +585,8 @@ export class OperationsStore {
    */
   private retrip(booking: StoredBooking, planned: StoredTrip[]): void {
     const keep = new Set(planned.map((trip) => trip.id));
-    for (const trip of booking.trips) if (!keep.has(trip.id)) { this.dispatch.delete(trip.id); this.vanParts.delete(trip.id); }
-    for (const id of movedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) this.dispatch.set(id, clearedOnMove(d)); this.vanParts.delete(id); }
+    for (const trip of booking.trips) if (!keep.has(trip.id)) { this.dispatch.delete(trip.id); this.vanParts.delete(trip.id); this.checkins.delete(trip.id); }
+    for (const id of movedTripIds(booking.trips, planned)) { const d = this.dispatch.get(id); if (d) this.dispatch.set(id, clearedOnMove(d)); this.vanParts.delete(id); this.checkins.delete(id); }
     for (const id of paxChangedTripIds(booking.trips, planned)) {
       const d = this.dispatch.get(id);
       if (d) d.boat_splits = [];

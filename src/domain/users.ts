@@ -78,6 +78,8 @@ export function writeNeed(path: string): WriteNeed {
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).
   if (path.startsWith('/operations/deployments')) return { kind: 'area', areas: ['operations', 'fleet'] };
   // Dispatch: which boat and van a trip goes on, its final pickup, the pier note.
+  // Check-in: legacy `ckCanEdit` lets the pier staff in too.
+  if (/^\/operations\/trip-ops\/[^/]+\/checkins\//.test(path)) return { kind: 'area', areas: ['operations', 'pier'] };
   if (path.startsWith('/operations/trip-ops/')) return { kind: 'area', areas: ['operations'] };
   // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`).
   if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };

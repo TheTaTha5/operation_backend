@@ -30,7 +30,7 @@ flowchart LR
   catalogue["Catalogue and seat pool<br/>routes, route_times, route_seasons,<br/>route_day_overrides, boats,<br/>boat_capacity_overrides, deployments, seat_locks"]
   bookings["Bookings<br/>bookings, booking_trips, booking_trip_pax,<br/>booking_trip_lock_draws,<br/>booking_passengers, booking_addons,<br/>booking_approvals, booking_approval_days,<br/>booking_reconfirmations"]
   actions["Booking action records<br/>booking_history, booking_cancellations,<br/>booking_reschedules, booking_partial_cancels,<br/>booking_fee_items"]
-  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops"]
+  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops,<br/>booking_trip_checkins, booking_trip_checkin_events,<br/>booking_trip_checkin_event_tries"]
   sales["Agents and sales<br/>agents, agent_programs, agent_activity,<br/>markets, market_subs, sales_people"]
   rates["Rate types<br/>rate_types, rate_type_routes,<br/>rate_type_seat_prices, rate_type_charter_prices,<br/>rate_type_longtail_prices, rate_type_transfer_prices"]
 

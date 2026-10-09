@@ -1397,6 +1397,7 @@ and empty until set:
 "operations": { "boat_id": "b2", "boat_splits": [], "boat_pulled": false,
   "pickup_time_final": "06:40", "pickup_time_final_end": null, "pickup_final_at_pier": false, "return_same_van": false,
   "pier_note": { "text": "Late, call guide", "at": "2026-09-12T05:50:00.000Z", "by": "Ploy" },
+  "checkins": { "van": [], "pier": [] },
   "van_parts": [ { "idx": 0, "source": "main", "ad": 2, "chd": 1, "inf": 0, "foc": 0,
                    "group": { "id": "vgrp_…", "number": 3, "van_id": "veh07", "return_van_id": null, "pickup_time": "06:40" },
                    "sequence": 2, "return_van_id": null, "alt": null } ] }
@@ -1442,7 +1443,56 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 - A cancelled or rejected booking's dispatch cannot change (`409 cancelled`); an unknown trip is `404`.
 - The legacy import brings each active booking's boat, boat split, final pickup and pier note.
 
-Check-in comes next (`todo/trip-ops-and-vans-model.md`).
+Check-in has its own section below.
+
+### Check-in
+
+Legacy's van check-in and pier check-in screens: one record per trip, side (`van` or `pier`) and
+van part (`slot`, the part's `idx`; 0 is the main part). Every trip's `operations.checkins` carries
+them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `PUT /operations/trip-ops/{trip_id}/checkins/{van\|pier}/{slot}` | the whole record | `{ trip, warnings: [] }` |
+| `DELETE /operations/trip-ops/{trip_id}/checkins/{van\|pier}/{slot}` | — | `{ trip, warnings: [] }`; `404` if there is none |
+
+```jsonc
+{ "slot": 0, "expected": 3, "actual_pax": 2, "no_show": 1,
+  "checked_in_at": "2026-10-02T23:45:00.000Z", "checked_in_by": "Somchai",
+  "reason_code": "not_down", "reason_note": "lobby empty", "reason_at": "06:40",
+  "arrived_at": null, "arrived_by": null, "cleared_at": null, "cleared_by": null,
+  "flow": "standby", "flow_at": "06:35", "flow_by": "Somchai", "flow_note": null,
+  "reinstate": null,
+  "self_add": null,
+  "events": [ { "type": "no_show", "pax": 1, "ad": 1, "chd": 0, "inf": 0, "foc": 0, "reason_code": "not_down", "note": "lobby empty",
+                "at": "06:40", "by": "Somchai", "ts": "2026-10-02T23:40:00.000Z", "undone": null,
+                "tries": [ { "at": "06:50", "by": "Somchai", "note": "called again", "ts": "…" } ] } ],
+  "updated_at": "…", "updated_by": "Ploy" }
+```
+
+- **A write replaces the record**, as legacy's `ckWrite` does. A record has three kinds of field:
+  - **times staff type** (`reason_at`, `flow_at`, an event's or try's `at`, `reinstate.at`) are `HH:MM`;
+  - **instants** are ISO 8601;
+  - **staff names** (`checked_in_by`, an event's `by`, …) are the client's, as legacy's `ckMe()`.
+
+  Edit areas `operations` or `pier`, as legacy's `ckCanEdit`.
+- **Computed:**
+  - `no_show` is `expected − actual_pax`, never below 0; a value sent is ignored;
+  - `updated_at`, and `updated_by` from the login.
+- **Refused:**
+  - `400`:
+    - `actual_pax` or `expected` above what the part booked;
+    - a `slot` that isn't one of the trip's van parts;
+    - a malformed field, named with its path (`events[1].type must be no_show or cxl`).
+  - **The events are kept** (legacy §ckBack):
+    - removing, reordering or changing a recorded event, or a try, is `409 events_append_only`;
+    - to take one back, set its `undone` (`why`: `found` or `mistake`), and that is final:
+      changing or clearing it is `409 event_undone_is_final`;
+    - new events and tries go at the end.
+- **A trip moved** to another route or day loses its check-ins, as legacy's `bkOpsClear` does.
+- **The import** brings every legacy record of an imported booking, cancelled ones included: an
+  on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
+  changes 5 legacy records whose stored count disagreed.
 
 ### Reconfirm
 

@@ -8,6 +8,7 @@ import { refuse } from './booking-actions.js';
 import { pickupFields, pickupProblem } from './pickup.js';
 import type { PaxRow } from './pax.js';
 import type { VanPartView } from './van-groups.js';
+import type { CheckinView } from './checkin.js';
 
 export type BoatSplit = { boat_id: string; ad: number; chd: number; inf: number; foc: number };
 /** What a store keeps for one trip. */
@@ -18,7 +19,7 @@ export type StoredDispatch = {
   pier_note: { text: string; at: string; by: string | null } | null;
 };
 /** As a booking read shows it: `boat_pulled` when a boat it is on no longer sails on the trip's route that day, and who rides which van (`van-groups.ts`). */
-export type TripDispatch = StoredDispatch & { boat_pulled: boolean; van_parts: VanPartView[] };
+export type TripDispatch = StoredDispatch & { boat_pulled: boolean; van_parts: VanPartView[]; checkins: { van: CheckinView[]; pier: CheckinView[] } };
 export type DispatchPatch = Partial<{
   boat_id: string | null; boat_splits: BoatSplit[];
   pickup_time_final: string | null; pickup_time_final_end: string | null; pickup_final_at_pier: boolean;
@@ -30,10 +31,11 @@ export const EMPTY_DISPATCH: StoredDispatch = {
 };
 const copy = (d: StoredDispatch): StoredDispatch => ({ ...d, boat_splits: d.boat_splits.map((s) => ({ ...s })), pier_note: d.pier_note && { ...d.pier_note } });
 
-export const dispatchView = (stored: StoredDispatch | undefined, deployedBoats: ReadonlySet<string>, vanParts: VanPartView[]): TripDispatch => {
+export const dispatchView = (stored: StoredDispatch | undefined, deployedBoats: ReadonlySet<string>, vanParts: VanPartView[],
+  checkins: TripDispatch['checkins']): TripDispatch => {
   const d = copy(stored ?? EMPTY_DISPATCH);
   const boats = d.boat_id ? [d.boat_id] : d.boat_splits.map((s) => s.boat_id);
-  return { ...d, boat_pulled: boats.some((b) => !deployedBoats.has(b)), van_parts: vanParts };
+  return { ...d, boat_pulled: boats.some((b) => !deployedBoats.has(b)), van_parts: vanParts, checkins };
 };
 
 /** Legacy `bkOpsClear` when a trip moves to another route or day: everything goes but the pier note. */
