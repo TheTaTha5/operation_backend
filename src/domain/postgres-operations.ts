@@ -57,6 +57,7 @@ import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
 import type { StoredSalesPerson, SalesPersonSummary } from './team.js';
 import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
 import type { SalesFollowup, SalesTarget } from './sales-board.js';
+import type { StaffMember } from './staff.js';
 import { sortAddonServices, type AddonService } from './addon-services.js';
 import type { StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
@@ -1759,6 +1760,33 @@ export class PostgresOperationsStore {
     return { logins: u.logins, rate_types: u.rate_types };
   }
   async deleteSalesPerson(id: string): Promise<void> { await this.client().query('DELETE FROM sales_people WHERE id = $1', [id]); }
+
+  /** Staff and their welfare quotas (migration 202). */
+  private async readStaff(id?: string): Promise<StaffMember[]> {
+    const { rows } = await this.client().query(`SELECT s.id, s.code, s.name, s.dept, s.active, s.created_at, s.updated_at,
+        COALESCE((SELECT jsonb_object_agg(q.year::text, q.free_seats) FROM staff_quotas q WHERE q.staff_id = s.id), '{}'::jsonb) AS quotas
+      FROM staff s WHERE ($1::text IS NULL OR s.id = $1) ORDER BY s.id`, [id ?? null]);
+    return rows.map((r) => ({
+      id: r.id, code: r.code ?? null, name: r.name, dept: r.dept ?? null, active: r.active === true,
+      quotas: Object.fromEntries(Object.entries(r.quotas as Record<string, number>).sort(([a], [b]) => (a < b ? -1 : 1)).map(([y, n]) => [y, Number(n)])),
+      created_at: asIso(r.created_at), updated_at: asIso(r.updated_at),
+    }));
+  }
+  async listStaff(): Promise<StaffMember[]> { return this.readStaff(); }
+  async staffMember(id: string): Promise<StaffMember | undefined> { return (await this.readStaff(id))[0]; }
+  async saveStaff(s: StaffMember): Promise<void> {
+    await this.client().query(`INSERT INTO staff (id, code, name, dept, active, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, dept = EXCLUDED.dept, active = EXCLUDED.active, updated_at = EXCLUDED.updated_at`,
+    [s.id, s.code, s.name, s.dept, s.active, s.created_at, s.updated_at]);
+    await this.client().query('DELETE FROM staff_quotas WHERE staff_id = $1', [s.id]);
+    for (const [year, n] of Object.entries(s.quotas)) await this.client().query('INSERT INTO staff_quotas (staff_id, year, free_seats) VALUES ($1,$2,$3)', [s.id, Number(year), n]);
+  }
+  async deleteStaff(id: string): Promise<void> { await this.client().query('DELETE FROM staff WHERE id = $1', [id]); }
+  /** Bookings that name a staff member or a staff purpose: what quotas and the staff trips read. */
+  async staffBookings(): Promise<Booking[]> {
+    const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.staff_id IS NOT NULL OR b.purpose IN ('staff_welfare', 'staff_inspection') ORDER BY b.id`);
+    return rows.map(booking);
+  }
 
   /** The Sales Board's targets and follow-up marks (migration 201). */
   async listSalesTargets(salesId?: string): Promise<SalesTarget[]> {

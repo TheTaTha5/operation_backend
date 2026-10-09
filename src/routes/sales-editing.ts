@@ -39,6 +39,9 @@ import {
 import { parseActiveFilter, planAddonServiceCreate, planAddonServicePatch } from '../domain/addon-services.js';
 import { nationalityList, planNationality } from '../domain/nationalities.js';
 import { boardRange, parseFollowup, parseMonth, parseTarget, salesBoard } from '../domain/sales-board.js';
+import {
+  assertStaffDeletable, parseQuota, parseYear, planStaffCreate, planStaffPatch, STAFF_SERVER_OWNED, staffRoster, staffTrips, withQuota, type StaffMember,
+} from '../domain/staff.js';
 import { parseInsurance, planInsurance } from '../domain/insurance.js';
 
 type Request = FastifyRequest;
@@ -484,6 +487,51 @@ export function registerSalesRoutes(app: FastifyInstance, deps: {
       month, sales: await store.listSalesPeople(), agents: await store.agentRecords(), bookings, targets,
       followups: await store.listSalesFollowups(month), scope: scope(request),
     });
+  });
+
+  // ── Staff and their welfare quotas (staff.ts), area `sales` ──
+
+  const yearOf = (value: unknown): number => (value === undefined ? Number(todayInThailand().slice(0, 4)) : parseYear(value));
+  const staffOr404 = async (id: string) => (await store.staffMember(id)) ?? notFound(`Staff member ${id} not found`);
+  const staffView = async (member: StaffMember, year = Number(todayInThailand().slice(0, 4))) =>
+    staffRoster([member], year, await store.staffBookings()).staff[0];
+  /** Legacy's Staff & Welfare roster: quota, used and remaining for the year. */
+  app.get('/v1/staff', async (request) => staffRoster(await store.listStaff(), yearOf(query(request).year), await store.staffBookings()));
+  /** Legacy's "trips" tab (`staffTripsFor`). */
+  app.get('/v1/staff/trips', async (request) => ({ trips: staffTrips(yearOf(query(request).year), await store.staffBookings()) }));
+  app.get('/v1/staff/:id', async (request) => staffView(await staffOr404(param(request)), yearOf(query(request).year)));
+  app.post('/v1/staff', async (request, reply) => {
+    const body = record(request.body);
+    const created = await store.transaction(async () => {
+      const member = planStaffCreate(body, await store.listStaff(), Number(todayInThailand().slice(0, 4)), nowIso());
+      await store.saveStaff(member);
+      return staffView(member);
+    });
+    return reply.code(201).send(created);
+  });
+  app.patch('/v1/staff/:id', async (request) => store.transaction(async () => {
+    const stored = await staffOr404(param(request));
+    const next = planStaffPatch(stored, withoutServerOwned(record(request.body), await staffView(stored) as unknown as Record<string, unknown>, STAFF_SERVER_OWNED), nowIso());
+    if (next !== stored) await store.saveStaff(next);
+    return staffView(next);
+  }));
+  /** Legacy `staffSetQuota`. */
+  app.put('/v1/staff/:id/quotas/:year', async (request) => {
+    const year = parseYear(param(request, 'year'));
+    const freeSeats = parseQuota(record(request.body));
+    return store.transaction(async () => {
+      const next = withQuota(await staffOr404(param(request)), year, freeSeats, nowIso());
+      await store.saveStaff(next);
+      return staffView(next, year);
+    });
+  });
+  app.delete('/v1/staff/:id', async (request, reply) => {
+    await store.transaction(async () => {
+      const member = await staffOr404(param(request));
+      assertStaffDeletable(member, (await store.staffBookings()).filter((b) => b.staff_id === member.id).length);
+      await store.deleteStaff(member.id);
+    });
+    return reply.code(204).send();
   });
 
   app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));

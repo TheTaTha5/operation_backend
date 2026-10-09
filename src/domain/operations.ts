@@ -58,6 +58,7 @@ import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
 import { salesSummary, type StoredSalesPerson, type SalesPersonSummary } from './team.js';
 import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
 import type { SalesFollowup, SalesTarget } from './sales-board.js';
+import type { StaffMember } from './staff.js';
 import { addonServiceView, sortAddonServices, type AddonService } from './addon-services.js';
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
@@ -532,6 +533,19 @@ export class OperationsStore {
     this.directory.sales = this.directory.sales.filter((p) => p.id !== id);
     this.targets = this.targets.filter((t) => t.sales_id !== id);
     this.followups = this.followups.filter((f) => f.sales_id !== id);
+  }
+
+  /** Staff and their welfare quotas (migration 202). */
+  private staff = new Map<string, StaffMember>();
+  private copyStaff = (s: StaffMember): StaffMember => ({ ...s, quotas: { ...s.quotas } });
+  listStaff(): StaffMember[] { return [...this.staff.values()].map(this.copyStaff).sort((a, b) => (a.id < b.id ? -1 : 1)); }
+  staffMember(id: string): StaffMember | undefined { const found = this.staff.get(id); return found && this.copyStaff(found); }
+  saveStaff(member: StaffMember): void { this.staff.set(member.id, this.copyStaff(member)); }
+  deleteStaff(id: string): void { this.staff.delete(id); }
+  /** Bookings that name a staff member or a staff purpose: what quotas and the staff trips read. */
+  staffBookings(): Booking[] {
+    return [...this.bookings.values()].filter((b) => b.staff_id || b.purpose === 'staff_welfare' || b.purpose === 'staff_inspection')
+      .sort((a, b) => (a.id < b.id ? -1 : 1)).map((b) => this.view(b));
   }
 
   /** The Sales Board's targets and follow-up marks (migration 201), as the rows PostgreSQL holds. */
