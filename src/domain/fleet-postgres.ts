@@ -4,7 +4,8 @@
  * Dates are read as `::text` (CLAUDE.md), numerics converted with `Number`.
  */
 import type { Pool, PoolClient, QueryResultRow } from 'pg';
-import type { FleetRepo } from './fleet-store.js';
+import type { FleetRepo, FuelBudget } from './fleet-store.js';
+import type { Assignment } from './fleet-assignments.js';
 import type { Consumable, Movement, NewMovement, StockItem } from './fleet-stock.js';
 import type { Memo, MemoHistory, MemoLine, MemoReceipt } from './fleet-memos.js';
 import type { Project, ProjectLog } from './fleet-projects.js';
@@ -349,7 +350,37 @@ export class PostgresFleetRepo implements FleetRepo {
   async addSafetyLog(rows: readonly SafetyLog[]): Promise<void> {
     for (const l of rows) await this.q('INSERT INTO fleet_safety_log (item_id, date, type, "desc") VALUES ($1,$2,$3,$4)', [l.item_id, l.date, l.type, l.desc]);
   }
+
+  // ── Pier assignments, fuel budgets (migration 190) ──
+  async assignments(boatId?: string): Promise<Assignment[]> {
+    return (await this.q(`${ASSIGNMENT_SELECT}${boatId === undefined ? '' : ' WHERE boat_id = $1'}`, boatId === undefined ? [] : [boatId])).rows.map(assignmentRow);
+  }
+  async assignment(id: string): Promise<Assignment | undefined> { const r = (await this.q(`${ASSIGNMENT_SELECT} WHERE id = $1`, [id])).rows[0]; return r && assignmentRow(r); }
+  async putAssignment(a: Assignment): Promise<void> {
+    await this.q(`INSERT INTO boat_assignments (id, boat_id, type, from_pier, to_pier, start_date, end_date, reason, cost, cancelled, cancelled_at, cancelled_by,
+      created_date, created_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET boat_id = EXCLUDED.boat_id, type = EXCLUDED.type, from_pier = EXCLUDED.from_pier, to_pier = EXCLUDED.to_pier,
+        start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date, reason = EXCLUDED.reason, cost = EXCLUDED.cost, cancelled = EXCLUDED.cancelled,
+        cancelled_at = EXCLUDED.cancelled_at, cancelled_by = EXCLUDED.cancelled_by`,
+    [a.id, a.boat_id, a.type, a.from_pier, a.to_pier, a.start_date, a.end_date, a.reason, a.cost, a.cancelled, a.cancelled_at, a.cancelled_by, a.created_date, a.created_at, a.created_by]);
+  }
+  async fuelBudgets(): Promise<FuelBudget[]> {
+    return (await this.q('SELECT month, amount, set_at, set_by FROM fleet_fuel_budgets')).rows.map((r) => ({ month: r.month, amount: num(r.amount), set_at: iso(r.set_at), set_by: s(r.set_by) }));
+  }
+  async putFuelBudget(month: string, budget: FuelBudget | null): Promise<void> {
+    if (!budget) { await this.q('DELETE FROM fleet_fuel_budgets WHERE month = $1', [month]); return; }
+    await this.q(`INSERT INTO fleet_fuel_budgets (month, amount, set_at, set_by) VALUES ($1,$2,$3,$4)
+      ON CONFLICT (month) DO UPDATE SET amount = EXCLUDED.amount, set_at = EXCLUDED.set_at, set_by = EXCLUDED.set_by`, [month, budget.amount, budget.set_at, budget.set_by]);
+  }
 }
+
+const ASSIGNMENT_SELECT = `SELECT id, boat_id, type, from_pier, to_pier, start_date::text AS start_date, end_date::text AS end_date, reason, cost, cancelled, cancelled_at,
+  cancelled_by, created_date::text AS created_date, created_at, created_by FROM boat_assignments`;
+const assignmentRow = (r: QueryResultRow): Assignment => ({
+  id: r.id, boat_id: r.boat_id, type: r.type, from_pier: r.from_pier, to_pier: r.to_pier, start_date: r.start_date, end_date: r.end_date, reason: s(r.reason),
+  cost: num(r.cost), cancelled: r.cancelled, cancelled_at: isoOrNull(r.cancelled_at), cancelled_by: s(r.cancelled_by), created_date: r.created_date,
+  created_at: iso(r.created_at), created_by: s(r.created_by),
+});
 
 const requestRow = (r: QueryResultRow): DailyRequest => ({
   id: r.id, date: r.date, pier: r.pier, name: r.name, pax: numOrNull(r.pax), fuel: numOrNull(r.fuel), price: numOrNull(r.price), engine_hours: numOrNull(r.engine_hours),

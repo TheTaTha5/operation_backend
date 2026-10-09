@@ -51,6 +51,8 @@ import { registerSalesRoutes } from './sales-editing.js';
 import { registerFleetStockRoutes } from './fleet-stock.js';
 import { registerMoneyReportRoutes } from './money-reports.js';
 import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
+import { registerFleetExtrasRoutes } from './fleet-extras.js';
+import { pierOn, shopOf } from '../domain/fleet-assignments.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
 import { registerMoneyRoutes } from './money.js';
 import { cotDeductions } from '../domain/after-trip.js';
@@ -639,7 +641,13 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   const withAvailability = async (boats: BoatRecord[]) => {
     const today = todayInThailand();
     const ready = await boatsAvailableToday(store, boats);
-    return boats.map((boat) => ({ ...boatView(boat, today), status_effective: ready.get(boat.id)!.status, blocked_by: ready.get(boat.id)!.blocked_by }));
+    // The pier a boat works from today (its assignment; legacy `getBoatCurrentPier`) and the shop holding it.
+    const assignments = await store.fleetRepo.assignments(boats.length === 1 ? boats[0].id : undefined);
+    const started = await store.fleetJobs({ status: 'inprogress' });
+    return boats.map((boat) => ({
+      ...boatView(boat, today), status_effective: ready.get(boat.id)!.status, blocked_by: ready.get(boat.id)!.blocked_by,
+      pier_today: pierOn(boat, today, assignments), at_shop: shopOf(started, boat.id, ready.get(boat.id)!.status !== 'available'),
+    }));
   };
   app.get('/v1/boats', async () => ({ boats: await withAvailability(await store.boatRecords()) }));
   app.get('/v1/boats/:id', async (request) => (await withAvailability([(await store.boatRecord(paramId(request))) ?? notFound('Boat not found')]))[0]);
@@ -1920,6 +1928,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   registerMoneyReportRoutes(app, { store });
   /** Fleet maintenance, part A: availability, engines/gearboxes/propellers, incidents, jobs (`fleet.ts`). */
   registerFleetRoutes(app, { store });
+  /** Fleet maintenance, the extras: pier assignments, certificates, the replace wizard, fuel budget, reports (`fleet-extras.ts`). */
+  registerFleetExtrasRoutes(app, { store });
   registerMoneyRoutes(app, { store, assertBookingFresh });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body

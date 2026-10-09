@@ -13,11 +13,11 @@
  */
 import { assertKnown, bad, bool, conflict, isoDate, newFleetId, notFound, positive, record, required, WAREHOUSES } from './fleet-common.js';
 import { engineHours, type Engine, type MeterReading } from './fleet-assets.js';
-import { jobCost, type Job, type JobPart, type LinkedMemo } from './fleet-jobs.js';
+import { jobCost, type Job, type JobPart, type LinkedMemo, type ProgressLine } from './fleet-jobs.js';
 import type { OpenWork } from './fleet-availability.js';
 import { assertStock, movement, type Ctx, type Movement, type NewMovement, type StockItem } from './fleet-stock.js';
 import type { Memo } from './fleet-memos.js';
-import type { Project, ProjectJobs } from './fleet-projects.js';
+import type { Project, ProjectJobs, ProjectLog } from './fleet-projects.js';
 import type { Meter } from './fleet-daily.js';
 
 /** A project holds its boat from its actual (else planned) start while in progress or on hold. */
@@ -68,6 +68,44 @@ export function unlinkedChildJobs(jobs: readonly Job[], projectNo: string, today
   return jobs.filter((j) => j.status !== 'done').map((j) => ({
     ...j, parent_project_id: null, progress_log: [...j.progress_log, line(today, `Unlinked from cancelled project ${projectNo}`, by)],
   }));
+}
+
+// ── Log lines legacy writes across parts A and B ("Design — extras" 6) ──
+
+const baht = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+type MemoEvent = { kind: 'create' } | { kind: 'edit' } | { kind: 'cancel'; reason: string | null };
+/**
+ * A memo on a job writes legacy's `flPushLog` line onto the job's incident (create, edit, cancel), and
+ * on create a line onto the job itself, dated the memo's date. `by` is legacy's `ระบบ`.
+ */
+export function memoJobLines(memo: Pick<Memo, 'no' | 'title' | 'amount' | 'memo_date'>, event: MemoEvent): { job: ProgressLine | null; incident: string } {
+  if (event.kind === 'create') {
+    return { job: { date: memo.memo_date, text: `📋 สร้าง Memo ${memo.no} · ฿${baht(memo.amount)}`, by: 'ระบบ', created_on: null }, incident: `📋 สร้าง Memo ${memo.no} · ${memo.title} · ฿${baht(memo.amount)}` };
+  }
+  if (event.kind === 'edit') return { job: null, incident: `✏️ แก้ไข Memo ${memo.no} · ฿${baht(memo.amount)}` };
+  return { job: null, incident: `🚫 ยกเลิก Memo ${memo.no} · ${event.reason ?? ''}`.trimEnd() };
+}
+/** A memo made for a project writes the project's log (`flSaveMemo`, `_memoProjectId`). */
+export const memoProjectLine = (memo: Pick<Memo, 'project_id' | 'no' | 'title' | 'amount' | 'memo_date'>): ProjectLog =>
+  ({ project_id: memo.project_id!, date: memo.memo_date, text: `Memo ${memo.no} · ${memo.title} · ฿${baht(memo.amount)} (Project overhead)`, by: 'user' });
+
+/** A line dated `today` (`created_on` stays null: written the day it says). */
+const today = (date: string, text: string, by: string): ProgressLine => ({ date, text, by, created_on: null });
+/** Jobs made under a project (`_projCreateForId`): the project's log names each. */
+export const projectCreatedLines = (projectId: string, jobs: readonly Pick<Job, 'no' | 'title'>[], date: string): ProjectLog[] =>
+  jobs.map((j) => ({ project_id: projectId, date, text: `+ Created MJ ${j.no} · ${j.title}`, by: 'user' }));
+/** A split job under a project (`flSplitExistingJob`). */
+export const projectSplitLine = (projectId: string, from: string, nos: readonly string[], date: string): ProjectLog =>
+  ({ project_id: projectId, date, text: `+ Split ${from} → ${nos.join(', ')}`, by: 'user' });
+/**
+ * A job linked to or unlinked from a project by `PATCH parent_project_id` (`flMaintLinkProjectPick`,
+ * `flMaintUnlinkProject`): a line on each side.
+ */
+export function projectLinkLines(job: Pick<Job, 'no' | 'title'>, from: Pick<Project, 'id' | 'no'> | null, to: Pick<Project, 'id' | 'no' | 'name'> | null, date: string): { project: ProjectLog[]; job: ProgressLine[] } {
+  const project: ProjectLog[] = [], lines: ProgressLine[] = [];
+  if (from) { project.push({ project_id: from.id, date, text: `− Unlinked MJ ${job.no}`, by: 'user' }); lines.push(today(date, `🔗 Unlinked from project ${from.no}`, 'user')); }
+  if (to) { project.push({ project_id: to.id, date, text: `+ Linked MJ ${job.no} · ${job.title}`, by: 'user' }); lines.push(today(date, `🔗 Linked to project ${to.no} · ${to.name}`, 'user')); }
+  return { project, job: lines };
 }
 
 /** A job part's warehouse, written as legacy's label (part A imports labels in all eight spellings). */

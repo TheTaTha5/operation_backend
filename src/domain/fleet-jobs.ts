@@ -90,6 +90,8 @@ export class FleetDraft implements AssetContext {
     for (const j of data.jobs ?? []) this.jobs.set(j.id, copyJob(j));
     this.now = now;
   }
+  /** A project's number for the lines a job under it writes (part B's projects; the id until the route sets it). */
+  projectNoOf: (id: string) => string = (id) => id;
   boatName = (id: string): string => this.boats.get(id)?.name ?? id;
   engineHours = (id: string): number => {
     const e = this.engines.get(id);
@@ -484,9 +486,9 @@ export function newJobs(d: FleetDraft, body: Record<string, unknown>, ids: () =>
   return [job];
 }
 
-/** A job made under a project says so (the project's own log is part B's). */
+/** A job made under a project says so (`_projCreateForId`); the project's own line is written by the route. */
 function projectLine(job: Job, d: FleetDraft): void {
-  if (job.parent_project_id) job.progress_log.push(line(d.today, `+ Created under project ${job.parent_project_id}`, 'user', d.today));
+  if (job.parent_project_id) job.progress_log.push(line(d.today, `+ Created under project ${d.projectNoOf(job.parent_project_id)}`, 'user', d.today));
 }
 
 // ── Jobs: edit, board ──
