@@ -1424,7 +1424,8 @@ export class OperationsStore {
     assertKnownLocks(new Set(this.locks.keys()), trips);
   }
 
-  createBooking(input: BookingInput, actor?: string): Booking {
+  /** `exclude` leaves a lock out of the seats it is weighed against: a whole-boat hold being converted into this booking. */
+  createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Booking {
     if (input.external_id !== undefined) {
       const taken = [...this.bookings.values()].find((booking) => booking.external_id === input.external_id);
       if (taken) externalIdTaken(input.external_id, taken.id);
@@ -1435,7 +1436,7 @@ export class OperationsStore {
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
-      overDays: this.weighTrips(input.trips, {}, input.agent_id),
+      overDays: this.weighTrips(input.trips, exclude, input.agent_id),
     }, actor);
     const status = decision.status;
     const now = this.now();

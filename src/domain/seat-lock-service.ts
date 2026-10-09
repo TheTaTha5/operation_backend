@@ -42,7 +42,7 @@ export interface SeatLockIO {
 export type NewLockInput = {
   route_id: string; service_date: string; pax: number; holder_type: HolderType; agent_id: string | null;
   reason: string | null; expiry: string | null; pending?: PendingChoice;
-  /** A whole-boat hold: set by the import and tests only (creating them is their own design, not written yet). */
+  /** A whole-boat hold with none of its rules checked: tests only. The API makes holds with `BoatHoldService`. */
   boat_id?: string | null;
 };
 export type LockChanges = {
@@ -66,7 +66,7 @@ const bad = (message: string): never => refuseLock(message, 400);
 const conflict = (message: string, code: string): never => refuseLock(message, 409, code);
 
 /** The holder a write leaves: `agent_id` alone means an agent lock; `null` alone means office. */
-function nextHolder(current: { holder_type: HolderType; agent_id: string | null }, changes: { holder_type?: HolderType; agent_id?: string | null }): { holder_type: HolderType; agent_id: string | null } {
+export function nextHolder(current: { holder_type: HolderType; agent_id: string | null }, changes: { holder_type?: HolderType; agent_id?: string | null }): { holder_type: HolderType; agent_id: string | null } {
   const holder_type = changes.holder_type
     ?? (changes.agent_id === undefined ? current.holder_type : changes.agent_id ? 'agent' : current.holder_type === 'agent' ? 'office' : current.holder_type);
   const agent_id = holder_type === 'agent' ? (changes.agent_id === undefined ? current.agent_id : changes.agent_id) : (changes.agent_id ?? null);
@@ -171,7 +171,8 @@ export class SeatLockService {
     let row: LockRow = {
       id: `lock_${randomUUID()}`, version: 1, route_id: input.route_id, service_date: input.service_date, pax: input.pax, pending_pax: 0, released_pax: 0,
       holder_type: input.holder_type, agent_id: input.agent_id, status: 'active', expiry: input.expiry, reason: input.reason,
-      group_id: null, parent_id: null, sub_name: null, boat_id: input.boat_id ?? null, created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
+      group_id: null, parent_id: null, sub_name: null, boat_id: input.boat_id ?? null, boat_deal: input.boat_id ? 'fixed' : null, converted_booking_id: null,
+      created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
     };
     const short = await this.short(row, 0, 0);
     const events = [this.event(by, { lock_id: row.id, group_id: null, type: 'create', qty: input.pax })];
@@ -335,6 +336,7 @@ export class SeatLockService {
     return this.releaseWhole(row, by, 'release-round');
   }
   private async releaseWhole(row: LockRow, by: string | undefined, type: 'release' | 'release-round'): Promise<SeatLock> {
+    if (row.status === 'converted') refuseLock(`This hold became booking ${row.converted_booking_id}: cancel the booking to free the boat`, 409, 'hold_converted');
     if (row.status === 'released') return (await this.views([row]))[0];
     await this.io.holdPool(row.route_id, row.service_date);
     const { numbers } = await this.tree(row);
@@ -400,7 +402,7 @@ export class SeatLockService {
       plans.push({ parent, kid: {
         id: `lock_${randomUUID()}`, version: 1, route_id: parent.route_id, service_date: parent.service_date, pax: input.pax, pending_pax: 0, released_pax: 0,
         holder_type: parent.holder_type, agent_id: parent.agent_id, status: 'active', expiry: null, reason: input.reason,
-        group_id: parent.group_id, parent_id: parent.id, sub_name: input.sub_name, boat_id: null, created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
+        group_id: parent.group_id, parent_id: parent.id, sub_name: input.sub_name, boat_id: null, boat_deal: null, converted_booking_id: null, created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
       } });
     }
     if (short.length) {
@@ -438,7 +440,7 @@ export class SeatLockService {
       const row: LockRow = {
         id: `lock_${randomUUID()}`, version: 1, route_id: input.route_id, service_date: date, pax: input.pax, pending_pax: 0, released_pax: 0,
         holder_type: input.holder_type, agent_id: input.agent_id, status: 'active', expiry: null, reason: null,
-        group_id: group.id, parent_id: null, sub_name: null, boat_id: null, created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
+        group_id: group.id, parent_id: null, sub_name: null, boat_id: null, boat_deal: null, converted_booking_id: null, created_at: now, created_by: by ?? null, updated_at: now, released_at: null,
       };
       const short = await this.short(row, 0, 0);
       if (short) { shorts.push(short); if (input.pending) row.pending_pax = pendingFor(short, input.pending); }

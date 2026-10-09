@@ -29,7 +29,7 @@ export function placedOn(bookings: readonly Booking[], boatId: string, routeId: 
  * Checks a change to one boat's deployment on one date: `before` is what stands, `after` what is asked
  * (`undefined` = removed). Moving a boat to another route is a removal from the old route.
  * - A past date (Asia/Bangkok) only for an admin: `409 past_date`.
- * - A boat a charter holds can't leave its route: `409 charter_boat`.
+ * - A boat a charter holds can't leave its route: `409 charter_boat`; nor one a whole-boat hold takes: `409 boat_held`.
  * - A boat with bookings placed on it leaves, or shrinks below them, only with `remove_anyway`
  *   (legacy's confirm dialog): `409 seats_sold`. Then the answer warns `boat_pulled` (the bookings
  *   show it too) or `oversold`. Only bookings placed on that boat count, as in legacy (decided 2026-10-09).
@@ -38,6 +38,8 @@ export function placedOn(bookings: readonly Booking[], boatId: string, routeId: 
 export function checkDeploymentChange(before: Deployment | undefined, after: Deployment | undefined, ctx: {
   today: string; admin: boolean; removeAnyway: boolean; boatName: string; catalogueLicense: number | undefined;
   placedBefore: { bookings: number; pax: number; charter: string | null };
+  /** An active whole-boat hold that takes the boat on its route that day (legacy `opHoldOnly`). */
+  heldBy?: string | null;
 }): DeploymentWarning[] {
   const date = after?.service_date ?? before?.service_date;
   if (!date) return [];
@@ -51,6 +53,7 @@ export function checkDeploymentChange(before: Deployment | undefined, after: Dep
   const leaves = !after || after.route_id !== before.route_id;
   const { placedBefore: placed } = ctx;
   if (leaves && placed.charter) refuse('Cannot unassign - charter is active. Cancel the charter booking first.', 409, 'charter_boat');
+  if (leaves && ctx.heldBy) refuse('Cannot unassign - this boat is held whole for an agent. Release the hold on the Seat Locks page first.', 409, 'boat_held');
   const shrinks = !leaves && after!.capacity < placed.pax;
   if ((leaves && placed.bookings > 0) || shrinks) {
     if (!ctx.removeAnyway) {

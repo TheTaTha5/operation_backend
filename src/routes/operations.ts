@@ -2,8 +2,11 @@ import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw } from '../domain/operations.js';
 import { SeatLockService } from '../domain/seat-lock-service.js';
+import { BoatHoldService } from '../domain/boat-hold-service.js';
+import { assertConverts, convertBody } from '../domain/boat-holds.js';
 import {
-  assertGroupOwnedEcho, assertOwnedEcho, isoDay, parseAdd, parseConfirm, parseGroupChanges, parseLockChanges, parseNewGroup, parseNewLock, parseRelease, parseSubGroup,
+  assertGroupOwnedEcho, assertHoldOwnedEcho, assertOwnedEcho, isHoldRequest, isoDay, parseAdd, parseConfirm, parseGroupChanges, parseHoldChanges, parseLockChanges,
+  parseNewGroup, parseNewHold, parseNewLock, parseRelease, parseSubGroup,
 } from '../domain/seat-lock-input.js';
 import { STATUS_CODES } from 'node:http';
 import { docs } from './openapi.js';
@@ -486,6 +489,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   };
   // The seat-lock commands, written once over the store (seat-lock-service.ts).
   const locks = new SeatLockService(store);
+  // Whole-boat holds (boat-hold-service.ts): a boat must be ready that day, as Boat Operation asks.
+  const holds = new BoatHoldService(store, async (boat, date) => availability(boat, date, await openWork(store, boat.id)));
   const assertLockFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown; user?: { user?: StoredUser } }): Promise<void> => {
     const expected = sentVersion(request);
     if (expected === undefined) return requireVersion(request, 'seat lock');
@@ -920,8 +925,18 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return 'held' in outcome ? reply.code(202).send(outcome.held) : reply.code(201).send(outcome.done);
   });
   async function createBooking(request: FastifyRequest) {
+    const plan = await planBooking(request, request.body);
+    const created = await store.transaction(() => writeBooking(request, request.body, plan));
+    return bookingAnswer(request, plan, created);
+  }
+  /**
+   * A create, up to its transaction: parsed, its agent checked, its pickups filled and priced. Split
+   * from the write so a whole-boat hold's conversion can create the booking inside its own
+   * transaction (`/v1/seat-locks/{id}/convert`).
+   */
+  async function planBooking(request: FastifyRequest, body: unknown) {
     const actor = actorOf(request.user);
-    const { viaStatus, ...input } = bookingInput(request.body);
+    const { viaStatus, ...input } = bookingInput(body);
     const agent = request.user?.user?.agent_id;
     if (agent) {
       if (input.agent_id !== undefined && input.agent_id !== agent) forbidden(`This login books for agent ${agent} only`);
@@ -929,7 +944,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     }
     // `status` on create is deprecated for `intent` and goes when both clients send `intent`; the
     // log says who still sends it.
-    if (viaStatus) request.log.warn({ status: (request.body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
+    if (viaStatus) request.log.warn({ status: (body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
     // A deactivated agent takes no new bookings (todo/sales-editing-model.md, decision 1).
     if (input.agent_id) assertAgentBookable(await store.agent(input.agent_id));
     // The server prices the booking (README "Prices"); a B2C booking keeps the price sent.
@@ -941,21 +956,27 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const { manual_total: sentManual, ...sentHeader } = input.header ?? {};
     const manual = priced ? manualTotal ?? undefined : sentManual;
     const header = createHeader({ ...sentHeader, ...(priceHeader as BookingHeader), ...(manual === undefined ? {} : { manual_total: manual }) }, actor, new Date().toISOString());
+    return { actor, input, header, priced };
+  }
+  /** The create's writes, inside the caller's transaction. `exclude` leaves a hold being converted out of the seats. */
+  async function writeBooking(request: FastifyRequest, body: unknown, plan: Awaited<ReturnType<typeof planBooking>>, exclude: Exclusion = {}): Promise<Booking> {
+    const { actor, input, header, priced } = plan;
     const q = priced?.quote;
-    const created = await store.transaction(async () => {
-      const attachments = await bookingFiles(record(request.body), [], actor, input.upgrades);
-      const booking = await store.createBooking({
-        ...input, header, ...(attachments ? { attachments } : {}),
-        ...(priced ? { rate_type_ref: priced.rateTypeRef ?? undefined } : {}),
-        ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
-      }, actor);
-      await syncAltParts(booking);
-      // Love Kingdom resent an order it had held, and now it books: the held one is settled.
-      if (isB2CPush(request.user?.user) && booking.external_id) await resolveHeldCreates(booking.external_id, booking.id, actor);
-      if (!q) return (await store.booking(booking.id))!;
-      await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
-      return (await store.booking(booking.id))!;
-    });
+    const attachments = await bookingFiles(record(body), [], actor, input.upgrades);
+    const booking = await store.createBooking({
+      ...input, header, ...(attachments ? { attachments } : {}),
+      ...(priced ? { rate_type_ref: priced.rateTypeRef ?? undefined } : {}),
+      ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
+    }, actor, exclude);
+    await syncAltParts(booking);
+    // Love Kingdom resent an order it had held, and now it books: the held one is settled.
+    if (isB2CPush(request.user?.user) && booking.external_id) await resolveHeldCreates(booking.external_id, booking.id, actor);
+    if (!q) return (await store.booking(booking.id))!;
+    await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
+    return (await store.booking(booking.id))!;
+  }
+  function bookingAnswer(request: FastifyRequest, plan: Awaited<ReturnType<typeof planBooking>>, created: Booking) {
+    const { input, priced } = plan;
     const warnings = priced ? [...replacedPrices(input.header, priced.header), ...priced.quote.warnings] : [];
     return withIssues(request, warnings.length ? { ...created, price_warnings: warnings } : created);
   }
@@ -1879,6 +1900,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       today: todayInThailand(), admin: !user || user.role === 'admin', removeAnyway: anyway, boatName: boat?.name ?? boatId,
       catalogueLicense: boat?.license_pax,
       placedBefore: before ? placedOn(await store.bookingsOn(date, before.route_id), boatId, before.route_id, date) : { bookings: 0, pax: 0, charter: null },
+      heldBy: before ? (await store.lockRows({ serviceDate: date, routeId: before.route_id, boat: true })).find((l) => l.boat_id === boatId && l.status === 'active')?.id ?? null : null,
     });
     // A boat not ready that day (fleet decision 2): legacy's Boat Operation offers only ready boats and its
     // bulk forms skip the rest, so putting one on a route (or another route) needs `deploy_anyway`.
@@ -2514,16 +2536,33 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   const optionalDay = (value: unknown, name: string): string | undefined => (value === undefined || value === '' ? undefined : isoDay(value, name));
   app.get('/v1/seat-locks', { schema: docs.listLocks }, async (request) => {
     const query = request.query as Record<string, unknown>;
+    const kind = query.kind === undefined || query.kind === '' ? undefined : query.kind === 'boat' ? true : query.kind === 'seats' ? false
+      : badRequest('kind must be boat (whole-boat holds) or seats (every other lock)');
     return { seat_locks: await locks.list({
       routeId: optionalString(query.route_id), serviceDate: optionalDay(query.service_date ?? query.date, 'service_date'),
       from: optionalDay(query.from, 'from'), to: optionalDay(query.to, 'to'), groupId: optionalString(query.group_id),
-      parentIds: optionalString(query.parent_id) ? [optionalString(query.parent_id)!] : undefined, agentId: optionalString(query.agent_id),
+      parentIds: optionalString(query.parent_id) ? [optionalString(query.parent_id)!] : undefined, agentId: optionalString(query.agent_id), boat: kind,
     }) };
   });
+  /** A lock, or with `boat_id` a whole-boat hold (legacy's Hold-whole-boat form, `boat-hold-service.ts`). */
   app.post('/v1/seat-locks', { schema: docs.createLock }, async (request, reply) => {
+    if (isHoldRequest(request.body)) {
+      const hold = parseNewHold(request.body);
+      return reply.code(201).send(await store.transaction(() => holds.create(hold, by(request))));
+    }
     const input = parseNewLock(request.body);
     return reply.code(201).send(await store.transaction(() => locks.create(input, by(request))));
   });
+  /** Legacy's boat list in the hold form (`bkV2BoatLockPickList`): `lock_id` is the hold being edited. */
+  app.get('/v1/seat-locks/boat-options', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const routeId = string(query.route_id, 'route_id'), date = isoDay(query.service_date ?? query.date, 'service_date');
+    const ownId = optionalString(query.lock_id);
+    const own = ownId ? (await store.lockRows({ ids: [ownId] }))[0] ?? lockNotFound() : undefined;
+    return holds.options(routeId, date, own);
+  });
+  /** The stored row of the lock in the path, for the hold commands. */
+  const lockRowOf = async (request: { params: unknown }) => (await store.lockRows({ ids: [lockId(request)] }))[0];
   /** Legacy `bkV2LockReleaseOverdueGo`: every overdue lock of the day that still holds seats. */
   app.post('/v1/seat-locks/release-overdue', async (request) => {
     const body = record(request.body ?? {});
@@ -2534,10 +2573,16 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.get('/v1/seat-locks/:id/log', async (request) => ({ events: (await locks.log(lockId(request))) ?? lockNotFound() }));
   /** Client facts only; a server-owned field with a new value is `400 server_owned`, naming the command. */
   app.patch('/v1/seat-locks/:id', async (request) => {
-    const changes = parseLockChanges(withoutVersion(request.body));
     return store.transaction(async () => {
       await assertLockFresh(request);
       const current = (await locks.lock(lockId(request))) ?? lockNotFound();
+      if (current.boat_id) {
+        // A whole-boat hold: legacy's edit form (`bkV2BoatLockEdit`), its boat and deal included.
+        const changes = parseHoldChanges(withoutVersion(request.body));
+        assertHoldOwnedEcho(request.body, current);
+        return holds.amend((await lockRowOf(request))!, changes, by(request));
+      }
+      const changes = parseLockChanges(withoutVersion(request.body));
       assertOwnedEcho(request.body, current);
       return (await locks.amend(lockId(request), changes, by(request))) ?? lockNotFound();
     });
@@ -2547,14 +2592,45 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const input = parseAdd(withoutVersion(request.body));
     return store.transaction(async () => { await assertLockFresh(request); return (await locks.add(lockId(request), input, by(request))) ?? lockNotFound(); });
   });
+  /** A whole-boat hold goes whole (legacy `bkV2BoatLockRelease`): a number of seats means nothing to it. */
+  const releaseHold = async (request: { params: unknown; user?: unknown }, seats: number | undefined) => {
+    const row = await lockRowOf(request);
+    if (!row?.boat_id) return undefined;
+    if (seats !== undefined) refuseWith('A whole-boat hold is released whole: send no pax', 400, 'boat_hold');
+    return holds.release(row, by(request));
+  };
   app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => {
     const seats = parseRelease(withoutVersion(request.body));
-    return store.transaction(async () => { await assertLockFresh(request); return (await locks.release(lockId(request), seats, by(request))) ?? lockNotFound(); });
+    return store.transaction(async () => {
+      await assertLockFresh(request);
+      return (await releaseHold(request, seats)) ?? (await locks.release(lockId(request), seats, by(request))) ?? lockNotFound();
+    });
   });
   app.post('/v1/seat-locks/:id/release-departure', async (request) => store.transaction(async () => {
     await assertLockFresh(request);
-    return (await locks.releaseDeparture(lockId(request), by(request))) ?? lockNotFound();
+    return (await releaseHold(request, undefined)) ?? (await locks.releaseDeparture(lockId(request), by(request))) ?? lockNotFound();
   }));
+  /**
+   * Legacy "เหมาลำ" on a hold (`bkV2BoatLockToCharter` → the booking form → `bkV2BoatLockOnConvert`):
+   * a booking create whose body is filled from the hold where it is silent, and the hold `converted`,
+   * in one transaction. The booking is weighed with the hold left out, so its boat is free to it alone.
+   */
+  app.post('/v1/seat-locks/:id/convert', async (request, reply) => {
+    const before = (await lockRowOf(request)) ?? lockNotFound();
+    holds.convertible(before);
+    const body = convertBody(withoutVersion(request.body), before);
+    const plan = await planBooking(request, body);
+    assertConverts(plan.input.trips, plan.input.intent, before);
+    const done = await store.transaction(async () => {
+      await assertLockFresh(request);
+      const row = (await lockRowOf(request)) ?? lockNotFound();
+      holds.convertible(row);
+      assertConverts(plan.input.trips, plan.input.intent, row);
+      const booking = await writeBooking(request, body, plan, { lockId: row.id });
+      return { booking, seat_lock: await holds.converted(row, booking.id, by(request)) };
+    });
+    return reply.code(201).send({ booking: bookingAnswer(request, plan, done.booking), seat_lock: done.seat_lock });
+  });
   app.post('/v1/seat-locks/:id/confirm-pending', async (request) => {
     const want = parseConfirm(withoutVersion(request.body));
     return store.transaction(async () => { await assertLockFresh(request); return (await locks.confirmPending(lockId(request), want, by(request))) ?? lockNotFound(); });

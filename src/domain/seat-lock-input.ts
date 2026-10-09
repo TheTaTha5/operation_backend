@@ -5,8 +5,10 @@
  */
 import { isIsoTime } from './calendar.js';
 import { refuse } from './booking-actions.js';
-import { isHolderType, type HolderType, type PendingChoice, type SeatLock, type SeatLockGroup } from './seat-locks.js';
+import { isHolderType, type BoatDeal, type HolderType, type PendingChoice, type SeatLock, type SeatLockGroup } from './seat-locks.js';
 import type { AddInput, GroupChanges, LockChanges, NewGroupInput, NewLockInput, SubGroupInput } from './seat-lock-service.js';
+import type { HoldChanges, NewHoldInput } from './boat-hold-service.js';
+import { isBoatDeal } from './boat-holds.js';
 
 const bad = (message: string): never => refuse(message, 400);
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -54,14 +56,53 @@ export function parseNewLock(raw: unknown): NewLockInput {
   };
 }
 
+/** A whole-boat hold (`boat_id`): legacy's Hold-whole-boat form (§bkLock). Its rules are `boat-holds.ts`. */
+export const isHoldRequest = (raw: unknown): boolean => isRecord(raw) && raw.boat_id !== undefined && raw.boat_id !== null;
+const boatDeal = (value: unknown): BoatDeal => (isBoatDeal(value) ? value : bad('boat_deal must be "fixed" (this boat) or "any" (any boat that big)'));
+const minimum = (value: unknown): number => (typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : bad('Enter the minimum seats promised: pax must be a positive integer'));
+
+export function parseNewHold(raw: unknown): NewHoldInput {
+  const input = body(raw);
+  if (input.pending !== undefined && input.pending !== null) bad('pending does not apply to a whole-boat hold: it takes a boat, not seats');
+  return {
+    route_id: text(input.route_id, 'route_id'), service_date: isoDay(input.service_date ?? input.date, 'service_date'), boat_id: text(input.boat_id, 'boat_id'),
+    pax: minimum(input.pax), boat_deal: optional(input, 'boat_deal', boatDeal) ?? 'fixed', ...holderOf(input),
+    reason: optional(input, 'reason', (v) => note(v, 'reason', MAX_REASON)) ?? null,
+    expiry: input.expiry === undefined || input.expiry === null || input.expiry === '' ? null : isoDay(input.expiry, 'expiry'),
+  };
+}
+
+export function parseHoldChanges(raw: unknown): HoldChanges {
+  const input = body(raw);
+  if (input.pending !== undefined && input.pending !== null) bad('pending does not apply to a whole-boat hold: it takes a boat, not seats');
+  if (input.sub_name !== undefined) bad('A whole-boat hold has no sub-groups');
+  const anyway = input.change_boat_anyway;
+  if (anyway !== undefined && typeof anyway !== 'boolean') bad('change_boat_anyway must be true or false');
+  const out: HoldChanges = {
+    route_id: optional(input, 'route_id', (v) => text(v, 'route_id')),
+    service_date: optional(input, 'service_date', (v) => isoDay(v, 'service_date')),
+    boat_id: optional(input, 'boat_id', (v) => text(v, 'boat_id')),
+    pax: optional(input, 'pax', minimum),
+    boat_deal: optional(input, 'boat_deal', boatDeal),
+    holder_type: optional(input, 'holder_type', holderType),
+    agent_id: optional(input, 'agent_id', agentId),
+    reason: optional(input, 'reason', (v) => note(v, 'reason', MAX_REASON)),
+    expiry: optional(input, 'expiry', (v) => (v === null || v === '' ? null : isoDay(v, 'expiry'))),
+    change_boat_anyway: anyway as boolean | undefined,
+  };
+  return Object.fromEntries(Object.entries(out).filter(([, v]) => v !== undefined)) as HoldChanges;
+}
+
 /** What `PATCH` may not set, and the command that does. */
 const OWNED: Record<string, string> = {
-  status: 'use POST /v1/seat-locks/{id}/release (or /add, which reactivates a released lock)',
+  status: 'use POST /v1/seat-locks/{id}/release (or /add, which reactivates a released lock; /convert turns a whole-boat hold into a charter)',
   pending_pax: 'it is set by the "pending" choice and POST /v1/seat-locks/{id}/confirm-pending',
   released_pax: 'use POST /v1/seat-locks/{id}/release or /release-departure',
   group_id: 'a bulk lock is made with POST /v1/seat-lock-groups',
   parent_id: 'a sub-group is made with POST /v1/seat-locks/{id}/sub-groups',
-  boat_id: 'whole-boat holds are made by the import only, for now',
+  boat_id: 'a seat lock cannot become a whole-boat hold: make one with POST /v1/seat-locks and boat_id',
+  boat_deal: 'only a whole-boat hold has a deal',
+  converted_booking_id: 'it is set by POST /v1/seat-locks/{id}/convert',
   drawn_pax: 'it is worked out from the bookings that draw on the lock',
   remaining_pax: 'it is worked out by the server', held_pax: 'it is worked out by the server', allocated_pax: 'it is worked out by the server',
   sub_group_room: 'it is worked out by the server', holding: 'it is worked out by the server', state: 'it is worked out by the server',
@@ -80,6 +121,9 @@ export function assertOwnedEcho(raw: unknown, current: SeatLock | SeatLockGroup,
     if (input[field] !== undefined && !same(input[field], (current as Record<string, unknown>)[field])) refuse(`${field} cannot be changed with PATCH: ${instead}`, 400, 'server_owned');
   }
 }
+/** A hold's `PATCH` moves its boat and changes its deal; the rest is owned as on any lock. */
+const HOLD_OWNED: Record<string, string> = Object.fromEntries(Object.entries(OWNED).filter(([field]) => field !== 'boat_id' && field !== 'boat_deal'));
+export const assertHoldOwnedEcho = (raw: unknown, current: SeatLock): void => assertOwnedEcho(raw, current, HOLD_OWNED);
 
 export function parseLockChanges(raw: unknown): LockChanges {
   const input = body(raw);

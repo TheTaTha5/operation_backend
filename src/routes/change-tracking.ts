@@ -43,6 +43,8 @@ type Snapshot = {
   boat?: { id: string; days: Map<string, string>; overrideRoute?: string };
   /** A reorder: every route's place before it. */
   sorts?: Map<string, number | undefined>;
+  /** A whole-boat hold write: the deployments of the days it may place a boat on, by `date:boat`, with their route. */
+  holdDays?: { dates: string[]; deployments: Map<string, string> };
 };
 
 const params = (r: FastifyRequest) => (r.params ?? {}) as Record<string, string>;
@@ -140,7 +142,23 @@ async function snapshot(store: Store, r: FastifyRequest): Promise<Snapshot> {
     if (params(r).date) boat.overrideRoute = (await store.listDeployments(params(r).date, params(r).date)).find((d) => d.boat_id === id)?.route_id;
   }
   const sorts = url(r) === '/v1/routes/order' ? new Map((await store.listRoutes()).map((x) => [x.id, x.sort])) : undefined;
-  return { bookings, invoices, vanDay, deployment, held, boat, sorts };
+  // Making or moving a whole-boat hold places its boat on the route (a deployment), as legacy's cell.
+  let holdDays: Snapshot['holdDays'];
+  if ((url(r) === '/v1/seat-locks' && r.method === 'POST' && body(r).boat_id) || (url(r) === '/v1/seat-locks/:id' && r.method === 'PATCH')) {
+    const current = params(r).id ? (await store.lockRows({ ids: [params(r).id] }))[0] : undefined;
+    if (!params(r).id || current?.boat_id) {
+      const dates = [...new Set([current?.service_date, body(r).service_date ?? body(r).date].filter((d): d is string => typeof d === 'string' && d.length > 0))];
+      holdDays = { dates, deployments: await deploymentsOn(store, dates) };
+    }
+  }
+  return { bookings, invoices, vanDay, deployment, held, boat, sorts, holdDays };
+}
+
+/** Every deployment on the dates, `date:boat` → route. */
+async function deploymentsOn(store: Store, dates: readonly string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  for (const date of dates) for (const d of await store.listDeployments(date, date)) out.set(`${d.service_date}:${d.boat_id}`, d.route_id);
+  return out;
 }
 
 /** A boat's deployments from today, each as one comparable string, by `date|route`. */
@@ -169,6 +187,22 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
   if (path === '/v1/bookings' && r.method === 'POST') {
     const id = (result as { id?: string } | undefined)?.id;
     if (id) await booking(id, true);
+  }
+  // A whole-boat hold converted into a charter booking: the booking is new.
+  if (path === '/v1/seat-locks/:id/convert') {
+    const id = (result as { booking?: { id?: string } } | undefined)?.booking?.id;
+    if (id) await booking(id, true);
+  }
+  // A hold placed its boat on a route that day, or moved it with the hold.
+  if (before.holdDays) {
+    const after = await deploymentsOn(store, before.holdDays.dates);
+    for (const key of new Set([...before.holdDays.deployments.keys(), ...after.keys()])) {
+      const was = before.holdDays.deployments.get(key), now = after.get(key);
+      if (was === now) continue;
+      const [date, boat] = [key.slice(0, 10), key.slice(11)];
+      out.push({ kind: 'deployment', entity_id: `${date}:${boat}`, action: !now ? 'deleted' : was ? 'updated' : 'created',
+        route_days: [was, now].filter((x): x is string => !!x).map((route_id) => ({ route_id, service_date: date })), changed_by: by });
+    }
   }
   for (const id of before.bookings.keys()) await booking(id);
   if (before.vanDay) {
