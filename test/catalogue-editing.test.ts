@@ -366,7 +366,7 @@ test('a boat\'s seats for one day: operations, a reason, the unlock right to rai
 });
 
 test('pure rules: overlaps, stored status, family guesses, permissions', () => {
-  const e = (id: string, from: string, to: string | null) => ({ id, status: 'available' as const, from_date: from, to_date: to, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null });
+  const e = (id: string, from: string, to: string | null) => ({ id, status: 'available' as const, from_date: from, to_date: to, loc: null, province: null, loc_type: null, detail: null, note: null, reason: null, project_id: null, planned_over: null });
   let n = 0;
   const ids = () => `t${n++}`;
   // An entry spanning the new range is split around it; one inside it goes; one after it stays.

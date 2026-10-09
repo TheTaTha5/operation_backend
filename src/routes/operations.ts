@@ -48,6 +48,8 @@ import {
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { parseJobDate, parsePickupNameTh, sendFor, vanJobsDay } from '../domain/van-jobs.js';
 import { registerSalesRoutes } from './sales-editing.js';
+import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
+import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
@@ -629,11 +631,14 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * licence on file: claiming a registration the vessel does not hold would be worse than saying
    * there is none, and a missing licence is not a licence of zero.
    */
-  app.get('/v1/boats', async () => {
+  /** `status_effective` and `blocked_by`: today's status with open work (fleet's `boatEffStatus`) beside the log's own. */
+  const withAvailability = async (boats: BoatRecord[]) => {
     const today = todayInThailand();
-    return { boats: (await store.boatRecords()).map((boat) => boatView(boat, today)) };
-  });
-  app.get('/v1/boats/:id', async (request) => boatView((await store.boatRecord(paramId(request))) ?? notFound('Boat not found'), todayInThailand()));
+    const ready = await boatsAvailableToday(store, boats);
+    return boats.map((boat) => ({ ...boatView(boat, today), status_effective: ready.get(boat.id)!.status, blocked_by: ready.get(boat.id)!.blocked_by }));
+  };
+  app.get('/v1/boats', async () => ({ boats: await withAvailability(await store.boatRecords()) }));
+  app.get('/v1/boats/:id', async (request) => (await withAvailability([(await store.boatRecord(paramId(request))) ?? notFound('Boat not found')]))[0]);
 
   // ── Editing the catalogue (todo/catalogue-editing-model.md, decided 2026-10-09). The rules are
   //    `src/domain/catalogue.ts`'s; these gather rows and write what it answers. ──
@@ -779,20 +784,32 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   }));
   /** The status timeline (legacy `saveStatus`, `editStatus`, `delStatus`), `config`. */
   const entryId = (request: { params: unknown }): string => (request.params as { entry_id: string }).entry_id;
+  /**
+   * An `available` entry while open work still holds the boat on its first day is legacy's confirm
+   * (`§boatPlanAhead`): `409 open_work`, or with `plan_ahead: true` the boat is planned ahead of it.
+   */
+  const plannedEntry = async (current: BoatRecord, saved: { log: BoatRecord['status_log']; entry: BoatRecord['status_log'][number] }, confirmed: boolean) => {
+    const entry = planAhead(saved.entry, current.name, current.id, await openWork(store, current.id), confirmed);
+    return { log: saved.log.map((e) => (e.id === entry.id ? entry : e)), entry };
+  };
   app.post('/v1/boats/:id/status-log', async (request, reply) => {
-    const fields = parseStatusEntry(record(request.body));
+    const { plan_ahead: planRaw, ...rest } = record(request.body);
+    const confirmed = anywayFlag(planRaw, 'plan_ahead');
+    const fields = parseStatusEntry(rest);
     return reply.code(201).send(await store.transaction(async () => {
       const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
-      const { log, entry } = addStatusEntry(current.status_log, fields, Date.now());
+      const { log, entry } = await plannedEntry(current, addStatusEntry(current.status_log, fields, Date.now()), confirmed);
       await store.writeBoat({ ...current, status_log: log }, new Date().toISOString());
       return entry;
     }));
   });
   app.patch('/v1/boats/:id/status-log/:entry_id', async (request) => {
-    const fields = parseStatusEntry(record(request.body));
+    const { plan_ahead: planRaw, ...rest } = record(request.body);
+    const confirmed = anywayFlag(planRaw, 'plan_ahead');
+    const fields = parseStatusEntry(rest);
     return store.transaction(async () => {
       const current = (await store.boatRecord(paramId(request))) ?? notFound('Boat not found');
-      const { log, entry } = editStatusEntry(current.status_log, entryId(request), fields);
+      const { log, entry } = await plannedEntry(current, editStatusEntry(current.status_log, entryId(request), fields), confirmed);
       await store.writeBoat({ ...current, status_log: log }, new Date().toISOString());
       return entry;
     });
@@ -1842,27 +1859,33 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     if (value === true || value === 'true') return true;
     return badRequest('remove_anyway must be true or false');
   };
-  const guardDeployment = async (request: { user?: { user?: StoredUser } }, date: string, boatId: string, after: Deployment | undefined, anyway: boolean) => {
+  const guardDeployment = async (request: { user?: { user?: StoredUser } }, date: string, boatId: string, after: Deployment | undefined, anyway: boolean, deployAnyway = false) => {
     const before = (await store.listDeployments(date, date)).find((d) => d.boat_id === boatId);
     const boat = (await store.listBoats()).find((b) => b.id === boatId);
+    const boatRecord = await store.boatRecord(boatId);
     // A retired boat is hidden from legacy's Boat Operation, so it can't be put on a route (catalogue decision 13).
-    if (after && (await store.boatRecord(boatId))?.retired) refuseWith(`${boat?.name ?? boatId} is retired: restore it before deploying it`, 409, 'boat_retired');
+    if (after && boatRecord?.retired) refuseWith(`${boat?.name ?? boatId} is retired: restore it before deploying it`, 409, 'boat_retired');
     const user = request.user?.user;
-    return {
-      before,
-      warnings: checkDeploymentChange(before, after, {
-        today: todayInThailand(), admin: !user || user.role === 'admin', removeAnyway: anyway, boatName: boat?.name ?? boatId,
-        catalogueLicense: boat?.license_pax,
-        placedBefore: before ? placedOn(await store.bookingsOn(date, before.route_id), boatId, before.route_id, date) : { bookings: 0, pax: 0, charter: null },
-      }),
-    };
+    const warnings: (ReturnType<typeof checkDeploymentChange>[number] | ReadinessWarning)[] = checkDeploymentChange(before, after, {
+      today: todayInThailand(), admin: !user || user.role === 'admin', removeAnyway: anyway, boatName: boat?.name ?? boatId,
+      catalogueLicense: boat?.license_pax,
+      placedBefore: before ? placedOn(await store.bookingsOn(date, before.route_id), boatId, before.route_id, date) : { bookings: 0, pax: 0, charter: null },
+    });
+    // A boat not ready that day (fleet decision 2): legacy's Boat Operation offers only ready boats and its
+    // bulk forms skip the rest, so putting one on a route (or another route) needs `deploy_anyway`.
+    if (after && boatRecord && (!before || before.route_id !== after.route_id)) {
+      const ready = checkBoatReady(boatRecord.name, availability(boatRecord, date, await openWork(store, boatId)), deployAnyway);
+      if (ready) warnings.push(ready);
+    }
+    return { before, warnings };
   };
   app.post('/operations/deployments', async (request, reply) => {
     const body = record(request.body);
     const input = deployment(body);
     const anyway = removeAnyway(body.remove_anyway);
+    const deployAnyway = anywayFlag(body.deploy_anyway, 'deploy_anyway');
     return reply.code(201).send(await store.transaction(async () => {
-      const { warnings } = await guardDeployment(request, input.service_date, input.boat_id, input, anyway);
+      const { warnings } = await guardDeployment(request, input.service_date, input.boat_id, input, anyway, deployAnyway);
       const saved = await store.createDeployment(input);
       return warnings.length ? { ...saved, warnings } : saved;
     }));
@@ -1883,6 +1906,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * insurance: `sales-editing.ts` (todo/sales-editing-model.md).
    */
   registerSalesRoutes(app, { store, assertBookingFresh, agentCredit });
+  /** Fleet maintenance, part A: availability, engines/gearboxes/propellers, incidents, jobs (`fleet.ts`). */
+  registerFleetRoutes(app, { store });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an

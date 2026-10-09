@@ -104,6 +104,9 @@ export function writeNeed(path: string): WriteNeed {
   // on routes, families and boats its `config` (`save('config')`, decision 2).
   if (/^\/v1\/boats\/[^/]+\/capacity-overrides(\/|$)/.test(path)) return { kind: 'area', areas: ['operations'] };
   if (/^\/v1\/boats\/[^/]+\/(retire|restore)$/.test(path)) return { kind: 'area', areas: ['fleet'] };
+  // Fleet maintenance, part A (todo/fleet-maintenance-model.md): assets, incidents and jobs are legacy's
+  // `fleet` (`flSave`), job starts and closes included though they write the boat's status log.
+  if (/^\/v1\/fleet\/(engines|gearboxes|propellers|incidents|jobs)(\/|$)/.test(path)) return { kind: 'area', areas: ['fleet'] };
   if (path === '/v1/boats' || path.startsWith('/v1/boats/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/route-families' || path.startsWith('/v1/route-families/')) return { kind: 'area', areas: ['config'] };
   if (path === '/v1/routes' || path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
