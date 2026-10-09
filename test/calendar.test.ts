@@ -72,3 +72,10 @@ test('date stepping survives month, year and leap boundaries', () => {
   assert.deepEqual([...eachDate('2026-08-27', '2026-08-26')], [], 'reversed range yields nothing');
   assert.equal([...eachDate('2026-01-01', '2026-12-31')].length, 365);
 });
+
+test('a date is a real calendar day, not just its shape', async () => {
+  const { isIsoDate } = await import('../src/domain/calendar.js');
+  assert.equal(isIsoDate('2062-01-31'), true);
+  assert.equal(isIsoDate('2028-02-29'), true, 'a leap day');
+  for (const bad of ['2062-01-32', '2027-02-29', '2026-13-01', '2026-00-10', '2026-1-01', 'tomorrow']) assert.equal(isIsoDate(bad), false, bad);
+});
