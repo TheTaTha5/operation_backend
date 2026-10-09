@@ -55,6 +55,7 @@ import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 import { mapLegacyMoney } from './legacy-invoices.js';
+import { groupOrders, jobNotes, sentMarks, thaiNames, type ImportedGroup } from './legacy-van-jobs.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -194,6 +195,10 @@ async function main() {
     const vanDrivers = await read('SELECT key, driver, phone, plate FROM vanjob_driver');
     const vanLogRows = await read('SELECT sb_vehicles_id, idx, at, kind, text FROM sb_vehicles__log ORDER BY sb_vehicles_id, idx');
     const vanSent = await read('SELECT key, value FROM vanjob_sent');
+    // Van job orders (migration 080): special requests, Thai pickup names, the order staff put groups in.
+    const vanSreq = await read('SELECT key, value FROM vanjob_sreq');
+    const vanPickupTh = await read('SELECT key, value FROM vanjob_pickup_th');
+    const groupOrderMeta = await read("SELECT value FROM app_meta WHERE key = 'bkv2_grp_order'");
     const legacyMarkets = await read('SELECT * FROM sb_markets');
     const legacyMarketSubs = await read('SELECT sb_markets_id, idx, value FROM sb_markets__subs ORDER BY sb_markets_id, idx');
     const legacySales = await read('SELECT * FROM sb_sales');
@@ -356,7 +361,7 @@ async function main() {
     const vanDays = new Map<string, Row>();
     const vanDay = (vanId: string, day: string): Row => {
       const key = `${vanId}|${day}`;
-      return vanDays.get(key) ?? vanDays.set(key, { van_id: vanId, service_date: day, status: null, zone: null, driver: null, driver_phone: null, plate: null, sent_at: null }).get(key)!;
+      return vanDays.get(key) ?? vanDays.set(key, { van_id: vanId, service_date: day, status: null, zone: null, driver: null, driver_phone: null, plate: null }).get(key)!;
     };
     // Legacy's dayZone map became one column per date on sb_vehicles (`dayzone_2026_06_12`).
     for (const v of legacyVans) {
@@ -386,15 +391,7 @@ async function main() {
       if (!day || !ISO_DAY.test(day) || !vanIds.has(vanId ?? '')) { note('day drivers dropped: bad key or unknown van'); continue; }
       Object.assign(vanDay(vanId!, day), { driver: str(d.driver) || null, driver_phone: str(d.phone) || null, plate: str(d.plate) || null });
     }
-    for (const s of vanSent) {
-      // `date::vanId[~route[~group]]`: several per van when sent per route or group; the latest stands.
-      const [day, rest] = str(s.key).split('::');
-      const vanId = (rest ?? '').split('~')[0];
-      const at = instant(jsonValue(s.value));
-      if (!day || !ISO_DAY.test(day) || !vanIds.has(vanId) || !at) { note('sent-to-driver marks dropped: bad key, unknown van or no time'); continue; }
-      const row = vanDay(vanId, day);
-      if (!row.sent_at || String(row.sent_at) < at) row.sent_at = at;
-    }
+    // "Sent to the driver" is per job (migration 080): it lands on the van groups, once they are known below.
 
     // ── Bookings: all-or-nothing per booking, so no booking arrives missing a day ──
     const tripsOf = new Map<string, Row[]>();
@@ -603,6 +600,9 @@ async function main() {
     const approvalDayLicensedFree = (await target.query(`SELECT 1 FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = 'booking_approval_days' AND column_name = 'licensed_free'`)).rowCount === 1;
     const report = { skip, note };
+    // The special request a job order prints (legacy VANJOB_SREQ), by legacy booking id; "" = blanked.
+    const jobNoteOf = jobNotes(vanSreq);
+    for (const id of jobNoteOf.keys()) if (!legacyBookings.some((b) => str(b.id) === id)) note('special requests dropped: booking not in legacy');
     for (const b of legacyBookings) {
       const legacyId = str(b.id);
       const status = str(b.status);
@@ -699,7 +699,7 @@ async function main() {
       const created = instant(b.bookedat) ?? instant(b.createdat) ?? new Date().toISOString();
       bookings.push({
         ...header,
-        id, status, external_id: legacyId,
+        id, status, external_id: legacyId, job_note: jobNoteOf.get(legacyId) ?? null,
         agent_id: str(b.agentid) || null, voucher_ref: str(b.voucherref) || null, rate_type_ref: str(b.ratetyperef) || null,
         booking_mode: myTrips[0]!.booking_mode,
         cancellation_reason: str(b.cancellation_reason) || str(b.cancelreason) || null,
@@ -872,9 +872,21 @@ async function main() {
       if (distinct.length > 1) conflicts.push(`${g.day} ${g.route} ${g.zone} group ${number}: members on ${distinct.join(', ')} — imported with no van`);
       const id = `${PREFIX}vgrp_${g.day}_${g.route}_${number}`;
       groupIdOf.set(key, id);
-      vanGroups.push({ id, service_date: g.day, route_id: g.route, zone: g.zone, number, van_id: distinct.length === 1 ? distinct[0] : null, return_van_id: null, pickup_time: null });
+      vanGroups.push({ id, service_date: g.day, route_id: g.route, zone: g.zone, number, van_id: distinct.length === 1 ? distinct[0] : null, return_van_id: null, pickup_time: null, display_order: null });
     }
     for (const a of allocations) { a.van_group_id = a.group_key ? groupIdOf.get(String(a.group_key)) ?? null : null; delete a.group_key; }
+
+    // ── Van job orders (migration 080, legacy-van-jobs.ts): the group order, the sent marks, the Thai names ──
+    const order = groupOrders(groupOrderMeta[0]?.value, (day, route, zone, n) => groupIdOf.get(`${day}|${route}|${zone}|${n}`), note);
+    for (const g of vanGroups) g.display_order = order.get(String(g.id)) ?? null;
+    const imported: ImportedGroup[] = keys.map((key) => {
+      const g = groupMembers.get(key)!, id = groupIdOf.get(key)!;
+      return { id, day: g.day, route: g.route, zone: g.zone, legacyNumber: g.number, van: (vanGroups.find((x) => x.id === id)?.van_id as string | null) ?? null };
+    });
+    const tripAt = new Map(trips.map((t) => [String(t.id), `${t.service_date}|${t.route_id}`]));
+    const returnRuns = new Set(allocations.filter((a) => a.return_van_id).map((a) => `${tripAt.get(String(a.booking_trip_id))}|${a.return_van_id}`));
+    const jobSends = sentMarks(vanSent, imported, returnRuns, note);
+    const pickupNames = thaiNames(vanPickupTh, note);
 
     // ── Agents, their markets and salespeople. Legacy ids are kept, because bookings and seat locks
     //    already carry them in `agent_id`. Upserted like vans; an agent's programmes and activity are
@@ -1178,6 +1190,12 @@ async function main() {
     await insert('booking_trip_operations', tripOps);
     await insert('booking_trip_boat_splits', boatSplitRows);
     await insert('booking_trip_van_allocations', allocations);
+    // Marks on imported groups went with them; a return-only mark is an imported van's dated row, replaced like the others.
+    await target.query('DELETE FROM van_job_sends WHERE group_id IS NULL AND van_id = ANY($1::text[])', [importedVans]);
+    await insert('van_job_sends', jobSends);
+    // Legacy is the Thai names' master until operations cuts over: replaced whole.
+    await target.query('DELETE FROM pickup_name_th');
+    await insert('pickup_name_th', pickupNames);
 
     const { rows: [after] } = await target.query(`SELECT
       (SELECT count(*) FROM bookings)::int bookings, (SELECT count(*) FROM booking_trips)::int trips,
@@ -1204,6 +1222,9 @@ async function main() {
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
+    console.log(`van job orders: ${jobSends.length} of ${vanSent.length} sent marks (${jobSends.filter((s) => !s.group_id).length} return-only), `
+      + `${bookings.filter((b) => b.job_note !== null).length} special requests (${bookings.filter((b) => b.job_note === '').length} blanked), `
+      + `${pickupNames.length} of ${vanPickupTh.length} Thai pickup names, ${order.size} groups ordered`);
     console.log(`agents: ${agents.length} agents, ${agentPrograms.length} programmes, ${agentActivity.length} activity entries, ${markets.length} markets, ${subs.length} sub-markets, ${salesPeople.length} salespeople`);
     if (!withRateTypes) console.log('rate types: not imported (this API is their master since 2026-10-09; --rate-types seeds an empty database)');
     else console.log(`rate types: ${rateTypes.rateTypes.length} of ${legacyRateTypes.rates.length}, ${rateTypes.routes.length} routes, ${rateTypes.seat.length} seat prices, `
