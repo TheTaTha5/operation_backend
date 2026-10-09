@@ -32,7 +32,8 @@ are done.*
    are demo data.
 8. Files go to `/v1/attachments` (not `/api/attach`), and are shown through a fetch with the Bearer
    header.
-9. Deployments handle `409 seats_sold` with `remove_anyway`; seat locks send `If-Match`.
+9. Deployments handle `409 seats_sold` with `remove_anyway`; seat locks send `If-Match`, save bulk
+   locks, sub-groups, pending seats, expiry and reason to the API, and read every number back (§6.1).
 10. Live updates come from `GET /v1/changes/stream`. The 30 s, 60 s and 120 s polls go.
 11. Programs, the boat form, Boat Status and the day-seats dialog save to `/v1/routes`,
     `/v1/route-families` and `/v1/boats` (§3.14). Routes and boats are the API's now.
@@ -1080,17 +1081,44 @@ whole availability cache after any write. Legacy's `_laStartSSE` (`EventSource('
 **Already right:** one server lock per route and day, diffed and rolled back; `drawn_pax`; the
 holder kept when the agent list is missing.
 
-**To do:**
-- Keep each lock's `version` (it has one, and an `ETag`) and send `If-Match` on
-  `PATCH /v1/seat-locks/{id}` and `POST /v1/seat-locks/{id}/release`. `409 stale_version` → reload
-  the locks and show the message.
-- A `PATCH` changes `pax` and `agent_id` only. A larger `pax` is capacity-checked (`409`); below
-  `drawn_pax` is `409` ("those seats are sold"). A lock on a closed day is `409 route_closed`.
-- Take a lock's used seats from `drawn_pax` after a booking save (refetch, or the feed), not from
-  `bookingV2DrawLock` / `bookingV2ReturnBookingDraws` counting locally.
+**Built here since (2026-10-09, migration 048, README "Agent seat locks"):** everything the Seat
+Locks tab keeps "for the session only" now has a home: bulk locks (`/v1/seat-lock-groups`, one lock
+per departure), sub-groups, pending seats, expiry, reason, holder type, released seats, the release
+cutoff (`overdue`) and the log. The server works out every number the tab shows.
+
+**To do (breaking where marked):**
+- Keep each lock's `version` (it has one, and an `ETag`) and send `If-Match` on every write to one
+  lock (`PATCH`, `release`, `add`, `release-departure`, `confirm-pending`, `sub-groups`) and to a bulk
+  lock. `409 stale_version` → reload the locks and show the message.
+- **Breaking:** a bulk lock is no longer sent as N day locks. Create it with
+  `POST /v1/seat-lock-groups` and read it back as one row (`GET /v1/seat-lock-groups`, "x / y
+  departures past" from `departures_past`/`departures`). "Grouping them again needs a group field on
+  the server": it is `group_id`.
+- **Breaking:** an agent lock needs a real agent (`400`), and a booking draws only from its own
+  agent's locks or office/global ones (`400 lock_other_agent`). Send `holder_type: "office"` for an
+  office hold, never a typed name as `agent_id`; put the name in `reason`.
+- **Breaking:** `PATCH` with a server-owned field changed (`status`, `pending_pax`, `released_pax`,
+  `group_id`, `parent_id`) is `400 server_owned`; unchanged it is ignored. Use the commands.
+- **Breaking:** short of seats is `409 seats_short` with `short: [{service_date, free, want, short}]`:
+  show the "ที่นั่งว่างไม่พอ" dialog from it and resend with `pending: "split"` or `"all"`, instead
+  of `bkV2LockShort` working it out in the browser. Confirm with `POST …/confirm-pending`.
+- **Breaking:** `pax` is what was asked; a release no longer lowers it. Legacy's `qty` is
+  `pax − released_pax`; send `pax` = edited `qty` + `released_pax`. Release with
+  `POST …/release { pax? }` (legacy's modal), and a departure with `POST …/release-departure`;
+  "release every overdue lock of the day" is `POST /v1/seat-locks/release-overdue`.
+- Read `held_pax`, `remaining_pax`, `pending_pax`, `state`, `holding`, `overdue` from the lock
+  instead of `bkV2LockHeldRemaining`, `bkV2LockDrawable`, `bkV2LockSubShares`, `bkV2LockOverdue` and
+  the expiry sweep (`bkV2LockExpireSweep` must stop writing `expired`: expiry is worked out on read).
+- Sub-groups: `POST /v1/seat-locks/{id}/sub-groups { sub_name, pax, reason? }`; a draw names the
+  sub-group's id in `lockDraws`. The audit, sweep and reconcile screens are not needed: `drawn_pax`
+  is counted from the bookings, never a counter.
+- The log: `GET /v1/seat-locks/{id}/log` (and `/v1/seat-lock-groups/{id}/log`) instead of `l.log`.
+  Draw and return lines are written by the server from booking saves; stop writing them.
 
 ```
-POST /v1/seat-locks   { "route_id": "r1", "service_date": "2026-10-12", "pax": 6, "agent_id": "a12" }
+POST /v1/seat-locks   { "route_id": "r1", "service_date": "2026-10-12", "pax": 6, "agent_id": "a12", "expiry": "2026-10-10", "reason": "Love Boom" }
+POST /v1/seat-lock-groups { "route_id": "r5", "date_from": "2026-11-01", "date_to": "2027-03-31", "weekdays": [2, 4], "pax": 30,
+                            "agent_id": "amrsvysasrifkh", "release_days_before": 2, "release_time": "15:00" }
 ```
 
 ### 6.2 Availability (`ops/50-ops-availability.js`)
@@ -1139,7 +1167,6 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Agent create/edit, programs, contracts, markets, salespeople, add-on catalogue, nationalities, insurance overrides | `ag*` (already shown read-only), `ct*`, `insPersist` | `legacy-replacement.md` §6, `agents.md` |
-| Seat-lock extras: sub-groups, pending seats, cutoff, expiry, reason, log, bulk grouping | `bookingV2Lock*` | `ops/30-ops-locks.js` header; `legacy-replacement.md` §5 (log) |
 | Fleet maintenance | `05-fleet.js` | `legacy-replacement.md` §9 (scope undecided) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
@@ -1246,6 +1273,7 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Boat form, Boat Status timeline, restore | `/v1/boats`, `/v1/boats/{id}`, `…/status-log`, `…/retire`, `…/restore` | To do |
 | Day-seats dialog (`boatCapSet`) | `PUT/DELETE /v1/boats/{id}/capacity-overrides/{date}` | To do |
 | Seat locks | `/v1/seat-locks…` | Partial (`If-Match`) |
+| Seat locks | `/v1/seat-locks…`, `/v1/seat-lock-groups…` | To do (§6.1: bulk locks, sub-groups, pending, expiry, log) |
 | Availability everywhere (`getAllotment`) | `GET /v1/availability`, `GET /operations/allotment` | Done |
 | Pickup time setup (areas, profiles, cells) | `/v1/pickup-areas…`, `/v1/pickup-time-profiles…` | To do |
 | Pickup time on the booking form | `GET /v1/pickup-time` | To do |

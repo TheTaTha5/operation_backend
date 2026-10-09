@@ -47,15 +47,18 @@ test('two people edit the same booking: the second save, made from the old copy,
   assert.equal((await send('PATCH', `/v1/bookings/${id}`, { lead_pax: 'X', version: 3 }, { 'if-match': '"2"' })).statusCode, 400, 'two that disagree');
 });
 
-test('a seat lock has a version too, and the client sets only its pax and agent', async () => {
+test('a seat lock has a version too, and PATCH refuses a server-owned field', async () => {
   const created = await send('POST', '/v1/seat-locks', { route_id: 'r1', service_date: '2042-01-03', pax: 2, version: 99 });
   assert.equal(created.statusCode, 201, created.body);
   assert.equal(created.json().version, 1);
   const id = created.json().id as string;
 
-  const grown = await send('PATCH', `/v1/seat-locks/${id}`, { pax: 3, status: 'released', version: 1 });
+  const owned = await send('PATCH', `/v1/seat-locks/${id}`, { pax: 3, status: 'released', version: 1 });
+  assert.deepEqual([owned.statusCode, owned.json().code], [400, 'server_owned'], 'status is not a client fact: the release command sets it');
+  assert.match(owned.json().message, /release/);
+  const grown = await send('PATCH', `/v1/seat-locks/${id}`, { pax: 3, status: 'active', version: 1 });
   assert.equal(grown.statusCode, 200, grown.body);
-  assert.deepEqual([grown.json().pax, grown.json().status, grown.json().version], [3, 'active', 2], 'status is not a client fact');
+  assert.deepEqual([grown.json().pax, grown.json().status, grown.json().version], [3, 'active', 2], 'an unchanged status echoed back is ignored');
   assert.equal((await send('PATCH', `/v1/seat-locks/${id}`, { pax: 4 }, { 'if-match': '"1"' })).json().code, 'stale_version');
   assert.equal((await send('POST', `/v1/seat-locks/${id}/release`, {}, { 'if-match': '"1"' })).statusCode, 409);
   const released = await send('POST', `/v1/seat-locks/${id}/release`, {}, { 'if-match': '"2"' });

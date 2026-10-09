@@ -35,6 +35,16 @@ test('a booking write without the version is 428; with it, it goes through', asy
 
 test('a seat-lock write without the version is 428', async () => {
   const lock = (await send('POST', '/v1/seat-locks', { route_id: 'r1', service_date: '2057-03-01', pax: 2 })).json();
+  assert.equal(lock.created_by, 'vreq-admin', 'the login made it');
   assert.equal((await send('POST', `/v1/seat-locks/${lock.id}/release`)).statusCode, 428);
   assert.equal((await send('POST', `/v1/seat-locks/${lock.id}/release`, { version: lock.version })).statusCode, 200);
+});
+
+test('a bulk-lock write without the version is 428 too; its log names the login', async () => {
+  const group = (await send('POST', '/v1/seat-lock-groups', { route_id: 'r1', date_from: '2057-03-02', date_to: '2057-03-03', pax: 1 })).json();
+  assert.equal((await send('PATCH', `/v1/seat-lock-groups/${group.id}`, { pax: 2 })).statusCode, 428);
+  assert.equal((await send('PATCH', `/v1/seat-lock-groups/${group.id}`, { pax: 2 }, { 'if-match': '"1"' })).statusCode, 200);
+  assert.equal((await send('PATCH', `/v1/seat-lock-groups/${group.id}`, { pax: 3, version: 1 })).json().code, 'stale_version');
+  const [created] = (await send('GET', `/v1/seat-lock-groups/${group.id}/log`)).json().events;
+  assert.deepEqual([created.type, created.by], ['create', 'vreq-admin']);
 });

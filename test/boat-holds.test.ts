@@ -3,10 +3,13 @@ import { after, test } from 'node:test';
 import type { InjectOptions } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { createStore } from '../src/routes/operations.js';
+import { SeatLockService } from '../src/domain/seat-lock-service.js';
 
 // Whole-boat holds (todo/boat-holds-model.md, approved 2026-10-09), on whichever store DATABASE_URL
 // selects. The API creates no holds yet (the import does), so the test makes one through the store.
 const store = createStore();
+const hold = (service_date: string, pax: number, boat_id: string) =>
+  store.transaction(async () => new SeatLockService(store).create({ route_id: 'r1', service_date, pax, holder_type: 'office', agent_id: null, reason: null, expiry: null, boat_id }));
 const app = buildApp({ store });
 after(async () => app.close());
 const send = (method: InjectOptions['method'], url: string, payload?: object) => app.inject({ method, url, ...(payload ? { payload } : {}) });
@@ -16,9 +19,9 @@ test('a hold takes its whole boat, as a charter does, whatever it promised', asy
   const date = '2059-02-01';
   await send('POST', '/operations/deployments', { boat_id: 'hb-held', route_id: 'r1', service_date: date, capacity: 38, license_pax: 47 });
   await send('POST', '/operations/deployments', { boat_id: 'hb-open', route_id: 'r1', service_date: date, capacity: 20, license_pax: 25 });
-  const hold = await store.transaction(async () => store.createLock({ route_id: 'r1', service_date: date, pax: 30, agent_id: 'hb-agent', boat_id: 'hb-held' }));
+  const held = await hold(date, 30, 'hb-held');
   const read = (await send('GET', `/v1/seat-locks?route_id=r1&service_date=${date}`)).json();
-  assert.equal(read.seat_locks.find((l: { id: string }) => l.id === hold.id).boat_id, 'hb-held');
+  assert.equal(read.seat_locks.find((l: { id: string }) => l.id === held.id).boat_id, 'hb-held');
 
   const seats = await day(date);
   assert.deepEqual([seats.available_seats, seats.locked_pax, seats.licensed_free], [20, 0, 25], 'all 38 (and its 47 licensed) out; the hold holds nothing more');
@@ -39,7 +42,7 @@ test('a hold takes its whole boat, as a charter does, whatever it promised', asy
 test('a hold whose boat is not deployed holds its seats as a plain lock', async () => {
   const date = '2059-02-02';
   await send('POST', '/operations/deployments', { boat_id: 'hb-only', route_id: 'r1', service_date: date, capacity: 40 });
-  await store.transaction(async () => store.createLock({ route_id: 'r1', service_date: date, pax: 12, agent_id: 'hb-agent', boat_id: 'hb-elsewhere' }));
+  await hold(date, 12, 'hb-elsewhere');
   const seats = await day(date);
   assert.deepEqual([seats.available_seats, seats.locked_pax], [28, 12]);
 });

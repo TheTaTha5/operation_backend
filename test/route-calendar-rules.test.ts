@@ -2,8 +2,13 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { buildApp } from '../src/app.js';
 import { assertRoutesOpen, isLegacyB2C, routeCalendar, type RouteSeason } from '../src/domain/calendar.js';
-import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type DayDemand } from '../src/domain/capacity.js';
+import { assertDayFits, capacityNumbers, dayCapacity, freeForLock, licenceShortfall, weighDay, type DayDemand } from '../src/domain/capacity.js';
 import { OperationsStore, tripsToCheckOpen, type BookingTripInput, type StoredTrip } from '../src/domain/operations.js';
+import { SeatLockService } from '../src/domain/seat-lock-service.js';
+
+/** A lock as the API makes one, on the in-process store. */
+const newLock = (store: OperationsStore, route_id: string, service_date: string, pax: number) =>
+  new SeatLockService(store).create({ route_id, service_date, pax, holder_type: 'office', agent_id: null, reason: null, expiry: null });
 
 // Closed days, land routes and a marine day with no boat: `README.md`, "Land routes and days with no boat".
 
@@ -57,7 +62,7 @@ test('a land route has no seat pool: any number sells, and available_seats is nu
   });
   assert.doesNotThrow(() => assertDayFits(day, demand('land', 500)));
   assert.equal(weighDay(day, demand('land', 500)), undefined, 'never over the allotment, so never waits for approval');
-  assert.doesNotThrow(() => assertLockFits(day, 300, 0));
+  assert.equal(freeForLock(day), null, 'a lock is never short of seats there');
 });
 
 test('a marine day with no boat sells ungated, and says how many wait for a boat', () => {
@@ -67,7 +72,7 @@ test('a marine day with no boat sells ungated, and says how many wait for a boat
   assert.doesNotThrow(() => assertDayFits(day, demand('r1', 30)));
   assert.equal(weighDay(day, demand('r1', 30)), undefined);
   assert.equal(licenceShortfall(day, demand('r1', 30)), 0, 'no over-licence warning without a licence to be over');
-  assert.doesNotThrow(() => assertLockFits(day, 20, 0), 'a lock too: legacy treats no boat as no limit (bookingV2LockFreeOn)');
+  assert.equal(freeForLock(day), null, 'a lock too: legacy treats no boat as no limit (bkV2LockFreeOn)');
 
   refused(() => assertDayFits(day, demand('r1', 4, { draws: new Map([['l1', 4]]) })), 409, undefined, /has 3 seats left/);
   refused(() => assertDayFits(day, demand('r1', 0, { charters: [{ boat_id: 'b1', pax: 10 }] })), 400, undefined, /not deployed/);
@@ -90,11 +95,11 @@ function seeded(): OperationsStore {
   return store;
 }
 
-test('the store refuses a new booking, an added or moved trip, a reschedule, a restore and a lock on a closed day', () => {
+test('the store refuses a new booking, an added or moved trip, a reschedule, a restore and a lock on a closed day', async () => {
   const store = seeded();
   refused(() => store.createBooking({ trips: [tripIn('r1', '2040-03-10')] }), 409, 'route_closed', /Phi Phi \(r1\) does not run on 2040-03-10/);
   refused(() => store.createBooking({ trips: [tripIn('r1', '2041-01-01')] }), 409, 'route_closed', /2041-01-01/);
-  refused(() => store.createLock({ route_id: 'r1', service_date: '2040-03-10', pax: 2 }), 409, 'route_closed');
+  await assert.rejects(newLock(store, 'r1', '2040-03-10', 2), (error: Error & { statusCode?: number; code?: string }) => error.statusCode === 409 && error.code === 'route_closed');
 
   const booking = store.createBooking({ trips: [tripIn('r1', '2040-03-01')] });
   refused(() => store.amendBooking(booking.id, { trips: [{ ...tripIn('r1', '2040-03-10'), id: booking.trips[0].id }] }), 409, 'route_closed');
@@ -115,12 +120,12 @@ test('a legacy B2C booking is saved on a closed day, as legacy saves it', () => 
   refused(() => store.createBooking({ external_id: 'LOV-2', trips: [tripIn('r1', '2040-03-10')] }), 409, 'route_closed');
 });
 
-test('a land route and a marine day with no boat take bookings and locks without a seat check', () => {
+test('a land route and a marine day with no boat take bookings and locks without a seat check', async () => {
   const store = seeded();
   assert.equal(store.createBooking({ trips: [tripIn('land1', '2040-03-05', 60)] }).status, 'confirmed', 'land: no boats, no limit');
   assert.equal(store.capacity('land1', '2040-03-05').available_seats, null);
 
-  const lock = store.createLock({ route_id: 'r1', service_date: '2040-03-05', pax: 8 });
+  const lock = await newLock(store, 'r1', '2040-03-05', 8);
   const booking = store.createBooking({ trips: [{ ...tripIn('r1', '2040-03-05', 30), lock_draws: [{ lock_id: lock.id, qty: 5 }] }] });
   assert.equal(booking.status, 'confirmed', 'no boat yet: sold before boats are assigned');
   assert.deepEqual([store.capacity('r1', '2040-03-05').unplaced_pax, store.capacity('r1', '2040-03-05').available_seats], [33, 0], '30 sold, 3 still locked');

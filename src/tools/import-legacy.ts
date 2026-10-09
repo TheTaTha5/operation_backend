@@ -38,8 +38,10 @@
  * A booking's approvals (`legacy-approvals.ts`) come with it: legacy's one over-allotment/discount
  * approval and one FOC approval per booking, with the days and reason, so an imported booking waiting
  * over the allotment holds no seats here either. Its `foc_reason` is its own, else its FOC
- * approval's. A seat lock spanning days (bulk or month) becomes one lock per departure on the days
- * the route runs (`legacy-locks.ts`), `lg_<legacy id>_<date>`; a booking's draw lands on its day's.
+ * approval's. Seat locks come with their sub-groups and their log (`legacy-locks.ts`, migration 048):
+ * a bulk or month lock becomes a group `lg_<legacy id>` and one lock per departure on the days the
+ * route runs, `lg_<legacy id>_<date>`; a booking's draw lands on the lock (or sub-group) it names, on
+ * its day.
  *
  * Rows go in as SQL, not through the API, so the capacity check is skipped on purpose: legacy days
  * that were oversold arrive oversold rather than half-imported. The mapping itself reuses the domain
@@ -57,8 +59,8 @@ import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
 import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
-import { lockDays, spansDays } from './legacy-locks.js';
-import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { mapLegacyLocks } from './legacy-locks.js';
+import { routeCalendar, todayInThailand, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
@@ -183,6 +185,7 @@ async function main() {
     const boatDays = await read('SELECT trips_id, key, value FROM trips__boat');
     const capOverrides = await read('SELECT key, cap, reason FROM boat_capovr');
     const legacyLocks = await read('SELECT * FROM sb_seat_locks');
+    const legacyLockLog = await read('SELECT * FROM sb_seat_locks__log ORDER BY sb_seat_locks_id, idx');
     const legacyBookings = await read('SELECT * FROM sb_bookings');
     const legacyTrips = await read('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx');
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
@@ -267,59 +270,15 @@ async function main() {
       overrides.push({ boat_id: boatId, service_date: day, capacity: Math.max(0, int(o.cap)), reason: str(o.reason) || null });
     }
 
-    // ── Seat locks: parents only. A sub-lock is carved out of its parent, and legacy holds seats at
-    //    the parent (bkV2LockPoolHold); importing both would hold the same seats twice. ──
-    const parentOf = new Map<string, string>();
-    for (const l of legacyLocks) if (str(l.parentid)) parentOf.set(str(l.id), str(l.parentid));
-    const locks: Row[] = [];
-    // legacy parent id → its route and the imported lock of each date (one date for a day lock)
-    const lockAt = new Map<string, { route: string; days: Map<string, string> }>();
-    // A lock spanning days becomes one per departure, on the days the route runs here (legacy-locks.ts).
+    // ── Seat locks, their sub-groups and their log (legacy-locks.ts, migration 048). A bulk lock
+    //    becomes a group and one lock per departure on the days the route runs here. ──
     const calendar = routeCalendar(
       (await target.query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons')).rows as RouteSeason[],
       (await target.query('SELECT route_id, service_date::text, kind FROM route_day_overrides')).rows as RouteDayOverride[]);
-    for (const l of legacyLocks) {
-      const legacyId = str(l.id);
-      if (parentOf.has(legacyId)) { note('sub-locks folded into their parent'); continue; }
-      const day = str(l.date), routeId = str(l.routeid), qty = int(l.qty);
-      const scope = str(l.scope) || 'day';
-      if (!spansDays(l) && !day) { skip('seat lock', legacyId, 'undated lock has no date'); continue; }
-      if (!spansDays(l) && !ISO_DAY.test(day)) { skip('seat lock', legacyId, `bad date ${day}`); continue; }
-      if (!routes.has(routeId)) { skip('seat lock', legacyId, `route ${routeId || '(none)'} not in catalogue`); continue; }
-      if (qty <= 0) { skip('seat lock', legacyId, `qty ${qty}`); continue; }
-      const created = instant(l.createdat) ?? new Date().toISOString();
-      const agentId = str(l.holdertype) === 'agent' && str(l.holderid) ? str(l.holderid) : null;
-      const active = str(l.status) === 'active';
-      const days = new Map<string, string>();
-      if (spansDays(l)) {
-        const rounds = lockDays(l, (date) => calendar.isOpen(routeId, date));
-        if (typeof rounds === 'string') { skip('seat lock', legacyId, `${scope} lock: ${rounds}`); continue; }
-        if (rounds.length === 0) { note(`${scope} locks with no departure left (no day the route runs, or every seat pending)`); continue; }
-        for (const round of rounds) {
-          const id = `${PREFIX}${legacyId}_${round.service_date}`;
-          locks.push({
-            id, route_id: routeId, service_date: round.service_date, pax: round.pax, agent_id: agentId,
-            status: round.released ? 'released' : 'active', created_at: created, updated_at: created, released_at: null,
-          });
-          days.set(round.service_date, id);
-        }
-        note(`${scope} locks split into one lock per departure`);
-        note(`${scope} lock departures (${str(l.status) || '(blank)'} lock) → ${rounds.filter((r) => !r.released).length ? 'active, released where legacy released the round' : 'released'}`);
-        if (rounds.length) note(`${scope} lock departures written`, rounds.length);
-      } else {
-        const id = PREFIX + legacyId;
-        // A whole-boat hold takes its boat (todo/boat-holds-model.md); `qty` is the minimum promised.
-        const boatId = scope === 'boat' ? str(l.boatid) || null : null;
-        if (scope === 'boat') note(boatId ? 'whole-boat holds imported with their boat' : 'whole-boat holds with no boat (a plain lock)');
-        locks.push({
-          id, route_id: routeId, service_date: day, pax: qty, agent_id: agentId, boat_id: boatId,
-          status: active ? 'active' : 'released', created_at: created, updated_at: created, released_at: null,
-        });
-        days.set(day, id);
-        note(`locks ${str(l.status) || '(blank)'} → ${active ? 'active' : 'released'}`);
-      }
-      lockAt.set(legacyId, { route: routeId, days });
-    }
+    const { groups: lockGroups, locks, events: lockEvents, lockAt } = mapLegacyLocks({ locks: legacyLocks, log: legacyLockLog }, {
+      prefix: PREFIX, agents: new Set(legacyAgents.map((a) => str(a.id)).filter(Boolean)), routes,
+      isOpen: (routeId, date) => calendar.isOpen(routeId, date), today: todayInThailand(), now: new Date().toISOString(),
+    }, { skip, note });
 
     // ── Vans: the catalogue keeps legacy's ids (upserted, like deployments), and everything dated
     //    about a van is replaced for the vans imported ──
@@ -671,8 +630,8 @@ async function main() {
         for (const r of rows) myPax.push({ booking_trip_id: tripId, category: r.category, residency: r.residency, count: r.count });
         myVanTrips.push({ t, tripId, counts: countsOf(rows) });
 
-        // Draws: sub-lock draws count against the parent; a draw that cannot land is dropped and the
-        // seats are then taken from the general pool, which is what they would have cost unlocked.
+        // Draws land on the lock they name, a sub-group included; a draw that cannot land is dropped and
+        // the seats are then taken from the general pool, which is what they would have cost unlocked.
         let raw: unknown = [];
         try { raw = JSON.parse(str(t.lockdraws) || '[]'); } catch { note('draws dropped: unreadable JSON'); }
         const byLock = new Map<string, number>();
@@ -681,7 +640,7 @@ async function main() {
           const qty = int(d.qty);
           const legacyLock = str(d.lockId);
           if (qty <= 0) continue;
-          const lock = lockAt.get(parentOf.get(legacyLock) ?? legacyLock);
+          const lock = lockAt.get(legacyLock);
           if (charter) { note('draws dropped: on a charter'); continue; }
           if (!lock) { note('draws dropped: lock not imported'); continue; }
           // a bulk lock has one lock per departure: the draw lands on its day's
@@ -1107,6 +1066,8 @@ async function main() {
     const removed = remove.length ? (await target.query('DELETE FROM bookings WHERE id = ANY($1::text[])', [remove])).rowCount : 0;
     const replacedBookings = (await target.query(`DELETE FROM bookings WHERE id LIKE '${PREFIX}%'`)).rowCount;
     const replacedLocks = (await target.query(`DELETE FROM seat_locks WHERE id LIKE '${PREFIX}%'`)).rowCount;
+    // Their log lines go with them (ON DELETE CASCADE); a bulk lock's group after its departures.
+    const replacedLockGroups = (await target.query(`DELETE FROM seat_lock_groups WHERE id LIKE '${PREFIX}%'`)).rowCount;
     // Deleting the bookings already cascaded their trips' allocations and trip operations.
     const replacedGroups = (await target.query(`DELETE FROM van_groups WHERE id LIKE '${PREFIX}%'`)).rowCount;
     const importedVans = vans.map((v) => String(v.id));
@@ -1167,7 +1128,14 @@ async function main() {
       'ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, registered_persons = EXCLUDED.registered_persons');
     // A day's seats set here (trip-ops raise, PUT /v1/boats/{id}/capacity-overrides: `set_at`) win over legacy's.
     await insert('boat_capacity_overrides', overrides, 'ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason WHERE boat_capacity_overrides.set_at IS NULL');
-    await insert('seat_locks', locks);
+    await insert('seat_lock_groups', lockGroups);
+    // Parents before their sub-groups: `parent_id` is a key.
+    await insert('seat_locks', locks.filter((l) => !l.parent_id));
+    await insert('seat_locks', locks.filter((l) => l.parent_id));
+    // In legacy's order, so the serial id is the log's order.
+    await target.query(`INSERT INTO seat_lock_events (lock_id, group_id, type, qty, trip_date, booking_id, note, day, at, by, imported)
+      SELECT e.lock_id, e.group_id, e.type, e.qty, e.trip_date, e.booking_id, e.note, e.day, e.at, e.by, e.imported
+      FROM jsonb_populate_recordset(NULL::seat_lock_events, $1::jsonb) WITH ORDINALITY AS e ORDER BY e.ordinality`, [JSON.stringify(lockEvents)]);
     await insert('pickup_areas', pickupAreas, upsert(pickupAreas));
     await insert('pickup_time_profiles', timeProfiles, upsert(timeProfiles));
     await target.query('DELETE FROM pickup_times WHERE profile_id = ANY($1::text[])', [timeProfiles.map((pr) => String(pr.id))]);
@@ -1226,7 +1194,7 @@ async function main() {
     const { rows: [after] } = await target.query(`SELECT
       (SELECT count(*) FROM bookings)::int bookings, (SELECT count(*) FROM booking_trips)::int trips,
       (SELECT count(*) FROM booking_trip_pax)::int pax_cells, (SELECT count(*) FROM booking_passengers)::int passengers,
-      (SELECT count(*) FROM booking_trip_lock_draws)::int lock_draws, (SELECT count(*) FROM seat_locks)::int seat_locks, (SELECT count(*) FROM booking_approvals)::int approvals,
+      (SELECT count(*) FROM booking_trip_lock_draws)::int lock_draws, (SELECT count(*) FROM seat_locks)::int seat_locks, (SELECT count(*) FROM seat_lock_groups)::int seat_lock_groups, (SELECT count(*) FROM seat_lock_events)::int seat_lock_events, (SELECT count(*) FROM booking_approvals)::int approvals,
       (SELECT count(*) FROM deployments)::int deployments, (SELECT count(*) FROM boat_capacity_overrides)::int capacity_overrides,
       (SELECT count(*) FROM vans)::int vans, (SELECT count(*) FROM van_day_routes)::int van_day_routes, (SELECT count(*) FROM van_days)::int van_days,
       (SELECT count(*) FROM van_groups)::int van_groups, (SELECT count(*) FROM booking_trip_van_allocations)::int van_allocations,
@@ -1240,8 +1208,8 @@ async function main() {
     console.log(`\n${commit ? 'COMMIT' : 'DRY RUN (rolled back)'}`);
     console.log(`Love Kingdom's orders: --b2c=${b2cMode}; ${pushedOrders.size} booking(s) here carry an external_id (pushed)`);
     console.log(`read from legacy: ${legacyBookings.length} bookings, ${legacyTrips.length} trips, ${legacyPassengers.length} passengers, ${boatDays.length} boat-days, ${legacyLocks.length} locks, ${capOverrides.length} overrides`);
-    console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks`);
-    console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
+    console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks, ${replacedLockGroups} bulk locks`);
+    console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks (${locks.filter((l) => l.parent_id).length} sub-groups, ${locks.filter((l) => l.group_id && !l.parent_id).length} bulk departures of ${lockGroups.length} bulk locks), ${lockEvents.length} lock log lines, ${deployments.length} deployments, ${overrides.length} overrides`);
     console.log(`action records: ${cancellations.length} cancellations, ${reschedules.length} reschedules, ${partialCancels.length} partial cancels, ${feeItems.length} fee items, ${historyLines.length} history lines`);
     console.log(`money: ${money.invoices.length} invoices (${money.lines.length} lines), ${money.payments.length} payments, ${money.slips.length} slips; replaced ${replacedInvoices} invoices, ${replacedPayments} payments`);
     if (madeHere.length) console.log(`  removed with the bookings they named, made here: invoices ${madeHere.join(', ')}`);

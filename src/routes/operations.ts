@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type SeatLock } from '../domain/operations.js';
+import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw } from '../domain/operations.js';
+import { SeatLockService } from '../domain/seat-lock-service.js';
+import {
+  assertGroupOwnedEcho, assertOwnedEcho, isoDay, parseAdd, parseConfirm, parseGroupChanges, parseLockChanges, parseNewGroup, parseNewLock, parseRelease, parseSubGroup,
+} from '../domain/seat-lock-input.js';
+import { STATUS_CODES } from 'node:http';
 import { docs } from './openapi.js';
 import { PostgresOperationsStore } from '../domain/postgres-operations.js';
 import { Authenticator } from '../auth.js';
@@ -394,11 +399,6 @@ function closeAnyway(value: unknown): boolean {
   return badRequest('close_anyway must be true or false');
 }
 
-function lockInput(body: unknown): Omit<SeatLock, 'id' | 'status' | 'version' | 'created_at' | 'updated_at'> {
-  const input = record(body);
-  return { route_id: string(input.route_id, 'route_id'), service_date: string(input.service_date, 'service_date'), pax: pax(input.pax), agent_id: optionalString(input.agent_id) };
-}
-
 export type Store = OperationsStore | PostgresOperationsStore;
 /** PostgreSQL when `DATABASE_URL` is set, else the in-process store. */
 export const createStore = (): Store => process.env.DATABASE_URL ? new PostgresOperationsStore(process.env.DATABASE_URL) : new OperationsStore();
@@ -417,6 +417,16 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.setSerializerCompiler(({ httpStatus }) => String(httpStatus).startsWith('2')
     ? (data) => JSON.stringify(data)
     : (data) => { const e = data as { statusCode?: number; code?: string; error?: string; message?: string }; return JSON.stringify({ statusCode: e.statusCode, code: e.code, error: e.error, message: e.message }); });
+  // A refusal that carries more than a message (`seats_short` lists the short days) sends it beside
+  // the usual four fields. Every other error goes to Fastify's own handler, as before.
+  app.setErrorHandler((error, _request, reply) => {
+    const extra = (error as { extra?: object }).extra;
+    if (!extra) throw error;
+    const statusCode = (error as { statusCode?: number }).statusCode ?? 500;
+    // Serialized here, so a route's documented error shape cannot drop the extra fields.
+    return reply.code(statusCode).type('application/json').serializer(JSON.stringify)
+      .send({ statusCode, code: (error as { code?: string }).code, error: STATUS_CODES[statusCode], message: (error as Error).message, ...extra });
+  });
   /**
    * Every request but `/v1/login` is authenticated, and every write is checked against the caller's
    * rights (`assertMayWrite`): what legacy checked only in the browser. Any logged-in user may read.
@@ -474,11 +484,19 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const current = await store.booking(bookingId(request));
     if (current) assertFresh(`Booking ${current.id}`, expected, current.version);
   };
+  // The seat-lock commands, written once over the store (seat-lock-service.ts).
+  const locks = new SeatLockService(store);
   const assertLockFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown; user?: { user?: StoredUser } }): Promise<void> => {
     const expected = sentVersion(request);
     if (expected === undefined) return requireVersion(request, 'seat lock');
-    const current = await store.lock(lockId(request));
+    const current = await locks.lock(lockId(request));
     if (current) assertFresh(`Seat lock ${current.id}`, expected, current.version);
+  };
+  const assertGroupFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown; user?: { user?: StoredUser } }): Promise<void> => {
+    const expected = sentVersion(request);
+    if (expected === undefined) return requireVersion(request, 'bulk lock');
+    const [current] = await store.lockGroupRows({ ids: [lockId(request)] });
+    if (current) assertFresh(`Seat lock group ${current.id}`, expected, current.version);
   };
   // The version of the booking or lock a response carries, as its `ETag`, so a client can send it back.
   app.addHook('preSerialization', async (_request, reply, payload) => {
@@ -2498,26 +2516,104 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return reply.code(204).send();
   });
 
+  /**
+   * Agent seat locks (todo/seat-lock-extras-model.md, decided 2026-10-09): day locks, sub-groups,
+   * pending seats, expiry and the lock log. The rules are `seat-locks.ts`; the commands
+   * `seat-lock-service.ts`. Every write to one lock needs its version from a login, as a booking's.
+   */
+  const lockNotFound = (): never => notFound('Seat lock not found');
+  const groupNotFound = (): never => notFound('Seat lock group not found');
+  const by = (request: { user?: unknown }): string | undefined => actorOf(request.user as Parameters<typeof actorOf>[0]);
+  const optionalDay = (value: unknown, name: string): string | undefined => (value === undefined || value === '' ? undefined : isoDay(value, name));
   app.get('/v1/seat-locks', { schema: docs.listLocks }, async (request) => {
     const query = request.query as Record<string, unknown>;
-    return { seat_locks: await store.listLocks(optionalString(query.route_id), optionalString(query.service_date ?? query.date)) };
+    return { seat_locks: await locks.list({
+      routeId: optionalString(query.route_id), serviceDate: optionalDay(query.service_date ?? query.date, 'service_date'),
+      from: optionalDay(query.from, 'from'), to: optionalDay(query.to, 'to'), groupId: optionalString(query.group_id),
+      parentIds: optionalString(query.parent_id) ? [optionalString(query.parent_id)!] : undefined, agentId: optionalString(query.agent_id),
+    }) };
   });
-  app.post('/v1/seat-locks', { schema: docs.createLock }, async (request, reply) => reply.code(201).send(await store.transaction(() => store.createLock(lockInput(request.body)))));
+  app.post('/v1/seat-locks', { schema: docs.createLock }, async (request, reply) => {
+    const input = parseNewLock(request.body);
+    return reply.code(201).send(await store.transaction(() => locks.create(input, by(request))));
+  });
+  /** Legacy `bkV2LockReleaseOverdueGo`: every overdue lock of the day that still holds seats. */
+  app.post('/v1/seat-locks/release-overdue', async (request) => {
+    const body = record(request.body ?? {});
+    const date = isoDay(body.service_date ?? body.date, 'service_date');
+    return store.transaction(() => locks.releaseOverdue(date, optionalString(body.route_id), by(request)));
+  });
+  app.get('/v1/seat-locks/:id', async (request) => (await locks.lock(lockId(request))) ?? lockNotFound());
+  app.get('/v1/seat-locks/:id/log', async (request) => ({ events: (await locks.log(lockId(request))) ?? lockNotFound() }));
+  /** Client facts only; a server-owned field with a new value is `400 server_owned`, naming the command. */
   app.patch('/v1/seat-locks/:id', async (request) => {
-    const body = record(request.body);
-    // Only these two are a lock's client facts; anything else in the body is ignored, never stored.
-    const changes: Partial<Pick<SeatLock, 'pax' | 'agent_id'>> = {
-      ...(body.pax === undefined ? {} : { pax: pax(body.pax) }),
-      ...(body.agent_id === undefined ? {} : { agent_id: string(body.agent_id, 'agent_id') }),
-    };
+    const changes = parseLockChanges(withoutVersion(request.body));
     return store.transaction(async () => {
       await assertLockFresh(request);
-      return (await store.amendLock(lockId(request), changes)) ?? notFound('Seat lock not found');
+      const current = (await locks.lock(lockId(request))) ?? lockNotFound();
+      assertOwnedEcho(request.body, current);
+      return (await locks.amend(lockId(request), changes, by(request))) ?? lockNotFound();
     });
   });
-  app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => store.transaction(async () => {
+  /** Legacy "+ seats". */
+  app.post('/v1/seat-locks/:id/add', async (request) => {
+    const input = parseAdd(withoutVersion(request.body));
+    return store.transaction(async () => { await assertLockFresh(request); return (await locks.add(lockId(request), input, by(request))) ?? lockNotFound(); });
+  });
+  app.post('/v1/seat-locks/:id/release', { schema: docs.releaseLock }, async (request) => {
+    const seats = parseRelease(withoutVersion(request.body));
+    return store.transaction(async () => { await assertLockFresh(request); return (await locks.release(lockId(request), seats, by(request))) ?? lockNotFound(); });
+  });
+  app.post('/v1/seat-locks/:id/release-departure', async (request) => store.transaction(async () => {
     await assertLockFresh(request);
-    return (await store.releaseLock(lockId(request))) ?? notFound('Seat lock not found');
+    return (await locks.releaseDeparture(lockId(request), by(request))) ?? lockNotFound();
   }));
+  app.post('/v1/seat-locks/:id/confirm-pending', async (request) => {
+    const want = parseConfirm(withoutVersion(request.body));
+    return store.transaction(async () => { await assertLockFresh(request); return (await locks.confirmPending(lockId(request), want, by(request))) ?? lockNotFound(); });
+  });
+  app.post('/v1/seat-locks/:id/sub-groups', async (request, reply) => {
+    const input = parseSubGroup(withoutVersion(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      await assertLockFresh(request);
+      return (await locks.createSubGroup(lockId(request), input, by(request))) ?? lockNotFound();
+    }));
+  });
+
+  /** Bulk locks: a group plus one lock per departure the route runs (legacy `scope: 'bulk'`). */
+  app.get('/v1/seat-lock-groups', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    return { seat_lock_groups: await locks.groups({ routeId: optionalString(query.route_id), agentId: optionalString(query.agent_id) }) };
+  });
+  app.get('/v1/seat-lock-groups/:id', async (request) => (await locks.group(lockId(request))) ?? groupNotFound());
+  app.get('/v1/seat-lock-groups/:id/log', async (request) => ({ events: (await locks.groupLog(lockId(request))) ?? groupNotFound() }));
+  app.post('/v1/seat-lock-groups', async (request, reply) => {
+    const input = parseNewGroup(request.body);
+    return reply.code(201).send(await store.transaction(() => locks.createGroup(input, by(request))));
+  });
+  app.patch('/v1/seat-lock-groups/:id', async (request) => {
+    const changes = parseGroupChanges(withoutVersion(request.body));
+    return store.transaction(async () => {
+      await assertGroupFresh(request);
+      const current = (await locks.group(lockId(request))) ?? groupNotFound();
+      assertGroupOwnedEcho(request.body, current);
+      return (await locks.amendGroup(lockId(request), changes, by(request))) ?? groupNotFound();
+    });
+  });
+  app.post('/v1/seat-lock-groups/:id/add', async (request) => {
+    const input = parseAdd(withoutVersion(request.body));
+    return store.transaction(async () => { await assertGroupFresh(request); return (await locks.addGroup(lockId(request), input, by(request))) ?? groupNotFound(); });
+  });
+  app.post('/v1/seat-lock-groups/:id/release', async (request) => {
+    const seats = parseRelease(withoutVersion(request.body));
+    return store.transaction(async () => { await assertGroupFresh(request); return (await locks.releaseGroup(lockId(request), seats, by(request))) ?? groupNotFound(); });
+  });
+  app.post('/v1/seat-lock-groups/:id/sub-groups', async (request, reply) => {
+    const input = parseSubGroup(withoutVersion(request.body));
+    return reply.code(201).send(await store.transaction(async () => {
+      await assertGroupFresh(request);
+      return (await locks.groupSubGroups(lockId(request), input, by(request))) ?? groupNotFound();
+    }));
+  });
   done();
 }
