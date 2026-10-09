@@ -204,7 +204,9 @@ any other is `400`.
 
 **A login tied to one agent** (`agent_id`, for Love Kingdom's service user, `a_b2c`) books for that
 agent only: a create without `agent_id` gets it, another agent is `403`, the list shows only its
-bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`.
+bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`. The `a_b2c`
+login's bad input is held for ops rather than refused (`202`, see
+[Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)).
 
 ### Love Kingdom's API key
 
@@ -911,6 +913,10 @@ with a `409`. (A booking is never created in a released status: it is cancelled 
     duplicate-voucher check.
   - `q=` — a case-insensitive substring of the booking id, `voucher_ref` or `lead_pax`. `%` and `_`
     are ordinary characters, not wildcards.
+  - `updated_since=` — an ISO instant (`2026-10-09T03:00:00Z`): bookings whose `updated_at` is **at
+    or after** it, so the booking at the boundary comes again rather than one changed in the same
+    millisecond being missed. Love Kingdom's reconciliation read: it keeps the newest `updated_at` it
+    has seen and asks from there. Anything else is a `400`.
 
   Every page carries `total`: how many bookings the filters match, ignoring `cursor` and `limit`, so
   it is the same on every page. A badge count is `?status=pending_approval&limit=1`, read `total`.
@@ -2118,6 +2124,106 @@ pick up (`cargo`). A stop rides its group's van. Writes need the `operations` ed
   `group_id` puts one on another group. `area_id` is a plain id, not checked against the
   pickup-area catalogue.
 
+### Love Kingdom's push: held orders and B2C issues
+
+Love Kingdom books here itself (`docs/love-kingdom-integration.md`); legacy's pull is not ported
+(`todo/b2c-sync-model.md`). Legacy stored whatever it pulled and listed what looked wrong. Here what
+can be stored is stored and checked; what cannot is **held**, never lost.
+
+**Held orders.** When Love Kingdom's login (a login whose `agent_id` is `a_b2c`) sends
+`POST /v1/bookings`, `PATCH /v1/bookings/{id}` or `POST /v1/bookings/{id}/cancel` and it is refused
+as bad input (`400`: unknown route, no date, no passengers, a bad pax key, an unknown pickup area,
+FOC without a reason…), nothing changes in the bookings, and:
+
+- the body is kept as it was sent, with the refusal's message as `problem` (`b2c_held_orders`,
+  migration 100);
+- the answer is `202`, holding **no seats**:
+
+```json
+{ "code": "held_for_review", "message": "Not booked: Unknown route: r99. Held for ops to review as held_6f1c…",
+  "held_order": { "id": "held_6f1c…", "action": "create", "external_id": "LOV-4190737", "booking_id": null,
+    "problem": "Unknown route: r99", "status": "open", "attempts": 1, "received_at": "…", "last_received_at": "…",
+    "received_by": "lovekingdom", "decided_at": null, "decided_by": null, "note": null, "resolved_booking_id": null,
+    "request": { "…": "the body as sent" } } }
+```
+
+- Only a `400`, and only that login. `403`, `404`, `409` (sold out, `route_closed`,
+  `duplicate_external_id`, `stale_version`, `booking_closed`) and `428` answer as before: they are
+  not bad data. Staff, legacy's client and a caller with authentication off still get the `400`. A
+  body that is not JSON at all is refused before it reaches the handler, and is not held.
+- `action` is `create`, `amend` or `cancel`; an amend or cancel carries the `booking_id` it was for
+  and that booking's `external_id`.
+- **A retry is the same order:** a create with the `external_id` of an open held create replaces its
+  request and problem and counts `attempts` up.
+- **Fixed and resent:** when Love Kingdom's login then books that `external_id` (`201`), the open held
+  create is resolved by itself: `resolved_booking_id` is the booking, `note` `Booked as …`.
+
+| Method + path | What |
+|---|---|
+| `GET /v1/b2c/held-orders?status=open` | `{ held_orders }`, newest first. `status` `open` (default), `resolved`, `dismissed` or `all` |
+| `GET /v1/b2c/held-orders/{id}` | one; `404` |
+| `POST /v1/b2c/held-orders/{id}/resolve` | `{ booking_id?, note? }`: handled (booked by hand, or resent) |
+| `POST /v1/b2c/held-orders/{id}/dismiss` | `{ note? }`: nothing to do (a test, a duplicate) |
+
+Resolving and dismissing need the `operations` area; Love Kingdom's login cannot. Only an `open`
+order can be decided: another answers `409 wrong_status` (`Held order … is already resolved`).
+`booking_id` must be a booking (`400`), and goes with `resolve` only. `status`, `decided_by` and
+`decided_at` are the server's: a body that sends them is ignored. No `version`: the only change is
+`open` to closed, and a second click is already a `409`.
+
+**B2C issues.** What is wrong in a B2C booking that *was* stored, as legacy's post-import checks
+found it (`b2cCheckOrders`). Computed from the booking each time, never stored, so a booking ops
+correct drops off by itself. The messages are legacy's, in Thai.
+
+| `code` | `severity` | When |
+|---|---|---|
+| `nat_unread` | `warn` | the lead's or a passenger's nationality is not a two-letter code (`TH`, `GB`) |
+| `nat_mix` | `warn` | a seat trip has Thai-priced seats (`*_th`) and more known foreigners aboard (passengers whose nationality is a code other than `TH`; with no list, the lead) than its other seats. The park page would buy them Thai tickets |
+| `money_parts` | `warn` | a price part was sent (`priceBreakdown` / `price_seat`…`price_extra`) and the parts differ from `total` by more than ฿1 |
+| `pickup_area` | `info` | a pickup or hotel text, no `pickup_area_id`, and not `pickup_self` |
+
+A cancelled, rejected or weather-cancelled booking has none. Love Kingdom's login gets
+`issues: [{ code, severity, message }]` on its create and amend answers (`[]` when nothing is wrong);
+nobody else's answer changes.
+
+**The panel: `GET /v1/b2c/issues`**, legacy's orange "ใบ B2C ที่ต้องเช็ค" panel, for any login:
+
+```json
+{ "held_orders": [ "…every open held order…" ],
+  "issues": [ { "booking_id": "…", "external_id": "LOV-4190737", "service_date": "2030-01-04", "lead_pax": "Jane Doe",
+                "code": "nat_unread", "severity": "warn", "message": "อ่านสัญชาติผู้จองไม่ออก: \"Slovak\"" } ],
+  "counts": { "held": 1, "warn": 1, "info": 0 }, "signature": "3f2a9c1b0d4e" }
+```
+
+- It checks the bookings of agent `a_b2c` that still hold or wait for seats and have a trip from
+  today (Thailand) on, ordered by date.
+- `signature` is legacy's `issueSig`: 12 hex characters that change when a held order or a `warn`
+  line comes or goes (not an `info` line, not a reworded message). Legacy's panel stays dismissed
+  until it changes, kept in `localStorage`; dismissing is the client's, as in legacy.
+
+**Legacy's own B2C bookings** come through the import until Love Kingdom's push takes over, which
+`import-legacy.ts --b2c=all|pushed|none` sets (see [Importing legacy's B2C
+bookings](#importing-legacys-b2c-bookings)).
+
+#### Importing legacy's B2C bookings
+
+Legacy keeps each line of a Love Kingdom order as `b2c_<order>_<line>`. Once Love Kingdom pushes the
+same order here (`external_id` = `<order>`), a copy from legacy would hold the same seats twice. The
+import's `--b2c` says how far that has gone:
+
+| `--b2c=` | Legacy's B2C bookings |
+|---|---|
+| `all` (default) | imported, as before |
+| `pushed` | skipped when a booking here (not `lg_`) has the order's `external_id`; the others are imported |
+| `none` | all skipped: Love Kingdom's push is the only source |
+
+The test orders `b2c_BK-…` are never imported. Skipped bookings are counted in the report's notes.
+Each run deletes every `lg_` booking first, so switching mode also removes the copies earlier runs
+made. Switching too early loses orders only legacy has; too late counts pushed orders twice. Use
+`pushed` from the day Love Kingdom's push goes live, and `none` once it has pushed its open orders
+(rehearsed 2026-10-09 on a copy: `all` 5,351 bookings, 543 of them B2C; `pushed` with two orders
+pushed 5,344; `none` 4,808).
+
 ### Live updates (the change feed)
 
 How a screen learns that someone else changed something, without reloading everything. Every write
@@ -2145,6 +2251,8 @@ the last number it saw and refetches only the records named.
   - `route`: its calendar;
   - `invoice`: issued, changed, voided, or a payment recorded or corrected. Its bookings are in the
     feed as well, since their `invoice` and `payment_state` changed.
+  - `b2c_held_order`: Love Kingdom's write held for review, retried, resolved or dismissed (see
+    [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)). `route_days` is `null`.
 
   `action` is `created`, `updated` or `deleted`.
 - **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking

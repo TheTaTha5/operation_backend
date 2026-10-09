@@ -1,6 +1,6 @@
 # Database schema
 
-The PostgreSQL schema as `migrations/*.sql` builds it: 40 tables in seven areas, plus `schema_migrations`,
+The PostgreSQL schema as `migrations/*.sql` builds it: its tables in eight areas, plus `schema_migrations`,
 the migrator's own ledger, which is not drawn.
 
 Checked against every migration in `migrations/` (001–023) applied to an empty PostgreSQL 17
@@ -50,6 +50,7 @@ flowchart LR
   bookings -. "rate_type_ref" .-> rates
   money -- "invoice_lines.booking_id" --> bookings
   money -- "invoices.agent_id" --> sales
+  b2c["Love Kingdom's held orders<br/>b2c_held_orders"] -- "booking_id, resolved_booking_id" --> bookings
 ```
 
 ## 1. Catalogue and seat pool
@@ -854,6 +855,42 @@ erDiagram
 - **One live invoice per booking** is checked by the API, not the database. A partial unique index
   can't see `voided` through the join, and legacy has one booking with two.
 - **`changes.kind`** also takes `invoice` (045).
+
+## 8. Love Kingdom's held orders
+
+A write from Love Kingdom's login that was refused as bad input, kept as it was sent for ops to
+handle (migration 100, README "Love Kingdom's push").
+
+```mermaid
+erDiagram
+  b2c_held_orders {
+    text id PK "held_<uuid>"
+    text action "create, amend or cancel"
+    text external_id UK "Love Kingdom's order; unique among open creates"
+    text booking_id FK "amend/cancel: the booking it was for"
+    jsonb request "the body as sent"
+    text problem "the refusal's message"
+    integer attempts
+    text status "open, resolved or dismissed"
+    timestamptz received_at
+    timestamptz last_received_at
+    text received_by
+    timestamptz decided_at "set exactly when not open"
+    text decided_by
+    text note
+    text resolved_booking_id FK
+  }
+  bookings { text id PK }
+  bookings |o--o{ b2c_held_orders : "amended by"
+  bookings |o--o{ b2c_held_orders : "settles"
+```
+
+- **One open held create per order:** a partial unique index on `external_id` where
+  `status = 'open' AND action = 'create'`. A retry updates that row (`attempts`).
+- **Both booking keys are `ON DELETE SET NULL`:** the held order outlives a booking the import
+  replaces.
+- **`changes.kind`** also takes `b2c_held_order` (100). The migration adds it to whatever list the
+  constraint has, so another branch's kind is kept whichever runs first.
 
 ## Ids with no foreign key
 

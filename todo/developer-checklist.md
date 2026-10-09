@@ -67,6 +67,27 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.
+  Once `feat/b2c-push` is deployed (integration doc §6a, §6b, §7):
+  - push every order with boat items to `POST /v1/bookings` (legacy's pull is not ported), and
+    back-fill the open orders made before go-live; tell you when the back-fill is done;
+  - treat `202 held_for_review` as "not booked yet" (bad input is held for ops, no longer a `400`,
+    CS's saves included) and show its `message`; read `issues` on create and amend;
+  - alert on its own failed calls, and reconcile with `GET /v1/bookings?updated_since=`.
+- **Ops (B2C):** Love Kingdom's held orders and the B2C issues list are `GET /v1/b2c/issues`
+  (legacy's orange panel); they resolve or dismiss held orders there. The legacy client's panel
+  should read it instead of `/api/b2c/health`.
+
+## Switch the import off legacy's B2C bookings (after `feat/b2c-push`)
+
+The import copies legacy's `b2c_…` bookings until told otherwise (`--b2c=all`, the default). A copy of
+an order Love Kingdom also pushed holds its seats twice; an order skipped before Love Kingdom pushed
+it is missing here. So, in this order:
+
+1. **The day Love Kingdom's push goes live:** run every import with `--b2c=pushed` (skips the orders
+   pushed here, still copies the rest).
+2. **Once Love Kingdom says its back-fill is done:** check nothing is left only in legacy:
+   `SELECT id FROM bookings WHERE id LIKE 'lg_b2c_%' AND split_part(substr(id, 8), '_', 1) NOT IN (SELECT external_id FROM bookings WHERE external_id IS NOT NULL AND id NOT LIKE 'lg_%')`
+   should list only past or cancelled orders. Then run imports with `--b2c=none`.
 
 ## Ask ops
 

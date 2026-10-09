@@ -58,6 +58,7 @@ not allow your browser origin (CORS), and a token in the page would let anyone b
 | Amend | `PATCH /v1/bookings/{id}` |
 | Cancel | `POST /v1/bookings/{id}/cancel` (releases the seats) |
 | Hold, then release | `POST /v1/seat-locks`, `POST /v1/seat-locks/{id}/release` |
+| What changed since you last looked | `GET /v1/bookings?updated_since=2026-10-09T03:00:00Z` (see §6b) |
 
 **Keep the `id` we return.** It is the booking's id here. Store it on your booking, for example
 next to `opsAgentCode`, and use it for every later call.
@@ -101,10 +102,10 @@ POST /v1/bookings
 | "Confirm" or "Save as quote" | `intent`: `confirm` (default) or `quote` | **Don't send `status`.** We decide it and return it; read `status` from the response. The old `status` field still works for now but is deprecated and logged. See below. |
 | channel → `opsAgentCode` | `agent_id` | We key agents by **id** (`a_b2c`), not code, and agent codes are not unique. Map each channel to an agent id from `GET /v1/agents`. |
 | `customer.name/phone/email/nationality` | `leadPax`, `leadPhone`, `leadEmail`, `leadNationality` | |
-| item `programId` / `opsRouteId` | `trips[].routeId` | Must exist in `GET /v1/routes`, else `400 Unknown route`. |
+| item `programId` / `opsRouteId` | `trips[].routeId` | Must exist in `GET /v1/routes`, else the order is held (`202 held_for_review`, §6a). |
 | item `travelDate` | `trips[].date` | `YYYY-MM-DD`. Send the string, never a JS `Date`. |
 | `paxAdult/Child/Infant/Foc` + `paxThai/paxForeign` | `trips[].pax` | Grid of `ad`/`chd`/`inf`/`foc` × `_fr` (foreign) / `_th` (Thai). Infants and FOC take seats. An unknown key is a `400`. See §6. |
-| why FOC passengers are free | `focReason` | **Required** when you confirm a booking with `foc` passengers, else `400`. |
+| why FOC passengers are free | `focReason` | **Required** when you confirm a booking with `foc` passengers, else the order is held (§6a). |
 | `pickupZone`, `pickupHotel` | `trips[].zone`, `hotelName` (`pickupZone` on the header too) | |
 | `addonsSelected[{addonId,qty}]` | `addOns[{type,amount,qty}]` | `type` is the ops code (`longtail-join`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). `amount` is the **line total**, not a unit price. |
 | `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
@@ -134,7 +135,8 @@ the decision: `confirmed`, or `rejected`.
 1. `GET /v1/availability` for the date. Show `available_seats`. It is `null` on a land route
    (`unlimited: true`): there is no seat limit to show.
 2. Staff saves → `POST /v1/bookings` with `intent`. On `201`, store our `id` and show our
-   `status` (§4). On `409`, show "sold out" and nothing is written.
+   `status` (§4). On `409`, show "sold out" and nothing is written. On `202`, show the `message`:
+   the order is held for ops (§6a).
 3. An edit to date or pax → `PATCH /v1/bookings/{id}` with the full `trips`. It is weighed
    again: `409` if it no longer fits at all, or `200` with `status: pending_approval` if it now
    needs ops to approve it.
@@ -167,13 +169,68 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 
 | Status | Meaning | What to do |
 |---|---|---|
-| `400` | Bad input: missing field, unknown route or lock, bad pax key, a `status` other than `quote`/`confirmed`, FOC without `focReason` | Bug in the mapping. Log the `message`, and don't retry. |
+| `202` `held_for_review` | **Bad input, held for ops instead of refused** (see §6a). On create, amend and cancel, what would be a `400` for anyone else: missing field, unknown route or lock, bad pax key, unknown pickup area, a `status` other than `quote`/`confirmed`, FOC without `focReason`. **Nothing was booked or changed, and no seats are held.** | Show "waiting for confirmation". Log the `message`: it is a bug in the mapping. Fix it and resend, or leave it to ops. Don't retry the same body blindly. |
+| `400` | Bad input on any other call (a lock, a list filter) | Bug in the mapping. Log the `message`, and don't retry. |
 | `401` / `403` | No token or an expired one (`401`); a call your service user may not make (`403`) | Log in again on `401`. A `403` is a bug in the mapping: log the `message`. |
 | `404` | Booking or lock id not found | |
 | `409` | The route does not run that day (`route_closed`), seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, closed, or the state changed. Show it to the user, and don't retry blindly. |
 | `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |
 
+### 6a. Held orders: bad data is kept, not lost (since 2026-10-09)
+
+A customer who paid must not vanish because one field did not map. So when your login's
+`POST /v1/bookings`, `PATCH /v1/bookings/{id}` or `POST /v1/bookings/{id}/cancel` has bad input, we
+keep your request as it was sent and answer `202`:
+
+```json
+{ "code": "held_for_review", "message": "Not booked: Unknown route: r99. Held for ops to review as held_6f1c…",
+  "held_order": { "id": "held_6f1c…", "action": "create", "external_id": "LOV-4190737", "status": "open", "attempts": 1,
+    "problem": "Unknown route: r99", "request": { "…": "your body" }, "…": "…" } }
+```
+
+- Ops see it in their issues panel and handle it: book it by hand, or dismiss it.
+- **Resending the same order** (same `external_id`) while it is held updates the held one, it does
+  not make a second. **Once your fixed create books it (`201`), the held one is closed by itself.**
+- A held amend or cancel leaves the booking exactly as it was. Re-read it before you try again.
+- Only bad input is held. Sold out, `route_closed`, `duplicate_external_id`, `stale_version` and
+  `428` answer as before (§6).
+- This applies to everything your login sends, CS's bookings included: CS staff see "held" where
+  they used to see the `400`. Show them the `message`.
+
+**What we store, we also check.** Your create and amend answers carry `issues`, `[]` when nothing is
+wrong:
+
+| `code` | Means |
+|---|---|
+| `nat_unread` | a nationality that is not a two-letter code (`GB`, not `British`) |
+| `nat_mix` | Thai-priced seats (`*_th`) for more foreigners than the other seats hold |
+| `money_parts` | the price parts you sent (`priceBreakdown`) do not add up to `total` |
+| `pickup_area` | a hotel or pickup text with no pickup area: ops will choose one (info only) |
+
+The booking is stored either way; ops see the same list. Fix the mapping where you can.
+
+### 6b. Watching your own calls (health)
+
+We no longer read your database, so nothing on our side notices a call you never made or one that
+failed. **Alert on your own failed calls** (`5xx`, timeouts, and `202 held_for_review`). To check
+nothing was lost, reconcile now and then:
+
+```
+GET /v1/bookings?updated_since=2026-10-09T03:00:00Z&limit=100   (follow next_cursor)
+```
+
+It lists your bookings changed **at or after** that instant, each with `updated_at` and `version`.
+Keep the newest `updated_at` you have seen and ask from there; the boundary booking comes again, so
+nothing changed in the same millisecond is missed. Compare with your orders: an order you think you
+booked that is not here was not booked.
+
 ## 7. Known gaps, read before going live
+
+- **Back-fill before go-live.** While legacy still runs, our import copies legacy's `b2c_…` rows for
+  the orders you have not pushed. Once your push is live, **push every open order that has boat
+  items, the ones made before go-live included**, so the import can stop copying legacy's. Until
+  then the import skips every order you have pushed, so none is here twice. Tell us when the
+  back-fill is done.
 
 - **Retrying a create.** If `POST /v1/bookings` times out, resend it with the same `external_id`.
   If the first one was written, the retry answers `409` with `code: "duplicate_external_id"` and
@@ -196,6 +253,9 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 3. Create a booking and check `GET /v1/availability` dropped by its pax.
 4. Fill a day's seats on sale, create one more, and expect `201` with `status: pending_approval` and
    `allocated_pax: 0` (or `409` when the boat has no registered seats beyond those on sale).
-5. Create with a `foc` passenger and no `focReason`, and expect `400`.
+5. Create with a `foc` passenger and no `focReason`, and expect `202` with `code: held_for_review`
+   and no booking. Resend it with a `focReason` and expect `201`.
 6. Lock → book with `lockDraws` → release, and check `locked_pax` returns to 0.
-7. Cancel, and check the seats come back.
+7. Cancel (with `If-Match`), and check the seats come back.
+8. Amend with an old `If-Match` and expect `409 stale_version`; without one, `428`.
+9. `GET /v1/bookings?updated_since=<the time before step 3>` lists what you created and cancelled.
