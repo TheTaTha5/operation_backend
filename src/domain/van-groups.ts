@@ -19,8 +19,16 @@ export type VanGroup = {
   id: string; service_date: string; route_id: string; zone: string; number: number;
   van_id: string | null; return_van_id: string | null; pickup_time: string | null;
 };
-/** An alternate pickup or drop-off point; only an `alt_pickup` part has one (slice D builds them). */
-export type AltPoint = { pick_area_id: string | null; pick_hotel: string | null; pick_zone: string | null; drop_area_id: string | null; drop_hotel: string | null; drop_zone: string | null };
+/**
+ * An alternate pickup or drop-off point, its own pickup time and whose pickup it is; only an
+ * `alt_pickup` part has one, built from the booking's `alt_pickups` (`alt-pickups.ts`).
+ */
+export type AltPoint = {
+  pick_area_id: string | null; pick_hotel: string | null; pick_zone: string | null; drop_area_id: string | null; drop_hotel: string | null; drop_zone: string | null;
+  pick_time: string | null; alt_who: string | null;
+};
+/** Legacy `bkSplitOwnPick`: an alternate-pickup part picked up somewhere of its own keeps its own pickup time. */
+export const ownPickup = (p: StoredVanPart): boolean => p.source === 'alt_pickup' && !!(p.alt?.pick_hotel || p.alt?.pick_area_id);
 export type PartSource = 'main' | 'manual' | 'alt_pickup';
 export type StoredVanPart = Counts & {
   idx: number; source: PartSource; group_id: string | null; sequence: number | null; return_van_id: string | null; alt: AltPoint | null;
@@ -262,8 +270,11 @@ export function setGroup(state: VanDayState, groupId: string, body: Record<strin
   if (body.pickup_time !== undefined) {
     const time = body.pickup_time === null || body.pickup_time === '' ? null : typeof body.pickup_time === 'string' && isIsoTime(body.pickup_time.trim()) ? body.pickup_time.trim() : bad('pickup_time must be HH:MM, or null');
     group.pickup_time = time;
-    // Legacy writes an own-pickup part's time to the part (pick_time, slice D); every other member's trip gets it.
-    for (const { trip, part } of membersOf(state, group.id)) if (part.source !== 'alt_pickup') plan.dispatch.set(trip.trip_id, { ...plan.dispatch.get(trip.trip_id), pickup_time_final: time });
+    // Legacy `bkV2VanGroupSetTime`: an own-pickup part takes the time itself; every other member's trip gets it as its final pickup.
+    for (const { trip, part } of membersOf(state, group.id)) {
+      if (ownPickup(part)) putParts(state, plan, trip, trip.parts.map((p) => (p.idx === part.idx ? { ...p, alt: { ...p.alt!, pick_time: time } } : p)));
+      else plan.dispatch.set(trip.trip_id, { ...plan.dispatch.get(trip.trip_id), pickup_time_final: time });
+    }
   }
   putGroup(state, plan, group);
   assertCapacity(state, group, vans);
@@ -319,7 +330,7 @@ export function clearRouteVans(state: VanDayState): VanPlan {
 
 // ── PATCH /operations/trip-ops/{trip_id} `van_parts` ──
 
-type PartInput = Counts & { idx: number; source?: PartSource; group_id: string | null; sequence: number | null; return_van_id: string | null };
+type PartInput = Counts & { idx: number; source?: PartSource; group_id: string | null; sequence: number | null; return_van_id: string | null; pick_time?: string | null };
 const count = (v: unknown, name: string): number => (v === undefined || v === null ? 0 : Number.isInteger(v) && (v as number) >= 0 ? v as number : bad(`${name} must be a whole number, 0 or more`));
 
 /** `null` or `[]` is one whole, ungrouped part again (legacy unsplit). */
@@ -337,6 +348,9 @@ export function parseVanParts(value: unknown): PartInput[] {
     return {
       idx: idx as number, source, ad: count(p.ad, `${at}.ad`), chd: count(p.chd, `${at}.chd`), inf: count(p.inf, `${at}.inf`), foc: count(p.foc, `${at}.foc`),
       group_id: id('group_id'), sequence, return_van_id: id('return_van_id'),
+      ...(p.pick_time === undefined ? {} : {
+        pick_time: p.pick_time === null || p.pick_time === '' ? null : typeof p.pick_time === 'string' && isIsoTime(p.pick_time.trim()) ? p.pick_time.trim() : bad(`${at}.pick_time must be HH:MM, or null`),
+      }),
     };
   });
   if (new Set(parts.map((p) => p.idx)).size !== parts.length) bad('van_parts names an idx twice');
@@ -375,8 +389,11 @@ export function setTripParts(state: VanDayState, tripId: string, input: PartInpu
     if (partPax(r) === 0) bad(`van_parts: part ${r.idx} carries nobody`);
     if ((r.chd > 0 || r.inf > 0) && r.ad === 0) warnings.add('child_without_adult');
     if (r.return_van_id && returnSameVan) bad('Send return_same_van or a return_van_id, not both');
+    // Legacy `bkV2SetSplitPickTime`: only a part picked up somewhere of its own has its own time.
+    if (r.pick_time !== undefined && !(kept && ownPickup(kept))) bad(`van_parts: part ${r.idx} has no pickup of its own; set the trip's pickup_time_final`);
     return { idx: r.idx, source: kept ? 'alt_pickup' : r.idx === 0 ? 'main' : 'manual', ad: r.ad, chd: r.chd, inf: r.inf, foc: r.foc,
-      group_id: r.group_id, sequence: r.sequence, return_van_id: r.return_van_id, alt: kept?.alt ?? null };
+      group_id: r.group_id, sequence: r.sequence, return_van_id: r.return_van_id,
+      alt: kept?.alt ? { ...kept.alt, ...(r.pick_time === undefined ? {} : { pick_time: r.pick_time }) } : null };
   });
   const touched = new Set<string>();
   for (const p of parts) {

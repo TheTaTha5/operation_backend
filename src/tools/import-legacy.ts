@@ -49,6 +49,7 @@ import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
 import { lockDays, spansDays } from './legacy-locks.js';
 import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -460,6 +461,27 @@ async function main() {
         }
       }
     };
+    // Legacy builds alternate-pickup parts while it draws the board (`bkV2HealAltSplits`), so a booking
+    // whose parts were never saved has none. The server's `altPickupParts` builds them here as it would.
+    const altPartsOf = (tripId: string, counts: Counts, alts: readonly AltPickup[]) => {
+      const mine = allocations.filter((a) => a.booking_trip_id === tripId);
+      if (mine.some((a) => a.source !== 'main')) return;
+      const main = mine[0];
+      const current = main ? [{ idx: 0, source: 'main' as const, ...counts, group_id: main.group_key ? 'main' : null, sequence: (main.sequence as number | null) ?? null, return_van_id: (main.return_van_id as string | null) ?? null, alt: null }] : [];
+      const parts = altPickupParts(alts, counts, current);
+      if (!parts) return;
+      note('alternate-pickup parts built: legacy had not saved them');
+      for (let i = allocations.length - 1; i >= 0; i--) if (allocations[i].booking_trip_id === tripId) allocations.splice(i, 1);
+      for (const part of parts) {
+        allocations.push({
+          booking_trip_id: tripId, idx: part.idx, ad: part.ad, chd: part.chd, inf: part.inf, foc: part.foc,
+          group_key: part.group_id ? main!.group_key : null, sequence: part.sequence, return_van_id: part.return_van_id, source: part.source,
+          pick_area_id: part.alt?.pick_area_id ?? null, pick_hotel: part.alt?.pick_hotel ?? null, pick_zone: part.alt?.pick_zone ?? null,
+          drop_area_id: part.alt?.drop_area_id ?? null, drop_hotel: part.alt?.drop_hotel ?? null, drop_zone: part.alt?.drop_zone ?? null,
+          pick_time: part.alt?.pick_time ?? null, alt_who: part.alt?.alt_who ?? null,
+        });
+      }
+    };
     const vanOpsOf = (src: Row, t: Row, tripId: string, counts: Counts, zone: string) => {
       const final = pickupWindow(src.ops_pickuptimefinal, 'final pickup times');
       // The boat (or boats) and the pier note (migration 033). A split names two boats or more, each in the catalogue.
@@ -507,11 +529,12 @@ async function main() {
           return_van_id: knownVan(part.ret, 'return vans'), source: idx === 0 ? 'main' : alt ? 'alt_pickup' : 'manual',
           pick_area_id: alt ? str(alt.pickAreaId) || null : null, pick_hotel: alt ? str(alt.pickHotel) || null : null, pick_zone: alt ? str(alt.pickZone) || null : null,
           drop_area_id: alt ? str(alt.dropAreaId) || null : null, drop_hotel: alt ? str(alt.dropHotel) || null : null, drop_zone: alt ? str(alt.dropZone) || null : null,
+          pick_time: alt ? clockOf(alt.pickTime, 'alternate pickup times') : null, alt_who: alt ? str(alt.altWho) || null : null,
         });
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -637,6 +660,13 @@ async function main() {
       // trip's (legacy `bkOpsRead`, booking.js:1917). A booking that releases its seats takes no part
       // in van assignment (R1), so what it still holds is not carried over.
       const firstDay = legacyTripRows.map((t) => str(t.date)).sort()[0];
+      // Alternate pickups (migration 037), read by the API's own parser so legacy's spellings and old `qty` entries map the same way.
+      let bookingAlts: AltPickup[] = [];
+      const rawAlt = jsonValue(b.altpickups);
+      if (Array.isArray(rawAlt) && rawAlt.length) {
+        try { bookingAlts = parseAltPickups(rawAlt); bookingAlts.forEach((a, seq) => altPickups.push({ booking_id: id, seq, ...a })); }
+        catch (error) { note(`alternate pickups dropped: ${(error as Error).message}`); }
+      }
       const addOnTypes = addOnsOf.get(legacyId) ?? [];
       for (const { t, tripId, counts } of myVanTrips) {
         const src = str(t.date) === firstDay ? b : t;
@@ -644,6 +674,7 @@ async function main() {
         checkinsOf(src, tripId);
         if (!holdsSeats(status)) { if (hasVanOps(src)) note('van data not imported: booking cancelled or rejected'); continue; }
         vanOpsOf(src, t, tripId, counts, groupZone(t, b, addOnTypes));
+        if (str(t.date) === firstDay && bookingAlts.length) altPartsOf(tripId, counts, bookingAlts);
       }
 
       let seq = 0;
@@ -659,6 +690,7 @@ async function main() {
         if ((kind !== 'discount' && kind !== 'extra') || (mode !== 'amount' && mode !== 'percent') || !(value > 0)) { note('adjustments dropped: kind, mode or value does not fit'); continue; }
         adjustments.push({ booking_id: id, seq: adjustmentSeq++, kind, mode, value, label: str(a.label) || null, note: str(a.note) || null });
       }
+      // Alternate pickups (migration 037), read by the API's own parser so legacy's spellings and old `qty` entries map the same way.
       // Reconfirmation (migration 035). A record saved before legacy split out `sent` (§rcSplit) has no
       // such key; legacy reads a "done" one as sent, at the time and by the person who confirmed it.
       const rc = jsonValue(b.ops_reconfirm) as Row | null;
@@ -947,6 +979,7 @@ async function main() {
     await insert('booking_passengers', passengers);
     await insert('booking_adjustments', adjustments);
     await insert('booking_reconfirmations', reconfirms);
+    await insert('booking_alt_pickups', altPickups);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);
     await insert('booking_trip_checkin_event_tries', checkinTries);

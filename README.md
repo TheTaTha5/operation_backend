@@ -1405,7 +1405,7 @@ and empty until set:
 
 `van_parts` is who rides which van. A trip with nothing set reads as one whole, ungrouped part
 (`idx 0`). More parts are a split across vans; `source` is `main` (idx 0), `manual` (a split), or
-`alt_pickup` (an alternate pickup point, with its points in `alt`).
+`alt_pickup` (built from the booking's `alt_pickups`, with its points in `alt`; see "Alternate pickups").
 
 `PATCH /operations/trip-ops/{trip_id}` sets it (the `operations` edit area). An absent field is
 unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
@@ -1444,6 +1444,43 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 - The legacy import brings each active booking's boat, boat split, final pickup and pier note.
 
 Check-in has its own section below.
+
+### Alternate pickups
+
+Some of a booking's passengers picked up, or dropped off, somewhere else (the sales form's
+"รับหลายจุด"). `alt_pickups` is a booking field: accepted on `POST /v1/bookings` and
+`PATCH /v1/bookings/{id}`, returned on every read. The list replaces outright (absent = unchanged,
+`[]` or `null` = clear). Legacy's spelling `altPickups` and its keys (`areaId`, `dropSame`,
+`dropAreaId`, `dropArea`, `dropZone`, `dropPlace`) are accepted, and an old entry with only `qty`
+counts as that many adults.
+
+```jsonc
+"alt_pickups": [ { "who": "Mr B", "ad": 1, "chd": 0, "inf": 0, "foc": 0,
+                   "area_id": "pa_kata", "area": "Kata", "zone": "PK", "place": "Kata Palm",
+                   "drop_same": true, "drop_area_id": null, "drop_area": null, "drop_zone": null, "drop_place": null } ]
+```
+
+**The server builds the van parts** from them, after every create, edit, partial cancel and
+reschedule (legacy `bkV2SyncAltPickupSplits`, which ran in each browser):
+- It works on the booking's first day only, and not on a cancelled booking, as legacy does.
+- An entry counts when it has passengers and a place, area, name or drop-off.
+- The main part (idx 0) keeps the rest of the trip's passengers, category by category. Each entry
+  becomes an `alt_pickup` part, carrying its points in `alt` (`pick_*`, `drop_*` when
+  `drop_same` is false, `alt_who`, `pick_time`).
+- Parts keep their van group, order and return van by position:
+  - a new entry with its own pickup starts ungrouped;
+  - a drop-off-only entry rides with the main part.
+- With no entries, or when they take every passenger, or the trip has one passenger, an automatic
+  split folds back into one part that keeps the main part's group.
+- **A split made by hand** (`van_parts` with `manual` parts) is left alone.
+- An alternate-pickup part's passengers can't be changed in `van_parts` (`409 alt_pickup_split`).
+  Its group, order, return van and own `pick_time` can (`van_parts[i].pick_time`). Only a part
+  with its own pickup has one: anything else is `400`.
+- A group's `pickup_time` goes to such a part's `pick_time`; every other member gets it as the
+  trip's final pickup (legacy `bkV2VanGroupSetTime`).
+
+The import brings every entry. For a booking whose parts legacy never saved, it builds them the
+same way.
 
 ### Check-in
 
