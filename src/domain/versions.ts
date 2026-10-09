@@ -3,8 +3,8 @@
  *
  * Bookings and seat locks carry a `version`: 1 on create, +1 on every write. A client sends back the
  * version it read, as `If-Match: "7"` (the `ETag` it was given) or `"version": 7` in the body. If the
- * record has moved on, the write is refused and nothing changes. Without either, the write goes
- * through as before (last write wins): optional until every client sends it.
+ * record has moved on, the write is refused and nothing changes. A login must send one (`428
+ * version_required`, decided 2026-10-09); with authentication off it is not checked.
  */
 import { refuse } from './booking-actions.js';
 

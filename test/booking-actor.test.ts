@@ -15,7 +15,12 @@ test('every write is signed by the token\'s user, whatever the body says', async
   const login = await app.inject({ method: 'POST', url: '/v1/login', payload: { username: 'ops1', password: 'pw' } });
   assert.equal(login.statusCode, 200, login.body);
   const headers = { authorization: `Bearer ${login.json().access_token}` };
-  const send = (method: 'POST' | 'PATCH' | 'GET', url: string, payload?: object) => app.inject({ method, url, headers, ...(payload ? { payload } : {}) });
+  // A write to a booking sends the version it read (If-Match is required of a login).
+  const send = async (method: 'POST' | 'PATCH' | 'GET', url: string, payload?: object) => {
+    const booking = method !== 'GET' && /^\/v1\/bookings\/[^/]+/.exec(url);
+    const version = booking ? (await app.inject({ method: 'GET', url: booking[0], headers })).json().version : undefined;
+    return app.inject({ method, url, headers, ...(payload || version ? { payload: { ...payload, ...(version ? { version } : {}) } } : {}) });
+  };
 
   const date = '2037-04-01';
   await send('POST', '/operations/deployments', { boat_id: 'boat-actor', route_id: 'r1', service_date: date, capacity: 20 });
@@ -44,7 +49,12 @@ test('every write is signed by the token\'s user, whatever the body says', async
 test('who confirmed and who approved come from the login, never a typed name', async () => {
   const login = await app.inject({ method: 'POST', url: '/v1/login', payload: { username: 'ops1', password: 'pw' } });
   const headers = { authorization: `Bearer ${login.json().access_token}` };
-  const send = (method: 'POST' | 'GET', url: string, payload?: object) => app.inject({ method, url, headers, ...(payload ? { payload } : {}) });
+  // A write to a booking sends the version it read (If-Match is required of a login).
+  const send = async (method: 'POST' | 'GET', url: string, payload?: object) => {
+    const booking = method !== 'GET' && /^\/v1\/bookings\/[^/]+/.exec(url);
+    const version = booking ? (await app.inject({ method: 'GET', url: booking[0], headers })).json().version : undefined;
+    return app.inject({ method, url, headers, ...(payload || version ? { payload: { ...payload, ...(version ? { version } : {}) } } : {}) });
+  };
   const date = '2037-04-02';
   await send('POST', '/operations/deployments', { boat_id: 'boat-actor-2', route_id: 'r1', service_date: date, capacity: 20 });
 

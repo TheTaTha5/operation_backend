@@ -424,15 +424,21 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    */
   const sentVersion = (request: { headers: Record<string, unknown>; body?: unknown }): number | undefined =>
     expectedVersion(request.headers['if-match'], isRecord(request.body) ? request.body.version : undefined);
-  const assertBookingFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown }): Promise<void> => {
+  /**
+   * A logged-in caller must send the version it read (decided 2026-10-09): a save without it would
+   * overwrite edits it has not seen. With authentication off nothing is checked, as for permissions.
+   */
+  const requireVersion = (request: { user?: { user?: StoredUser } }, what: string): never | undefined =>
+    request.user?.user ? refuseWith(`Send the ${what}'s version you read, as If-Match: "7" or "version": 7 in the body, so this save cannot overwrite a change you have not seen`, 428, 'version_required') : undefined;
+  const assertBookingFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown; user?: { user?: StoredUser } }): Promise<void> => {
     const expected = sentVersion(request);
-    if (expected === undefined) return;
+    if (expected === undefined) return requireVersion(request, 'booking');
     const current = await store.booking(bookingId(request));
     if (current) assertFresh(`Booking ${current.id}`, expected, current.version);
   };
-  const assertLockFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown }): Promise<void> => {
+  const assertLockFresh = async (request: { headers: Record<string, unknown>; body?: unknown; params: unknown; user?: { user?: StoredUser } }): Promise<void> => {
     const expected = sentVersion(request);
-    if (expected === undefined) return;
+    if (expected === undefined) return requireVersion(request, 'seat lock');
     const current = await store.lock(lockId(request));
     if (current) assertFresh(`Seat lock ${current.id}`, expected, current.version);
   };
