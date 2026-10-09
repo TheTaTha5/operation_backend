@@ -53,10 +53,6 @@ Check `changes_kind_check` after migrating.
 
 ## Known issues
 
-- **Occasional PostgreSQL test failures under `--test-concurrency=3`.** These are serialization
-  retries running out (`40001`) in pricing and booking-save tests. A clean rerun passes. Investigate:
-  booking writes now read more (invoices, weather cases, lock rows) inside serializable
-  transactions.
 - **Still waiting on people** (`todo/developer-checklist.md`):
   - **Ops:** a route with no boat yet; the B2C orphans; projects PRJ-001…007.
   - **Sales:** the add-on catalogue's contents.

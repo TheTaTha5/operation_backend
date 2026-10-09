@@ -78,7 +78,7 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `npm run build` | Compile TypeScript into `dist/`. |
 | `npm start` | Run the compiled service. |
 | `npm test` | Run HTTP route tests. |
-| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. Use a fresh, empty database. Three test files run at a time (`--test-concurrency=3`), as on CI's runner: with a test-sized database PostgreSQL watches whole tables for serialization conflicts, so eleven files at once on a many-core machine made unrelated bookings collide until a request ran out of retries (`40001`, a `500`), about one test per run, on `main` too. |
+| `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. Use a fresh, empty database. Three test files run at a time (`--test-concurrency=3`), as on CI's runner: with a test-sized database PostgreSQL watches whole tables for serialization conflicts, so eleven files at once on a many-core machine made unrelated bookings collide often. A collision is retried, and the retry runs alone (`transaction` in `src/domain/postgres-operations.ts`), so it no longer runs out of retries. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
@@ -3482,7 +3482,7 @@ an agent who has not confirmed numbers; `pax` is the minimum seats promised.
 - **Who creates them:** only the legacy import, for now; only a full release applies to one here
   (`400 boat_hold` for the other commands). Creating and converting holds is their own design.
 
-Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
+Booking creation/amendment/rescheduling and lock changes run in one serialized capacity guard. PostgreSQL deployments use transaction-scoped advisory locks for each route/date pool, so concurrent API instances cannot oversell. Every write is a `SERIALIZABLE` transaction, retried on a serialization failure (`40001`) or deadlock; **a retry runs alone**: each transaction holds a gate (an advisory lock taken before `BEGIN`) shared, a retry takes it exclusive, so it waits for the transactions in flight and none runs beside it. A first attempt never waits, so writes stay concurrent until two collide; a collision costs one retry, never a `500`. Over-capacity requests return `409`; invalid input returns `400`; unknown resources return `404`.
 
 `GET /api/health` remains available for service health checks. It returns `{ status: "ok", commit }`,
 where `commit` is the git SHA Railway built the running deploy from (`null` outside Railway). If it

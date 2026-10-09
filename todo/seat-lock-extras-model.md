@@ -89,9 +89,3 @@ cover them (legacy's behaviour unless said otherwise).
   `verify-import`: every mapped lock and log line present; locked seats per route and day match
   legacy on all 179 route-days. A replay of legacy's pool hold (`bkV2LockPoolHold`) for every active
   day lock from today matches on all 41 route-days.
-
-**Tests**
-
-- One full PostgreSQL run hit a `40001` serialization failure past the 8 retries in
-  `test/booking-adjustments` (unrelated file, under parallel load); the rerun on a fresh database
-  passed. Worth watching: `day()` now reads every sub-group of a day too.
