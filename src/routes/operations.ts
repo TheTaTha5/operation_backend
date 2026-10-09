@@ -13,14 +13,12 @@ import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHead
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
 import { parseBookingAddOns, type BookingAddOnInput } from '../domain/booking-addons.js';
 import { parseBookingAdjustments, type BookingAdjustmentInput } from '../domain/booking-adjustments.js';
-import type { AgentListQuery } from '../domain/agents.js';
 import {
   actorOf, createHeader, parseCancelRequest, parsePartialCancelRequest, parseRescheduleRequest, parseStatusCommandRequest, stampActor, STATUS_COMMANDS,
 } from '../domain/booking-actions.js';
 import { parseIntent, pendingApproval } from '../domain/booking-approvals.js';
 import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
-import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, charterSynced, checkBoatAssignment, parseDispatchPatch, parseRaise, paxByBoat } from '../domain/dispatch.js';
 import { changeContext, trackChanges } from './change-tracking.js';
 import { parseSince } from '../domain/changes.js';
@@ -43,10 +41,12 @@ import {
   patchStatusRange, patchZoneRange, statusRangeLines, vanDayLines, vanEditLines, vanMatrix, zoneRangeDeletedLine, zoneRangeLines, type VanLogLine,
 } from '../domain/vans.js';
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
+import { registerSalesRoutes } from './sales-editing.js';
+import { assertAgentBookable } from '../domain/agent-writes.js';
+import { assertInsuranceEcho } from '../domain/insurance.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
-import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import {
-  assertPaymentEcho, bangkokDay, bookingIdsOf, correctPayments, creditOf, feeInvoice, invoiceLines, invoiceMonth, invoiceNumber, invoiceView, issuedLine, issueInvoice,
+  assertPaymentEcho, bangkokDay, bookingIdsOf, correctPayments, feeInvoice, invoiceLines, invoiceMonth, invoiceNumber, invoiceView, issuedLine, issueInvoice,
   parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, voided, voidedLine, withDiscounts,
   type PaymentMethod, type StoredInvoice,
 } from '../domain/invoices.js';
@@ -306,12 +306,6 @@ function bookingStatusList(value: unknown): BookingStatus[] | undefined {
   const parts = (Array.isArray(value) ? value : [value]).flatMap((part) => String(part).split(',')).map((part) => part.trim()).filter((part) => part.length > 0);
   if (parts.length === 0) return undefined;
   return [...new Set(parts.map((part) => bookingStatus(part)!))];
-}
-
-/** `?active=` on the agent list: active agents by default, `false` for inactive ones, `all` for both. */
-function agentListQuery(query: Record<string, unknown>): AgentListQuery {
-  const active = query.active === undefined || query.active === 'true' ? true : query.active === 'false' ? false : query.active === 'all' ? undefined : badRequest('active must be true, false or all');
-  return { marketId: optionalString(query.market), salesId: optionalString(query.sales), q: optionalString(query.q), active };
 }
 
 /** `?active=` on the rate type list, as on agents: active by default, `false` for inactive ones, `all` for both. */
@@ -656,6 +650,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     // `status` on create is deprecated for `intent` and goes when both clients send `intent`; the
     // log says who still sends it.
     if (viaStatus) request.log.warn({ status: (request.body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
+    // A deactivated agent takes no new bookings (todo/sales-editing-model.md, decision 1).
+    if (input.agent_id) assertAgentBookable(await store.agent(input.agent_id));
     // The server prices the booking (README "Prices"); a B2C booking keeps the price sent.
     await fillPickups(input.header?.pickup_area_id, input.header?.dropoff_area_id, input.trips);
     const priced = isB2C(input) ? undefined : await priceFor({ agentId: input.agent_id, header: input.header ?? {}, trips: input.trips,
@@ -704,6 +700,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
       assertReconfirmEcho(body.reconfirm, stored.reconfirm);
       assertDocCheckEcho(body.doc_check, stored.doc_check);
+      assertInsuranceEcho(body.passengers, stored.passengers);
       assertPaymentEcho(body, stored);
       await fillPickups(changes.header?.pickup_area_id === undefined ? stored.pickup_area_id : changes.header.pickup_area_id ?? undefined,
         changes.header?.dropoff_area_id ?? undefined, changes.trips, changes.header?.pickup_area_id !== undefined);
@@ -1367,11 +1364,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   });
 
   /**
-   * Agents and their reference lists. Read-only for now: agents arrive through the legacy import.
-   * Any login may read them. Every caller sees every agent — scoping a salesperson
-   * to their own agents needs their salesperson id in the token, which is not decided yet.
+   * Agents, contracts, salespeople, markets, templates, the add-on catalogue, nationalities and
+   * insurance: `sales-editing.ts` (todo/sales-editing-model.md).
    */
-  app.get('/v1/markets', async () => ({ markets: await store.listMarkets() }));
+  registerSalesRoutes(app, { store, assertBookingFresh });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an
@@ -1842,52 +1838,6 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       },
     });
   }
-
-  /** Agents' contracts, read-only (todo/contracts-model.md); any login may read them. */
-  app.get('/v1/contracts', async (request) => ({ contracts: await store.listContracts(parseContractListQuery(request.query as Record<string, unknown>)) }));
-  app.get('/v1/contracts/:id', async (request) => (await store.contract((request.params as { id: string }).id)) ?? notFound('Contract not found'));
-  app.get('/v1/sales', async () => ({ sales: await store.listSalesPeople() }));
-  app.get('/v1/agents', async (request) => ({ agents: await store.listAgents(agentListQuery(request.query as Record<string, unknown>)) }));
-  /** The agent, and its credit (legacy `agCreditState`; todo/money-model.md slice 1). */
-  app.get('/v1/agents/:id', async (request) => {
-    const agent = (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found');
-    const bookings: Booking[] = [];
-    let cursor: string | undefined;
-    do {
-      const page = await store.listBookings({ agentId: agent.id, limit: 1000, ...(cursor ? { cursor } : {}) });
-      bookings.push(...page.bookings);
-      cursor = page.next_cursor;
-    } while (cursor);
-    return { ...agent, credit: creditOf(agent, bookings) };
-  });
-  app.get('/v1/agents/:id/activity', async (request) => {
-    const query = request.query as Record<string, unknown>;
-    const limit = query.limit === undefined ? 50 : Number(query.limit);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 200) badRequest('limit must be an integer between 1 and 200');
-    return { activity: (await store.agentActivity((request.params as { id: string }).id, limit)) ?? notFound('Agent not found') };
-  });
-  /** Which rate type an agent is priced at, by travel date (README, "Rate seasons"). */
-  app.get('/v1/agents/:id/rate-seasons', async (request) => ({ seasons: (await store.rateSeasons((request.params as { id: string }).id)) ?? notFound('Agent not found') }));
-  /** Replaces the table, area `sales` (the hook), and logs legacy's line in the agent's activity. */
-  app.put('/v1/agents/:id/rate-seasons', async (request) => {
-    const agentId = (request.params as { id: string }).id;
-    const seasons = parseRateSeasons(record(request.body));
-    const names = new Map<string, string>();
-    for (const id of new Set(seasons.map((season) => season.rate_type_id))) {
-      const rateType = await store.rateType(id);
-      if (!rateType) badRequest(`Rate type ${id} does not exist (GET /v1/rate-types)`);
-      names.set(id, rateType!.name || rateType!.code || id);
-    }
-    const activity = { at: new Date().toISOString(), by: actorOf(request.user) ?? null, kind: 'rate', text: seasonsActivityText(seasons, (id) => names.get(id) ?? id) };
-    return { seasons: (await store.transaction(async () => store.setRateSeasons(agentId, seasons, activity))) ?? notFound('Agent not found') };
-  });
-  /** The rate type for one travel date: the covering season with the latest `from`, else the agent's own. */
-  app.get('/v1/agents/:id/rate-type', async (request) => {
-    const date = (request.query as Record<string, unknown>).date;
-    if (typeof date !== 'string' || !isIsoDate(date)) badRequest('date must be YYYY-MM-DD');
-    const agent = (await store.agent((request.params as { id: string }).id)) ?? notFound('Agent not found');
-    return rateTypeFor(agent.rate_type_id, agent.rate_seasons, date as string);
-  });
 
   /**
    * Rate types: the price lists agents are sold at (`src/domain/rate-types.ts`). Under `booking:*`

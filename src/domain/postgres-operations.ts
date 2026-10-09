@@ -45,9 +45,15 @@ import type { VanStop } from './van-stops.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
+import type { AgentUsage, ContractHistoryEntry } from './agent-writes.js';
+import type { StoredSalesPerson, SalesPersonSummary } from './team.js';
+import { sortDocuments, sortTemplates, type ContractDocument, type ContractTemplate } from './contract-templates.js';
+import { sortAddonServices, type AddonService } from './addon-services.js';
+import type { StoredNationality } from './nationalities.js';
+import { carryInsurance, type InsuranceFields } from './insurance.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
-  type Agent, type AgentActivity, type AgentListQuery, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
+  type Agent, type AgentActivity, type AgentListQuery, type AgentProgram, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
 } from './agents.js';
 import {
   assertOwner, assertRateTypeUnused, assertRouteBlock, generateRateTypeCode, newRateTypeRow, nextRouteSeq, patchedRateTypeRow, rateTypeExists, rateTypeView, routeRows, selectRateTypes,
@@ -143,7 +149,8 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
   (SELECT to_jsonb(dc) || jsonb_build_object('results', COALESCE((SELECT jsonb_object_agg(r.item, jsonb_build_object('result', r.result, 'evidence', r.evidence, 'detail', r.detail))
      FROM booking_doc_check_results r WHERE r.booking_id = dc.booking_id), '{}'::jsonb)) FROM booking_doc_checks dc WHERE dc.booking_id = b.id) AS doc_check,
   COALESCE((
-    SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
+    SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc,
+      'age', pg.age, 'insurance_reviewed_at', pg.insurance_reviewed_at, 'insurance_reviewed_by', pg.insurance_reviewed_by) ORDER BY pg.seq)
     FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', a.seq, 'type', a.type, 'label', a.label, 'amount', a.amount, 'qty', a.qty, 'note', a.note,
@@ -256,6 +263,9 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     seq: Number(passenger.seq), name: String(passenger.name),
     nationality: passenger.nationality ?? undefined, type: passenger.type ?? undefined,
     foc: passenger.foc ?? undefined,
+    ...(passenger.age == null ? {} : { age: Number(passenger.age) }),
+    ...(passenger.insurance_reviewed_at == null ? {} : { insurance_reviewed_at: jsonInstant(passenger.insurance_reviewed_at) }),
+    ...(passenger.insurance_reviewed_by == null ? {} : { insurance_reviewed_by: String(passenger.insurance_reviewed_by) }),
   })) as BookingPassenger[],
   // A NULL column is left off rather than sent as null, matching the in-process store, which never
   // set it. `amount` is NUMERIC; Number() keeps it a JSON number whichever way `pg` hands it over.
@@ -719,8 +729,10 @@ export class PostgresOperationsStore {
   private async writePassengers(bookingId: string, passengers: readonly BookingPassengerInput[]): Promise<void> {
     await this.client().query('DELETE FROM booking_passengers WHERE booking_id = $1', [bookingId]);
     for (const [seq, passenger] of passengers.entries()) {
-      await this.client().query('INSERT INTO booking_passengers (booking_id, seq, name, nationality, type, foc) VALUES ($1,$2,$3,$4,$5,$6)',
-        [bookingId, seq, passenger.name, passenger.nationality ?? null, passenger.type ?? null, passenger.foc ?? null]);
+      await this.client().query(`INSERT INTO booking_passengers (booking_id, seq, name, nationality, type, foc, age, insurance_reviewed_at, insurance_reviewed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [bookingId, seq, passenger.name, passenger.nationality ?? null, passenger.type ?? null, passenger.foc ?? null,
+          passenger.age ?? null, passenger.insurance_reviewed_at ?? null, passenger.insurance_reviewed_by ?? null]);
     }
   }
 
@@ -1029,7 +1041,7 @@ export class PostgresOperationsStore {
     await this.client().query(`UPDATE bookings SET ${assignments.join(', ')} WHERE id = $1`, values);
     // `booking_data` is deliberately left as it was written at create time. The blob is on its way
     // out, and re-serialising an amendment into it would grow the thing being deleted.
-    if (changes.passengers) await this.writePassengers(id, changes.passengers);
+    if (changes.passengers) await this.writePassengers(id, carryInsurance(current.passengers, changes.passengers));
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
     if (changes.alt_pickups) await this.writeAltPickups(id, changes.alt_pickups);
@@ -1285,11 +1297,11 @@ export class PostgresOperationsStore {
       COALESCE((SELECT array_agg(s.name ORDER BY s.idx, s.name) FROM market_subs s WHERE s.market_id = m.id), '{}') AS subs FROM markets m`);
     return sortMarkets(rows.map((row) => ({ id: String(row.id), name: String(row.name), color: text(row.color), sort: num(row.sort), subs: (row.subs as string[]).map(String) })));
   }
-  async listSalesPeople(): Promise<SalesPerson[]> {
-    const { rows } = await this.client().query('SELECT id, code, name, full_name, designation, email, tel, color, active FROM sales_people');
+  async listSalesPeople(): Promise<SalesPersonSummary[]> {
+    const { rows } = await this.client().query('SELECT id, code, name, full_name, designation, email, tel, color, active, signature IS NOT NULL AS has_signature FROM sales_people');
     return sortSalesPeople(rows.map((row) => ({
       id: String(row.id), code: text(row.code), name: String(row.name), full_name: text(row.full_name), designation: text(row.designation),
-      email: text(row.email), tel: text(row.tel), color: text(row.color), active: row.active === true,
+      email: text(row.email), tel: text(row.tel), color: text(row.color), active: row.active === true, has_signature: row.has_signature === true,
     })));
   }
   async listAgents(query: AgentListQuery): Promise<AgentSummary[]> {
@@ -1326,6 +1338,177 @@ export class PostgresOperationsStore {
     if (!known) return undefined;
     const { rows } = await this.client().query('SELECT id, at, by, kind, text FROM agent_activity WHERE agent_id = $1', [id]);
     return latestActivity(rows.map((row) => ({ at: asIso(row.at), by: text(row.by), kind: String(row.kind), text: String(row.text), seq: Number(row.id) })), limit);
+  }
+
+  // ── Sales editing (todo/sales-editing-model.md): the rules are `agent-writes.ts`'s and the
+  //    other modules'; these only read and write the rows, as the in-process store keeps them. ──
+
+  async agentRecord(id: string): Promise<StoredAgent | undefined> {
+    const { rows: [row] } = await this.client().query(`${AGENT_SELECT} WHERE a.id = $1 FOR UPDATE OF a`, [id]);
+    return row && storedAgent(row);
+  }
+  async agentRecords(): Promise<StoredAgent[]> { return (await this.client().query(AGENT_SELECT)).rows.map(storedAgent); }
+  /** Inserts or replaces the agent, replaces its programmes, and appends the activity lines in order. */
+  async saveAgent(agent: StoredAgent, activity: readonly AgentActivity[]): Promise<void> {
+    const { programs, ...columns } = agent;
+    const names = Object.keys(columns);
+    await this.client().query(`INSERT INTO agents (${names.join(', ')}) VALUES (${names.map((_, i) => `$${i + 1}`).join(', ')})
+      ON CONFLICT (id) DO UPDATE SET ${names.filter((n) => n !== 'id' && n !== 'created_at').map((n) => `${n} = EXCLUDED.${n}`).join(', ')}`, Object.values(columns));
+    await this.client().query('DELETE FROM agent_programs WHERE agent_id = $1', [agent.id]);
+    for (const [idx, p] of programs.entries()) {
+      await this.client().query('INSERT INTO agent_programs (agent_id, route_id, idx, book_from, book_to, note) VALUES ($1,$2,$3,$4,$5,$6)',
+        [agent.id, p.route_id, idx, p.book_from, p.book_to, p.note]);
+    }
+    await this.addAgentActivity(agent.id, activity);
+  }
+  async addAgentActivity(agentId: string, activity: readonly AgentActivity[]): Promise<void> {
+    for (const a of activity) {
+      await this.client().query('INSERT INTO agent_activity (agent_id, at, by, kind, text) VALUES ($1,$2,$3,$4,$5)', [agentId, a.at, a.by, a.kind, a.text]);
+    }
+  }
+  async agentUsage(id: string): Promise<AgentUsage> {
+    const { rows: [u] } = await this.client().query(`SELECT
+      (SELECT count(*) FROM bookings WHERE agent_id = $1)::int AS bookings, (SELECT count(*) FROM contracts WHERE agent_id = $1)::int AS contracts,
+      (SELECT count(*) FROM seat_locks WHERE agent_id = $1)::int AS seat_locks, (SELECT count(*) FROM invoices WHERE agent_id = $1)::int AS invoices,
+      (SELECT count(*) FROM users WHERE agent_id = $1)::int AS logins`, [id]);
+    return { bookings: u.bookings, contracts: u.contracts, seat_locks: u.seat_locks, invoices: u.invoices, logins: u.logins };
+  }
+  async deleteAgent(id: string): Promise<void> {
+    // Issued documents name the agent without a cascade; an agent with a contract cannot get here.
+    await this.client().query('DELETE FROM contract_documents WHERE agent_id = $1', [id]);
+    await this.client().query('DELETE FROM agents WHERE id = $1', [id]);
+  }
+  /** Newest first. */
+  async contractHistory(agentId: string): Promise<ContractHistoryEntry[]> {
+    const { rows } = await this.client().query(`SELECT version, archived_at::text, contract_start::text, contract_end::text, rate_type_id, programs, signatory, archived_by
+      FROM agent_contract_history WHERE agent_id = $1 ORDER BY id DESC`, [agentId]);
+    return rows.map((r) => ({
+      version: r.version ?? null, archived_at: r.archived_at, contract_start: r.contract_start ?? null, contract_end: r.contract_end ?? null,
+      rate_type_id: r.rate_type_id ?? null, programs: r.programs as AgentProgram[], signatory: r.signatory ?? null, archived_by: r.archived_by ?? null,
+    }));
+  }
+  async addContractHistory(agentId: string, h: ContractHistoryEntry): Promise<void> {
+    await this.client().query(`INSERT INTO agent_contract_history (agent_id, version, archived_at, contract_start, contract_end, rate_type_id, programs, signatory, archived_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [agentId, h.version, h.archived_at, h.contract_start, h.contract_end, h.rate_type_id, JSON.stringify(h.programs), h.signatory === null ? null : JSON.stringify(h.signatory), h.archived_by]);
+  }
+  async setContractFields(id: string, fields: Partial<Pick<Contract, 'rate_type_id' | 'doc_id'>>): Promise<void> {
+    if (fields.rate_type_id !== undefined) await this.client().query('UPDATE contracts SET rate_type_id = $2 WHERE id = $1', [id, fields.rate_type_id]);
+    if (fields.doc_id !== undefined) await this.client().query('UPDATE contracts SET doc_id = $2 WHERE id = $1', [id, fields.doc_id]);
+  }
+
+  async saveMarket(market: Market): Promise<void> {
+    await this.client().query(`INSERT INTO markets (id, name, color, sort) VALUES ($1,$2,$3,$4)
+      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, color = EXCLUDED.color, sort = EXCLUDED.sort`, [market.id, market.name, market.color, market.sort]);
+    await this.client().query('DELETE FROM market_subs WHERE market_id = $1', [market.id]);
+    for (const [idx, name] of market.subs.entries()) await this.client().query('INSERT INTO market_subs (market_id, idx, name) VALUES ($1,$2,$3)', [market.id, idx, name]);
+  }
+  async deleteMarket(id: string): Promise<void> { await this.client().query('DELETE FROM markets WHERE id = $1', [id]); }
+
+  async salesPerson(id: string): Promise<StoredSalesPerson | undefined> {
+    const { rows: [r] } = await this.client().query('SELECT id, code, name, full_name, designation, email, tel, color, active, signature FROM sales_people WHERE id = $1', [id]);
+    return r && { id: String(r.id), code: text(r.code), name: String(r.name), full_name: text(r.full_name), designation: text(r.designation),
+      email: text(r.email), tel: text(r.tel), color: text(r.color), active: r.active === true, signature: text(r.signature) };
+  }
+  async saveSalesPerson(p: StoredSalesPerson): Promise<void> {
+    await this.client().query(`INSERT INTO sales_people (id, code, name, full_name, designation, email, tel, color, active, signature) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, full_name = EXCLUDED.full_name, designation = EXCLUDED.designation,
+        email = EXCLUDED.email, tel = EXCLUDED.tel, color = EXCLUDED.color, active = EXCLUDED.active, signature = EXCLUDED.signature`,
+    [p.id, p.code, p.name, p.full_name, p.designation, p.email, p.tel, p.color, p.active, p.signature]);
+  }
+  async salesUsage(id: string): Promise<{ logins: number; rate_types: number }> {
+    const { rows: [u] } = await this.client().query(`SELECT (SELECT count(*) FROM users WHERE sales_id = $1)::int AS logins,
+      (SELECT count(*) FROM rate_types WHERE owner_sales_id = $1)::int AS rate_types`, [id]);
+    return { logins: u.logins, rate_types: u.rate_types };
+  }
+  async deleteSalesPerson(id: string): Promise<void> { await this.client().query('DELETE FROM sales_people WHERE id = $1', [id]); }
+
+  async listTemplates(): Promise<ContractTemplate[]> {
+    const { rows } = await this.client().query(`SELECT id, code, name, active, is_default, created_date::text, note, form, accent, accent_hex, font, sections, text, created_at, updated_at
+      FROM contract_templates`);
+    return sortTemplates(rows.map((r) => ({
+      id: String(r.id), code: String(r.code), name: String(r.name), active: r.active === true, is_default: r.is_default === true, created_date: r.created_date ?? null,
+      note: text(r.note), form: text(r.form), accent: text(r.accent), accent_hex: text(r.accent_hex), font: text(r.font),
+      sections: r.sections as ContractTemplate['sections'], text: r.text as ContractTemplate['text'], created_at: asIso(r.created_at), updated_at: asIso(r.updated_at),
+    })));
+  }
+  async saveTemplate(t: ContractTemplate): Promise<void> {
+    await this.client().query(`INSERT INTO contract_templates (id, code, name, active, is_default, created_date, note, form, accent, accent_hex, font, sections, text, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET code = EXCLUDED.code, name = EXCLUDED.name, active = EXCLUDED.active, is_default = EXCLUDED.is_default,
+        note = EXCLUDED.note, form = EXCLUDED.form, accent = EXCLUDED.accent, accent_hex = EXCLUDED.accent_hex, font = EXCLUDED.font,
+        sections = EXCLUDED.sections, text = EXCLUDED.text, updated_at = EXCLUDED.updated_at`,
+    [t.id, t.code, t.name, t.active, t.is_default, t.created_date, t.note, t.form, t.accent, t.accent_hex, t.font, JSON.stringify(t.sections), JSON.stringify(t.text), t.created_at, t.updated_at]);
+  }
+  /** Makes it the default, and active; the old default first, as the index allows one. */
+  async setDefaultTemplate(id: string, now: string): Promise<void> {
+    await this.client().query('UPDATE contract_templates SET is_default = false, updated_at = $2 WHERE is_default AND id <> $1', [id, now]);
+    await this.client().query('UPDATE contract_templates SET is_default = true, active = true, updated_at = $2 WHERE id = $1', [id, now]);
+  }
+  async deleteTemplate(id: string): Promise<void> { await this.client().query('DELETE FROM contract_templates WHERE id = $1', [id]); }
+
+  private async readDocuments(where: string, param: string): Promise<ContractDocument[]> {
+    const { rows } = await this.client().query(`SELECT id, agent_id, contract_id, version, lang, generated_at, generated_by, template_id, template_name, rate_type_ref,
+      rate_type_name, page_count, content FROM contract_documents WHERE ${where} = $1`, [param]);
+    return sortDocuments(rows.map((r) => ({
+      id: String(r.id), agent_id: String(r.agent_id), contract_id: text(r.contract_id), version: String(r.version), lang: (r.lang ?? null) as ContractDocument['lang'],
+      generated_at: asIso(r.generated_at), generated_by: text(r.generated_by), template_id: text(r.template_id), template_name: text(r.template_name),
+      rate_type_ref: text(r.rate_type_ref), rate_type_name: text(r.rate_type_name), page_count: num(r.page_count), content: r.content as Record<string, unknown>,
+    })));
+  }
+  async listDocuments(agentId: string): Promise<ContractDocument[]> { return this.readDocuments('agent_id', agentId); }
+  async contractDocument(id: string): Promise<ContractDocument | undefined> { return (await this.readDocuments('id', id))[0]; }
+  async addDocument(d: ContractDocument): Promise<void> {
+    await this.client().query(`INSERT INTO contract_documents (id, agent_id, contract_id, version, lang, generated_at, generated_by, template_id, template_name,
+      rate_type_ref, rate_type_name, page_count, content) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    [d.id, d.agent_id, d.contract_id, d.version, d.lang, d.generated_at, d.generated_by, d.template_id, d.template_name, d.rate_type_ref, d.rate_type_name, d.page_count, JSON.stringify(d.content)]);
+  }
+  async deleteDocument(id: string): Promise<void> {
+    await this.client().query('UPDATE contracts SET doc_id = NULL WHERE doc_id = $1', [id]);
+    await this.client().query('DELETE FROM contract_documents WHERE id = $1', [id]);
+  }
+
+  async listAddonServices(): Promise<AddonService[]> {
+    const { rows } = await this.client().query(`SELECT s.id, s.name, s.type, s.description, s.active, s.sort, s.created_at, s.updated_at,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('id', v.id, 'name', v.name, 'unit', v.unit, 'selling', v.selling, 'net', v.net) ORDER BY v.seq)
+        FROM addon_service_variants v WHERE v.service_id = s.id), '[]'::jsonb) AS variants FROM addon_services s`);
+    return sortAddonServices(rows.map((r) => ({
+      id: String(r.id), name: String(r.name), type: r.type as AddonService['type'], description: text(r.description), active: r.active === true, sort: num(r.sort),
+      variants: (r.variants as Record<string, unknown>[]).map((v) => ({ id: String(v.id), name: String(v.name), unit: text(v.unit), selling: num(v.selling), net: num(v.net) })),
+      created_at: asIso(r.created_at), updated_at: asIso(r.updated_at),
+    })));
+  }
+  async addonService(id: string): Promise<AddonService | undefined> { return (await this.listAddonServices()).find((s) => s.id === id); }
+  async saveAddonService(s: AddonService): Promise<void> {
+    await this.client().query(`INSERT INTO addon_services (id, name, type, description, active, sort, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, type = EXCLUDED.type, description = EXCLUDED.description, active = EXCLUDED.active,
+        sort = EXCLUDED.sort, updated_at = EXCLUDED.updated_at`, [s.id, s.name, s.type, s.description, s.active, s.sort, s.created_at, s.updated_at]);
+    await this.client().query('DELETE FROM addon_service_variants WHERE service_id = $1', [s.id]);
+    for (const [seq, v] of s.variants.entries()) {
+      await this.client().query('INSERT INTO addon_service_variants (service_id, seq, id, name, unit, selling, net) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [s.id, seq, v.id, v.name, v.unit, v.selling, v.net]);
+    }
+  }
+  async deleteAddonService(id: string): Promise<void> { await this.client().query('DELETE FROM addon_services WHERE id = $1', [id]); }
+
+  async listNationalities(): Promise<StoredNationality[]> {
+    const { rows } = await this.client().query('SELECT code, name, builtin, sort, created_at, created_by FROM nationalities');
+    return rows.map((r) => ({ code: String(r.code), name: String(r.name), builtin: r.builtin === true, sort: num(r.sort), created_at: asIso(r.created_at), created_by: text(r.created_by) }));
+  }
+  async addNationality(n: StoredNationality): Promise<void> {
+    await this.client().query('INSERT INTO nationalities (code, name, builtin, sort, created_at, created_by) VALUES ($1,$2,$3,$4,$5,$6)', [n.code, n.name, n.builtin, n.sort, n.created_at, n.created_by]);
+  }
+
+  /** The insurance command's result (`insurance.ts`): the lead's fields and the named passengers'. */
+  async setInsurance(bookingId: string, lead: InsuranceFields | undefined, passengers: ReadonlyMap<number, InsuranceFields>): Promise<void> {
+    if (lead) {
+      await this.client().query('UPDATE bookings SET lead_age = $2, lead_insurance_reviewed_at = $3, lead_insurance_reviewed_by = $4 WHERE id = $1',
+        [bookingId, lead.age, lead.reviewed_at, lead.reviewed_by]);
+    }
+    for (const [seq, f] of passengers) {
+      await this.client().query('UPDATE booking_passengers SET age = $3, insurance_reviewed_at = $4, insurance_reviewed_by = $5 WHERE booking_id = $1 AND seq = $2',
+        [bookingId, seq, f.age, f.reviewed_at, f.reviewed_by]);
+    }
   }
 
   // ── Rate types ─────────────────────────────────────────────────────────────────────────────────

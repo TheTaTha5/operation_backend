@@ -20,6 +20,8 @@ export type BookingHeader = {
   sold_by?: string; purpose?: string; staff_id?: string; staff_purpose?: string;
   lead_pax?: string; lead_nationality?: string; lead_type?: string; lead_foc?: boolean;
   lead_phone?: string; lead_email?: string;
+  /** The lead's insurance fields (migration 093): set by PUT /v1/bookings/{id}/insurance only. */
+  lead_age?: number; lead_insurance_reviewed_at?: string; lead_insurance_reviewed_by?: string;
   pickup_area_id?: string; pickup_self?: boolean; pickup_area?: string; pickup_zone?: string;
   hotel_name?: string; room_number?: string;
   dropoff_same?: boolean; dropoff_area_id?: string; dropoff_area?: string; dropoff_hotel_name?: string;
@@ -63,6 +65,7 @@ export const BOOKING_HEADER_COLUMNS = [
   'schema_ver',
   'sold_by', 'purpose', 'staff_id', 'staff_purpose',
   'lead_pax', 'lead_nationality', 'lead_type', 'lead_foc', 'lead_phone', 'lead_email',
+  'lead_age', 'lead_insurance_reviewed_at', 'lead_insurance_reviewed_by',
   'pickup_area_id', 'pickup_self', 'pickup_area', 'pickup_zone', 'hotel_name', 'room_number',
   'dropoff_same', 'dropoff_area_id', 'dropoff_area', 'dropoff_hotel_name',
   'guide_english', 'guide_russian', 'guide_chinese', 'guide_other_lang',
@@ -90,11 +93,11 @@ export const BOOKING_HEADER_COLUMNS = [
 
 export const BOOKING_HEADER_DATE_COLUMNS = ['market_at', 'booking_date'] as const;
 export const BOOKING_HEADER_NUMERIC_COLUMNS = [
-  'cash_on_tour_amount', 'manual_total', 'total',
+  'lead_age', 'cash_on_tour_amount', 'manual_total', 'total',
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
 ] as const;
 
-export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at', 'special_meals_pier_at'] as const;
+export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at', 'special_meals_pier_at', 'lead_insurance_reviewed_at'] as const;
 //example ISO_DATE: 2024-06-01
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -176,6 +179,9 @@ function fields(document: Record<string, unknown>): readonly Field[] {
     ['lead_foc', bool, own('leadFoc', 'lead_foc')],
     ['lead_phone', text, own('leadPhone', 'lead_phone')],
     ['lead_email', text, own('leadEmail', 'lead_email')],
+    ['lead_age', num, own('lead_age')],
+    ['lead_insurance_reviewed_at', text, own('lead_insurance_reviewed_at')],
+    ['lead_insurance_reviewed_by', text, own('lead_insurance_reviewed_by')],
 
     ['pickup_area_id', text, own('pickupAreaId', 'pickup_area_id')],
     ['pickup_self', bool, own('pickupSelf', 'pickup_self')],

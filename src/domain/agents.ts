@@ -147,7 +147,7 @@ export const sortMarkets = (markets: readonly Market[]): Market[] =>
   [...markets].sort((a, b) => (a.sort ?? Infinity) - (b.sort ?? Infinity) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
 /** Salespeople by name, then id. */
-export const sortSalesPeople = (people: readonly SalesPerson[]): SalesPerson[] =>
+export const sortSalesPeople = <T extends SalesPerson>(people: readonly T[]): T[] =>
   [...people].sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' }) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
 /** Newest first; entries at the same instant keep the order they were written in (`seq`, later first). */

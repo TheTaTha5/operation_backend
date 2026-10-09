@@ -6,7 +6,11 @@
  * passenger list is one fact, not fifty-seven, so there is no per-field merge to define.
  */
 
-export type BookingPassengerInput = { name: string; nationality?: string; type?: string; foc?: boolean };
+export type BookingPassengerInput = {
+  name: string; nationality?: string; type?: string; foc?: boolean;
+  /** Set by `PUT /v1/bookings/{id}/insurance` only (`insurance.ts`); a `PATCH` keeps them for the same passenger. */
+  age?: number; insurance_reviewed_at?: string; insurance_reviewed_by?: string;
+};
 export type BookingPassenger = BookingPassengerInput & { seq: number };
 
 const invalid = (message: string): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = 400; throw error; };

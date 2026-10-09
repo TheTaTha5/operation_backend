@@ -90,6 +90,12 @@ export function writeNeed(path: string): WriteNeed {
   // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`).
   if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
+  // Sales editing (todo/sales-editing-model.md): templates, issued documents and the add-on catalogue
+  // are sales'; salespeople and markets are the Team & Markets screen's, under `config` (decision 2);
+  // a nationality is added from the booking form (decision 11).
+  if (/^\/v1\/(contract-templates|contract-documents|addon-services)(\/|$)/.test(path)) return { kind: 'area', areas: ['sales'] };
+  if (/^\/v1\/(sales|markets)(\/|$)/.test(path)) return { kind: 'area', areas: ['config'] };
+  if (path === '/v1/nationalities') return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
   if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
