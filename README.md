@@ -1442,7 +1442,53 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 - A cancelled or rejected booking's dispatch cannot change (`409 cancelled`); an unknown trip is `404`.
 - The legacy import brings each active booking's boat, boat split, final pickup and pier note.
 
-Reconfirmation and check-in come next (`todo/trip-ops-and-vans-model.md`).
+Check-in comes next (`todo/trip-ops-and-vans-model.md`).
+
+### Reconfirm
+
+Did the customer confirm their pickup, and was the agent's re-confirm list sent: legacy's Re-confirm
+page and the ops board's re-confirm column. Every booking read carries it as `reconfirm`, `null`
+until something is recorded:
+
+```jsonc
+"reconfirm": { "status": "done", "via": "reconfirm", "at": "2026-09-09T10:02:11.000Z", "by": "Nok",
+               "sent": true, "sent_at": "2026-09-09T11:00:00.000Z", "sent_by": "Nok" }
+```
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `PUT /v1/bookings/{id}/reconfirm` | `{status, via?}` | the booking |
+| `DELETE /v1/bookings/{id}/reconfirm` | — | the booking |
+| `POST /v1/reconfirm/sent` | `{booking_ids: [...], sent: true\|false}` | `{bookings: [{id, reconfirm}], skipped: [{id, reason}]}` |
+
+- **`status`** is what the customer said:
+  - `wa`: WhatsApp sent, awaiting;
+  - `noans`: called, no answer;
+  - `off`: called, phone off;
+  - `callback`: call back later;
+  - `done`: confirmed.
+
+  **`via`** is where it was recorded: `reconfirm` (the Re-confirm page, the default), or `list` /
+  `phone` (the ops board). The server stamps `at` and `by` from the login. Anything else is `400`.
+- **Sending the list is a separate fact** (legacy §rcSplit):
+  - setting or clearing the status keeps `sent` as it was;
+  - sending never changes the status;
+  - `sent: true` stamps `sent_at` and `sent_by` (again on a resend);
+  - `sent: false` undoes it;
+  - a record left with neither a status nor a send is removed (`reconfirm: null`).
+- `POST /v1/reconfirm/sent` passes over cancelled and rejected bookings when sending, as legacy does,
+  and lists them in `skipped`. An unknown booking id refuses the whole request (`400`).
+- **History:** setting a status logs legacy's line ("Re-confirm: WhatsApp sent · awaiting", or
+  "Re-confirmed pickup (phone)" from the ops board); a send logs "Re-confirm sent to agent".
+- `PATCH /v1/bookings/{id}` may echo `reconfirm` back unchanged; any other value is `400`.
+- Writes need the `operations` edit area. They don't change the booking's `version`.
+- **Legacy differences:**
+  - the ops board's "re-confirmed (list/phone)" and its clear button dropped the "sent" mark in
+    legacy; here they keep it, as legacy's own Re-confirm page does;
+  - re-confirming every booking on a trip at once is one `PUT` per booking: skip those already
+    `done`, as legacy does.
+- The import brings every legacy record. One saved before legacy split out "sent" counts as sent
+  when its status is `done`, at the time and by the person who confirmed it, as legacy reads it.
 
 ### Van groups
 

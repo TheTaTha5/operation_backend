@@ -29,6 +29,7 @@ import { pickupFields, type PickupWindow } from './pickup.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { clearedOnMove, dispatchView, EMPTY_DISPATCH, type StoredDispatch, type TripDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
+import { reconfirmView, type Reconfirm, type StoredReconfirm } from './reconfirm.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import { copyStop, type VanStop } from './van-stops.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
@@ -154,6 +155,8 @@ export type Booking = BookingHeader & {
   booking_mode?: string;
   pax: number;
   allocated_pax: number;
+  /** Did the customer confirm their pickup, and was the agent's list sent (`reconfirm.ts`). */
+  reconfirm: Reconfirm | null;
 };
 
 /**
@@ -222,7 +225,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
 export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
-export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax'> & { trips: StoredTrip[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm'> & { trips: StoredTrip[] };
 
 /**
  * The wire shape of a stored booking.
@@ -242,7 +245,7 @@ export const decodeBookingCursor = (value: string): BookingCursor => {
 };
 
 /** `dispatch` gives each trip's dispatch as a read shows it; without it, every trip's is empty. */
-export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch): Booking {
+export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) => TripDispatch, reconfirm: StoredReconfirm | null = null): Booking {
   const trips = stored.trips.map(({ ovn_of, ...trip }): BookingTrip => ({
     ...trip, pax: formatPaxGrid(trip.pax), pax_total: paxTotal(trip.pax), lock_draws: Object.fromEntries(trip.lock_draws.map((draw) => [draw.lock_id, draw.qty])),
     ...ovnOfIndex(stored.trips, ovn_of), operations: dispatch({ ovn_of, ...trip }),
@@ -252,7 +255,10 @@ export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) 
   const seats = stored.trips.filter((trip) => trip.booking_mode !== 'charter').reduce((sum, trip) => sum + paxTotal(trip.pax), 0);
   // Approvals are copied: the store decides them in place, and a view already handed out must not change.
   const approvals = (stored.approvals ?? []).map((approval) => ({ ...approval, days: approval.days.map((day) => ({ ...day })) }));
-  return { ...stored, approvals, trips, route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax, allocated_pax: bookingHoldsSeats(stored) ? seats : 0 };
+  return {
+    ...stored, approvals, trips, route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
+    allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm),
+  };
 }
 
 const fail = (message: string, statusCode: number): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
@@ -540,11 +546,20 @@ export class OperationsStore {
 
   private view(stored: StoredBooking): Booking {
     return bookingView(stored, (trip) => dispatchView(this.dispatch.get(trip.id), this.deployedBoats(trip.route_id, trip.service_date),
-      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups)));
+      vanPartsView(this.vanParts.get(trip.id) ?? [], trip.pax, this.vanGroups)), this.reconfirms.get(stored.id) ?? null);
   }
   private deployedBoats(routeId: string, date: string): Set<string> {
     return new Set(this.deployments.filter((d) => d.route_id === routeId && d.service_date === date).map((d) => d.boat_id));
   }
+
+  /** Each booking's reconfirmation (migration 035), by booking id. */
+  private reconfirms = new Map<string, StoredReconfirm>();
+  /** `null` removes it. */
+  setReconfirm(bookingId: string, record: StoredReconfirm | null): void {
+    if (record) this.reconfirms.set(bookingId, { ...record }); else this.reconfirms.delete(bookingId);
+  }
+  /** Appends a line to a booking's history, inside the write it describes. */
+  addHistory(bookingId: string, line: HistoryLine): void { this.log(bookingId, line); }
 
   /** Each trip's dispatch (migration 033), by trip id. */
   private dispatch = new Map<string, StoredDispatch>();
