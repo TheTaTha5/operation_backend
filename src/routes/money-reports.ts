@@ -44,11 +44,11 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     for (const date of eachDate(from, to)) for (const b of await store.bookingsOnDate(date)) if (!seen.has(b.id)) seen.set(b.id, b);
     return [...seen.values()];
   };
-  const allBookings = async (): Promise<Booking[]> => {
+  const allBookings = async (agentId?: string): Promise<Booking[]> => {
     const out: Booking[] = [];
     let cursor: string | undefined;
     do {
-      const page = await store.listBookings({ limit: 1000, ...(cursor ? { cursor } : {}) });
+      const page = await store.listBookings({ limit: 1000, ...(agentId ? { agentId } : {}), ...(cursor ? { cursor } : {}) });
       out.push(...page.bookings);
       cursor = page.next_cursor;
     } while (cursor);
@@ -181,7 +181,7 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     const stored = await store.listInvoices({ agentId: id });
     const invoices = await views(stored);
     const refunds = await store.listRefunds({ agentId: id });
-    const bookings = (await allBookings()).filter((b) => b.agent_id === id);
+    const bookings = await allBookings(id);
     return agentStatement(agent, invoices, refunds, creditBalance(refunds, await store.paymentsOf(stored.map((i) => i.id))), creditOf(agent, bookings));
   });
   app.get('/v1/reports/travel-summary', async (request) => {
