@@ -34,10 +34,10 @@ Merge fixes made by the lead (in the merge commits):
 
 | Area | Branch | Migrations | Note (Flagged list) |
 |---|---|---|---|
-| Money 5–6: partner van bills, money reports |  | 120 |  |
-| Fleet A: availability, assets, incidents and jobs |  | 130 |  |
-| Money 2–4: proforma, pier money, after the trip |  | 110–112 |  |
-| Fleet B: stock, memos, Daily Log, projects, safety |  | 140–143 |  |
+| Money 5–6: partner van bills, money reports | `feat/money-van-bills-and-reports` | 120 | `todo/money-model.md` |
+| Fleet A: availability, assets, incidents and jobs | `feat/fleet-availability-and-jobs` | 130 | `todo/fleet-maintenance-model.md` |
+| Money 2–4: proforma, pier money, after the trip | `feat/money-pier-and-after-trip` | 110–112 | `todo/money-model.md` |
+| Fleet B: stock, memos, Daily Log, projects, safety | `feat/fleet-stock-memos-log-projects` | 140–143 | `todo/fleet-maintenance-model.md` |
 
 After the last merge: 501 tests; in-process all pass (8 PostgreSQL-only skipped); PostgreSQL passes
 on a rerun, with the flake below on a first run. The change-kind list holds 10 kinds.
@@ -46,7 +46,7 @@ on a rerun, with the flake below on a first run. The change-kind list holds 10 k
 
 | Task | Branch |
 |---|---|
-| Reports gain the slice 3–4 figures; the PostgreSQL flake |  (an agent worktree) |
+| Reports gain the slice 3–4 figures; the PostgreSQL flake | `chore/reports-and-flake` (an agent worktree) |
 
 ## Known issues
 
