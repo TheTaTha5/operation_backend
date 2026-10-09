@@ -59,6 +59,10 @@ import { builtinNationalities, type StoredNationality } from './nationalities.js
 import { carryInsurance, type InsuranceFields } from './insurance.js';
 import { copyBill, type StoredVanBill, type VanRate, type VanRateField } from './van-bills.js';
 import type { DailySettings } from './money-reports.js';
+import { copyAsset, matchesAsset, sortAssets, type AssetKind, type AssetOf, type AssetQuery, type Engine, type Gearbox, type Propeller } from './fleet-assets.js';
+import {
+  copyIncident, copyJob, matchesIncident, matchesJob, sortIncidents, sortJobs, type Incident, type IncidentQuery, type Job, type JobQuery,
+} from './fleet-jobs.js';
 
 export type Deployment = {
   boat_id: string;
@@ -806,6 +810,28 @@ export class OperationsStore {
     this.catalogue.overrides = [...this.catalogue.overrides.filter((o) => o.route_id !== routeId), ...next.overrides];
   }
   newSeasonId(): string { return this.id('season'); }
+
+  // ── Fleet, part A (todo/fleet-maintenance-model.md; migration 130): the rules are `fleet-*.ts`'s ──
+  private fleet = {
+    engine: new Map<string, Engine>(), gearbox: new Map<string, Gearbox>(), propeller: new Map<string, Propeller>(),
+    incidents: new Map<string, Incident>(), jobs: new Map<string, Job>(),
+  };
+  private fleetMap<K extends AssetKind>(kind: K): Map<string, AssetOf[K]> { return this.fleet[kind] as unknown as Map<string, AssetOf[K]>; }
+  fleetAssets<K extends AssetKind>(kind: K, q: AssetQuery = {}): AssetOf[K][] {
+    return sortAssets([...this.fleetMap(kind).values()].filter((a) => matchesAsset(a, q))).map((a) => copyAsset(a));
+  }
+  fleetAsset<K extends AssetKind>(kind: K, id: string): AssetOf[K] | undefined { const a = this.fleetMap(kind).get(id); return a && copyAsset(a); }
+  putFleetAsset<K extends AssetKind>(kind: K, asset: AssetOf[K]): void { this.fleetMap(kind).set(asset.id, copyAsset(asset)); }
+  fleetIncidents(q: IncidentQuery = {}): Incident[] { return sortIncidents([...this.fleet.incidents.values()].filter((i) => matchesIncident(i, q))).map(copyIncident); }
+  fleetIncident(id: string): Incident | undefined { const i = this.fleet.incidents.get(id); return i && copyIncident(i); }
+  putFleetIncident(incident: Incident): void { this.fleet.incidents.set(incident.id, copyIncident(incident)); }
+  deleteFleetIncident(id: string): boolean { return this.fleet.incidents.delete(id); }
+  fleetJobs(q: JobQuery = {}): Job[] { return sortJobs([...this.fleet.jobs.values()].filter((j) => matchesJob(j, q))).map(copyJob); }
+  fleetJob(id: string): Job | undefined { const j = this.fleet.jobs.get(id); return j && copyJob(j); }
+  putFleetJob(job: Job): void { this.fleet.jobs.set(job.id, copyJob(job)); }
+  deleteFleetJob(id: string): boolean { return this.fleet.jobs.delete(id); }
+  /** Every number in use, to refuse a duplicate and to answer the next one. */
+  fleetNumbers(table: 'incidents' | 'jobs'): { id: string; no: string }[] { return [...this.fleet[table].values()].map((x) => ({ id: x.id, no: x.no })); }
 
   async transaction<T>(work: () => T | Promise<T>): Promise<T> {
     const prior = this.tail;

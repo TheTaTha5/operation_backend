@@ -46,6 +46,14 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    exactly; 2 (โกอู๊ด and สตอ, 2026-08 period 3) each miss one run, because the van-group import drops
    the van of a legacy group whose members sat on different vans (see the import's "van group
    conflicts"). Then decide the open points in `todo/money-model.md` "Flagged".
+1b7. **Fleet part A is this API's once `feat/fleet-availability-and-jobs` is merged** (migration
+   130): after deploying (and after `seed:boats`), run `npm run seed:boats -- --commit` again if the
+   boats were seeded before (it now reads legacy's 15 plan-ahead entries into `planned_over`, on boats
+   never edited here), then `npm run import:fleet -- --commit` once (rehearsed 2026-10-09: 54 engines,
+   59 gearboxes, 62 propellers, 73 incidents, 122 jobs, nothing skipped). **Legacy must stop editing
+   assets, incidents and jobs at the same moment** (integration branch §3.15); a re-run overwrites
+   edits made here to legacy's records. From then on deploying a boat under repair needs
+   `deploy_anyway` (Boat Operation, §3.13).
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -112,6 +120,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     off its invoice. Stop tagging on panel open, `bk.refund` and the weather `acctCreateDeposit`.
     "Deposit held" is `GET /v1/agents/{id}` → `credit_balance`; "Use deposit" is a payment with
     `method: "credit"` (handoff §2.8).
+- **Legacy integration client, fleet part A (once 130 is deployed, handoff §3.15, §3.13):** the
+  Asset, Incident and Maintenance screens and the job board save to `/v1/fleet/…` and stop writing
+  `FL_ENGINES`, `FL_GEARBOXES`, `FL_PROPELLERS`, `FL_INCIDENTS`, `FL_MAINT`; boat status reads
+  `status_effective` / `GET /v1/fleet/availability` instead of `boatEffStatus`; Boat Operation answers
+  `409 boat_not_ready` with `deploy_anyway: true`; the Boat Status plan-ahead confirm resends
+  `plan_ahead: true`. They keep numbering `INC-`/`MJ-` themselves (`next_no` helps).
 - **Legacy integration client, seat locks (`feat/seat-lock-extras`, handoff §6.1):** save bulk
   locks to `/v1/seat-lock-groups` (not N day locks), sub-groups, pending seats (`409 seats_short` →
   the "ที่นั่งว่างไม่พอ" dialog, resend with `pending`), expiry and reason; office holds as

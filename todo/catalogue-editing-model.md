@@ -13,10 +13,9 @@ and retire/restore, a boat's seats for one day, Love Kingdom's `POST /v1/routes`
    it as legacy has it, as `sync:boats` did; nothing else is built for it.
 2. **`meal_venue_id` and the venues list** move with costing (Money reports, decision 7).
 3. **`daily_cap`** when someone wants a limit on a land route (decision 7). Today a value is `400`.
-4. **Fleet rules on the boat** (`fleet-maintenance-model.md` slices 1–2): the effective status
-   (status log plus open work), refusing or warning when a fixing/unavailable boat is deployed, the
-   timeline's "planned ahead" confirm (`ovrJobs`), certificate expiry status and renewal. The data is
-   stored now; the rules are fleet's.
+4. **Fleet rules on the boat** (`fleet-maintenance-model.md`): certificate expiry status and
+   renewal, pier assignments. (The effective status, `deploy_anyway` and the timeline's `plan_ahead`
+   are built: fleet part A.)
 5. **Clients:** the legacy integration client (handoff §3.14) and Love Kingdom (§3b) must switch;
    see `developer-checklist.md`.
 

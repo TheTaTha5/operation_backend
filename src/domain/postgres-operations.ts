@@ -71,6 +71,32 @@ import {
   decidedRecord, decideStatus, discountOf, focCountOf, reweigh,
   type ApprovalDay, type ApprovalKind, type ApprovalStatus, type ApprovalWarning, type BookingApproval, type NewApproval,
 } from './booking-approvals.js';
+import { sortAssets, type AssetKind, type AssetOf, type AssetQuery } from './fleet-assets.js';
+import { sortIncidents, sortJobs, type Incident, type IncidentQuery, type Job, type JobQuery } from './fleet-jobs.js';
+
+/** Fleet tables (migration 130): each record's own columns; its lists live in child tables. */
+const FLEET_ASSET_TABLES: Record<AssetKind, { table: string; log: string; fk: string; columns: readonly string[] }> = {
+  engine: {
+    table: 'fleet_engines', log: 'fleet_engine_log', fk: 'engine_id',
+    columns: ['id', 'brand', 'model', 'serial', 'hp', 'boat_id', 'pos', 'status', 'base_hours', 'service_interval', 'buy_date', 'price', 'note', 'spare_location',
+      'last_service_hours', 'last_service_date', 'retired', 'retired_on', 'retired_reason'],
+  },
+  gearbox: {
+    table: 'fleet_gearboxes', log: 'fleet_gearbox_log', fk: 'gearbox_id',
+    columns: ['id', 'brand', 'model', 'model_suffix', 'serial', 'boat_id', 'engine_id', 'on_boat_id', 'on_boat_pos', 'status', 'base_hours', 'install_hours',
+      'service_interval', 'last_service_hours', 'last_service_date', 'buy_date', 'note', 'spare_location', 'shaft_length', 'rotation', 'gear_ratio', 'oil_capacity'],
+  },
+  propeller: {
+    table: 'fleet_propellers', log: 'fleet_propeller_log', fk: 'propeller_id',
+    columns: ['id', 'brand', 'serial', 'old_serial', 'boat_id', 'gearbox_id', 'prop_pos', 'diameter', 'pitch', 'size', 'blades', 'material', 'rotation', 'hub_size',
+      'cupping', 'cost', 'install_hours', 'status', 'buy_date', 'note', 'spare_location'],
+  },
+};
+const FLEET_INCIDENT_COLUMNS = ['id', 'no', 'boat_id', 'date', 'time', 'title', 'detail', 'remark', 'priority', 'severity', 'status', 'job_id', 'related_job_ids',
+  'closed_on', 'quick_fix', 'resolved_on'] as const;
+const FLEET_JOB_COLUMNS = ['id', 'no', 'boat_id', 'type', 'title', 'detail', 'location', 'status', 'start_date', 'end_date', 'incident_id', 'boat_status',
+  'boat_status_reason', 'set_fixing', 'outcome', 'close_note', 'awaiting_invoice', 'parent_project_id', 'legacy_cost', 'board_lane', 'owner', 'due_date',
+  'parked_on', 'pinned', 'pinned_on'] as const;
 
 /**
  * `bookingHoldsSeats` in SQL, for the seat counts that cannot load every booking: a
@@ -1442,13 +1468,82 @@ export class PostgresOperationsStore {
     return u as RouteUsage;
   }
 
+  // ── Fleet, part A (todo/fleet-maintenance-model.md; migration 130): the rules are `fleet-*.ts`'s ──
+  // A record is read whole with `to_jsonb` (dates come back as YYYY-MM-DD text, never a JS Date) and
+  // written whole: the row upserted, its child rows replaced in the order sent.
+
+  async fleetAssets<K extends AssetKind>(kind: K, q: AssetQuery = {}): Promise<AssetOf[K][]> {
+    const t = FLEET_ASSET_TABLES[kind];
+    const { rows } = await this.client().query(`SELECT to_jsonb(a) AS row,
+        COALESCE((SELECT jsonb_agg(to_jsonb(l) - '${t.fk}' - 'seq' ORDER BY l.seq) FROM ${t.log} l WHERE l.${t.fk} = a.id), '[]'::jsonb) AS log
+      FROM ${t.table} a WHERE ($1::text[] IS NULL OR a.id = ANY($1)) AND ($2::text IS NULL OR a.boat_id = $2)`, [q.ids ?? null, q.boatId ?? null]);
+    return sortAssets(rows.map((r) => ({ ...r.row, log: r.log }) as AssetOf[K]));
+  }
+  async fleetAsset<K extends AssetKind>(kind: K, id: string): Promise<AssetOf[K] | undefined> { return (await this.fleetAssets(kind, { ids: [id] }))[0]; }
+  async putFleetAsset<K extends AssetKind>(kind: K, asset: AssetOf[K]): Promise<void> {
+    const t = FLEET_ASSET_TABLES[kind];
+    await this.upsertWhole(t.table, t.columns, asset as unknown as Record<string, unknown>);
+    await this.replaceChildren(t.log, t.fk, asset.id, 'seq', asset.log);
+  }
+  async fleetIncidents(q: IncidentQuery = {}): Promise<Incident[]> {
+    const { rows } = await this.client().query(`SELECT to_jsonb(i) AS row,
+        COALESCE((SELECT jsonb_agg(to_jsonb(a) - 'incident_id' - 'idx' ORDER BY a.idx) FROM fleet_incident_assets a WHERE a.incident_id = i.id), '[]'::jsonb) AS damaged_assets,
+        COALESCE((SELECT jsonb_agg(to_jsonb(l) - 'incident_id' - 'seq' ORDER BY l.seq) FROM fleet_incident_log l WHERE l.incident_id = i.id), '[]'::jsonb) AS progress_log
+      FROM fleet_incidents i WHERE ($1::text[] IS NULL OR i.id = ANY($1)) AND ($2::text IS NULL OR i.boat_id = $2) AND ($3::text IS NULL OR i.job_id = $3)`,
+    [q.ids ?? null, q.boatId ?? null, q.jobId ?? null]);
+    return sortIncidents(rows.map((r) => ({ ...r.row, damaged_assets: r.damaged_assets, progress_log: r.progress_log }) as Incident));
+  }
+  async fleetIncident(id: string): Promise<Incident | undefined> { return (await this.fleetIncidents({ ids: [id] }))[0]; }
+  async putFleetIncident(i: Incident): Promise<void> {
+    await this.upsertWhole('fleet_incidents', FLEET_INCIDENT_COLUMNS, i as unknown as Record<string, unknown>);
+    await this.replaceChildren('fleet_incident_assets', 'incident_id', i.id, 'idx', i.damaged_assets);
+    await this.replaceChildren('fleet_incident_log', 'incident_id', i.id, 'seq', i.progress_log);
+  }
+  async deleteFleetIncident(id: string): Promise<boolean> { return ((await this.client().query('DELETE FROM fleet_incidents WHERE id = $1', [id])).rowCount ?? 0) > 0; }
+  async fleetJobs(q: JobQuery = {}): Promise<Job[]> {
+    const child = (table: string, order: string) =>
+      `COALESCE((SELECT jsonb_agg(to_jsonb(c) - 'job_id' - '${order}' ORDER BY c.${order}) FROM ${table} c WHERE c.job_id = j.id), '[]'::jsonb)`;
+    const { rows } = await this.client().query(`SELECT to_jsonb(j) AS row, ${child('fleet_job_assets', 'idx')} AS assets, ${child('fleet_job_parts', 'idx')} AS parts,
+        ${child('fleet_job_log', 'seq')} AS progress_log, ${child('fleet_job_steps', 'idx')} AS steps
+      FROM fleet_jobs j WHERE ($1::text[] IS NULL OR j.id = ANY($1)) AND ($2::text IS NULL OR j.boat_id = $2) AND ($3::text IS NULL OR j.status = $3)
+        AND ($4::text IS NULL OR j.incident_id = $4)`, [q.ids ?? null, q.boatId ?? null, q.status ?? null, q.incidentId ?? null]);
+    return sortJobs(rows.map((r) => ({ ...r.row, assets: r.assets, parts: r.parts, progress_log: r.progress_log, steps: r.steps }) as Job));
+  }
+  async fleetJob(id: string): Promise<Job | undefined> { return (await this.fleetJobs({ ids: [id] }))[0]; }
+  async putFleetJob(j: Job): Promise<void> {
+    await this.upsertWhole('fleet_jobs', FLEET_JOB_COLUMNS, j as unknown as Record<string, unknown>);
+    await this.replaceChildren('fleet_job_assets', 'job_id', j.id, 'idx', j.assets);
+    await this.replaceChildren('fleet_job_parts', 'job_id', j.id, 'idx', j.parts);
+    await this.replaceChildren('fleet_job_log', 'job_id', j.id, 'seq', j.progress_log);
+    await this.replaceChildren('fleet_job_steps', 'job_id', j.id, 'idx', j.steps);
+  }
+  async deleteFleetJob(id: string): Promise<boolean> { return ((await this.client().query('DELETE FROM fleet_jobs WHERE id = $1', [id])).rowCount ?? 0) > 0; }
+  async fleetNumbers(table: 'incidents' | 'jobs'): Promise<{ id: string; no: string }[]> {
+    const { rows } = await this.client().query(`SELECT id, no FROM ${table === 'incidents' ? 'fleet_incidents' : 'fleet_jobs'}`);
+    return rows.map((r) => ({ id: String(r.id), no: String(r.no) }));
+  }
+  /** The row with these columns, inserted or replaced; JSON turns into each column's type in SQL. */
+  private async upsertWhole(table: string, columns: readonly string[], row: Record<string, unknown>): Promise<void> {
+    const values = Object.fromEntries(columns.map((c) => [c, row[c] ?? null]));
+    await this.client().query(`INSERT INTO ${table} (${columns.join(', ')}) SELECT ${columns.join(', ')} FROM jsonb_populate_record(NULL::${table}, $1::jsonb)
+      ON CONFLICT (id) DO UPDATE SET ${columns.filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).join(', ')}`, [JSON.stringify(values)]);
+  }
+  /** A record's child rows replaced by `items`, numbered by their place. */
+  private async replaceChildren(table: string, fk: string, id: string, order: string, items: readonly object[]): Promise<void> {
+    await this.client().query(`DELETE FROM ${table} WHERE ${fk} = $1`, [id]);
+    if (!items.length) return;
+    await this.client().query(`INSERT INTO ${table} SELECT * FROM jsonb_populate_recordset(NULL::${table}, $1::jsonb)`,
+      [JSON.stringify(items.map((item, n) => ({ ...item, [fk]: id, [order]: n })))]);
+  }
+
   /** Every field of every boat, its documents and status log in order, by name then id. */
   async boatRecords(id?: string): Promise<BoatRecord[]> {
     const { rows } = await this.client().query(`SELECT b.*, b.retired_on::text AS retired_on_text, b.unretired_on::text AS unretired_on_text,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('name', d.name, 'expires_on', d.expires_on::text, 'renew_status', d.renew_status) ORDER BY d.idx)
         FROM boat_documents d WHERE d.boat_id = b.id), '[]'::jsonb) AS documents_json,
       COALESCE((SELECT jsonb_agg(jsonb_build_object('id', l.id, 'status', l.status, 'from_date', l.from_date::text, 'to_date', l.to_date::text, 'loc', l.loc,
-          'province', l.province, 'loc_type', l.loc_type, 'detail', l.detail, 'note', l.note, 'reason', l.reason, 'project_id', l.project_id) ORDER BY l.seq)
+          'province', l.province, 'loc_type', l.loc_type, 'detail', l.detail, 'note', l.note, 'reason', l.reason, 'project_id', l.project_id,
+          'planned_over', to_jsonb(l.planned_over)) ORDER BY l.seq)
         FROM boat_status_log l WHERE l.boat_id = b.id), '[]'::jsonb) AS log_json
       FROM boats b WHERE ($1::text IS NULL OR b.id = $1) ORDER BY b.name, b.id`, [id ?? null]);
     const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));

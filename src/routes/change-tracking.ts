@@ -229,6 +229,11 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     const id = (result as { id?: string } | undefined)?.id;
     if (id) out.push({ kind: 'boat', entity_id: id, action: 'created', route_days: null, changed_by: by });
   }
+  // A job's start, close or boat status writes its boat's status log (fleet maintenance, part A).
+  if (/^\/v1\/fleet\/jobs\/:id\/(start|close|boat-status)$/.test(path)) {
+    const job = await store.fleetJob(params(r).id);
+    if (job) out.push({ kind: 'boat', entity_id: job.boat_id, action: 'updated', route_days: null, changed_by: by });
+  }
   if (before.boat) {
     // The route-days whose seats moved: deployments the write changed, and an override's day.
     const after = await boatDays(store, before.boat.id);
