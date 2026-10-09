@@ -7,7 +7,10 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 1. **Push `main`** again: deploying applies migrations 039–044 (add-on checks, attachments,
    allergies, document check, pickup areas, the change feed). Once `feat/invoices` is merged, 045
    (invoices and payments), 046 (who raised a boat's day capacity) and 047 (whole-boat holds) come
-   with it.
+   with it. Once `feat/weather-closures` is merged, 060 (weather closures and their follow-ups) and
+   061 (refunds, credits, invoice lines taken off, payment method `credit`); then re-import, which
+   brings legacy's 5 closures and 40 follow-ups. 060 rewrites `changes_kind_check`: if another branch
+   adds a change kind too, the later migration must list both.
 1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
    the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas,
@@ -64,6 +67,13 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     Cancel and restore now issue and void the fee invoice on the server: stop calling
     `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
     legacy's "Save anyway?" and resend with `overpay_anyway: true`.
+  - weather (once 060–061 are deployed): the Boat Operation "Cancel trip (weather)" dialog, the
+    weather panel and the inline manifest column read and write `/v1/weather-closures` (close, note,
+    notify, undo with `undo_anyway`); "Resolve" calls `/reschedule` (`reason: "weather"`) or
+    `/cancel-weather` with `outcome`; the server moves the trips and takes only that booking's share
+    off its invoice. Stop tagging on panel open, `bk.refund` and the weather `acctCreateDeposit`.
+    "Deposit held" is `GET /v1/agents/{id}` → `credit_balance`; "Use deposit" is a payment with
+    `method: "credit"` (handoff §2.8).
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.

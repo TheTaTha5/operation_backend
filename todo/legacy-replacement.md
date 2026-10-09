@@ -29,11 +29,7 @@ DELETE /v1/boats/{id}/capacity-overrides/{date}
 
 ## 3. Operations
 
-```
-GET    /v1/weather-closures?from=&to=
-POST   /v1/weather-closures           close a route on a date, flag affected bookings (legacy sb_weather)
-DELETE /v1/weather-closures/{id}
-```
+Built: weather closures (`/v1/weather-closures`, legacy `sb_weather` and `bk.weatherResolve`).
 
 ## 4. Bookings
 
