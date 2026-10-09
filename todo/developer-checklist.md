@@ -4,9 +4,13 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 ## Deploy what is on `main`
 
-1. **Push `main`.** It is about 60 commits ahead of GitHub; Railway runs none of it until then. Deploying
-   applies migrations 024–038; the day-of-operations import (vans, check-ins, reconfirm, upgrades)
-   needs a fresh legacy import run afterwards.
+1. **Push `main`** again: deploying applies migrations 039–043 (add-on checks, attachments,
+   allergies, document check, pickup areas).
+1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
+   (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
+   the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas.
+1c. **After that import,** validate the booking area keys on Railway:
+   `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
    `AUTH_JWT_SECRET` and `AUTH_REQUIRED=true`; set `B2C_API_KEY` to legacy's value.
 3. **Import the users — nobody can log in until you do:**
@@ -34,8 +38,14 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     check-ins, pier note, route upgrade; and `reconfirm`, `alt_pickups`, `upgrades` on the booking.
     Its screens write through `PATCH /operations/trip-ops/{trip}`, the check-in, van-group, van-stop
     and vans endpoints, `PUT /v1/bookings/{id}/reconfirm`, `POST /v1/reconfirm/sent` and
-    `POST /v1/bookings/{id}/upgrade` (README → "Dispatch" to "Upgrades"). Upgrade payment slips are
-    refused until attachments exist.
+    `POST /v1/bookings/{id}/upgrade` (README → "Dispatch" to "Upgrades").
+  - removing or shrinking a boat with bookings on it answers `409 seats_sold`: its confirm dialog
+    resends with `remove_anyway: true`. Past dates are refused unless the login is an admin.
+  - the ops board's re-confirm buttons send `via: list|phone`; its clear sends `?all=true`.
+  - files upload to `POST /v1/attachments` (not `/api/attach`); bookings carry `attachments`,
+    upgrades `slips`, `allergy_list`, `doc_check` (its screen writes `/doc-check/…`); the pier's meal
+    editor saves through `PUT /v1/bookings/{id}/meals`; the Pickup time setup screen through
+    `/v1/pickup-areas` and `/v1/pickup-time-profiles`. A booking's pickup area must be in the catalogue.
   - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`): the
     server now prices every non-B2C booking on save and replaces a sent price (`price_warnings`). Its
     "use today's rate" button sends `rate: "agent"`; it sends `ovnCharge` and the charter price fields.
@@ -45,13 +55,6 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 ## Decisions waiting for you
 
-- **Live updates** (`change-feed-model.md`): the 5 questions at the end.
-- **Day-of-operations leftovers** (`trip-ops-and-vans-model.md` → "Needs a decision"): 5 items.
-- **Booking extras** (`booking-extras-model.md`): attachments, allergy list, document check, pickup
-  areas; 12 questions (A1–A3, B1, C1–C3, D1–D4).
-- **Add-on constraints** (`addons-model.md` Open 1): all hold on legacy data; add them?
-- **Next slice:** pricing (`pricing-model.md`, decided: contracts first) or deployment guards
-  (`deployment-guards-model.md`, has questions to answer).
 - **Make `If-Match` required** once the integration client and Love Kingdom send it (today it is
   optional: a save without it is last-write-wins).
 
