@@ -17,6 +17,8 @@ export const changeContext = new AsyncLocalStorage<Context>();
 
 type Snapshot = {
   bookings: Map<string, Booking | undefined>;
+  /** The bookings' invoices and their payments, to see which a write created or changed. */
+  invoices: Map<string, string>;
   /** The van parts of every booking on a van group's route and day, to see which a group write changed. */
   vanDay?: { date: string; routeId: string; parts: Map<string, string> };
   deployment?: { route_id: string } | undefined;
@@ -31,6 +33,14 @@ async function bookingIdsBefore(store: Store, r: FastifyRequest): Promise<string
   const path = url(r);
   if (path.startsWith('/v1/bookings/:id')) return [params(r).id];
   if (path === '/v1/reconfirm/sent') return Array.isArray(body(r).booking_ids) ? (body(r).booking_ids as unknown[]).map(String) : [];
+  if (path === '/v1/invoices' && r.method === 'POST') {
+    const ids = body(r).booking_ids ?? body(r).bookingIds;
+    return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : [];
+  }
+  if (path.startsWith('/v1/invoices/:id')) {
+    const invoice = await store.invoice(params(r).id);
+    return invoice ? [...new Set(invoice.lines.map((l) => l.booking_id).filter((id): id is string => !!id))] : [];
+  }
   if (path.startsWith('/operations/trip-ops/:trip_id')) {
     const found = await store.tripForDispatch(params(r).trip_id);
     return found ? [found.booking.id] : [];
@@ -49,9 +59,18 @@ async function vanDayOf(store: Store, r: FastifyRequest): Promise<{ date: string
   return typeof date === 'string' && typeof b.route_id === 'string' ? { date, routeId: b.route_id } : undefined;
 }
 
+/** Each invoice of these bookings, as one comparable string: the invoice and its payments. */
+async function invoicePrints(store: Store, bookingIds: readonly string[]): Promise<Map<string, string>> {
+  if (!bookingIds.length) return new Map();
+  const invoices = await store.invoicesOfBookings(bookingIds);
+  const payments = await store.paymentsOf(invoices.map((i) => i.id));
+  return new Map(invoices.map((i) => [i.id, JSON.stringify([i, payments.filter((p) => p.invoice_id === i.id)])]));
+}
+
 async function snapshot(store: Store, r: FastifyRequest): Promise<Snapshot> {
   const bookings = new Map<string, Booking | undefined>();
   for (const id of await bookingIdsBefore(store, r)) bookings.set(id, await store.booking(id));
+  const invoices = await invoicePrints(store, [...bookings.keys()]);
   const day = await vanDayOf(store, r);
   const vanDay = day && { ...day, parts: new Map((await store.bookingsOn(day.date, day.routeId)).map((b) => [b.id, partsOf(b)])) };
   let deployment: Snapshot['deployment'];
@@ -59,7 +78,7 @@ async function snapshot(store: Store, r: FastifyRequest): Promise<Snapshot> {
     const date = String(params(r).service_date ?? body(r).service_date ?? ''), boat = String(params(r).boat_id ?? body(r).boat_id ?? '');
     deployment = (await store.listDeployments(date, date)).find((d) => d.boat_id === boat);
   }
-  return { bookings, vanDay, deployment };
+  return { bookings, invoices, vanDay, deployment };
 }
 
 async function describe(store: Store, r: FastifyRequest, before: Snapshot, result: unknown): Promise<ChangeInput[]> {
@@ -91,6 +110,11 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     const routes = [before.deployment?.route_id, after?.route_id].filter((x): x is string => !!x);
     out.push({ kind: 'deployment', entity_id: `${date}:${boat}`, action: !after ? 'deleted' : before.deployment ? 'updated' : 'created',
       route_days: routes.map((route_id) => ({ route_id, service_date: date })), changed_by: by });
+  }
+  // An invoice a write issued or changed: by its own endpoints, or by a booking's cancel or restore.
+  for (const [id, print] of await invoicePrints(store, [...before.bookings.keys()])) {
+    const was = before.invoices.get(id);
+    if (was !== print) out.push({ kind: 'invoice', entity_id: id, action: was === undefined ? 'created' : 'updated', route_days: null, changed_by: by });
   }
   if (path.startsWith('/v1/routes/:id/')) out.push({ kind: 'route', entity_id: params(r).id, action: 'updated', route_days: null, changed_by: by });
   return mergeChanges(out);

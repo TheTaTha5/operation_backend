@@ -53,19 +53,15 @@ POST   /v1/agents/{id}/deactivate, /v1/agents/{id}/activate
 PUT    /v1/agents/{id}/rate-bindings
 POST   /v1/contracts, PATCH /v1/contracts/{id}           (contracts-model.md)
 GET    /v1/contract-templates, PUT /v1/contract-templates/{id}
-GET    /v1/add-ons                    add-on catalogue (legacy sb_extras)
 GET    /v1/nationalities
 GET    /v1/insurance-overrides, PUT /v1/insurance-overrides/{date}
 ```
 
 ## 7. Money
 
-```
-GET    /v1/invoices, GET /v1/invoices/{id}, POST /v1/invoices, PATCH /v1/invoices/{id}
-POST   /v1/invoices/{id}/void
-GET    /v1/payments?booking_id=, POST /v1/payments
-GET    /v1/reports/market-stats?from=&to=    computed from bookings, not stored
-```
+Designed in `money-model.md`: invoices and payments, proforma, pier money and on-tour sales
+(`sb_extras`), cash-on-tour decisions (`ts_cot`), no-show charges (`travel_sum`), partner van bills,
+reports. `sb_market_stats` / `sb_market_monthly` are imported arrival figures, not money.
 
 ## 8. Pickups and vans
 
@@ -100,6 +96,4 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 - **Email images** (`/api/mailimg`, `/m/:id`) look like marketing, not operations. Confirm they can go.
 - **Resources mapped from field names only.** Check with someone who uses the screens:
   - `trips`: looks like the old per-day boat board, which deployments replace.
-  - `ts_cot` (`mode`, `deduct`, `payout`): looks like agent commission.
-  - `travel_sum` (`decision`, `amount`, `note`): looks like an approval record.
   - `fleet_drlock`: not identified.

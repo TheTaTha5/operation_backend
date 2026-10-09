@@ -1,6 +1,6 @@
 # Database schema
 
-The PostgreSQL schema as `migrations/*.sql` builds it: 40 tables in six areas, plus `schema_migrations`,
+The PostgreSQL schema as `migrations/*.sql` builds it: 40 tables in seven areas, plus `schema_migrations`,
 the migrator's own ledger, which is not drawn.
 
 Checked against every migration in `migrations/` (001–023) applied to an empty PostgreSQL 17
@@ -32,6 +32,7 @@ flowchart LR
   actions["Booking action records<br/>booking_history, booking_cancellations,<br/>booking_reschedules, booking_partial_cancels,<br/>booking_fee_items"]
   ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops,<br/>booking_trip_checkins, booking_trip_checkin_events,<br/>booking_trip_checkin_event_tries"]
   sales["Agents and sales<br/>agents, agent_programs, agent_activity,<br/>markets, market_subs, sales_people"]
+  money["Invoices and payments<br/>invoices, invoice_lines,<br/>invoice_number_counters,<br/>payments, payment_slips"]
   rates["Rate types<br/>rate_types, rate_type_routes,<br/>rate_type_seat_prices, rate_type_charter_prices,<br/>rate_type_longtail_prices, rate_type_transfer_prices"]
 
   bookings -- "trip route_id, lock draws" --> catalogue
@@ -47,6 +48,8 @@ flowchart LR
   rates -- "owner_sales_id" --> sales
   sales -. "agents.rate_type_id" .-> rates
   bookings -. "rate_type_ref" .-> rates
+  money -- "invoice_lines.booking_id" --> bookings
+  money -- "invoices.agent_id" --> sales
 ```
 
 ## 1. Catalogue and seat pool
@@ -772,6 +775,82 @@ erDiagram
 - **`valid_from`/`valid_to` and `travel_from`/`travel_to` do not stop a sale.**
 - **A rate type that an agent or a booking names can't be deleted** through the API (`409`). The
   database would allow it: neither `agents.rate_type_id` nor `bookings.rate_type_ref` has a key.
+
+## 7. Invoices and payments
+
+Legacy's accounting (migration 045, `todo/money-model.md` slice 1). The rules are in
+`src/domain/invoices.ts`. An invoice's status is not a column: `voided` and the payments decide it.
+
+```mermaid
+erDiagram
+  invoices {
+    text id PK
+    text number UK "INV-YYMM-NNNN"
+    text agent_id FK
+    text kind "booking, prepay or fee"
+    text fee_type "cancellation or reschedule; only on a fee"
+    text vat_mode "copied from the agent at issue"
+    numeric vat_rate
+    numeric subtotal "the lines less their discounts"
+    numeric net_amount
+    numeric vat_amount
+    numeric total
+    numeric wht_amount "printed; never part of total or paid"
+    timestamptz issued_at
+    timestamptz due_at
+    text note_ref_dear_remark "the document's header text"
+    date accept_at
+    boolean voided
+    timestamptz voided_at "null on a legacy void"
+    text voided_by
+    text void_reason
+    text created_by
+  }
+  invoice_lines {
+    text invoice_id PK, FK
+    int seq PK
+    text booking_id FK
+    text label
+    numeric amount "as issued; never recomputed"
+    numeric discount
+  }
+  invoice_number_counters {
+    text year_month PK "YYMM"
+    int last
+  }
+  payments {
+    text id PK
+    text invoice_id FK
+    numeric amount "above 0"
+    text method "transfer, cash or card"
+    date paid_on
+    text ref
+    text recorded_by
+    timestamptz recorded_at
+    timestamptz deleted_at "a deleted payment stays, out of every total"
+    text deleted_by
+    text delete_reason
+  }
+  payment_slips {
+    text payment_id PK, FK
+    int seq PK
+    text attachment_id FK
+  }
+  agents { text id PK }
+  bookings { text id PK }
+  attachments { text id PK }
+  agents |o--o{ invoices : "billed"
+  invoices ||--|{ invoice_lines : "has"
+  bookings |o--o{ invoice_lines : "billed on"
+  invoices ||--o{ payments : "paid by"
+  payments ||--o{ payment_slips : "has"
+  attachments ||--o{ payment_slips : "is"
+```
+
+- **A booking's invoice** is found through its lines: a fee invoice has one line naming the booking.
+- **One live invoice per booking** is checked by the API, not the database. A partial unique index
+  can't see `voided` through the join, and legacy has one booking with two.
+- **`changes.kind`** also takes `invoice` (045).
 
 ## Ids with no foreign key
 

@@ -52,6 +52,7 @@ import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domai
 import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
+import { mapLegacyMoney } from './legacy-invoices.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -178,6 +179,10 @@ async function main() {
     const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
     const legacyFeeItems = await read('SELECT * FROM sb_bookings__feeitems ORDER BY sb_bookings_id, idx');
     const legacyHistory = await read('SELECT * FROM sb_bookings__history ORDER BY sb_bookings_id, idx');
+    const legacyMoney = {
+      invoices: await read('SELECT * FROM sb_invoices'), bookingIds: await read('SELECT * FROM sb_invoices__bookingids'),
+      lineItems: await read('SELECT * FROM sb_invoices__lineitems'), payments: await read('SELECT * FROM sb_payments'),
+    };
     const legacyVans = await read('SELECT * FROM sb_vehicles');
     const vanDayRoutes = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__dayroute');
     const vanDayStatus = await read('SELECT sb_vehicles_id, key, value FROM sb_vehicles__daystatus');
@@ -1025,6 +1030,17 @@ async function main() {
     const rateIds = rateTypes.rateTypes.map((r) => String(r.id));
     const rateTypesOnlyHere = (await target.query('SELECT id FROM rate_types WHERE id <> ALL($1::text[]) ORDER BY id', [legacyRateTypes.rates.map((r) => str(r.id))])).rows.map((r) => String(r.id));
 
+    // ── Invoices and payments (migration 045, `legacy-invoices.ts`): after the bookings and agents they name ──
+    const routeNames = new Map((await target.query('SELECT id, name FROM routes')).rows.map((r) => [String(r.id), String(r.name)]));
+    const firstTrips = new Map(trips.filter((t) => Number(t.seq) === 0).map((t) => [String(t.booking_id), t]));
+    const money = mapLegacyMoney(legacyMoney, {
+      prefix: PREFIX, agents: agentIds, files: filesHere, routeName: (id) => routeNames.get(id),
+      bookings: new Map(bookings.map((b) => [String(b.id), {
+        voucher_ref: (b.voucher_ref as string | null) ?? null, legacy_id: String(b.external_id),
+        route_id: String(firstTrips.get(String(b.id))?.route_id ?? ''), service_date: String(firstTrips.get(String(b.id))?.service_date ?? ''),
+      }])),
+    }, report);
+
     // ── Write, in one transaction ──
     await target.query('BEGIN');
     const insert = async (table: string, rows: Row[], conflict = '') => {
@@ -1035,6 +1051,12 @@ async function main() {
         await target.query(`INSERT INTO ${table} (${list}) SELECT ${list} FROM jsonb_populate_recordset(NULL::${table}, $1::jsonb) ${conflict}`, [JSON.stringify(chunk)]);
       }
     };
+    // Money is mirrored like the bookings: what was imported is replaced. Until Money moves here, an
+    // invoice made here on a booking that is replaced goes with it, and is listed below.
+    const madeHere = (await target.query(`SELECT DISTINCT invoice_id FROM invoice_lines WHERE invoice_id NOT LIKE '${PREFIX}%'
+      AND (booking_id LIKE '${PREFIX}%' OR booking_id = ANY($1::text[])) ORDER BY invoice_id`, [remove])).rows.map((r) => String(r.invoice_id));
+    const replacedPayments = (await target.query(`DELETE FROM payments WHERE invoice_id LIKE '${PREFIX}%' OR invoice_id = ANY($1::text[])`, [madeHere])).rowCount;
+    const replacedInvoices = (await target.query(`DELETE FROM invoices WHERE id LIKE '${PREFIX}%' OR id = ANY($1::text[])`, [madeHere])).rowCount;
     const removed = remove.length ? (await target.query('DELETE FROM bookings WHERE id = ANY($1::text[])', [remove])).rowCount : 0;
     const replacedBookings = (await target.query(`DELETE FROM bookings WHERE id LIKE '${PREFIX}%'`)).rowCount;
     const replacedLocks = (await target.query(`DELETE FROM seat_locks WHERE id LIKE '${PREFIX}%'`)).rowCount;
@@ -1123,6 +1145,10 @@ async function main() {
     await insert('booking_reschedules', reschedules);
     await insert('booking_partial_cancels', partialCancels);
     await insert('booking_fee_items', feeItems);
+    await insert('invoices', money.invoices);
+    await insert('invoice_lines', money.lines);
+    await insert('payments', money.payments);
+    await insert('payment_slips', money.slips);
     await insert('booking_approvals', approvals);
     // Each imported booking has at most one approval of each kind, so (booking, kind) finds its id.
     if (approvalDays.length) {
@@ -1159,6 +1185,9 @@ async function main() {
     console.log(`removed: ${removed} named booking(s); replaced ${replacedBookings} earlier-imported bookings, ${replacedLocks} locks`);
     console.log(`written: ${bookings.length} bookings, ${trips.length} trips, ${pax.length} pax cells, ${passengers.length} passengers, ${draws.length} lock draws, ${locks.length} seat locks, ${deployments.length} deployments, ${overrides.length} overrides`);
     console.log(`action records: ${cancellations.length} cancellations, ${reschedules.length} reschedules, ${partialCancels.length} partial cancels, ${feeItems.length} fee items, ${historyLines.length} history lines`);
+    console.log(`money: ${money.invoices.length} invoices (${money.lines.length} lines), ${money.payments.length} payments, ${money.slips.length} slips; replaced ${replacedInvoices} invoices, ${replacedPayments} payments`);
+    if (madeHere.length) console.log(`  removed with the bookings they named, made here: invoices ${madeHere.join(', ')}`);
+    for (const [change, count] of money.statusDiffers) console.log(`  invoice status legacy stored → worked out here: ${change} (${count})`);
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);

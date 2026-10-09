@@ -220,7 +220,8 @@ copies.**
 | `t.charterPriceMode` / `Manual` / `Note` | `trips[].charter_price_mode` / `charter_price_manual` / `charter_price_note` |
 
 - **`mergeInto` keeps only what the API does not hold:** `history` (until `refreshDetail` replaces
-  it), `weatherResolve`, `rebook`, `invoiceId`, `paymentStatus`, `b2cOverride`, `refund`, `createdAt`.
+  it), `weatherResolve`, `rebook`, `b2cOverride`, `refund`, `createdAt`. (`invoiceId` and
+  `paymentStatus` now come from the booking's `invoice` and `payment_state`: see 2.7.)
   Remove `ops`, `upgrades`, `altPickups`, `docCheck`, `adjustments` from its keep list, and stop
   copying `ops`, `ovnCharge`, `promoId`, `rtRef` from the old trips. Its comment "adjustments are not
   stored by the server yet" is out of date.
@@ -406,8 +407,7 @@ list when sent, and are left alone when absent.
 
 **Already right, end to end** (see `integration-client.md`): Save draft / Submit use `intent`;
 Submit on a quote calls `/confirm`; approve, reject, FOC approve/reject, weather cancel, cancel,
-restore, partial cancel and reschedule are commands; restore's fee invoice is voided only after the
-server agrees; `over_licence` and `lock_short` warnings are toasts; the approval card reads
+restore, partial cancel and reschedule are commands; `over_licence` and `lock_short` warnings are toasts; the approval card reads
 `approvals[].days[].licensed_free`.
 
 | Command | From | To |
@@ -436,6 +436,36 @@ server agrees; `over_licence` and `lock_short` warnings are toasts; the approval
   legacy's own lines.
 
 ---
+
+### 2.7 Invoices and payments (Accounting, Daily PFM payments)
+
+**The server now issues, numbers, totals and settles invoices** (README "Invoices and payments"). The
+Accounting screen and the Daily PFM payment dialogs move from `SB_INVOICES`/`SB_PAYMENTS` to these:
+
+| Legacy | API |
+|---|---|
+| `acctCreateInvoice(agentId, ids, dueDays)`, `pfmIssueAll`, the prepay in `pfmRecSubmit` | `POST /v1/invoices` `{ agent_id, booking_ids, kind: "booking" \| "prepay" }`; the server sets lines, VAT, `number` and `due_at` |
+| `acctInvSet` (ref, dear, acceptAt, remark, whtAmount) | `PATCH /v1/invoices/{id}` `{ ref, dear, accept_at, remark, wht_amount }` |
+| `acctInvDisc` | `PUT /v1/invoices/{id}/discounts` `{ lines: [{ seq, discount }] }` |
+| `acctVoidInvoice`, `pfmEditVoidInvoice` | `POST /v1/invoices/{id}/void` `{ reason }` |
+| `acctRecordPayment`, `pfmRecSubmit` | `POST /v1/invoices/{id}/payments` `{ amount, method, paid_on, ref, slip_ids }` |
+| `pfmEditSubmit` | `POST /v1/invoices/{id}/payment-corrections` `{ payments: [{ id, amount?, method?, paid_on?, deleted? }], reason }` |
+| `acctInvoiceState`, `acctInvoiceBalance`, `acctBookingInvoice`, `acctBookingPaid` | the invoice's `status`, `paid`, `balance`; the booking's `invoice` and `payment_state` |
+| `agCreditState` | `GET /v1/agents/{id}` → `credit` |
+| `acctNextInvoiceNo` | delete: the server numbers |
+
+- **Delete client-side:** `acctCreateFeeInvoice` and the void in `bkV2CancelBooking` and
+  `bkV2RestoreBooking`. `/cancel` voids the booking's invoice and issues the cancellation fee
+  invoice; `/restore` voids it.
+- **Refusals to show as they are:**
+  - `409 booking_already_invoiced`, `409 booking_cancelled` and `400 booking_not_agents` on issue;
+  - `409 invoice_has_payments` on a discount;
+  - `409 invoice_void`;
+  - `409 payment_deleted`.
+- **`409 overpayment`** is legacy's "Save anyway?" confirm. On yes, resend the same body with
+  `overpay_anyway: true`.
+- **Writes need the `accounting` area.**
+- **A deleted payment stays** with `deleted_at`. Leave it out of what you list.
 
 ## 3. Day-of-operations
 
@@ -1001,9 +1031,9 @@ work for the session only and save nowhere** (see "The one thing to know first")
 
 | Area | Legacy data / functions | Where it is tracked |
 |---|---|---|
-| Invoices, payments, deposits, reports, credit used | `SB_INVOICES`, `SB_PAYMENTS`, `SB_DEPOSITS`, `acct*`, `bk.invoiceId`, `bk.paymentStatus`, `bk.refund` | `todo/legacy-replacement.md` §7 |
+| Deposits, refunds, money reports (invoices and payments moved: 2.7) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, `renderTravelSum` | `todo/money-model.md` slices 2–6, open 5 |
 | Pier payments, booking payment slips, cash-on-tour collection, the unpaid-proforma decision (`ops.pfm`) | `pck*` payment flows, `paymentSlips`, `pfm*` | `booking-extras-model.md` open 1; `trip-ops-and-vans-model.md` 8. (The booking's `cash_on_tour_*` amounts are stored.) |
-| On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | not in README; see "Questions" |
+| On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
 | Route and boat catalogue editing, boat per-day seat overrides, `act-capunlock` gate | `ROUTES`, `BOATS`, `boatCapSet` | README "Routes and boats are still edited in legacy"; `legacy-replacement.md` §2; `deployment-guards-model.md` 2 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Agent create/edit, programs, contracts, markets, salespeople, add-on catalogue, nationalities, insurance overrides | `ag*` (already shown read-only), `ct*`, `insPersist` | `legacy-replacement.md` §6, `agents.md` |
@@ -1045,6 +1075,8 @@ work for the session only and save nowhere** (see "The one thing to know first")
 10. **`SB_EXTRAS`.** In the client it is day-of extras sold on tour (`bookingV2ExtraSave`: service,
     qty, price, to-company, commission, payment). `legacy-replacement.md` §6 calls `sb_extras` the
     add-on catalogue. Which is it, and where will day-of extras live?
+    *Answer (2026-10-09): on-tour sales, as in the client. `legacy-replacement.md` was wrong and is
+    corrected; they become `booking_tour_sales` in Money slice 3 (`todo/money-model.md`).*
 11. **Rate type writes.** `POST/PATCH/PUT/DELETE /v1/rate-types…` exist, but README says the next
     import run puts legacy's prices back until cutover. With legacy off, this app cannot edit them in
     legacy either. Should the Rate Types screen write to the API now, or stay read-only?
@@ -1101,7 +1133,8 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Agents list and detail | `GET /v1/agents…`, `/v1/markets`, `/v1/sales` | Done (read-only) |
 | Agent rate seasons | `GET/PUT /v1/agents/{id}/rate-seasons`, `GET …/rate-type?date=` | To do |
 | Rate types, contracts (display) | `GET /v1/rate-types…`, `GET /v1/contracts…` | To do |
-| Money, weather closures, catalogue editing, fleet maintenance, on-tour extras | — | Not in API (§7) |
+| Invoices and payments (Accounting, Daily PFM payments) | `/v1/invoices…`, `GET /v1/payments` | To do |
+| Pier money, on-tour extras, weather closures, catalogue editing, fleet maintenance | — | Not in API (§7) |
 
 ## Rules and gotchas
 
