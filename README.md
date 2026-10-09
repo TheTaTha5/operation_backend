@@ -1541,6 +1541,38 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
 
+### Attachments
+
+Files: an agent's voucher, a passport, a payment slip. A file is uploaded once, then named by a
+booking's `attachments` or an upgrade sale's `slips`. Files are kept in the database, as legacy
+keeps them (`attachments`, migration 040).
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `POST /v1/attachments` | `{filename, mime, data_b64}` (legacy's `dataB64` too) | `201 {id, name, mime, size}` |
+| `GET /v1/attachments/{id}` | — | the file itself, with its `Content-Type` |
+| `DELETE /v1/attachments/{id}` | — | `204` |
+
+- **Upload refusals (`400`):**
+  - over 6 MB (legacy's limit);
+  - a type other than `image/jpeg`, `image/png` or `application/pdf`;
+  - data that isn't base64.
+
+  Ids look like legacy's, `att_<time>_<hex>`. Upload and delete need the `operations`, `pier` or
+  `accounting` edit area.
+- **Download:** any login may download (decided 2026-10-09). A login tied to an agent may download
+  only its own bookings' files (others answer `404`).
+- **Delete:** a file still named by a booking or an upgrade sale is `409 attachment_in_use`.
+- **A booking's `attachments`** (on `POST`/`PATCH /v1/bookings`, every read):
+  `[{id, kind?}]`, where `kind` is `upload`, `capture` or `paste`. The list replaces outright.
+  - Each id must be an uploaded file (`400`).
+  - A read shows `{id, name, mime, size, kind, by, at}`: the server fills the file's details, and
+    stamps `by` and `at` when a document is added. A document kept keeps its own.
+- **An upgrade sale's `slips`:** the same list of ids (see "Upgrades").
+- **Import:** `npm run import:attachments [-- --commit]` copies the legacy files something points at
+  (5,887 of 6,342; batches, re-runnable). Run it before the main import, which then links each
+  booking's documents and upgrade slips to them.
+
 ### Upgrades
 
 **On-tour sales.** An upsell sold to the customer on the day ("Longtail · Join → เหมา (Charter)"):
@@ -1551,7 +1583,8 @@ spellings (`sellPrice`, `toCompany`, `feePct`) are accepted.
 ```jsonc
 "upgrades": [ { "id": "up_1789029877535", "label": "Longtail · Join → เหมา (Charter)", "sell_price": 1100, "to_company": 770,
                 "commission": 330, "seller": "BEST", "note": null, "collected": true, "settle": "pending",
-                "method": "card", "fee_pct": 5, "fee": 55, "customer_paid": 1155, "at": "2026-09-10T08:44:37.535Z" } ]
+                "method": "card", "fee_pct": 5, "fee": 55, "customer_paid": 1155, "at": "2026-09-10T08:44:37.535Z",
+                "slips": [ { "id": "att_mtvcoqp0_efb5fa2ab1", "name": "4767.jpg", "mime": "image/jpeg", "size": 539033 } ] } ]
 ```
 
 - **Computed:**
@@ -1567,7 +1600,7 @@ spellings (`sellPrice`, `toCompany`, `feePct`) are accepted.
   - `fee_pct` above 100;
   - an `id` twice;
   - `settle` other than `pending` / `done`;
-  - **non-empty `slips`**: payment-slip attachments have no home here yet.
+  - a `slips` id that isn't an uploaded file (see "Attachments").
 
   `id` is the client's (`up_<ms>`), made by the server if absent. `settle` starts `pending`.
 - **History**, in legacy's words: "Upgrade · <label> · ขาย ฿2,000 · บริษัท ฿1,300 · คอม ฿700 ·
@@ -1605,8 +1638,8 @@ spellings (`sellPrice`, `toCompany`, `feePct`) are accepted.
   upgrade). It drops the charge unless it was collected, logs "Upgrade undone · back to <from>",
   and keeps the upgrade's record.
 
-The import brings every legacy sale, with its own fee and amount paid. Its payment slips are not
-kept (7 sales): attachments have no home yet.
+The import brings every legacy sale, with its own fee and amount paid, and its payment slips (once
+`import:attachments` has copied the files).
 
 ### Reconfirm
 

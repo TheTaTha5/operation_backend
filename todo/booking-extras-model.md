@@ -16,82 +16,13 @@
 The rest of the booking area. Each part is independent. Source: wt-lk-inbox@`658298d`, `allotment_v2/js/08-app.js` and `server.js`; counts
 from legacy production, read-only, 2026-10-09.
 
-## 1. Attachments
+## 1. Attachments: built
 
-**Legacy.** One file store for everything. `server.js` keeps each file as a `bytea` row in
-`allotment.attachments` (`id att_<time>_<hex>, booking_id, filename, mime, size, data, uploaded_by,
-created_at`).
-- `POST /api/attach` takes JSON `{bookingId, filename, mime, dataB64}`.
-  - Limit: 6 MB.
-  - Any mime type.
-  - Any logged-in user who may edit.
-- `GET /api/attach/:id` serves a file to any logged-in user.
-- `DELETE` doesn't check whether anything still points at the file.
-
-Records point at files through JSON lists of `{id, name, mime, size, …}`, with no foreign key:
-
-| Who points at files | Records | Refs |
-|---|---|---|
-| Booking documents `bk.attachments` (`kind` upload/capture/paste, `by`, `at`) | 4,020 | 5,319 (10 missing) |
-| Booking payment slips `bk.paymentSlips` (with `amount`) | 392 | 442 |
-| Pier payments `bk.pierPayments[].slips` | 34 | 34 |
-| Upgrade sales `upgrades[].slips` | 7 | 7 |
-| On-tour extras `SB_EXTRAS[].slips` | 49 | 49 |
-| Invoice payments `SB_PAYMENTS[].slips` | 354 | 375 |
-| Cash-on-tour decisions `TS_COT[].slips` | 8 | 8 |
-| Fleet projects `p.docs[].attId` | 9 | 58 |
-
-- **Files:** 6,342, using 699 MB. JPEG 6,117 (666 MB; images are shrunk in the browser), PNG 214
-  (all daily-report chart images, public, deleted after 120 days), PDF 11. The largest is 1.4 MB.
-- **Orphans:** 248 files (38 MB) are referenced by nothing. 71 point at a booking id that doesn't
-  exist (drafts upload under their code before the booking exists).
-
-**Proposed.** One file table, and one reference table per owner (an owner-type column would lose
-the foreign keys). This slice covers the booking's own documents and upgrade slips. The payment
-slips come with the payments model, the fleet docs with fleet.
-
-```sql
-CREATE TABLE attachments (
-  id TEXT PRIMARY KEY,                       -- legacy's att_… ids kept
-  filename TEXT NOT NULL, mime TEXT NOT NULL CHECK (mime IN ('image/jpeg', 'image/png', 'application/pdf')),
-  size INTEGER NOT NULL CHECK (size > 0 AND size <= 6291456),
-  data BYTEA NOT NULL,                       -- or a storage key: decision A1
-  uploaded_by TEXT, uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE TABLE booking_documents (             -- legacy bk.attachments
-  booking_id TEXT NOT NULL REFERENCES bookings (id) ON DELETE CASCADE,
-  seq INTEGER NOT NULL, attachment_id TEXT NOT NULL REFERENCES attachments (id),
-  kind TEXT CHECK (kind IN ('upload', 'capture', 'paste')), by TEXT, at TIMESTAMPTZ,
-  PRIMARY KEY (booking_id, seq)
-);
-CREATE TABLE booking_upgrade_slips (
-  booking_id TEXT NOT NULL, upgrade_id TEXT NOT NULL, seq INTEGER NOT NULL,
-  attachment_id TEXT NOT NULL REFERENCES attachments (id),
-  PRIMARY KEY (booking_id, upgrade_id, seq),
-  FOREIGN KEY (booking_id, upgrade_id) REFERENCES booking_upgrades (booking_id, id) ON DELETE CASCADE
-);
-```
-
-**Contract.**
-- `POST /v1/attachments` takes legacy's JSON `{filename, mime, data_b64}` and answers
-  `201 {id, name, mime, size}`.
-  - `400`: over 6 MB, or a type outside JPEG, PNG and PDF.
-  - Area `operations` (or `pier` for slips).
-- `GET /v1/attachments/{id}` returns the file itself.
-- Bookings take `attachments: [{id, kind?}]`, and `upgrades[].slips: [{id}]`.
-  - Both lists replace outright.
-  - An unknown id is `400`.
-  - The server fills `name`, `mime` and `size` from the file, and `by` and `at` when one is added.
-- `DELETE /v1/attachments/{id}` refuses a file still referenced (`409 attachment_in_use`).
-
-**Decisions.**
-- **A1. Where the bytes live.**
-  - **Postgres `bytea`, as legacy does (proposed):** simplest; one backup. 700 MB today, growing
-    roughly 100 MB a month.
-  - **Object storage** (a Railway volume or S3/R2 bucket): a key in the row.
-- **A2. Import:** every referenced file (5,890, about 660 MB; proposed), leaving the 248 orphans and
-  the chart images behind. Or start empty and keep legacy's server for old files.
-- **A3. Who may download:** any login, as legacy (proposed), or the area that wrote it.
+Migration 040, `src/domain/attachments.ts`, `npm run import:attachments`; README → "Attachments".
+Still to come with their owners: the other payment slips (booking `paymentSlips`, pier payments,
+on-tour extras, invoice payments, cash-on-tour: their files are already copied) and the fleet
+project documents. Left behind in legacy: 248 files nobody names, the daily-report chart images, and
+9 files legacy's records name but lost.
 
 ## 2. Allergy list
 

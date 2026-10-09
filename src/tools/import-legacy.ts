@@ -544,6 +544,9 @@ async function main() {
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
     // Approvals (`legacy-approvals.ts`). Legacy's `licFree` goes to the approval day when this schema keeps it (025).
     const approvals: Row[] = [], approvalDays: ApprovalDayRow[] = [];
+    // Files copied by `npm run import:attachments` (migration 040): a document or slip is linked only to a file that is here.
+    const filesHere = new Set((await target.query('SELECT id FROM attachments')).rows.map((r) => String(r.id)));
+    const documents: Row[] = [], upgradeSlips: Row[] = [];
     const approvalDayLicensedFree = (await target.query(`SELECT 1 FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = 'booking_approval_days' AND column_name = 'licensed_free'`)).rowCount === 1;
     const report = { skip, note };
@@ -712,14 +715,27 @@ async function main() {
           if (legacyAddOnRows.some((a) => Number(a.jad) === 0 && Number(a.jchd) === 0 && a.jad !== null)) note('add-ons imported with a join of 0 adults and 0 children: nobody joins');
         } catch (error) { note(`add-ons dropped: ${(error as Error).message}`); }
       }
-      // On-tour upgrades (migration 038), with legacy's own fee and amount paid. Payment slips are
-      // attachments, which have no home here yet: they are counted, not kept.
+      // The booking's documents (migration 040, legacy bk.attachments), linked to the files copied here.
+      const legacyDocs = jsonValue(b.attachments);
+      let docSeq = 0;
+      for (const d of Array.isArray(legacyDocs) ? legacyDocs as Row[] : []) {
+        const fileId = str(d?.id);
+        if (!fileId || !filesHere.has(fileId)) { note('booking documents dropped: the file is not here (run import:attachments first, or legacy lost it)'); continue; }
+        const kind = str(d.kind);
+        documents.push({ booking_id: id, seq: docSeq++, attachment_id: fileId, kind: ['upload', 'capture', 'paste'].includes(kind) ? kind : null, by: str(d.by) || null, at: instant(d.at) ?? null });
+      }
+      // On-tour upgrades (migration 038), with legacy's own fee and amount paid, and their payment slips (040).
       let upgradeSeq = 0;
       for (const u of upgradesOf.get(legacyId) ?? []) {
         const sell = Number(u.sellprice);
         if (!str(u.id) || !(sell >= 0)) { note('upgrades dropped: no id or no price'); continue; }
         const slips = jsonValue(u.slips);
-        if (Array.isArray(slips) && slips.length) note('upgrade payment slips not kept: attachments have no home yet');
+        let slipSeq = 0;
+        for (const x of Array.isArray(slips) ? slips as Row[] : []) {
+          const fileId = str(x?.id);
+          if (!fileId || !filesHere.has(fileId)) { note('upgrade payment slips dropped: the file is not here'); continue; }
+          upgradeSlips.push({ booking_id: id, upgrade_id: str(u.id), seq: slipSeq++, attachment_id: fileId });
+        }
         const num = (v: unknown) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
         const settle = str(u.settle);
         upgrades.push({
@@ -1019,6 +1035,8 @@ async function main() {
     await insert('booking_reconfirmations', reconfirms);
     await insert('booking_alt_pickups', altPickups);
     await insert('booking_upgrades', upgrades);
+    await insert('booking_upgrade_slips', upgradeSlips);
+    await insert('booking_documents', documents);
     await insert('booking_addons', bookingAddOns);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);

@@ -30,6 +30,7 @@ import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from 
 import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
+import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
@@ -146,7 +147,13 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'drop_same', x.drop_same, 'drop_area_id', x.drop_area_id, 'drop_area', x.drop_area, 'drop_zone', x.drop_zone, 'drop_place', x.drop_place) ORDER BY x.seq)
     FROM booking_alt_pickups x WHERE x.booking_id = b.id), '[]'::jsonb) AS alt_pickups,
   COALESCE((
-    SELECT jsonb_agg(to_jsonb(u) - 'booking_id' ORDER BY u.seq) FROM booking_upgrades u WHERE u.booking_id = b.id), '[]'::jsonb) AS upgrades,
+    SELECT jsonb_agg(to_jsonb(u) - 'booking_id' || jsonb_build_object('slips', COALESCE((SELECT jsonb_agg(s.attachment_id ORDER BY s.seq)
+      FROM booking_upgrade_slips s WHERE s.booking_id = u.booking_id AND s.upgrade_id = u.id), '[]'::jsonb)) ORDER BY u.seq)
+    FROM booking_upgrades u WHERE u.booking_id = b.id), '[]'::jsonb) AS upgrades,
+  COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment_id', d.attachment_id, 'kind', d.kind, 'by', d.by, 'at', d.at) ORDER BY d.seq)
+    FROM booking_documents d WHERE d.booking_id = b.id), '[]'::jsonb) AS attachments,
+  COALESCE((SELECT jsonb_agg(jsonb_build_object('id', f.id, 'name', f.filename, 'mime', f.mime, 'size', f.size)) FROM attachments f
+    WHERE f.id IN (SELECT attachment_id FROM booking_documents WHERE booking_id = b.id UNION SELECT attachment_id FROM booking_upgrade_slips WHERE booking_id = b.id)), '[]'::jsonb) AS files,
   (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
     FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
   COALESCE((
@@ -235,12 +242,16 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
     ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
   })),
+  attachments: ((row.attachments as Record<string, unknown>[]) ?? []).map((d): DocumentRow => ({
+    attachment_id: String(d.attachment_id), kind: (d.kind as DocumentRow['kind']) ?? null, by: (d.by as string) ?? null, at: d.at ? jsonInstant(d.at) : null,
+  })),
   upgrades: (row.upgrades as Record<string, unknown>[]).map((u): StoredUpgrade => {
     const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
     return {
       id: String(u.id), label: String(u.label), sell_price: Number(u.sell_price), to_company: num(u.to_company), seller: (u.seller as string) ?? null,
       note: (u.note as string) ?? null, collected: (u.collected as boolean) ?? null, settle: (u.settle as StoredUpgrade['settle']) ?? null,
       method: (u.method as string) ?? null, fee_pct: num(u.fee_pct), fee: num(u.fee), customer_paid: num(u.customer_paid), at: u.at ? jsonInstant(u.at) : null,
+      slips: ((u.slips as string[]) ?? []).map(String),
     };
   }),
   alt_pickups: (row.alt_pickups as Record<string, unknown>[]).map(({ seq: _seq, ...a }) => ({
@@ -310,7 +321,7 @@ const booking = (row: QueryResultRow): Booking => {
     const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
     return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups),
       checkinsView(((t.checkins as Record<string, unknown>[]) ?? []).map(storedCheckin)), activeUpgrade(((t.upgrades as Record<string, unknown>[]) ?? []).map(tripUpgrade)));
-  }, storedReconfirm(row.reconfirm));
+  }, storedReconfirm(row.reconfirm), new Map(((row.files as AttachmentRef[]) ?? []).map((f) => [f.id, { id: f.id, name: f.name, mime: f.mime, size: Number(f.size) }])));
 };
 /** A check-in record from `CHECKINS_JSON`: its columns as jsonb, timestamps as ISO text. */
 const storedCheckin = (r: Record<string, unknown>): StoredCheckin => {
@@ -635,6 +646,15 @@ export class PostgresOperationsStore {
       await this.client().query(`INSERT INTO booking_upgrades (booking_id, seq, id, label, sell_price, to_company, seller, note, collected, settle, method, fee_pct, fee, customer_paid, at)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
         [bookingId, seq, u.id, u.label, u.sell_price, u.to_company, u.seller, u.note, u.collected, u.settle, u.method, u.fee_pct, u.fee, u.customer_paid, u.at]);
+      for (const [slipSeq, attachmentId] of u.slips.entries()) {
+        await this.client().query('INSERT INTO booking_upgrade_slips (booking_id, upgrade_id, seq, attachment_id) VALUES ($1,$2,$3,$4)', [bookingId, u.id, slipSeq, attachmentId]);
+      }
+    }
+  }
+  private async writeDocuments(bookingId: string, rows: readonly DocumentRow[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_documents WHERE booking_id = $1', [bookingId]);
+    for (const [seq, d] of rows.entries()) {
+      await this.client().query('INSERT INTO booking_documents (booking_id, seq, attachment_id, kind, by, at) VALUES ($1,$2,$3,$4,$5,$6)', [bookingId, seq, d.attachment_id, d.kind, d.by, d.at]);
     }
   }
   private async writeAltPickups(bookingId: string, alts: readonly AltPickup[]): Promise<void> {
@@ -796,6 +816,7 @@ export class PostgresOperationsStore {
     await this.writeAddOns(id, input.add_ons ?? []);
     await this.writeAdjustments(id, input.adjustments ?? []);
     await this.writeAltPickups(id, input.alt_pickups ?? []);
+    await this.writeDocuments(id, input.attachments ?? []);
     const sold = storedUpgrades(input.upgrades ?? [], [], new Date().toISOString(), actor ?? null);
     await this.writeUpgrades(id, sold.upgrades);
     await this.requestApprovals(id, decision.approvals);
@@ -870,6 +891,7 @@ export class PostgresOperationsStore {
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
     if (changes.alt_pickups) await this.writeAltPickups(id, changes.alt_pickups);
+    if (changes.attachments) await this.writeDocuments(id, changes.attachments);
     if (changes.upgrades) {
       const sold = storedUpgrades(changes.upgrades, current.upgrades, new Date().toISOString(), actor ?? null);
       await this.writeUpgrades(id, sold.upgrades);
@@ -1463,6 +1485,28 @@ export class PostgresOperationsStore {
   async deleteCheckin(tripId: string, kind: CheckinKind, slot: number): Promise<boolean> {
     return (await this.client().query('DELETE FROM booking_trip_checkins WHERE booking_trip_id = $1 AND kind = $2 AND slot = $3', [tripId, kind, slot])).rowCount === 1;
   }
+
+  // ── Attachments (migration 040) ──
+  async putAttachment(f: StoredFile): Promise<void> {
+    await this.client().query('INSERT INTO attachments (id, filename, mime, size, data, uploaded_by, uploaded_at) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [f.id, f.name, f.mime, f.size, f.data, f.uploaded_by, f.uploaded_at]);
+  }
+  async attachmentFile(id: string): Promise<StoredFile | undefined> {
+    const { rows: [r] } = await this.client().query('SELECT id, filename, mime, size, data, uploaded_by, uploaded_at FROM attachments WHERE id = $1', [id]);
+    return r && { id: r.id, name: r.filename, mime: r.mime, size: Number(r.size), data: r.data as Buffer, uploaded_by: r.uploaded_by ?? null, uploaded_at: (r.uploaded_at as Date).toISOString() };
+  }
+  /** The files that exist among `ids`. */
+  async attachmentRefs(ids: readonly string[]): Promise<Map<string, AttachmentRef>> {
+    const { rows } = await this.client().query('SELECT id, filename, mime, size FROM attachments WHERE id = ANY($1::text[])', [ids]);
+    return new Map(rows.map((r) => [r.id as string, { id: r.id as string, name: r.filename as string, mime: r.mime as string, size: Number(r.size) }]));
+  }
+  /** The bookings that point at a file, by their documents or their upgrade slips. */
+  async attachmentBookings(id: string): Promise<Booking[]> {
+    const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.id IN (SELECT booking_id FROM booking_documents WHERE attachment_id = $1
+      UNION SELECT booking_id FROM booking_upgrade_slips WHERE attachment_id = $1)`, [id]);
+    return rows.map(booking);
+  }
+  async deleteAttachment(id: string): Promise<boolean> { return (await this.client().query('DELETE FROM attachments WHERE id = $1', [id])).rowCount === 1; }
 
   /** Moves one trip to another route through the ordinary edit, which checks the route's calendar and seats. */
   async upgradeRoute(id: string, tripId: string, routeId: string, actor: string | undefined, entry: HistoryLine): Promise<Booking | undefined> {
