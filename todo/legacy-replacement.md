@@ -31,8 +31,8 @@ Built, attachments included (`/v1/attachments`, replacing `/api/attach*`).
 
 ## 5. Seat locks
 
-Built (migration 048, README "Agent seat locks"), the log included. Left: creating and converting
-whole-boat holds, their own design (not written yet; the pool side is migration 047).
+Built (migrations 047, 048, 180; README "Agent seat locks"), the log and whole-boat holds included
+(made, edited, released and converted into a charter here). Open questions: `seat-lock-extras-model.md`.
 
 ## 6. Sales: agents, prices, contracts
 

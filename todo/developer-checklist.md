@@ -103,7 +103,9 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
       - Pickup time setup through `/v1/pickup-areas` and `/v1/pickup-time-profiles`;
       - the ops board's re-confirm sends `via: list|phone`, and its clear sends `?all=true`.
   - **Areas that moved today** (each with its handoff section):
-    - seat locks (§6.1: bulk groups, sub-groups, pending seats, holder types, the log);
+    - seat locks (§6.1: bulk groups, sub-groups, pending seats, holder types, the log; whole-boat
+      holds: the Hold-whole-boat form, its boat list, release and "เหมาลำ" convert, and Boat
+      Operation's `409 boat_held`);
     - weather (§2.8);
     - invoices (§2.7);
     - Daily PFM, pier money, on-tour sales and after-trip decisions (§2.10; an upgrade's "collected"
@@ -162,6 +164,9 @@ So, in this order:
 - **B2C orphans:** cancel the 6 bookings of deleted Love Kingdom orders (2 in the future hold seats)
   and the 3 test bookings in legacy (`b2c-sync-model.md` 7).
 - **Fleet projects PRJ-001…007:** copies or real? (`fleet-maintenance-model.md` 10)
+- **Whole-boat holds:** a hold's "เหมาลำ" now refuses a quote and a booking without the held boat's
+  charter (legacy saved it and left the hold); a boat not yet on the route no longer counts as
+  taking seats from it (`seat-lock-extras-model.md`, "Flagged"). Confirm with ops.
 - **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
   pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
   invoice left overpaid by a cash-on-tour deduction.
