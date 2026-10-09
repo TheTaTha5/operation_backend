@@ -15,6 +15,8 @@ import { actorOf } from '../domain/booking-actions.js';
 import { todayInThailand } from '../domain/calendar.js';
 import { withoutServerOwned } from '../domain/server-owned.js';
 import { addDays, bad, isoDate, notFound, parsePier, record, WAREHOUSES } from '../domain/fleet-common.js';
+import type { Job } from '../domain/fleet-jobs.js';
+import { closedChildJobs, linkedMemos, planJobPartAdd, planJobPartRemove, projectJobs, unlinkedChildJobs } from '../domain/fleet-seams.js';
 import type { FleetRepo } from '../domain/fleet-store.js';
 import {
   balances, ITEM_SERVER_OWNED, matchesItem, parseConsumableQuery, parseItemListQuery, parseMergeIds, planAdjust, planConsumable, planConsumableVoid, planItemCreate,
@@ -27,7 +29,7 @@ import {
 import {
   parseProjectListQuery, planBillBack, planCancel as planProjectCancel, planComplete, planDocAdd, planDocDelete, planDocSet, planHold, planPlanAdd, planPlanDelete,
   planPlanSet, planProjectCreate, planProjectPatch, planReopen, planResume, planStart, planVisitAdd, planVisitDelete, planWorkDone, PROJECT_SERVER_OWNED,
-  projectView, sortProjects, type Project, type ProjectPlan,
+  projectView, sortProjects, type Project, type ProjectJobs, type ProjectPlan,
 } from '../domain/fleet-projects.js';
 import {
   assertDayOpen, dailyLogView, parseBoatDay, parseDate, parseIssues, parsePrices, parseRange, parseWater, pierOfBoat, planExtra, planIssueItemAdd, planIssueItemPatch,
@@ -124,6 +126,31 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
   });
   app.get('/v1/fleet/suppliers', async () => ({
     suppliers: supplierList([...(await fleet().memos()).map((m) => m.supplier), ...(await fleet().items()).map((i) => i.supplier)]),
+  }));
+
+  // ── A job's parts, taken from stock (legacy `flMaintAddPart`, `flMaintRemovePart`; fleet-seams.ts) ──
+
+  const jobOf = async (id: string): Promise<Job> => (await store.fleetJob(id)) ?? notFound('Job not found');
+  /** Answers the job as stored (refetch `GET /v1/fleet/jobs/{id}` for its cost and lane) and the item's stock. */
+  app.post('/v1/fleet/jobs/:id/parts', async (request, reply) => reply.code(201).send(await store.transaction(async () => {
+    const job = await jobOf(param(request));
+    const b = record(request.body);
+    const item = typeof b.item_id === 'string' && b.item_id ? await fleet().item(b.item_id) : undefined;
+    const plan = planJobPartAdd(job, item, item ? await fleet().movements({ itemIds: [item.id] }) : [], b, ctx(request));
+    await fleet().addMovements([plan.movement]);
+    await store.putFleetJob(plan.job);
+    return { job: plan.job, item: await itemDetail(item!.id) };
+  })));
+  app.delete('/v1/fleet/jobs/:id/parts/:idx', async (request) => store.transaction(async () => {
+    const job = await jobOf(param(request));
+    const idx = Number(param(request, 'idx'));
+    if (!Number.isInteger(idx) || idx < 0) bad('idx must be a whole number, 0 or more');
+    const part = job.parts[idx];
+    const item = part?.inv_id ? await fleet().item(part.inv_id) : undefined;
+    const plan = planJobPartRemove(job, idx, item, query(request).late_anyway === 'true', ctx(request));
+    if (plan.movement) await fleet().addMovements([plan.movement]);
+    await store.putFleetJob(plan.job);
+    return { job: plan.job, item: item ? await itemDetail(item.id) : null };
   }));
 
   // ── Consumables ──
@@ -229,8 +256,11 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
   // ── Projects ──
 
   const projectOf = async (id: string): Promise<Project> => (await fleet().project(id)) ?? notFound(`Project ${id} not found`);
+  /** A project's child jobs (part A's, `parent_project_id`) with their cost, memos included. */
+  const childJobs = async (projectId: string): Promise<Job[]> => (await store.fleetJobs({})).filter((j) => j.parent_project_id === projectId);
+  const jobsOf = async (projectId: string): Promise<ProjectJobs> => projectJobs(await childJobs(projectId), linkedMemos(await fleet().memos()), projectId);
   const projectRead = async (p: Project, memos?: readonly Memo[]) => projectView(p, {
-    jobs: await fleet().projectJobs(p.id), memos: (memos ?? await fleet().memos()).filter((m) => m.project_id === p.id), today: todayInThailand(),
+    jobs: await jobsOf(p.id), memos: (memos ?? await fleet().memos()).filter((m) => m.project_id === p.id), today: todayInThailand(),
   });
   const projectDetail = async (id: string) => {
     const p = await projectOf(id);
@@ -274,21 +304,34 @@ export function registerFleetStockRoutes(app: FastifyInstance, deps: { store: St
     await saveProject(plan, c.now);
     return projectDetail(id);
   }));
-  const projectCommand = (path: string, run: (p: Project, request: Request, c: ReturnType<typeof ctx>) => Promise<ProjectPlan> | ProjectPlan) =>
+  /** A command's plan, and the child jobs it closes or unlinks (legacy's cascade). */
+  type Cascaded = ProjectPlan & { jobs?: Job[] };
+  const projectCommand = (path: string, run: (p: Project, request: Request, c: ReturnType<typeof ctx>) => Promise<Cascaded> | Cascaded) =>
     app.post(`/v1/fleet/projects/:id/${path}`, async (request) => store.transaction(async () => {
       const c = ctx(request);
       const plan = await run(await projectOf(param(request)), request, c);
       await saveProject(plan, c.now);
+      for (const j of plan.jobs ?? []) await store.putFleetJob(j);
       return projectDetail(plan.project.id);
     }));
   projectCommand('start', async (p, _r, c) => planStart(p, await boatOf(p), c));
   projectCommand('hold', (p, r, c) => planHold(p, r.body, c));
   projectCommand('resume', (p, _r, c) => planResume(p, c));
-  projectCommand('cancel', async (p, r, c) => planProjectCancel(p, r.body, await boatOf(p), c));
+  projectCommand('cancel', async (p, r, c) => {
+    const plan = planProjectCancel(p, r.body, await boatOf(p), await jobsOf(p.id), c);
+    return { ...plan, jobs: plan.unlink ? unlinkedChildJobs(await childJobs(p.id), p.no, c.today, c.by) : [] };
+  });
   projectCommand('reopen', (p, _r, c) => planReopen(p, c));
-  projectCommand('work-done', async (p, r, c) => planWorkDone(p, r.body, await boatOf(p), await fleet().projectJobs(p.id), c));
+  projectCommand('work-done', async (p, r, c) => ({
+    ...planWorkDone(p, r.body, await boatOf(p), await jobsOf(p.id), c),
+    jobs: closedChildJobs(await childJobs(p.id), p.no, (no) => `✓ ปิดตามโปรเจค ${no} · งานเสร็จ (รอใบวางบิล)`, c.today),
+  }));
   projectCommand('bill-back', async (p, _r, c) => planBillBack(p, await boatOf(p), c));
-  projectCommand('complete', async (p, r, c) => planComplete(p, r.body, await boatOf(p), await fleet().projectJobs(p.id), c));
+  projectCommand('complete', async (p, r, c) => ({
+    ...planComplete(p, r.body, await boatOf(p), await jobsOf(p.id), c),
+    // From in progress legacy closes the open child jobs (`flProjMarkComplete`); awaiting the bill, they are closed already.
+    jobs: p.status === 'inprogress' ? closedChildJobs(await childJobs(p.id), p.no, (no) => `✓ Auto-closed by parent project ${no} mark-complete`, c.today) : [],
+  }));
   projectCommand('plan', (p, r, c) => planPlanAdd(p, r.body, c));
   projectCommand('vendor-visits', (p, r, c) => planVisitAdd(p, r.body, c));
   projectCommand('documents', async (p, r, c) => {

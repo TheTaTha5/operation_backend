@@ -13,7 +13,7 @@ import { realDate, type BoatRecord } from '../domain/catalogue.js';
 import { SEAT_RELEASING_STATUSES } from '../domain/booking-status.js';
 import { availability, jobWork, type OpenWork } from '../domain/fleet-availability.js';
 import {
-  ASSET_LIST_KEY, ASSET_PATHS, assertGearboxFits, assertPropellerFits, engineHours, engineService, formSpareLocation, gearboxLifetime, gearboxService,
+  ASSET_LIST_KEY, ASSET_PATHS, assertGearboxFits, assertPropellerFits, engineService, formSpareLocation, gearboxLifetime, gearboxService,
   installedEngine, installedGearbox, installedPropeller, movedSpare, newAsset, newAssetId, parseAssetInput, parseHours, pickable, removedAsset, serviced,
   swappedPair, withStatus, type AnyAsset, type AssetKind, type Engine, type Gearbox, type Propeller,
 } from '../domain/fleet-assets.js';
@@ -22,6 +22,8 @@ import {
   nextNo, patchedJob, quickSwap, removedJobAsset, resetService, shownStatus, silentDays, splitJob, startedJob, swapInstall,
   type Incident, type Job, type LinkedMemo,
 } from '../domain/fleet-jobs.js';
+import type { FleetRepo } from '../domain/fleet-store.js';
+import { linkedMemos, meterHours, projectWork } from '../domain/fleet-seams.js';
 
 type Request = FastifyRequest;
 const bad = (message: string): never => refuse(message, 400);
@@ -35,21 +37,19 @@ const optional = (value: unknown): string | undefined => (typeof value === 'stri
 const MAX_AVAILABILITY_DAYS = 62;
 
 /**
- * The work holding boats now (`boatJobBlock`'s list): started jobs that hold their boat. Projects
- * (part B) join here when they merge.
+ * The work holding boats now (`boatJobBlock`'s list): started jobs that hold their boat, and part B's
+ * projects in progress or on hold (`fleet-seams.ts` `projectWork`).
  */
 export async function openWork(store: Store, boatId?: string): Promise<OpenWork[]> {
   const jobs = await store.fleetJobs({ status: 'inprogress', ...(boatId ? { boatId } : {}) });
-  return jobs.map(jobWork).filter((w): w is OpenWork => w !== null);
+  const projects = (await (store.fleetRepo as FleetRepo).projects()).filter((p) => boatId === undefined || p.boat_id === boatId);
+  return [...jobs.map(jobWork), ...projects.map(projectWork)].filter((w): w is OpenWork => w !== null);
 }
 
-/**
- * Engine hours read the Daily Fleet Log's meters (`flEngHours`), which are part B's: until they merge
- * an engine's hours are the hours it came in with.
- */
-const hoursOf = (e: Engine): number => engineHours(e, []);
-/** Memos linked to jobs, for their cost (`flMaintCalcCost`): part B's memos, none until they merge. */
-const memosOf = (_jobId: string): LinkedMemo[] => [];
+/** Engine hours read the Daily Fleet Log's meters (`flEngHours`; part B's, `fleet-seams.ts` `meterHours`). */
+export const hoursLoader = async (store: Store): Promise<(e: Engine) => number> => meterHours(await (store.fleetRepo as FleetRepo).engineMeters());
+/** Memos linked to jobs, for their cost (`flMaintCalcCost`; part B's memos, `fleet-seams.ts` `linkedMemos`). */
+export const memosLoader = async (store: Store): Promise<(jobId: string) => LinkedMemo[]> => linkedMemos(await (store.fleetRepo as FleetRepo).memos());
 
 export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }): void {
   const { store } = deps;
@@ -62,7 +62,7 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
   const draftOf = async (load: Load = {}): Promise<FleetDraft> => new FleetDraft(todayInThailand(), {
     engines: await store.fleetAssets('engine'), gearboxes: await store.fleetAssets('gearbox'), propellers: await store.fleetAssets('propeller'),
     boats: load.boats === false ? [] : await store.boatRecords(), incidents: load.incidents ?? [], jobs: load.jobs ?? [],
-  }, hoursOf);
+  }, await hoursLoader(store));
   /** Engines first, so a gearbox's engine exists before the gearbox names it. */
   const commit = async (d: FleetDraft): Promise<void> => {
     for (const id of d.touched.engines) await store.putFleetAsset('engine', d.engines.get(id)!);
@@ -76,7 +76,7 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
 
   // ── Views: computed fields beside the stored ones ──
 
-  const assetView = (kind: AssetKind, a: AnyAsset, engines: ReadonlyMap<string, Engine>, withLog: boolean) => {
+  const assetView = (kind: AssetKind, a: AnyAsset, engines: ReadonlyMap<string, Engine>, withLog: boolean, hoursOf: (e: Engine) => number) => {
     const { log, ...rest } = a;
     const out: Record<string, unknown> = { ...rest };
     if (kind === 'engine') {
@@ -97,6 +97,7 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
     const today = todayInThailand();
     const boats = new Map((await store.boatRecords()).map((b) => [b.id, b]));
     const work = await openWork(store);
+    const memosOf = await memosLoader(store);
     const held = new Map<string, boolean>();
     const blocks = (boatId: string): boolean => {
       if (!held.has(boatId)) {
@@ -136,7 +137,7 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
     const base = `/v1/fleet/${path}`;
     const one = async (id: string): Promise<AnyAsset> => (await store.fleetAsset(kind, id)) ?? notFound(`${kind[0].toUpperCase()}${kind.slice(1)} not found`);
     const enginesById = async () => new Map((await store.fleetAssets('engine')).map((e) => [e.id, e]));
-    const detail = async (id: string) => assetView(kind, await one(id), await enginesById(), true);
+    const detail = async (id: string) => assetView(kind, await one(id), await enginesById(), true, await hoursLoader(store));
     /** Runs a command on a draft and answers the asset as it stands after it. */
     const command = (url: string, run: (d: FleetDraft, a: AnyAsset, b: Record<string, unknown>, request: Request) => void | Promise<void>) => {
       app.post(`${base}/:id/${url}`, async (request) => {
@@ -155,7 +156,8 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
     app.get(base, async (request) => {
       const boatId = optional(query(request).boat_id);
       const engines = await enginesById();
-      return { [ASSET_LIST_KEY[kind]]: (await store.fleetAssets(kind, boatId ? { boatId } : {})).map((a) => assetView(kind, a, engines, false)) };
+      const hoursOf = await hoursLoader(store);
+      return { [ASSET_LIST_KEY[kind]]: (await store.fleetAssets(kind, boatId ? { boatId } : {})).map((a) => assetView(kind, a, engines, false, hoursOf)) };
     });
     app.get(`${base}/:id`, async (request) => detail(param(request)));
 
@@ -320,7 +322,7 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
     const id = param(request);
     await store.transaction(async () => {
       const current = await incidentOr404(id);
-      const d = new FleetDraft(todayInThailand(), { incidents: [current] }, hoursOf);
+      const d = new FleetDraft(todayInThailand(), { incidents: [current] }, await hoursLoader(store));
       incidentLog(d, current, b);
       await commit(d);
     });
@@ -412,6 +414,8 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
   /** Close (`flMaintClose`). Answers `boat_status_after` and how many service baselines were reset. */
   jobCommand('/close', async (d, job, b) => {
     const incidentJobs = job.incident_id ? await store.fleetJobs({ incidentId: job.incident_id }) : [];
+    const hoursOf = await hoursLoader(store);
+    const memosOf = await memosLoader(store);
     const lifetimeOf = (g: Gearbox) => gearboxLifetime(g, (id) => { const e = d.engines.get(id); return e ? hoursOf(e) : undefined; });
     const { boat_status_after, service_reset } = closedJob(d, job, b, {
       cost: jobCost(job.parts, memosOf(job.id)).cost, otherWork: await openWork(store, job.boat_id), incidentJobs, lifetimeOf,
@@ -419,8 +423,9 @@ export function registerFleetRoutes(app: FastifyInstance, deps: { store: Store }
     return { boat_status_after, service_reset };
   });
   /** The manual "reset service hours" (`flMaintServiceResetManual`). */
-  jobCommand('/reset-service', (d, job) => {
+  jobCommand('/reset-service', async (d, job) => {
     if (!looksLikeService(job)) refuse(`${job.no} is not a service job with engines or gearboxes: nothing reset`, 409, 'not_a_service');
+    const hoursOf = await hoursLoader(store);
     const lifetimeOf = (g: Gearbox) => gearboxLifetime(g, (id) => { const e = d.engines.get(id); return e ? hoursOf(e) : undefined; });
     return { service_reset: resetService(d, job, lifetimeOf) };
   });

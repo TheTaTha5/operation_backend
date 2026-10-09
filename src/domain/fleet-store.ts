@@ -9,7 +9,7 @@
  */
 import type { Consumable, Movement, NewMovement, StockItem } from './fleet-stock.js';
 import type { Memo, MemoHistory, MemoReceipt } from './fleet-memos.js';
-import type { Project, ProjectJobs, ProjectLog } from './fleet-projects.js';
+import type { Project, ProjectLog } from './fleet-projects.js';
 import type { DailyBoat, DailyRequest, DailyRows, DayLock, Extra, FuelPrice, Issue, IssueItem, Meter, Water } from './fleet-daily.js';
 import type { SafetyItem, SafetyLog } from './fleet-safety.js';
 
@@ -45,11 +45,8 @@ export interface FleetRepo {
   addProjectLog(rows: readonly ProjectLog[]): Maybe<void>;
   /** Projects whose documents name this file. */
   attachmentProjects(attachmentId: string): Maybe<string[]>;
-  /**
-   * A project's child maintenance jobs: part A's jobs, which this branch does not have. None until
-   * the two are wired (flagged in the note).
-   */
-  projectJobs(projectId: string): Maybe<ProjectJobs>;
+  /** Every engine meter reading of the Daily Log (engine hours, `fleet-seams.ts` `meterHours`). */
+  engineMeters(): Maybe<Meter[]>;
 
   daily(from: string, to: string): Maybe<DailyRows>;
   fuelPrices(from: string, to: string): Maybe<FuelPrice[]>;
@@ -138,7 +135,7 @@ export class MemoryFleetRepo implements FleetRepo {
   attachmentProjects(attachmentId: string): string[] {
     return [...this.projectRows.values()].filter((p) => p.documents.some((d) => d.attachment_id === attachmentId)).map((p) => p.id);
   }
-  projectJobs(_projectId: string): ProjectJobs { return { jobs: [] }; }
+  engineMeters(): Meter[] { return [...this.meters.values()].map(clone); }
 
   daily(from: string, to: string): DailyRows {
     const inRange = <T extends { date: string }>(rows: Iterable<T>) => [...rows].filter((r) => r.date >= from && r.date <= to).map(clone);

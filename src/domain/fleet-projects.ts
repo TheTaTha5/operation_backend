@@ -190,14 +190,22 @@ export function planResume(p: Project, ctx: Ctx): ProjectPlan {
   };
 }
 
-export function planCancel(p: Project, raw: unknown, boat: BoatRecord | undefined, ctx: Ctx): ProjectPlan {
+/**
+ * Legacy `flProjCancel`. With open child jobs legacy asks whether to unlink them so they go on alone:
+ * `unlink_jobs: true` (the route unlinks them, `fleet-seams.ts` `unlinkedChildJobs`).
+ */
+export function planCancel(p: Project, raw: unknown, boat: BoatRecord | undefined, jobs: ProjectJobs, ctx: Ctx): ProjectPlan & { unlink: boolean } {
   if (p.status === 'completed') conflict('Completed projects cannot be cancelled', 'project_status');
   if (p.status === 'cancelled') conflict('Already cancelled', 'already_cancelled');
-  const reason = reasonOf(raw, 'A cancel');
+  const b = record(raw ?? {});
+  assertKnown(b, ['reason', 'unlink_jobs'], 'A cancel');
+  const reason = required(b.reason, 'reason', 'Reason required');
+  const open = jobs.jobs.filter((j) => j.open).length;
+  const unlink = (bool(b.unlink_jobs, 'unlink_jobs') ?? false) && open > 0;
   const wasRunning = p.status === 'inprogress' || p.status === 'on_hold';
   const next: Project = { ...p, status: 'cancelled', cancel_reason: reason, cancelled_on: ctx.today, updated_at: ctx.now };
   return {
-    project: next, log: [line(p, ctx, `✕ Project cancelled · ${reason}`)],
+    unlink, project: next, log: [line(p, ctx, `✕ Project cancelled · ${reason}${unlink ? ` · ${open} MJ unlinked` : ''}`)],
     ...(wasRunning && boat ? { boat: boatReturned(boat, p, ctx, `Returned · Project ${p.no} cancelled`, ' · project cancelled') } : {}),
   };
 }

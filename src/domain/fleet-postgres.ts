@@ -7,7 +7,7 @@ import type { Pool, PoolClient, QueryResultRow } from 'pg';
 import type { FleetRepo } from './fleet-store.js';
 import type { Consumable, Movement, NewMovement, StockItem } from './fleet-stock.js';
 import type { Memo, MemoHistory, MemoLine, MemoReceipt } from './fleet-memos.js';
-import type { Project, ProjectJobs, ProjectLog } from './fleet-projects.js';
+import type { Project, ProjectLog } from './fleet-projects.js';
 import type { DailyBoat, DailyRequest, DailyRows, DayLock, Extra, FuelPrice, Issue, IssueItem, Meter, Water } from './fleet-daily.js';
 import type { SafetyItem, SafetyLog } from './fleet-safety.js';
 
@@ -225,7 +225,10 @@ export class PostgresFleetRepo implements FleetRepo {
   async attachmentProjects(attachmentId: string): Promise<string[]> {
     return (await this.q('SELECT DISTINCT project_id FROM fleet_project_documents WHERE attachment_id = $1 ORDER BY project_id', [attachmentId])).rows.map((r) => r.project_id);
   }
-  async projectJobs(_projectId: string): Promise<ProjectJobs> { return { jobs: [] }; }
+  async engineMeters(): Promise<Meter[]> {
+    return (await this.q('SELECT date::text AS date, boat_id, trip_type, engine_id, reading FROM fleet_daily_meters ORDER BY date, boat_id, trip_type, engine_id')).rows
+      .map((r): Meter => ({ date: r.date, boat_id: r.boat_id, trip_type: r.trip_type, engine_id: r.engine_id, reading: num(r.reading) }));
+  }
 
   // ── Daily Fleet Log ──
   async daily(from: string, to: string): Promise<DailyRows> {
