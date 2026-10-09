@@ -231,10 +231,22 @@ const COMMAND_DOCS: Record<string, { summary: string; description: string }> = {
 const seatLock = {
   type: 'object',
   properties: {
-    id: { type: 'string' }, route_id: { type: 'string' }, service_date: isoDate, pax: { type: 'integer' }, agent_id: { type: 'string' },
+    id: { type: 'string' }, version: { type: 'integer' }, route_id: { type: 'string' }, service_date: isoDate,
+    pax: { type: 'integer', description: 'Seats asked for. A release never lowers it: see `released_pax`' },
+    holder_type: { type: 'string', enum: ['agent', 'office', 'global'], description: 'An agent lock serves that agent\'s bookings only; office and global serve any' },
+    agent_id: { type: 'string', nullable: true },
     status: { type: 'string', enum: ['active', 'released'] },
-    drawn_pax: { type: 'integer', description: 'Seats bookings have already drawn; the lock still holds `pax − drawn_pax`' },
-    created_at: { type: 'string', format: 'date-time' }, updated_at: { type: 'string', format: 'date-time' }, released_at: { type: 'string', format: 'date-time' },
+    state: { type: 'string', enum: ['active', 'depleted', 'expired', 'released'], description: 'Legacy\'s label, worked out on read' },
+    holding: { type: 'boolean', description: 'Active, not past `expiry`, and (a sub-group) its parent holding' },
+    drawn_pax: { type: 'integer', description: 'Seats bookings that hold seats have drawn from this lock' },
+    pending_pax: { type: 'integer', description: 'Asked but not free yet: holds nothing, cannot be drawn' },
+    released_pax: { type: 'integer', description: 'Given back by a release' },
+    remaining_pax: { type: 'integer', description: 'What a booking may draw now' },
+    held_pax: { type: 'integer', nullable: true, description: 'What it keeps off general sale now (a sub-group 0; a whole-boat hold null)' },
+    expiry: { ...isoDate, nullable: true }, reason: { type: 'string', nullable: true },
+    group_id: { type: 'string', nullable: true }, parent_id: { type: 'string', nullable: true }, sub_name: { type: 'string', nullable: true },
+    release_at: { type: 'string', format: 'date-time', nullable: true }, overdue: { type: 'boolean' },
+    created_at: { type: 'string', format: 'date-time' }, updated_at: { type: 'string', format: 'date-time' }, released_at: { type: 'string', format: 'date-time', nullable: true },
   },
 };
 
@@ -368,18 +380,20 @@ export const docs = {
   },
   listLocks: {
     tags: ['Seat locks'], summary: 'List seat locks', security: BEARER,
-    querystring: { type: 'object', properties: { route_id: { type: 'string' }, date: isoDate } },
+    querystring: { type: 'object', properties: { route_id: { type: 'string' }, date: isoDate, from: isoDate, to: isoDate, group_id: { type: 'string' }, parent_id: { type: 'string' }, agent_id: { type: 'string' } } },
     response: { 200: { type: 'object', properties: { seat_locks: { type: 'array', items: seatLock } } }, ...UNAUTHORIZED },
   },
   createLock: {
     tags: ['Seat locks'], summary: 'Hold seats for an agent', security: BEARER,
-    description: 'Takes seats out of the pool until released or drawn by a booking (`lockDraws`). There is no expiry: a lock you do not release holds its seats forever.',
-    body: { type: 'object', required: ['route_id', 'service_date', 'pax'], properties: { route_id: { type: 'string' }, service_date: isoDate, pax: { type: 'integer', minimum: 1 }, agent_id: { type: 'string' } } },
-    response: { 201: seatLock, 400: err('Invalid input'), 409: err('The route does not run that day (`route_closed`), or not enough seats'), ...UNAUTHORIZED },
+    description: 'Takes seats out of the pool until released, past its `expiry`, or drawn by a booking (`lockDraws`). Short of free seats it is `409 seats_short` with the `short` days, unless `pending` says how to go on: `split` locks what is free and keeps the rest pending, `all` keeps it all pending.',
+    body: { type: 'object', required: ['route_id', 'service_date', 'pax'], properties: {
+      route_id: { type: 'string' }, service_date: isoDate, pax: { type: 'integer', minimum: 1 }, holder_type: { type: 'string', enum: ['agent', 'office', 'global'] },
+      agent_id: { type: 'string' }, reason: { type: 'string' }, expiry: isoDate, pending: { type: 'string', enum: ['split', 'all'] } } },
+    response: { 201: seatLock, 400: err('Invalid input, or agent_id names no agent'), 409: err('The route does not run that day (`route_closed`), or not enough free seats (`seats_short`, with `short`)'), ...UNAUTHORIZED },
   },
   releaseLock: {
     tags: ['Seat locks'], summary: 'Release a seat lock', security: BEARER, params: idParam,
-    description: 'Idempotent. Seats already drawn by bookings stay with those bookings; only the undrawn rest goes back to the pool.',
-    response: { 200: seatLock, 404: err('Seat lock not found'), ...UNAUTHORIZED },
+    description: 'Body `{ pax? }`: that many undrawn seats back (absent: all that can be). `pax` stays as asked; `released_pax` grows. Seats drawn by bookings stay with them. A sub-group\'s seats go back to its parent. Idempotent.',
+    response: { 200: seatLock, 404: err('Seat lock not found'), 409: err('More than can be released (`below_floor`)'), ...UNAUTHORIZED },
   },
 };

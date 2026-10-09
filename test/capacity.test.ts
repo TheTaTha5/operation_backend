@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { assertDayFits, assertLockFits, dayCapacity, deploymentSeats, type DayDemand } from '../src/domain/capacity.js';
+import { assertDayFits, dayCapacity, deploymentSeats, freeForLock, type DayDemand } from '../src/domain/capacity.js';
 
 test('a boat sells its capacity, not its licence', () => {
   // b13 Oceanus: the company sells 38 of a registered 45 passengers.
@@ -77,9 +77,8 @@ test('a charter needs its boat deployed, free and big enough, and must not stran
   assert.throws(() => assertDayFits(day, demand({ charters: [{ boat_id: 'small', pax: 1 }, { boat_id: 'small', pax: 1 }] })), refusedWith(409), 'the same boat twice');
 });
 
-test('a lock resizes against the pool but never below its draws', () => {
+test('a lock is weighed against the free seats plus what it already holds', () => {
   const full = dayCapacity([{ boat_id: 'b', capacity: 10 }], [{ booking_mode: 'seat', pax: 12 }], []);
-  assert.throws(() => assertLockFits(full, 2, 3), refusedWith(409), 'below what is drawn');
-  assert.doesNotThrow(() => assertLockFits(full, 3, 3), 'shrinking to the draws needs nothing, even on an oversold day');
-  assert.throws(() => assertLockFits(full, 4, 3), refusedWith(409));
+  assert.equal(freeForLock(full), 0, 'an oversold day has nothing free, not a negative number');
+  assert.equal(freeForLock(full, 3), 1, 'the seats a lock holds are its own to keep');
 });

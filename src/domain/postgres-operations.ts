@@ -8,7 +8,7 @@ import type { Change, ChangeInput } from './changes.js';
 import {
   assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds, retargetTrip,
   licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
-  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
+  type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
 import { type PaxCategory, type PaxGrid, type PaxResidency } from './pax.js';
@@ -19,8 +19,9 @@ import {
   type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
 } from './booking-actions.js';
 import { SEAT_RELEASING_STATUSES } from './booking-status.js';
-import { assertDayFits, assertLockFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldLock, type HeldTrip } from './capacity.js';
-import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, routeCalendar, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
+import { assertDayFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldTrip } from './capacity.js';
+import { poolLocks, type GroupRow, type HolderType, type LockEvent, type LockQuery, type LockRow, type NewLockEvent } from './seat-locks.js';
+import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, routeCalendar, todayInThailand, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
 import {
   BOOKING_HEADER_COLUMNS, BOOKING_HEADER_DATE_COLUMNS, BOOKING_HEADER_NUMERIC_COLUMNS, BOOKING_HEADER_TIMESTAMP_COLUMNS,
   type BookingHeader,
@@ -72,7 +73,6 @@ const optionalInt = (value: unknown): number | undefined => value === null || va
 /** Calendar rows, read with their dates cast to text in SQL. */
 const season = (row: QueryResultRow): RouteSeason => ({ id: String(row.id), route_id: String(row.route_id), kind: row.kind as RouteSeason['kind'], from_date: String(row.from_date), to_date: String(row.to_date) });
 const dayOverride = (row: QueryResultRow): RouteDayOverride => ({ route_id: String(row.route_id), service_date: String(row.service_date), kind: row.kind as RouteDayOverride['kind'] });
-type LockInput = Omit<SeatLock, 'id' | 'status' | 'version' | 'created_at' | 'updated_at'>;
 /** `40001` serialization failure, `40P01` deadlock. Both mean "try again", not "the request was wrong". */
 const TRANSACTION_ATTEMPTS = 8;
 const isRetryable = (error: unknown): boolean => error instanceof Error && ['40001', '40P01'].includes((error as Error & { code?: string }).code ?? '');
@@ -400,7 +400,29 @@ const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | n
   status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
   at: r.at ? jsonInstant(r.at) : null, by: (r.by as string) ?? null, sent_at: r.sent_at ? jsonInstant(r.sent_at) : null, sent_by: (r.sent_by as string) ?? null,
 };
-const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, boat_id: row.boat_id ?? null, drawn_pax: Number(row.drawn_pax ?? 0) });
+/** Every `seat_locks` column, its dates cast to text. */
+const LOCK_COLUMNS = `id, version, route_id, service_date::text AS service_date, pax, pending_pax, released_pax, holder_type, agent_id, status, expiry::text AS expiry,
+  reason, group_id, parent_id, sub_name, boat_id, created_at, created_by, updated_at, released_at`;
+const lockRow = (row: QueryResultRow): LockRow => ({
+  id: String(row.id), version: Number(row.version), route_id: String(row.route_id), service_date: String(row.service_date), pax: Number(row.pax),
+  pending_pax: Number(row.pending_pax), released_pax: Number(row.released_pax), holder_type: row.holder_type as HolderType, agent_id: row.agent_id ?? null,
+  status: row.status as LockRow['status'], expiry: row.expiry ?? null, reason: row.reason ?? null, group_id: row.group_id ?? null, parent_id: row.parent_id ?? null,
+  sub_name: row.sub_name ?? null, boat_id: row.boat_id ?? null, created_at: asIso(row.created_at), created_by: row.created_by ?? null, updated_at: asIso(row.updated_at),
+  released_at: row.released_at ? asIso(row.released_at) : null,
+});
+const GROUP_COLUMNS = `id, version, route_id, holder_type, agent_id, date_from::text AS date_from, date_to::text AS date_to, weekdays, pax,
+  release_days_before, release_time, reason, created_at, created_by, updated_at`;
+const groupRow = (row: QueryResultRow): GroupRow => ({
+  id: String(row.id), version: Number(row.version), route_id: String(row.route_id), holder_type: row.holder_type as HolderType, agent_id: row.agent_id ?? null,
+  date_from: String(row.date_from), date_to: String(row.date_to), weekdays: (row.weekdays as unknown[]).map(Number), pax: Number(row.pax),
+  release_days_before: row.release_days_before === null ? null : Number(row.release_days_before), release_time: row.release_time ?? null, reason: row.reason ?? null,
+  created_at: asIso(row.created_at), created_by: row.created_by ?? null, updated_at: asIso(row.updated_at),
+});
+const lockEvent = (row: QueryResultRow): LockEvent => ({
+  id: Number(row.id), lock_id: row.lock_id ?? null, group_id: row.group_id ?? null, type: String(row.type), qty: row.qty === null ? null : Number(row.qty),
+  trip_date: row.trip_date ?? null, booking_id: row.booking_id ?? null, note: row.note ?? null, day: String(row.day), at: row.at ? asIso(row.at) : null,
+  by: row.by ?? null, imported: row.imported === true,
+});
 
 const text = (value: unknown): string | null => value === null || value === undefined ? null : String(value);
 const num = (value: unknown): number | null => value === null || value === undefined ? null : Number(value);
@@ -591,15 +613,18 @@ export class PostgresOperationsStore {
        WHERE t.route_id = ANY($1::text[]) AND t.service_date BETWEEN $2 AND $3 AND b.status <> ALL($5::text[]) AND NOT ${WAITING_FOR_SEATS}
          AND t.booking_id IS DISTINCT FROM $4
        GROUP BY t.route_id, t.service_date, t.booking_mode, t.charter_boat_id`, [ids, from, to, exclude.bookingId ?? null, releasing]);
+    // Every lock on those days that can count: the active ones, and every sub-group (a released one
+    // still counts its draws against its parent). `poolLocks` picks what holds.
     const { rows: locks } = await this.client().query(
-      `SELECT l.id, l.route_id, l.service_date::text AS service_date, l.pax, l.boat_id,
+      `SELECT ${LOCK_COLUMNS},
               COALESCE((SELECT SUM(d.qty) FROM booking_trip_lock_draws d
                         JOIN booking_trips t ON t.id = d.booking_trip_id
                         JOIN bookings b ON b.id = t.booking_id
                         WHERE d.seat_lock_id = l.id AND b.status <> ALL($5::text[]) AND NOT ${WAITING_FOR_SEATS} AND t.booking_id IS DISTINCT FROM $4), 0)::int AS drawn
        FROM seat_locks l
-       WHERE l.route_id = ANY($1::text[]) AND l.service_date BETWEEN $2 AND $3 AND l.status = 'active' AND l.id IS DISTINCT FROM $6`,
-      [ids, from, to, exclude.bookingId ?? null, releasing, exclude.lockId ?? null]);
+       WHERE l.route_id = ANY($1::text[]) AND l.service_date BETWEEN $2 AND $3 AND (l.status = 'active' OR l.parent_id IS NOT NULL)`,
+      [ids, from, to, exclude.bookingId ?? null, releasing]);
+    const today = todayInThailand();
     const { rows: kinds } = await this.client().query('SELECT id, kind FROM routes WHERE id = ANY($1::text[])', [ids]);
     const kindOf = new Map(kinds.map((row) => [String(row.id), row.kind as RouteKind]));
 
@@ -613,7 +638,7 @@ export class PostgresOperationsStore {
           ...dayCapacity(
             (deployedByDay.get(key) ?? []).map((row): DayDeployment => ({ boat_id: String(row.boat_id), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), override_capacity: optionalInt(row.override_capacity) })),
             (tripsByDay.get(key) ?? []).map((row): HeldTrip => ({ booking_mode: String(row.booking_mode), pax: Number(row.pax), charter_boat_id: row.charter_boat_id ?? undefined })),
-            (locksByDay.get(key) ?? []).map((row): HeldLock => ({ id: String(row.id), pax: Number(row.pax), drawn: Number(row.drawn), ...(row.boat_id ? { boat_id: String(row.boat_id) } : {}) })),
+            (() => { const rows = locksByDay.get(key) ?? []; return poolLocks(rows.map(lockRow), new Map(rows.map((row) => [String(row.id), Number(row.drawn)])), today, exclude.lockId); })(),
             kindOf.get(routeId)),
         });
       }
@@ -630,8 +655,8 @@ export class PostgresOperationsStore {
    * between the check and the write. A lock lives on one route and day, so the pool lock also
    * serializes every draw on it.
    */
-  private async assertTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = []): Promise<void> {
-    const days = demandByDay(trips);
+  private async assertTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = [], agentId?: string | null): Promise<void> {
+    const days = demandByDay(trips, agentId);
     const pools = new Map<string, { route_id: string; service_date: string }>();
     for (const day of [...days, ...vacating]) pools.set(`${day.route_id} ${day.service_date}`, { route_id: day.route_id, service_date: day.service_date });
     for (const key of [...pools.keys()].sort()) { const pool = pools.get(key)!; await this.lockPool(pool.route_id, pool.service_date); }
@@ -830,8 +855,8 @@ export class PostgresOperationsStore {
    * over it (`weighDay`). The same pool locks, in the same order, so the answer cannot go stale before
    * the write.
    */
-  private async weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = []): Promise<ApprovalDay[]> {
-    const days = demandByDay(trips);
+  private async weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = [], agentId?: string | null): Promise<ApprovalDay[]> {
+    const days = demandByDay(trips, agentId);
     const pools = new Map<string, { route_id: string; service_date: string }>();
     for (const day of [...days, ...vacating]) pools.set(`${day.route_id} ${day.service_date}`, { route_id: day.route_id, service_date: day.service_date });
     for (const key of [...pools.keys()].sort()) { const pool = pools.get(key)!; await this.lockPool(pool.route_id, pool.service_date); }
@@ -923,7 +948,7 @@ export class PostgresOperationsStore {
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
-      overDays: await this.weighTrips(input.trips),
+      overDays: await this.weighTrips(input.trips, {}, [], input.agent_id),
     }, actor);
     const status = decision.status;
     const head: BookingHeader = { ...input.header, ...(status === 'confirmed' ? confirmationStamp(actor, new Date().toISOString()) : {}) };
@@ -1010,7 +1035,7 @@ export class PostgresOperationsStore {
     await this.assertRoutes(replacement);
     await this.assertOpen(tripsToCheckOpen(current.external_id, current.trips, planned));
     const reweighed = reweighs(current, changes, claimsMoreSeats(current.trips, planned))
-      ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips), actor) : undefined;
+      ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips, current.agent_id), actor) : undefined;
     const status = reweighed?.status ?? current.status;
     await this.log(id, entry ?? editedLine(actor, changes, current.status));
     await this.writeTrips(id, current.trips, planned);
@@ -1118,7 +1143,7 @@ export class PostgresOperationsStore {
     }
     const { trips, warnings } = restoreTrips(current.trips, days);
     await this.assertOpen(current.trips);
-    await this.assertTrips(trips, { bookingId: id });
+    await this.assertTrips(trips, { bookingId: id }, [], current.agent_id);
     await this.writeTrips(id, current.trips, planTrips(current.trips, trips, newTripId));
     await this.touch(id, actor, ", status = 'confirmed', cancellation_reason = NULL");
     await this.client().query('DELETE FROM booking_cancellations WHERE booking_id = $1', [id]);
@@ -1159,7 +1184,7 @@ export class PostgresOperationsStore {
     const planned = planTrips(current.trips, trips, newTripId);
     await this.assertRoutes(trips);
     await this.assertOpen(tripsToCheckOpen(undefined, current.trips, planned));
-    if (claimsMoreSeats(current.trips, planned)) await this.assertTrips(trips, { bookingId: id }, current.trips);
+    if (claimsMoreSeats(current.trips, planned)) await this.assertTrips(trips, { bookingId: id }, current.trips, current.agent_id);
     await this.writeTrips(id, current.trips, planned);
     const plan = planRescheduleRecord(current, request, actor, locksReturned);
     const r = plan.record;
@@ -1173,44 +1198,64 @@ export class PostgresOperationsStore {
     return this.booking(id);
   }
 
-  /** Locks with what holding bookings have drawn from each, however many filters are given. */
-  private async readLocks(filter: { id?: string; routeId?: string; date?: string }): Promise<SeatLock[]> {
-    const { rows } = await this.client().query(`SELECT l.*,
-        COALESCE((SELECT SUM(d.qty) FROM booking_trip_lock_draws d
-                  JOIN booking_trips t ON t.id = d.booking_trip_id
-                  JOIN bookings b ON b.id = t.booking_id
-                  WHERE d.seat_lock_id = l.id AND b.status <> ALL($4::text[]) AND NOT ${WAITING_FOR_SEATS}), 0)::int AS drawn_pax
-      FROM seat_locks l
-      WHERE ($1::text IS NULL OR l.id = $1) AND ($2::text IS NULL OR l.route_id = $2) AND ($3::date IS NULL OR l.service_date = $3)
-      ORDER BY l.created_at`, [filter.id ?? null, filter.routeId ?? null, filter.date ?? null, [...SEAT_RELEASING_STATUSES]]);
-    return rows.map(lock);
+  // ── Seat locks: the I/O `SeatLockService` needs (seat-lock-service.ts). The rules are not here. ──
+  /** The route-day's advisory lock, which every draw on that day also takes. */
+  async holdPool(routeId: string, date: string): Promise<void> { await this.lockPool(routeId, date); }
+  async lockRows(q: LockQuery): Promise<LockRow[]> {
+    const { rows } = await this.client().query(`SELECT ${LOCK_COLUMNS} FROM seat_locks
+      WHERE ($1::text[] IS NULL OR id = ANY($1)) AND ($2::text IS NULL OR route_id = $2) AND ($3::date IS NULL OR service_date = $3)
+        AND ($4::date IS NULL OR service_date >= $4) AND ($5::date IS NULL OR service_date <= $5) AND ($6::text IS NULL OR group_id = $6)
+        AND ($7::text[] IS NULL OR parent_id = ANY($7)) AND ($8::text IS NULL OR agent_id = $8)
+      ORDER BY created_at, id`,
+    [q.ids ? [...q.ids] : null, q.routeId ?? null, q.serviceDate ?? null, q.from ?? null, q.to ?? null, q.groupId ?? null, q.parentIds ? [...q.parentIds] : null, q.agentId ?? null]);
+    return rows.map(lockRow);
   }
-  async createLock(input: LockInput): Promise<SeatLock> {
-    await this.assertOpen([input]);
-    await this.lockPool(input.route_id, input.service_date);
-    assertLockFits(await this.day(input.route_id, input.service_date), input.pax, 0);
-    const id = `lock_${randomUUID()}`;
-    await this.client().query("INSERT INTO seat_locks (id,route_id,service_date,pax,agent_id,boat_id,status) VALUES ($1,$2,$3,$4,$5,$6,'active')", [id, input.route_id, input.service_date, input.pax, input.agent_id ?? null, input.boat_id ?? null]);
-    return (await this.readLocks({ id }))[0];
+  async lockDrawn(ids: readonly string[]): Promise<Map<string, number>> {
+    const { rows } = await this.client().query(`SELECT d.seat_lock_id, SUM(d.qty)::int AS drawn FROM booking_trip_lock_draws d
+      JOIN booking_trips t ON t.id = d.booking_trip_id JOIN bookings b ON b.id = t.booking_id
+      WHERE d.seat_lock_id = ANY($1::text[]) AND b.status <> ALL($2::text[]) AND NOT ${WAITING_FOR_SEATS}
+      GROUP BY d.seat_lock_id`, [[...ids], [...SEAT_RELEASING_STATUSES]]);
+    const drawn = new Map(ids.map((id) => [id, 0]));
+    for (const row of rows) drawn.set(String(row.seat_lock_id), Number(row.drawn));
+    return drawn;
   }
-  async listLocks(routeId?: string, date?: string): Promise<SeatLock[]> { return this.readLocks({ routeId, date }); }
-  async amendLock(id: string, changes: Partial<Pick<SeatLock, 'pax' | 'agent_id'>>): Promise<SeatLock | undefined> {
-    const [current] = await this.readLocks({ id });
-    if (!current) return undefined;
-    const seats = changes.pax ?? current.pax;
-    if (current.status === 'active' && seats !== current.pax) {
-      await this.lockPool(current.route_id, current.service_date);
-      // Re-read under the pool lock: a draw on this lock takes the same lock, so this count is final.
-      const [locked] = await this.readLocks({ id });
-      assertLockFits(await this.day(current.route_id, current.service_date, { lockId: id }), seats, locked.drawn_pax ?? 0);
-    }
-    await this.client().query('UPDATE seat_locks SET pax=$2, agent_id=$3, version=version+1, updated_at=now() WHERE id=$1', [id, seats, changes.agent_id ?? current.agent_id ?? null]);
-    return (await this.readLocks({ id }))[0];
+  async putLock(r: LockRow): Promise<void> {
+    await this.client().query(`INSERT INTO seat_locks (id, version, route_id, service_date, pax, pending_pax, released_pax, holder_type, agent_id, status, expiry,
+        reason, group_id, parent_id, sub_name, boat_id, created_at, created_by, updated_at, released_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, route_id = EXCLUDED.route_id, service_date = EXCLUDED.service_date, pax = EXCLUDED.pax,
+        pending_pax = EXCLUDED.pending_pax, released_pax = EXCLUDED.released_pax, holder_type = EXCLUDED.holder_type, agent_id = EXCLUDED.agent_id,
+        status = EXCLUDED.status, expiry = EXCLUDED.expiry, reason = EXCLUDED.reason, group_id = EXCLUDED.group_id, parent_id = EXCLUDED.parent_id,
+        sub_name = EXCLUDED.sub_name, boat_id = EXCLUDED.boat_id, updated_at = EXCLUDED.updated_at, released_at = EXCLUDED.released_at`,
+    [r.id, r.version, r.route_id, r.service_date, r.pax, r.pending_pax, r.released_pax, r.holder_type, r.agent_id, r.status, r.expiry,
+      r.reason, r.group_id, r.parent_id, r.sub_name, r.boat_id, r.created_at, r.created_by, r.updated_at, r.released_at]);
   }
-  async lock(id: string): Promise<SeatLock | undefined> { return (await this.readLocks({ id }))[0]; }
-  async releaseLock(id: string): Promise<SeatLock | undefined> {
-    const { rowCount } = await this.client().query("UPDATE seat_locks SET version=version+(status='active')::int, status='released', released_at=COALESCE(released_at, now()), updated_at=now() WHERE id=$1", [id]);
-    return rowCount === 0 ? undefined : (await this.readLocks({ id }))[0];
+  async lockGroupRows(q: { ids?: readonly string[]; routeId?: string; agentId?: string }): Promise<GroupRow[]> {
+    const { rows } = await this.client().query(`SELECT ${GROUP_COLUMNS} FROM seat_lock_groups
+      WHERE ($1::text[] IS NULL OR id = ANY($1)) AND ($2::text IS NULL OR route_id = $2) AND ($3::text IS NULL OR agent_id = $3) ORDER BY created_at, id`,
+    [q.ids ? [...q.ids] : null, q.routeId ?? null, q.agentId ?? null]);
+    return rows.map(groupRow);
+  }
+  async putLockGroup(g: GroupRow): Promise<void> {
+    await this.client().query(`INSERT INTO seat_lock_groups (id, version, route_id, holder_type, agent_id, date_from, date_to, weekdays, pax,
+        release_days_before, release_time, reason, created_at, created_by, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8::smallint[],$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, holder_type = EXCLUDED.holder_type, agent_id = EXCLUDED.agent_id, pax = EXCLUDED.pax,
+        release_days_before = EXCLUDED.release_days_before, release_time = EXCLUDED.release_time, reason = EXCLUDED.reason, updated_at = EXCLUDED.updated_at`,
+    [g.id, g.version, g.route_id, g.holder_type, g.agent_id, g.date_from, g.date_to, g.weekdays, g.pax,
+      g.release_days_before, g.release_time, g.reason, g.created_at, g.created_by, g.updated_at]);
+  }
+  async addLockEvents(events: readonly NewLockEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    // In the order given: the serial id is the log's order.
+    await this.client().query(`INSERT INTO seat_lock_events (lock_id, group_id, type, qty, trip_date, booking_id, note, day, at, by)
+      SELECT e.lock_id, e.group_id, e.type, e.qty, e.trip_date, e.booking_id, e.note, e.day, e.at, e.by
+      FROM jsonb_populate_recordset(NULL::seat_lock_events, $1::jsonb) WITH ORDINALITY AS e ORDER BY e.ordinality`, [JSON.stringify(events)]);
+  }
+  async lockEvents(q: { lockId?: string; groupId?: string }): Promise<LockEvent[]> {
+    const { rows } = await this.client().query(`SELECT id, lock_id, group_id, type, qty, trip_date::text AS trip_date, booking_id, note, day::text AS day, at, by, imported
+      FROM seat_lock_events WHERE ($1::text IS NULL OR lock_id = $1) AND ($2::text IS NULL OR group_id = $2) ORDER BY id`, [q.lockId ?? null, q.groupId ?? null]);
+    return rows.map(lockEvent);
   }
   async allotment(routeId: string, date: string, exclude: Exclusion = {}): Promise<Capacity & { route_id: string; service_date: string; deployments: Deployment[] }> { return { route_id: routeId, service_date: date, ...(await this.capacity(routeId,date,exclude)), deployments: await this.listDeployments(date,date,routeId) }; }
 

@@ -1,4 +1,5 @@
 import type { RouteKind } from './calendar.js';
+import { lockTree, type HolderType, type TreeLock } from './seat-locks.js';
 
 /**
  * How many seats a deployed boat may actually sell.
@@ -72,12 +73,23 @@ export type Capacity = {
 export type DayDeployment = DeploymentLimits & { boat_id: string };
 /** A trip on the route that day, from a booking that holds seats. The caller applies any exclusion. */
 export type HeldTrip = { booking_mode: string; pax: number; charter_boat_id?: string };
-/** An active lock on the route that day, and how many of its seats holding bookings have drawn. */
-/** `boat_id`: a whole-boat hold (todo/boat-holds-model.md), which takes its boat as a charter does. */
-export type HeldLock = { id: string; pax: number; drawn: number; boat_id?: string };
+/**
+ * A holding lock on the route that day (`poolLocks` in seat-locks.ts picks them), and how many of its
+ * seats holding bookings have drawn. `pax` is what it still has: asked, less released.
+ *
+ * - `boat_id`: a whole-boat hold (todo/boat-holds-model.md), which takes its boat as a charter does.
+ * - `parent_id`: a sub-group, whose seats are its parent's; `released` a sub-group given back.
+ * - `pending`: seats asked but not free yet, which hold nothing (§lkPend).
+ * - `holder_type`/`agent_id`: whose bookings may draw from it. Absent, anyone's.
+ */
+export type HeldLock = {
+  id: string; pax: number; drawn: number; boat_id?: string; parent_id?: string; pending?: number; released?: boolean; created_at?: string;
+  holder_type?: HolderType; agent_id?: string;
+};
 
 export type BoatDay = { boat_id: string; sellable: number; licensed: number; license_pax?: number; chartered: boolean };
-export type LockDay = HeldLock & { remaining: number };
+/** `remaining` is what a booking may still draw from the lock; `held` what it keeps from the pool (a sub-group's are its parent's). */
+export type LockDay = HeldLock & { remaining: number; held: number };
 /**
  * A day's numbers plus the per-boat and per-lock detail a sale is checked against.
  * `licensed_free` is the registered passenger seats still unsold on the day's open boats, locks not
@@ -130,8 +142,8 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
     charter_pax += trip.pax;
     if (!trip.charter_boat_id || !deployed.has(trip.charter_boat_id)) unplaced += trip.pax;
   }
-  const lockDays = locks.map((l) => ({ ...l, remaining: holding.has(l.id) ? 0 : Math.max(l.pax - l.drawn, 0) }));
-  const locked_pax = lockDays.reduce((sum, l) => sum + l.remaining, 0);
+  const lockDays = lockNumbers(locks, holding);
+  const locked_pax = lockDays.reduce((sum, l) => sum + l.held, 0);
   const open = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.sellable, 0);
   const openLicensed = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.licensed, 0);
   const unlimited = kind === 'land';
@@ -146,6 +158,27 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
     boats, locks: lockDays,
     licensed_free: pooled ? openLicensed - unplaced - booked_pax : 0,
   };
+}
+
+/**
+ * What each lock may give and keeps from the pool. A sub-group divides its parent's seats rather than
+ * adding to them, so only a top-level lock holds anything (`lockTree`). A whole-boat hold on its
+ * deployed boat (`takingBoat`) holds and gives nothing: the boat is out of the pool instead.
+ */
+function lockNumbers(locks: readonly HeldLock[], takingBoat: ReadonlySet<string>): LockDay[] {
+  const node = (l: HeldLock): TreeLock => ({ id: l.id, pax: l.pax, pending: l.pending ?? 0, drawn: l.drawn, released: l.released === true, created_at: l.created_at ?? '' });
+  const ids = new Set(locks.map((l) => l.id));
+  const kids = new Map<string, HeldLock[]>();
+  for (const l of locks) if (l.parent_id && ids.has(l.parent_id)) kids.set(l.parent_id, [...(kids.get(l.parent_id) ?? []), l]);
+  const out = new Map<string, LockDay>();
+  for (const top of locks.filter((l) => !l.parent_id || !ids.has(l.parent_id))) {
+    const children = kids.get(top.id) ?? [];
+    const tree = lockTree(node(top), children.map(node));
+    const boat = takingBoat.has(top.id);
+    out.set(top.id, { ...top, remaining: boat ? 0 : tree.parent.remaining, held: boat ? 0 : tree.held });
+    for (const kid of children) out.set(kid.id, { ...kid, remaining: boat ? 0 : tree.children.get(kid.id)!.remaining, held: 0 });
+  }
+  return locks.map((l) => out.get(l.id)!);
 }
 
 /** The numbers alone, for responses that predate the per-boat detail. A land route has no seat count to give. */
@@ -163,9 +196,29 @@ export type DayDemand = {
   /** Seats drawn from each lock, by lock id. */
   draws: Map<string, number>;
   charters: { boat_id?: string; pax: number }[];
+  /** The booking's agent: an agent's lock serves that agent's bookings only. */
+  agent_id?: string | null;
 };
 
-const refuse = (message: string, statusCode: 400 | 409): never => { const error = new Error(message); (error as Error & { statusCode: number }).statusCode = statusCode; throw error; };
+const refuse = (message: string, statusCode: 400 | 409, code?: string): never => {
+  const error = new Error(message) as Error & { statusCode: number; code?: string };
+  error.statusCode = statusCode;
+  if (code) error.code = code;
+  throw error;
+};
+
+/**
+ * Refuses a draw the booking may not make: on a lock not holding that day, past what the lock has
+ * left, or on another agent's lock. A booking draws from its own agent's locks and from office and
+ * global ones (legacy `bkV2LocksForAgent`, decision 8–9).
+ */
+function assertDrawable(day: DayState, demand: DayDemand, lockId: string, qty: number): void {
+  const lock = day.locks.find((l) => l.id === lockId) ?? refuse(`Seat lock ${lockId} is not active on ${demand.route_id} ${demand.service_date}`, 400);
+  if (lock.holder_type === 'agent' && lock.agent_id !== (demand.agent_id ?? undefined)) {
+    refuse(`Seat lock ${lockId} holds seats for agent ${lock.agent_id}${demand.agent_id ? `, not ${demand.agent_id}` : '; this booking has no agent'}`, 400, 'lock_other_agent');
+  }
+  if (qty > lock.remaining) refuse(`Seat lock ${lockId} has ${lock.remaining} seats left`, 409);
+}
 
 /**
  * Throws unless `demand` fits `day`. `day` must be read with the booking being amended excluded, or
@@ -179,8 +232,7 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
   const where = `on ${demand.route_id} ${demand.service_date}`;
   let drawn = 0;
   for (const [lockId, qty] of demand.draws) {
-    const lock = day.locks.find((l) => l.id === lockId) ?? refuse(`Seat lock ${lockId} is not active ${where}`, 400);
-    if (qty > lock.remaining) refuse(`Seat lock ${lockId} has ${lock.remaining} seats left`, 409);
+    assertDrawable(day, demand, lockId, qty);
     drawn += qty;
   }
 
@@ -217,8 +269,7 @@ export function weighDay(day: DayState, demand: DayDemand): { need: number; over
   const where = `on ${demand.route_id} ${demand.service_date}`;
   let drawn = 0;
   for (const [lockId, qty] of demand.draws) {
-    const lock = day.locks.find((l) => l.id === lockId) ?? refuse(`Seat lock ${lockId} is not active ${where}`, 400);
-    if (qty > lock.remaining) refuse(`Seat lock ${lockId} has ${lock.remaining} seats left`, 409);
+    assertDrawable(day, demand, lockId, qty);
     drawn += qty;
   }
   // Charters take whole boats, out of the sellable seats and out of the licensed ones alike.
@@ -259,12 +310,7 @@ export function licenceShortfall(day: DayState, demand: DayDemand): number {
 }
 
 /**
- * Throws unless a lock of `pax` seats fits `day`, which must be read with that lock excluded. A lock
- * cannot shrink below what bookings have already drawn from it: those passengers are sold.
+ * The seats a lock could hold on `day`: what is available plus what it holds there already
+ * (`ownHeld`), or `null` on a day sold ungated, which never falls short (legacy `bkV2LockFreeOn`).
  */
-export function assertLockFits(day: DayState, pax: number, drawn: number): void {
-  if (pax < drawn) refuse(`Bookings have drawn ${drawn} seats from this lock; it cannot hold fewer`, 409);
-  if (sellsUngated(day)) return;
-  const need = pax - drawn;
-  if (need > 0 && day.available_seats < need) refuse('Insufficient available seats', 409);
-}
+export const freeForLock = (day: DayState, ownHeld = 0): number | null => (sellsUngated(day) ? null : Math.max(0, day.available_seats + ownHeld));

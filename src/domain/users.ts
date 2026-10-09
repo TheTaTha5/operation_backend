@@ -74,7 +74,7 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/users' || path.startsWith('/v1/users/')) return { kind: 'admin' };
   // The document check's note: legacy lets anyone edit it (decision C3, 2026-10-09).
   if (/^\/v1\/bookings\/[^/]+\/doc-check\/note$/.test(path)) return { kind: 'self' };
-  if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-locks')) return { kind: 'area', areas: ['operations'] };
+  if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-lock')) return { kind: 'area', areas: ['operations'] };
   // Files: booking documents (operations), pier and payment slips (pier, accounting); legacy let any editor upload.
   if (path === '/v1/attachments' || path.startsWith('/v1/attachments/')) return { kind: 'area', areas: ['operations', 'pier', 'accounting'] };
   // Legacy's "Pickup time setup" (psuPersist guards operations).

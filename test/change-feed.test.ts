@@ -48,6 +48,17 @@ test('seat locks and deployments are recorded; a dispatch write is the booking\'
   assert.deepEqual(about(all, booking.id).map((c) => c.action), ['created', 'updated'], 'the boat set on its trip');
 });
 
+test('a bulk lock records every departure it made; a draw records the lock it drew on', async () => {
+  const start = await version();
+  const group = (await send('POST', '/v1/seat-lock-groups', { route_id: 'r1', date_from: '2055-01-05', date_to: '2055-01-06', pax: 2 })).json();
+  const ids = group.seat_locks.map((l: { id: string }) => l.id);
+  const all = await since(start);
+  assert.deepEqual(ids.map((id: string) => about(all, id).map((c) => c.action)), [['created'], ['created']]);
+  const mid = await version();
+  await send('POST', '/v1/bookings', { trips: [{ route_id: 'r1', date: '2055-01-05', pax: 1, lock_draws: { [ids[0]]: 1 } }] });
+  assert.deepEqual(about(await since(mid), ids[0]).map((c) => [c.kind, c.action]), [['seat_lock', 'updated']], 'its drawn_pax moved');
+});
+
 test('the stream sends what changed, as it commits', async () => {
   const address = await app.listen({ port: 0, host: '127.0.0.1' });
   const date = '2055-01-04';

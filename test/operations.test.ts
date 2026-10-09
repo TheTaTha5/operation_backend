@@ -112,7 +112,8 @@ test('a charter takes its whole boat out of the seat pool', async () => {
 test('seats drawn from a lock are held once, not twice', async () => {
   const date = '2031-05-01';
   await request('POST', '/operations/deployments', { boat_id: 'boat-lock', route_id: 'r3', service_date: date, capacity: 20 });
-  const lock = (await request('POST', '/v1/seat-locks', { route_id: 'r3', service_date: date, pax: 6, agent_id: 'agent-1' })).json() as { id: string; drawn_pax: number };
+  // An office lock: any booking may draw from it (an agent's serves that agent's bookings only).
+  const lock = (await request('POST', '/v1/seat-locks', { route_id: 'r3', service_date: date, pax: 6 })).json() as { id: string; drawn_pax: number };
   assert.equal(lock.drawn_pax, 0);
   const available = async () => (await request('GET', `/v1/availability?route_id=r3&date=${date}`)).json();
   assert.equal((await available()).available_seats, 14);
@@ -210,7 +211,7 @@ test('a reservation being edited does not compete with its own seats', async () 
 test('seat locks reserve and release capacity', async () => {
   const date = '2030-01-03';
   await request('POST', '/operations/deployments', { boat_id: 'boat-2', route_id: 'r2', service_date: date, capacity: 2 });
-  const create = await request('POST', '/v1/seat-locks', { route_id: 'r2', service_date: date, pax: 2, agent_id: 'agent-1' });
+  const create = await request('POST', '/v1/seat-locks', { route_id: 'r2', service_date: date, pax: 2 });
   assert.equal(create.statusCode, 201);
   const lock = create.json() as { id: string };
   assert.equal((await request('POST', '/v1/bookings', { route_id: 'r2', service_date: date, pax: 1 })).statusCode, 409);
