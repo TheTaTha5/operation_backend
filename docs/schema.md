@@ -564,8 +564,9 @@ erDiagram
 ## 5. Agents and sales
 
 The resellers who sell trips, the markets they sell into, and the salespeople who own them. `users` are
-the staff logins (migration 027): a salesperson's login approves discounts on their agents' bookings. The
-API serves this area read-only. The rows arrive through the legacy import, with legacy's ids.
+the staff logins (migration 027): a salesperson's login approves discounts on their agents' bookings, and
+sees only their agents. This API is the master for this area since 2026-10-09 (migration 090,
+todo/sales-editing-model.md); the legacy import seeds it once with legacy's ids (`--sales`).
 
 ```mermaid
 erDiagram
@@ -590,6 +591,7 @@ erDiagram
     text tel
     text color
     boolean active
+    text signature "data:image URL, printed on contracts"
   }
   agents {
     text id PK "legacy id, e.g. a01"
@@ -640,6 +642,46 @@ erDiagram
   agents ||--o{ agent_programs : "may sell"
   routes ||--o{ agent_programs : "sold by"
   agents ||--o{ agent_activity : "audit log"
+  agent_contract_history {
+    bigint id PK
+    text agent_id FK
+    text version
+    date archived_at
+    date contract_start
+    date contract_end
+    text rate_type_id "snapshot, no FK"
+    jsonb programs
+    jsonb signatory
+    text archived_by
+  }
+  contract_templates {
+    text id PK
+    text code "unique when new or changed"
+    text name
+    boolean active
+    boolean is_default "one"
+    jsonb sections
+    jsonb text
+  }
+  contract_documents {
+    text id PK "gc_..."
+    text agent_id FK
+    text contract_id FK "null when none"
+    text version
+    text lang
+    timestamptz generated_at
+    text generated_by
+    text template_id "snapshot, no FK"
+    jsonb content "frozen"
+  }
+  contracts {
+    text id PK
+    text doc_id "the last document issued"
+  }
+  agents ||--o{ agent_contract_history : "renewed from"
+  agents ||--o{ contract_documents : "was sent"
+  contracts |o--o{ contract_documents : "printed as"
+  contract_templates |o..o{ agents : "prints with (no FK)"
   users {
     bigint id PK
     text username "unique ignoring case"
@@ -661,9 +703,17 @@ erDiagram
 ```
 
 - **`agent_programs`** lists the routes an agent may sell, with the booking window sales entered.
-- **`house` agents** (`a_walkin`, `a_staff`, `a_b2c`) are channels the business sells through
-  itself, not resellers.
-- **Agents are never hard-deleted,** because bookings point at them.
+- **`house` agents** (`a_walkin`, `a_staff`, `a_company`, `a_b2c`) are channels the business sells
+  through itself, not resellers.
+- **Agents are deactivated, not deleted** (`active`): a delete is refused while a booking, contract, seat
+  lock, invoice or login names the agent.
+- **`agent_contract_history`** is what a renewal archives: legacy's renewal edits the agent's contract
+  fields and makes no contract row.
+- **`contract_templates`** hold the wording a contract prints with; `agents.contract_template_id` has no
+  foreign key (legacy binds agents to templates the import writes later), and deleting a template
+  unbinds its agents. **`contract_documents`** are the documents issued, frozen as printed.
+- **`agents.code`** is unique for a new or changed code, checked by the write: 21 legacy codes are
+  shared, so there is no constraint yet.
 
 The `agents` box shows the structural columns. The rest describe the agent:
 
@@ -675,6 +725,17 @@ The `agents` box shows the structural columns. The rest describe the agent:
 | Signatory | `signatory_name` `signatory_designation` `signatory_tel` `signatory_signed_date` |
 | Booking channel | `booking_method` `booking_cutoff` `booking_cancel_policy` `booking_email` `booking_phone` |
 | Audit | `created_at` `updated_at` |
+
+### Add-on services and nationalities
+
+`addon_services` (`id`, `name`, `type` boat/van/guide/other, `description`, `active`, `sort`) and
+`addon_service_variants` (`service_id`, `seq`, `id`, `name`, `unit`, `selling`, `net`): the add-on catalogue
+(migration 091). `nationalities` (`code` PK, `name`, `builtin`, `sort`, `created_at`, `created_by`): legacy's
+73 built-ins, seeded by migration 092, and the custom ones the booking form adds. Passengers'
+nationalities stay free text (no foreign key).
+
+Insurance (migration 093) is on the passengers: `bookings.lead_age`, `lead_insurance_reviewed_at`,
+`lead_insurance_reviewed_by`, and `booking_passengers.age`, `insurance_reviewed_at`, `insurance_reviewed_by`.
 
 ## 6. Rate types
 

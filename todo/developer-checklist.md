@@ -15,6 +15,13 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 1b2. **Rate types are this API's now** (`feat/rate-types-cutover`): the import no longer touches
    them. If Railway has none yet (`SELECT count(*) FROM rate_types`), run the import once with
    `--rate-types`. From then on prices are edited here, not in legacy.
+1b3. **The sales area is this API's once `feat/sales-editing` is merged** (migrations 090–093):
+   the import no longer writes agents, markets, salespeople, contract templates or issued documents.
+   Run it once with `--sales` *before* deploying the code (or on a database with none), so Railway
+   gets legacy's latest agents, templates, 16 documents and 77 renewal archives; from then on they are
+   edited here. **Legacy must stop editing agents at the same moment** (the integration branch's
+   §6.5): an agent made in legacy afterwards never arrives. `import:contracts` reruns would overwrite
+   a main contract's rate and `doc_id` set here: stop rerunning it after this.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -57,6 +64,10 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
   - the booking screen shows `POST /v1/quote`'s price instead of computing it (`bkV2CalcQuote`): the
     server now prices every non-B2C booking on save and replaces a sent price (`price_warnings`). Its
     "use today's rate" button sends `rate: "agent"`; it sends `ovnCharge` and the charter price fields.
+  - sales editing (once `feat/sales-editing` is deployed): the Agent List, agent detail, Contract
+    Templates, Team & Markets, Add-on Services and Insurance screens save on the API and stop writing
+    `sb_agents`, `sb_markets`, `sb_sales`, `contract_templates`, `agent_artifacts`, `sb_nationalities`
+    and `insurance_overrides` (handoff §6.5–6.6). Salespeople and markets need the `config` area now.
   - accounting (once 045 is deployed): the Accounting screen and Daily PFM payments read and write
     `/v1/invoices` (issue, `PATCH` header and WHT, `PUT …/discounts`, `/void`, `/payments`,
     `/payment-corrections`) and `GET /v1/payments`. A booking's `invoice` and `payment_state` replace
@@ -82,8 +93,11 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 - **Re-enter the agents' rate seasons** once the season screen saves to this API: legacy kept them
   only in browsers, so none came across.
-- **The add-on catalogue** you asked for: what should it list, and with which prices? Legacy never
-  saved one (`sales-editing-model.md` 10).
+- **The add-on catalogue** is built (`/v1/addon-services`) and empty: what should it list, and with
+  which prices? Legacy never saved one (`sales-editing-model.md` 10).
+- **Agent codes:** 21 codes are shared by 2–3 agents (import report, "agent data to check"). Rename
+  them, then the unique constraint can go in.
+- **Templates:** two share code `CT-06`, and 8 are named "Template ใหม่": rename them.
 
 ## Housekeeping
 

@@ -1022,6 +1022,52 @@ POST /v1/seat-locks   { "route_id": "r1", "service_date": "2026-10-12", "pax": 6
   display. Read-only.
 - Writes to rate types exist on the API, but see "Questions" before wiring them.
 
+### 6.5 Agents, contracts' documents, templates, salespeople, markets (sales editing)
+
+**Change: the Agent List, agent detail, Contract Templates and Team & Markets screens save on the API.**
+The API is the master for these since 2026-10-09; the legacy import no longer writes them. README
+"Agents", "Contract templates and documents", "Salespeople and markets" have every field.
+
+| Legacy | API |
+|---|---|
+| `agCreateSubmit` | `POST /v1/agents` (`409 possible_duplicate` is `agFindDup`'s confirm: resend with `create_anyway: true`; `409 code_taken` is new) |
+| `agEditSave` sections `sales`, `profile`, `company`, `signatory`, `booking`, `notes`, `contracttmpl`; table cells, bulk set, fill-down, Excel import | `PATCH /v1/agents/{id}` with the fields changed (groups `company`, `signatory`, `booking_channel`) |
+| section `programs`, `agProgBulkApply`, the table's programme picker | `PUT /v1/agents/{id}/programs` (the whole list; a bare route id keeps its window) |
+| section `ratetype` (+ `_ctSyncMainRate`, `agProgSyncOnRate`) | `PUT /v1/agents/{id}/rate-type`; on `409 unpriced_programs` show legacy's confirm and resend with `drop_unpriced` true (OK) or false (Cancel). The server syncs the contract and the programmes: do not call anything else |
+| `ctRenewActivate` | `POST /v1/agents/{id}/renew` `{version, start, end, rate_type_id?, carry}` |
+| `agDelete` | `DELETE /v1/agents/{id}` (admin; `409 in_use` once anything names the agent: offer Deactivate) |
+| (new) | `POST /v1/agents/{id}/deactivate`, `/activate`; the booking form already hides `active === false` |
+| `ctArtifactSave`, `ctArtifactRemove` | `POST /v1/agents/{id}/documents`, `DELETE /v1/contract-documents/{id}`; list with `GET /v1/agents/{id}/documents` |
+| `cttNew`, `cttSetField`/`Text`/`Form`/`Accent`/`Hex`/`Font`/`Section`, `cttToggleActive`, `cttSetDefault`, `cttDelete` | `POST`/`PATCH /v1/contract-templates[/{id}]`, `POST /{id}/default`, `DELETE /{id}` |
+| `tmSaveModal` (sales), `tmDeleteSales` | `POST`/`PATCH`/`DELETE /v1/sales[/{id}]` (area `config` now, not `sales`) |
+| `tmSaveModal` (market), `tmApplyMarketOrder`, `tmDeleteMarket` | `POST`/`PATCH`/`DELETE /v1/markets[/{id}]`, `PUT /v1/markets/order` |
+| `agSubMarketRemember` | nothing: saving the agent adds the sub-market |
+| `agLog` | nothing: the server writes every activity line, signed with the login |
+
+- **Stop writing** `sb_agents`, `sb_markets`, `sb_sales`, `contract_templates`, `agent_artifacts` and
+  `sb_contracts`' `rateTypeId`/`docId` from the browser (`sbAgentsPersist`, `sbMarketsPersist`,
+  `sbSalesPersist`, `ctTmplPersist`, `ctArtifactsPersist`, `sbContractsPersist` for those two fields).
+- **A sales-bound login** (`LA_ME.salesId`, not admin) gets only its agents from `GET /v1/agents` and
+  `403` for another's: `laScopeAgents` can stay as display, but the server is the gate.
+- **`creditBalance`** is not accepted (the agent's `credit` block is worked out); drop the field from
+  the profile modal's save.
+- **Templates and documents** carry `sections`/`text` (template) and `content` (document) as the
+  screen's own JSON: `text` is legacy's `{en: {...}, th: {...}}`, `content` is the artifact's
+  `{sections, form, accent, accentHex, font, tmplText, overrides, customClauses}`.
+
+### 6.6 The add-on catalogue, nationalities, insurance
+
+- **Add-on Services screen** (`aos*`): `GET`/`POST`/`PATCH`/`DELETE /v1/addon-services` (area `sales`); it
+  starts empty instead of the hard-coded `SB_ADDON_SVCS`.
+- **Nationalities:** `bkV2AllNats` reads `GET /v1/nationalities`; `bkV2AddCustomNat` calls
+  `POST /v1/nationalities {name}` (area `operations`) and uses the `code` it answers. Stop
+  `sbNationalitiesPersist`.
+- **Insurance page** (`ins*`): read `lead_age`/`lead_insurance_reviewed_*` and each passenger's
+  `age`/`insurance_reviewed_*` from the booking; `insSetField` (age), `insToggleReviewed` and
+  `insRevertRow` call `PUT /v1/bookings/{id}/insurance` with the booking's `version`, the lead as
+  `"lead"` and a passenger by its `seq`. Name and nationality overrides are gone (none was ever
+  used). Stop `insPersist`.
+
 ---
 
 ## 7. Not in the API yet: legacy keeps doing these
@@ -1036,7 +1082,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | On-tour extras (day-of extras) | `SB_EXTRAS`, `bookingV2ExtraSave`, `sbExtrasPersist` | `todo/money-model.md` slice 3 |
 | Route and boat catalogue editing, boat per-day seat overrides, `act-capunlock` gate | `ROUTES`, `BOATS`, `boatCapSet` | README "Routes and boats are still edited in legacy"; `legacy-replacement.md` §2; `deployment-guards-model.md` 2 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
-| Agent create/edit, programs, contracts, markets, salespeople, add-on catalogue, nationalities, insurance overrides | `ag*` (already shown read-only), `ct*`, `insPersist` | `legacy-replacement.md` §6, `agents.md` |
+| Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
 | Seat-lock extras: sub-groups, pending seats, cutoff, expiry, reason, log, bulk grouping | `bookingV2Lock*` | `ops/30-ops-locks.js` header; `legacy-replacement.md` §5 (log) |
 | Fleet maintenance | `05-fleet.js` | `legacy-replacement.md` §9 (scope undecided) |
 | The computed van board and job orders; van-job special requests and Thai pickup names; the order van groups are listed in | `vehJobsFor`, `VANJOB_SREQ`, `VANJOB_PICKUP_TH`, `bkv2_grp_order` (`bookingV2GrpOrderSet`) | `trip-ops-and-vans-model.md` 9; see "Questions" |
