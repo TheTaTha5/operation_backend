@@ -30,26 +30,23 @@ Merge fixes made by the lead (in the merge commits):
 - **Booking writes:** B2C wraps them in `holdOnBadInput`. Weather's `cancel-weather` command sits
   beside it, and the status-command loop skips `cancel-weather`.
 
-## In progress (branches in agent worktrees, not merged)
+## Merged later the same day
 
-| Area | Branch | Worktree | Migrations |
+| Area | Branch | Migrations | Note (Flagged list) |
 |---|---|---|---|
-| Money 2–4: proforma, pier money, after the trip | `feat/money-pier-and-after-trip` | `.claude/worktrees/agent-a26db3c5646c38553` | 110–119 |
-| Money 5–6: partner van bills, money reports | `feat/money-van-bills-and-reports` | `.claude/worktrees/agent-ac9c2fb287e6425bb` | 120–129 |
-| Fleet A: availability, assets, incidents and jobs | `feat/fleet-availability-and-jobs` | `.claude/worktrees/agent-ab1c91a3ca99c79cf` | 130–139 |
-| Fleet B: stock, memos, Daily Log, projects, safety | `feat/fleet-stock-memos-log-projects` | `.claude/worktrees/agent-abcb4e3e795111d84` | 140–149 |
+| Money 5–6: partner van bills, money reports |  | 120 |  |
+| Fleet A: availability, assets, incidents and jobs |  | 130 |  |
+| Money 2–4: proforma, pier money, after the trip |  | 110–112 |  |
+| Fleet B: stock, memos, Daily Log, projects, safety |  | 140–143 |  |
 
-**If a branch is unfinished:** open its worktree, read `git status` and `git log main..HEAD`, and its
-note's "Design" section, then finish the build there.
+After the last merge: 501 tests; in-process all pass (8 PostgreSQL-only skipped); PostgreSQL passes
+on a rerun, with the flake below on a first run. The change-kind list holds 10 kinds.
 
-**To merge one:** `git merge --no-ff <branch>` into `main` (the lead uses the `D:\projects\ob-merge`
-worktree, with `node_modules` linked). Then run:
-- `npm run check`;
-- `npm test`;
-- PostgreSQL on a fresh database: create `ob_m_<n>` on localhost:5433, `npm run db:migrate`, then
-  `DATABASE_URL=… npm test`, then drop it.
+## In progress
 
-Check `changes_kind_check` after migrating.
+| Task | Branch |
+|---|---|
+| Reports gain the slice 3–4 figures; the PostgreSQL flake |  (an agent worktree) |
 
 ## Known issues
 
