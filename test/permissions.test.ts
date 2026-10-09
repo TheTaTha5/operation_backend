@@ -43,6 +43,30 @@ test('each write needs its area, as legacy assigns them', async () => {
   assert.equal(await status(everything, 'POST', '/v1/bookings', booking), 201, 'no list and can_edit: every area (legacy editInfo)');
 });
 
+test('van job orders: the sent tick, the group order and the Thai names are operations (legacy vanJobs*Persist)', async () => {
+  const pier = await as('perm.vj.pier', { edit_areas: ['pier'] });
+  const ops = await as('perm.vj.ops', { edit_areas: ['operations'] });
+  const thai = { name: 'Perm Test Hotel', name_th: 'โรงแรม' };
+  for (const [method, url, payload] of [
+    ['PUT', '/operations/pickup-names-th', thai], ['PUT', '/operations/van-jobs/2041-01-07/vgrp_nowhere/sent', {}],
+    ['PUT', '/operations/van-groups/order', { service_date: '2041-01-07', route_id: 'r1', zone: 'PK', group_ids: [] }],
+  ] as const) {
+    const refused = await app.inject({ method, url, headers: pier, payload });
+    assert.deepEqual([refused.statusCode, refused.json().message], [403, 'Needs the operations area'], url);
+    assert.notEqual((await app.inject({ method, url, headers: ops, payload })).statusCode, 403, url);
+  }
+  assert.equal((await app.inject({ method: 'GET', url: '/operations/van-jobs?date=2041-01-07', headers: pier })).statusCode, 200, 'reading is open');
+
+  // The special request is a booking field: a logged-in write sends the version it read.
+  await app.inject({ method: 'POST', url: '/operations/deployments', headers: ops, payload: { ...deploy, boat_id: 'boat-perm-vj', service_date: '2041-01-07' } });
+  const created = (await app.inject({ method: 'POST', url: '/v1/bookings', headers: ops, payload: { ...booking, service_date: '2041-01-07' } })).json();
+  const stale = await app.inject({ method: 'PATCH', url: `/v1/bookings/${created.id}`, headers: ops, payload: { job_note: 'x' } });
+  assert.equal(stale.statusCode, 428, stale.body);
+  const noted = await app.inject({ method: 'PATCH', url: `/v1/bookings/${created.id}`, headers: ops, payload: { job_note: 'ไม่ต้องส่งกลับ', version: created.version } });
+  assert.equal(noted.statusCode, 200, noted.body);
+  assert.equal(noted.json().special_request, 'ไม่ต้องส่งกลับ');
+});
+
 test('the user screens are admin only', async () => {
   const staff = await as('perm.staff', { edit_areas: ['operations'] });
   assert.equal((await app.inject({ method: 'GET', url: '/v1/users', headers: staff })).statusCode, 403);

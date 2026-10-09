@@ -35,7 +35,7 @@ import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checki
 import { checkDeploymentChange, placedOn } from '../domain/deployment-guards.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
-  addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
+  addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, orderZoneGroups, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
   vanDayState, visibleGroups, type VanGroup, type VanPlan,
 } from '../domain/van-groups.js';
 import {
@@ -43,6 +43,7 @@ import {
   patchStatusRange, patchZoneRange, statusRangeLines, vanDayLines, vanEditLines, vanMatrix, zoneRangeDeletedLine, zoneRangeLines, type VanLogLine,
 } from '../domain/vans.js';
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
+import { parseJobDate, parsePickupNameTh, sendFor, vanJobsDay } from '../domain/van-jobs.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
 import { parseRateSeasons, rateTypeFor, seasonsActivityText } from '../domain/rate-seasons.js';
 import {
@@ -1449,6 +1450,13 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const vanParts = body.van_parts === undefined ? undefined : parseVanParts(body.van_parts);
     return store.transaction(async () => {
       const found = (await store.tripForDispatch(tripId)) ?? notFound('Trip not found');
+      // Legacy's "ล้างออก" (`ckStrandClear`): a cancelled booking still in a van group prints struck through on
+      // the job order until its van parts are cleared, which is the one dispatch change it still takes.
+      const clearsOnly = vanParts !== undefined && vanParts.length === 0 && Object.keys(body).every((key) => key === 'van_parts' || key === 'version');
+      if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(found.booking.status) && clearsOnly) {
+        await store.setVanParts(tripId, []);
+        return { trip: (await store.tripForDispatch(tripId))!.trip, warnings: [] };
+      }
       if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(found.booking.status)) {
         refuseWith(`Booking ${found.booking.id} is ${found.booking.status}: its dispatch cannot change`, 409, 'cancelled');
       }
@@ -1618,6 +1626,76 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   app.delete('/operations/van-groups/:id', async (request, reply) => {
     await onGroup(request, async (day, group) => applyVanPlan(disbandGroup(day.state, group.id)));
     return reply.code(204).send();
+  });
+  /** Legacy's drag on the By-trip tab (`bookingV2GrpOrderSet`): the order of one zone's groups, which the job orders follow too. */
+  app.put('/operations/van-groups/order', async (request) => {
+    const body = record(request.body);
+    const { date, routeId } = routeDay(body);
+    return store.transaction(async () => {
+      await store.lockVanDay(date, routeId);
+      for (const group of orderZoneGroups(await store.vanGroupsOn(date, routeId), body)) await store.writeVanGroup(group);
+      return { service_date: date, route_id: routeId, groups: visibleGroups(await vanDayNow(date, routeId), await store.listVans()) };
+    });
+  });
+
+  /**
+   * Van job orders (todo/van-job-orders-model.md): the day's jobs and each one's sheet, built by
+   * `van-jobs.ts` from what the day holds; "sent to the driver" per job; the Thai pickup names.
+   */
+  const vanJobsOn = async (date: string) => vanJobsDay({
+    date, bookings: await store.bookingsOnDate(date), groups: await store.vanGroupsOnDate(date), stops: await store.vanStopsOn(date),
+    vans: await store.listVans(), vanDays: await store.vanDays(date, date), routes: await store.listRoutes(), areas: await store.listPickupAreas(),
+    names: await store.pickupNamesTh(), sends: await store.vanJobSends(date),
+  });
+  const jobTarget = (request: { params: unknown }) => {
+    const { date, key } = request.params as { date: string; key: string };
+    return { date: parseJobDate(date), key };
+  };
+  const sheetOf = async (date: string, key: string) =>
+    (await vanJobsOn(date)).sheets.get(key) ?? notFound(`Van job ${key} not found on ${date}: no van carries anyone on it that day`);
+
+  app.get('/operations/van-jobs', async (request) => {
+    const query = request.query as Record<string, unknown>;
+    const date = parseJobDate(query.date ?? query.service_date);
+    const routeId = typeof query.route_id === 'string' && query.route_id ? query.route_id : undefined;
+    const { day } = await vanJobsOn(date);
+    return routeId ? { ...day, jobs: day.jobs.filter((j) => j.route_id === routeId) } : day;
+  });
+  app.get('/operations/van-jobs/:date/:key', async (request) => {
+    const { date, key } = jobTarget(request);
+    const { fingerprint: _f, ...sheet } = await sheetOf(date, key);
+    return sheet;
+  });
+  /** Legacy's "ส่งคนขับแล้ว" tick: sent now, by the login, with the sheet as it is now. Ticking again re-sends. */
+  app.put('/operations/van-jobs/:date/:key/sent', async (request) => {
+    const { date, key } = jobTarget(request);
+    if (isRecord(request.body) && request.body.sent_at !== undefined) badRequest('sent_at is the server\'s: it is the time of this request');
+    return store.transaction(async () => {
+      const sheet = await sheetOf(date, key);
+      await store.putVanJobSend(sendFor(sheet.job, sheet.fingerprint, new Date().toISOString(), actorOf(request.user) ?? null));
+      return (await sheetOf(date, key)).job;
+    });
+  });
+  app.delete('/operations/van-jobs/:date/:key/sent', async (request) => {
+    const { date, key } = jobTarget(request);
+    return store.transaction(async () => {
+      const sheet = await sheetOf(date, key);
+      await store.deleteVanJobSend(sendFor(sheet.job, sheet.fingerprint, '', null));
+      return (await sheetOf(date, key)).job;
+    });
+  });
+
+  app.get('/operations/pickup-names-th', async () => ({
+    names: (await store.pickupNamesTh()).map(({ name, name_th, updated_at, updated_by }) => ({ name, name_th, updated_at, updated_by })),
+  }));
+  /** Legacy `vanJobsSetPickupTh`: typed once per place, used on every sheet; emptied, it is deleted. */
+  app.put('/operations/pickup-names-th', async (request) => {
+    const input = parsePickupNameTh(record(request.body));
+    return store.transaction(async () => {
+      if (input.name_th === null) await store.deletePickupNameTh(input.name_key);
+      else await store.putPickupNameTh({ ...input, name_th: input.name_th, updated_at: new Date().toISOString(), updated_by: actorOf(request.user) ?? null });
+      return { name: input.name, name_th: input.name_th };
+    });
   });
 
   /**

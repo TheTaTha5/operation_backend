@@ -18,6 +18,8 @@ export type Counts = Record<PaxCategory, number>;
 export type VanGroup = {
   id: string; service_date: string; route_id: string; zone: string; number: number;
   van_id: string | null; return_van_id: string | null; pickup_time: string | null;
+  /** Where staff dragged it among its zone's groups (legacy bkv2_grp_order); null = after those, by number. */
+  display_order: number | null;
 };
 /**
  * An alternate pickup or drop-off point, its own pickup time and whose pickup it is; only an
@@ -221,7 +223,7 @@ export function createGroup(state: VanDayState, body: Record<string, unknown>, v
   const refs = parseMembers(body.members);
   const plan = emptyPlan();
   // One sequence per route and day across every zone, as legacy numbers them; a kept, emptied group keeps its number.
-  const group: VanGroup = { id, service_date: state.service_date, route_id: state.route_id, zone: zone!, number: state.groups.reduce((m, g) => Math.max(m, g.number), 0) + 1, van_id: null, return_van_id: null, pickup_time: null };
+  const group: VanGroup = { id, service_date: state.service_date, route_id: state.route_id, zone: zone!, number: state.groups.reduce((m, g) => Math.max(m, g.number), 0) + 1, van_id: null, return_van_id: null, pickup_time: null, display_order: null };
   putGroup(state, plan, group);
   addParts(state, plan, group, refs, vans);
   if (body.van_id !== undefined && body.van_id !== null) {
@@ -455,6 +457,28 @@ export function groupView(state: VanDayState, group: VanGroup, vans: readonly Va
       ad: part.ad, chd: part.chd, inf: part.inf, foc: part.foc, sequence: part.sequence, pickup_time: trip.pickup_time, return_van_id: part.return_van_id })),
   };
 }
-/** The day's groups by number, leaving out one with nobody riding and no stop (decided 2026-10-09: it is kept, and hidden). */
+/** Legacy `bkV2ZoneOrder`: Phuket, Khao Lak, Ranong, then the self-arrive pier; anything else after. */
+export const zoneRank = (zone: string): number => ({ PK: 0, KL: 1, RN: 2, NoTransfer: 3, NT: 3 } as Record<string, number>)[zone] ?? 4;
+/** Zone, then the order staff dragged the zone's groups into, then number (legacy `bkV2GrpOrderGet`: groups not ordered follow by number). */
+export const groupOrder = (a: VanGroup, b: VanGroup): number =>
+  zoneRank(a.zone) - zoneRank(b.zone) || cmp(a.zone, b.zone) || (a.display_order ?? 1e9) - (b.display_order ?? 1e9) || a.number - b.number;
+/** The day's groups in the board's order, leaving out one with nobody riding and no stop (decided 2026-10-09: it is kept, and hidden). */
 export const visibleGroups = (state: VanDayState, vans: readonly Van[]): VanGroupView[] =>
-  [...state.groups].sort((a, b) => a.number - b.number).map((g) => groupView(state, g, vans)).filter((g) => g.members.length > 0 || g.stops.length > 0);
+  [...state.groups].sort(groupOrder).map((g) => groupView(state, g, vans)).filter((g) => g.members.length > 0 || g.stops.length > 0);
+
+/**
+ * `PUT /operations/van-groups/order` (legacy `bookingV2GrpOrderSet` / `…Reset`): the groups of one
+ * route, day and zone in the order staff dragged them. Those named are 1..n; the zone's others lose
+ * their place and follow by number. `[]` or `clear: true` resets. Answers the groups to write.
+ */
+export function orderZoneGroups(groups: readonly VanGroup[], body: Record<string, unknown>): VanGroup[] {
+  const zone = typeof body.zone === 'string' && body.zone ? body.zone : bad('zone is required: the groups are ordered within one zone');
+  const ids = body.clear === true ? [] : Array.isArray(body.group_ids) && body.group_ids.every((id) => typeof id === 'string' && id)
+    ? body.group_ids as string[] : bad('group_ids must be a list of van group ids, in the order to show them (or clear: true)');
+  if (new Set(ids).size !== ids.length) bad('group_ids names a group twice');
+  const own = groups.filter((g) => g.zone === zone);
+  for (const id of ids) {
+    if (!own.some((g) => g.id === id)) bad(`group_ids: ${id} is not a van group of zone ${zone} on this route and day`);
+  }
+  return own.map((g) => ({ ...g, display_order: ids.includes(g.id) ? ids.indexOf(g.id) + 1 : null })).filter((g) => g.display_order !== groups.find((x) => x.id === g.id)!.display_order);
+}

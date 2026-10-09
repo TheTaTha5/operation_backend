@@ -41,6 +41,7 @@ import { reconfirmView, type Reconfirm, type StoredReconfirm } from './reconfirm
 import { checkinsView, copyCheckin, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, sortRanges, sortVans, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import { copyStop, type VanStop } from './van-stops.js';
+import { specialRequest, type PickupNameTh, type VanJobSend } from './van-jobs.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
 
@@ -163,6 +164,11 @@ export type Booking = BookingHeader & {
   allergy_list: Allergy[];
   /** The kitchen's count (legacy `bkV2AllergyCount`): the list's people, or 1 for free text alone. Computed. */
   allergy_count: number;
+  /**
+   * What the van job order, van check-in and the pier print as the special request (legacy
+   * `vanJobsSreqFinal`): `job_note` when set (`""` = nothing), else the notes. Computed; `null` = none.
+   */
+  special_request: string | null;
   /** Every approval the booking waited for, oldest first. The last `pending` one of a kind is the one waiting. */
   approvals: BookingApproval[];
   /** The current cancellation's category and charge. Absent unless the booking was cancelled with one. */
@@ -268,7 +274,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
 export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
-export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'doc_check' | 'doc_check_status' | 'invoice' | 'payment_state'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
+export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'special_request' | 'doc_check' | 'doc_check_status' | 'invoice' | 'payment_state'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
 
 /**
  * The wire shape of a stored booking.
@@ -303,6 +309,7 @@ export function bookingView(stored: StoredBooking, dispatch: (trip: StoredTrip) 
     ...stored, approvals, trips, alt_pickups: (stored.alt_pickups ?? []).map((a) => ({ ...a })), upgrades: (stored.upgrades ?? []).map((u) => upgradeView(u, files)),
     doc_check: docCheckView(docCheck), doc_check_status: docCheckStatus(docCheck, (stored.attachments ?? []).length),
     allergy_list: (stored.allergy_list ?? []).map((a) => ({ ...a })), allergy_count: allergyCount(stored.allergy_list ?? [], stored.special_meals_allergies),
+    special_request: specialRequest(stored),
     attachments: (stored.attachments ?? []).map((d) => ({ ...(files.get(d.attachment_id) ?? { id: d.attachment_id, name: d.attachment_id, mime: 'application/octet-stream', size: 0 }), kind: d.kind, by: d.by, at: d.at })), route_id: first?.route_id ?? '', service_date: first?.service_date ?? '', booking_mode: first?.booking_mode, pax,
     allocated_pax: bookingHoldsSeats(stored) ? seats : 0, reconfirm: reconfirmView(reconfirm), ...bookingInvoice(invoices),
   };
@@ -789,11 +796,32 @@ export class OperationsStore {
   vanGroup(id: string): VanGroup | undefined { const g = this.vanGroups.get(id); return g && { ...g }; }
   storedVanParts(tripId: string): StoredVanPart[] { return (this.vanParts.get(tripId) ?? []).map((p) => ({ ...p, alt: p.alt && { ...p.alt } })); }
   writeVanGroup(group: VanGroup): void { this.vanGroups.set(group.id, { ...group }); }
-  /** Its stops stay on the day with no group, as PostgreSQL's ON DELETE SET NULL leaves them. */
+  /** Its stops stay on the day with no group, as PostgreSQL's ON DELETE SET NULL leaves them; its sent mark goes (ON DELETE CASCADE). */
   deleteVanGroup(id: string): void {
     this.vanGroups.delete(id);
     for (const stop of this.vanStops.values()) if (stop.group_id === id) stop.group_id = null;
+    this.vanJobSendRows = this.vanJobSendRows.filter((s) => s.group_id !== id);
   }
+
+  // ── Van job orders (migration 080) ──
+  private vanJobSendRows: VanJobSend[] = [];
+  private pickupNameRows = new Map<string, PickupNameTh>();
+  bookingsOnDate(date: string): Booking[] {
+    return [...this.bookings.values()].filter((b) => b.trips.some((t) => t.service_date === date)).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)).map((b) => this.view(b));
+  }
+  vanGroupsOnDate(date: string): VanGroup[] { return [...this.vanGroups.values()].filter((g) => g.service_date === date).map((g) => ({ ...g })); }
+  /** The day's marks: those on its groups, and the return-only ones dated that day. */
+  vanJobSends(date: string): VanJobSend[] {
+    return this.vanJobSendRows.filter((s) => (s.group_id ? this.vanGroups.get(s.group_id)?.service_date === date : s.service_date === date)).map((s) => ({ ...s }));
+  }
+  putVanJobSend(send: VanJobSend): void { this.deleteVanJobSend(send); this.vanJobSendRows.push({ ...send }); }
+  deleteVanJobSend(s: Pick<VanJobSend, 'group_id' | 'service_date' | 'route_id' | 'van_id'>): void {
+    this.vanJobSendRows = this.vanJobSendRows.filter((x) => (s.group_id ? x.group_id !== s.group_id
+      : !(x.group_id === null && x.service_date === s.service_date && x.route_id === s.route_id && x.van_id === s.van_id)));
+  }
+  pickupNamesTh(): PickupNameTh[] { return [...this.pickupNameRows.values()].sort((a, b) => (a.name_key < b.name_key ? -1 : a.name_key > b.name_key ? 1 : 0)).map((n) => ({ ...n })); }
+  putPickupNameTh(n: PickupNameTh): void { this.pickupNameRows.set(n.name_key, { ...n }); }
+  deletePickupNameTh(nameKey: string): boolean { return this.pickupNameRows.delete(nameKey); }
 
   // ── Van stops (migration 034) ──
   private vanStops = new Map<string, VanStop>();
@@ -833,6 +861,7 @@ export class OperationsStore {
     this.vanLogs.delete(id);
     this.vanRanges = this.vanRanges.filter((r) => r.van_id !== id);
     this.vanZones = this.vanZones.filter((r) => r.van_id !== id);
+    this.vanJobSendRows = this.vanJobSendRows.filter((s) => s.van_id !== id);
     return true;
   }
   vanZoneRanges(vanId?: string): VanZoneRange[] {

@@ -158,6 +158,8 @@ const booking = {
     agent_id: { type: 'string' },
     status: { type: 'string', enum: STATUSES, readOnly: true, description: `${SERVER_SET} Decided on create from \`intent\`, then moved by the commands and re-weighed by edits.` },
     foc_reason: { type: 'string' },
+    job_note: { type: 'string', description: 'The special request the van job order prints. Absent = the notes; `""` = nothing. `null` on PATCH clears it.' },
+    special_request: { type: ['string', 'null'], readOnly: true, description: 'Derived: `job_note` when set (`""` → null), else `notes`. What the job order, van check-in and the pier print.' },
     lead_pax: { type: 'string' },
     total: { type: 'number' },
     route_id: { type: 'string', description: 'Derived: first trip' },
