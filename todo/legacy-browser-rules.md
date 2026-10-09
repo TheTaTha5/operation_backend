@@ -7,7 +7,8 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 
 - **Source:** wt-lk-inbox @ `658298d` (2026-10-06), `allotment_v2/js/*.js`, `BACKUP/` ignored. Read on
   2026-10-10 by nine parallel readers, one file range each, then cross-checked. Checked against
-  `README.md`, `todo/*.md` and `src/domain/*.ts` on `main` @ `12b0129`.
+  `README.md`, `todo/*.md` and `src/domain/*.ts` on `main` @ `dcebb54`. Unmerged branches are
+  not counted as built; see "In progress on other branches".
 - **Files:** `app` = `08-app.js`, `core` = `04-data-core.js`, `fleet` = `05-fleet.js`,
   `eng` = `06-engine-assign.js`, `charter` = `07-charter.js`, `auth` = `01-auth-sync.js`,
   `ab` = `09-action-board.js`, `embed` = `10-embed.js`. Functions are named, not line numbers:
@@ -63,6 +64,21 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 A row is one rule; the same check repeated in several functions is one row. Counts come from the
 tables below (`missing?` counted as missing).
 
+### In progress on other branches (not merged, not counted above)
+
+Checked 2026-10-10 with `git branch --no-merged main`. When one merges, move its rows to built.
+
+| Branch | What it adds | Missing items it covers |
+|---|---|---|
+| `feat/boat-holds-commands` | whole-boat holds created, edited, released and converted; the deployment guard refuses a held boat (`409 boat_held`) | 2; Findings 3 |
+| `feat/sales-extras` | promo contracts written (add, edit, void, legacy's checks); staff and welfare quotas, the booking form's staff guard; sales targets, follow-up marks, the Sales Board | 7, part of 12, part of 30 |
+| `feat/pier-office` | the pier petty-cash book with its longtail and park-fee sheets, and the Pier Office lists (`todo/pier-office-model.md`) | part of 14 and 22 |
+| `feat/money-remainder` | design only: cost model, Trip P&L, refund payout, deposits | design for 11, 15 |
+| `feat/fleet-extras` | design only: pier assignments, certificates, replace wizard, reports, flags, log lines | design for 23, part of 27 |
+
+`feat/bulk-seat-locks` and `docs/cleanup` are also unmerged, but they look older than what `main`
+already has (the first renumbers a migration to 019).
+
 ## Findings to settle first
 
 Things the inventory turned up that are not just "build X".
@@ -74,15 +90,18 @@ Things the inventory turned up that are not just "build X".
    migration or todo note covers them, and `legacy-replacement.md` does not list them. Only
    `fleet-maintenance-model.md` ("licences belong to Pier") and `money-model.md` ("pier petty cash
    belongs with pier operations") mention any of it. The `pier` edit area exists but guards only
-   check-in and pier money.
+   check-in and pier money. `feat/pier-office` (unmerged) covers the petty cash and the office
+   lists. Gear stock moves, the roster and pay, the job sheet, guide orders and PR/PO are still on
+   no branch.
 2. **`README.md` is wrong about legacy's reschedule fee.** It says "Legacy left this fee unbilled".
    `bkV2RescheduleBooking` (app) adds the fee as a line onto the booking's existing invoice and
    raises its subtotal, net and total ("Booking already invoiced → top up that same invoice"). This
    API issues a separate fee invoice instead, which is a reasonable choice, but the README line
    should say so.
 3. **`deployment-guards-model.md` Open 1 is stale.** It says seat locks are per route and day, so
-   there is no boat hold to check. Whole-boat holds exist since migration 047, and
-   `src/domain/deployment-guards.ts` still lets a held boat be moved or removed.
+   there is no boat hold to check. Whole-boat holds exist since migration 047, and on `main`
+   `src/domain/deployment-guards.ts` still lets a held boat be moved or removed
+   (`feat/boat-holds-commands` fixes it).
 4. **Booking rules built differently with no note recording it.** Each needs a yes or a fix:
    - a trip whose route has no rate saves at ฿0 with a `not_offered`/`no_rate` warning; legacy
      disables Save (`bkV2NoRateTrips`, `bkV2RenderSubmitButton`);
@@ -124,7 +143,7 @@ holds its rows.
    changes.** Holds come only from the import; every command but a full release is `400 boat_hold`.
    Legacy `bkV2CreateBoatLock`, `bkV2BoatLockBlockers`, `bkV2BoatLockEdit`, `bkV2BoatLockSwap`,
    `bkV2BoatLockOnConvert`, and `opLocked` in Boat Operation. (Availability/capacity,
-   Deployments)
+   Deployments) *Built on `feat/boat-holds-commands`, unmerged.*
 3. **Van and pier no-shows and on-site cancels free their seats** (`getSeatsConsumed` via
    `ckLostByType`, also `_abAgentSplit`). `aboard.ts lostByType` exists but capacity does not use
    it. Confirm first (Findings 6). (Availability/capacity)
@@ -142,7 +161,7 @@ holds its rows.
 7. **Promo contracts cannot be written.** Create, edit, void, own-price grid, discount and
    buy-N-get-1 checks (`ctSaveAddPromo`, `ctVoidContract`) have no endpoint, yet `priceBooking`
    reads promos. Until then promos change only through the import (`contracts-model.md`).
-   (Sales/agents/contracts)
+   (Sales/agents/contracts) *Built on `feat/sales-extras`, unmerged.*
 8. **An upgraded trip stays priced on the route it was sold on, and the upgrade ends when the trip
    is moved** (`bkUpgActive`, `bkV2PrRoute`, `bkV2WithSold`). Here `activeUpgrade` looks only at
    `undone_at`, so moving the trip by `PATCH` leaves the upgrade in force, and a later re-price uses
@@ -154,23 +173,25 @@ holds its rows.
     charged twice (`bkV2ToggleAddOn`). Here the zone is priced as sent. (Pricing)
 11. **Manual deposits and paying from them** (`acctDepositSubmit`, `acctPayUseDeposit`,
     `acctApplyDeposit`): `money-model.md` Open 1 (`refunds.invoice_id NOT NULL`). (Money:
-    invoices/payments)
+    invoices/payments) *Designed on `feat/money-remainder`.*
 12. **House-account rules:** a staff booking must name the staff member, a company booking must
     give a reason (`companyPurpose`, dropped today), `purpose` is derived, `sold_by`/`staff_id` are
     cleared when a real agent is picked, and FOC beyond a staff member's yearly welfare quota is
     warned (`bkV2CommitBooking`, `bkV2ApplyAgentRules`, `staffQuota`, `staffWelfareUsed`). Staff
-    registry and quotas: `sales-editing-model.md` Open 1. (Bookings, Sales)
+    registry and quotas: `sales-editing-model.md` Open 1. (Bookings, Sales) *Staff quotas and
+    the staff guard built on `feat/sales-extras`, unmerged; check which of the other parts it
+    covers.*
 13. **The payment snapshot at create** (credit or prepaid, net days, contract version) is the
     client's here; pier money reads the agent's *current* pay type (`bkV2CommitBooking`
     `paymentSnapshot`). (Bookings)
 14. **Pier money with no home:** the pier petty-cash book with its opening balance, park-fee and
     longtail sheets (`pc*`); gear deposits and lost-item fines (`poIsCalc`, `poCloseSave`); pier
     staff trip allowance pay (`paPayOf`, `paWsMin`). (Money: pier money, Check-in/pier: Pier
-    Office)
+    Office) *Petty cash built on `feat/pier-office`, unmerged.*
 15. **Costing, Trip P&L and meal orders** wait for Fleet (`money-model.md` Open 1): cost template
     and plans (`ct*`), Trip P&L with close/freeze (`px*`, `pxClose`), meal venues and the sent meal
     order with its cost (`mv*`, `pckMealSend`), longtail cost (`drLtRate`). (Money: costing,
-    reports)
+    reports) *Designed on `feat/money-remainder`.*
 16. **Smaller money rules:** an upgrade's card fee capped at 5% (`bkV2ExtraSetPct`); an old fleet
     memo's lump-sum discount kept when re-totalled (`moLiveLegacyDisc`); a parts-free memo going
     straight to paid on receive (`flOpenReceiveMemo`); internal ฿0 bookings left out of sales totals
@@ -202,7 +223,8 @@ holds its rows.
     assignments and a boat's pier on a date (`flSaveAssignment`, `getBoatCurrentPier`); the job's
     repair location cascading to its engines (`flMaintSetRepairLoc`); swapping one engine out of a
     started job (`flMaintSwapEngine`); the Daily Log's per-boat booked and effective pax
-    (`flRenderDR`, `flBoatBookingsFor`). (Fleet, Deployments)
+    (`flRenderDR`, `flBoatBookingsFor`). (Fleet, Deployments) *Pier assignments and certificates
+    designed on `feat/fleet-extras`.*
 24. **Data repairs legacy runs on every render** that this API neither prevents nor runs: an
     overnight return leg's inherited hotel time (`bkV2HealOvnLegs`, `missing?`), a self-arrive trip
     with a clock pickup time (`bkV2HealSelfArrivePickup`). (Vans and dispatch)
