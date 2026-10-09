@@ -145,6 +145,179 @@ defaults to legacy unless it says otherwise.
 settings methods; `users.ts` `writeNeed` gains three paths; `routes/operations.ts` registers
 `money-reports.ts`. No existing endpoint changes.
 
+## Design: the rest of Money (decided 2026-10-10)
+
+Four parts, all decided: (1) the cost model and Trip P&L, (2) a refund's payout, (3) deposits into
+the agent's credit, (4) an overpaid invoice stays a manual matter (no change: the `overpaid` read
+stays). Legacy, read 2026-10-10 (wt-lk-inbox `08-app.js` `ct*`, `mv*`, `px*`, `ta*`, `pckMeal*`,
+`drLtRate`, `acctDeposit*`; `05-fleet.js` `flFuelPriceEff`). Legacy data, read-only, 2026-10-10:
+`cost_template` 22 lines, `cost_plans` 10 plans, `boat_rent` 2 boats (one with a rent), 3 meal venues,
+6 routes linked to a venue, 91 `trip_actuals` (90 meals sent, 36 notes, 2 overnight choices, none
+closed, none "ran"), 1 `pier_job.mv` (`'-'`), 0 deposits (legacy never saved `sb_deposits`).
+
+### What legacy does
+
+- **Cost template** (`cost_template`, `CT_DEFAULT`, `ctTplFill`): a VAT rate and cost lines in groups.
+  A line has parts: `fix` (per boat or per trip: qty × unit, or litres × the fuel price), `var` (per
+  head, four prices: adult/child × foreign/Thai, each falling back to a wider one), `step` (guides:
+  one per N heads, at least M; or +N crew over X heads). Lines marked `od` (van, longtail join and
+  charter) are priced per item ordered, not per head. A default line missing from a stored template
+  is added back unless it was deleted (`dropped`).
+- **Cost plans** (`cost_plans`): a route's design sheet (boat count, engines, capacity, pax, Thai pax,
+  price, child price and %, commission, fuel price, pinned boat) with per-line overrides (`ovr`: off,
+  or part values), per-group settings (`grp`: off, ±%), on-demand quantities and revenue (`od`), an
+  itinerary and price tiers. `ctCalc` prices the lines; `ctBreakEven` walks 1..seats for the first
+  profitable head count. Trip P&L uses only a plan's `ovr`/`grp` (and its fuel price as a last resort).
+- **Rented boats** (`boat_rent`, `ctRentOf`): per boat, a monthly rent (lump, or per seat × the boat's
+  seats), days in the period, days off, trips a day, VAT, contract dates, a fuel % and the lines the
+  owner pays (`ex`: depreciation, captain, crew). Per trip = rent ÷ (days − off) ÷ trips. Outside the
+  contract dates, or with no rent, the boat costs as the company's own.
+- **Meal venues** (`meal_venues`, `mv*`) and the route's venue (`routes.mealVenueId`); the pier job
+  sheet can name another venue for one boat and day, or `-` for no meal (`pjOf().mv`).
+- **Trip actuals** (`trip_actuals`, keyed `date::boat`): `meal` is written when the pier sends the
+  meal order (`pckMealSend`: on-board heads, adults and children, × the venue's prices, frozen);
+  `mealNote` (a note to the restaurant), `mealOvn` (per overnight return booking: meal `in` or `out`;
+  the order is refused while one is undecided), `closed` (the frozen P&L), `ran` (sailed empty).
+- **Trip P&L** (`pxTrip`, `pxDay`): every deployed boat of the day (optionally one pier), sorted by
+  departure. Pax on board (`pckOnBoard`) of the bookings on the boat, Thai share for park fees;
+  revenue = Σ trip amounts (`tsTripAmount`); the route's plan; fuel price `flFuelPriceEff`, else the
+  plan's. `ctCalc` gives each line's estimate; actuals replace it line by line: fuel = litres from the
+  Daily Fleet Log × price, meal = the order sent, van = each van's day rate shared by heads
+  (`pxVanCost`), longtails = what was ordered (`bkLtState`), rent = the contract. Revenue net =
+  (bookings + on-tour company share) × (1 − VAT/(100+VAT)). Each line is labelled actual (`r`),
+  plan-overridden (`p`), formula (`f`) or pending meal order (`w`). Closing freezes rows, cost and
+  revenue (`pxClose`, accounting); a boat with no pax and no booking did not sail and costs 0 unless
+  marked "ran" (`pxRan`, accounting). Break-even per trip at its own average price.
+- **Daily Report**: the longtail cost (`drLtRate`: the route plan's `ltc`/`ltj` unit, defaults
+  charter ฿600) × boats chartered and join heads; "left before boat costs" = revenue − (van cost +
+  longtail cost) + on-tour sales.
+- **Deposits** (`acctCreateDeposit`, `acctApplyDeposit`): agent, amount, method, note; spent as a
+  payment; "Deposit held" on the statement and dashboard. Never saved in production.
+
+### Fields and authority
+
+| Thing | Field | Kind |
+|---|---|---|
+| Template | `vat_rate`, `lines[]` (`id`, `group`, `label`, `vat`, `parts`, `on_demand`, `on_demand_qty`) | client fact (shape checked) |
+| | `dropped` | **computed**: default line ids not in `lines` |
+| Plan | `name`, `route_key`, `note`, `engines`, `boats`, `capacity`, `pax`, `pax_th`, `price`, `price_child`, `child_pct`, `commission_pct`, `fuel_price`, `boat_id`, `rent_off`, `overrides`, `groups`, `on_demand`, `itinerary`, `tiers` | client fact (`route_key` a route or family, `boat_id` a boat) |
+| | `seats`, `calc`, `break_even` | **computed** |
+| Boat rent | `rented`, `mode`, `amount`, `per_seat`, `days`, `days_off`, `trips_per_day`, `vat`, `note`, `from`, `to`, `fuel_pct`, `owner_pays` | client fact |
+| | `seats`, `total`, `run_days`, `per_day`, `per_trip`, `per_calendar_day` | **computed** |
+| Meal venue | `name`, `place`, `price_adult`, `price_child`, `phone`, `eta`, `note`, `active` | client fact |
+| Route | `meal_venue_id` | client fact (an existing venue), set by its own command |
+| Trip actual | `venue` (`null` = the route's, a venue id, or `none`) | client fact |
+| | `meal_note`, `meal_overnight[booking]` (`in`/`out`) | client fact |
+| | `meal` (venue, adults, children, prices, amount, at, by) | **computed** by `meal-order` |
+| | `ran` | **validated**: only on a boat with no pax and no booking |
+| | `closed` (revenue, cost, profit, pax, rows, at, by) | **computed** by `close`; **validated**: not on a boat that did not sail |
+| Trip P&L | everything | **computed** (`GET`) |
+| Refund payout | `paid_on`, `method`, `ref`, `slip_ids` | client fact; **validated**: a `refund` (not a credit), once |
+| | `paid_out_by`, `recorded_at` | **computed** |
+| Deposit | `agent_id`, `amount`, `method`, `received_on`, `ref`, `note`, `slip_ids` | client fact (agent exists, amount > 0) |
+| | `voided_*` | **validated** by `void`: a reason; not when the balance would go below 0 |
+| Credit balance | `credited`, `deposited`, `used`, `available` | **computed** |
+
+### Migrations
+
+`160_costing.sql`:
+
+```sql
+CREATE TABLE cost_settings (id BOOLEAN PRIMARY KEY DEFAULT true CHECK (id), vat_rate NUMERIC(5,2) NOT NULL CHECK (vat_rate >= 0),
+  updated_at TIMESTAMPTZ NOT NULL, updated_by TEXT);
+CREATE TABLE cost_lines (id TEXT PRIMARY KEY, sort INTEGER NOT NULL, group_name TEXT NOT NULL, label TEXT NOT NULL,
+  vat BOOLEAN NOT NULL, parts JSONB NOT NULL, on_demand BOOLEAN NOT NULL DEFAULT false, on_demand_qty NUMERIC(8,2));
+CREATE TABLE cost_plans (id TEXT PRIMARY KEY, sort INTEGER NOT NULL, name TEXT NOT NULL, route_key TEXT, note TEXT,
+  engines TEXT NOT NULL CHECK (engines IN ('3EN','4EN')), boats INTEGER NOT NULL CHECK (boats >= 1), capacity INTEGER NOT NULL CHECK (capacity >= 1),
+  pax INTEGER NOT NULL CHECK (pax >= 0), pax_th INTEGER NOT NULL CHECK (pax_th >= 0), price NUMERIC(12,2) NOT NULL, price_child NUMERIC(12,2),
+  child_pct NUMERIC(5,2) NOT NULL DEFAULT 0, commission_pct NUMERIC(5,2) NOT NULL DEFAULT 0, fuel_price NUMERIC(8,2) NOT NULL DEFAULT 0,
+  boat_id TEXT REFERENCES boats (id), rent_off BOOLEAN NOT NULL DEFAULT false,
+  overrides JSONB NOT NULL DEFAULT '{}', groups JSONB NOT NULL DEFAULT '{}', on_demand JSONB NOT NULL DEFAULT '{}',
+  itinerary JSONB NOT NULL DEFAULT '[]', tiers JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL, updated_by TEXT);
+CREATE TABLE boat_rents (boat_id TEXT PRIMARY KEY REFERENCES boats (id), rented BOOLEAN NOT NULL, mode TEXT NOT NULL CHECK (mode IN ('lump','seat')),
+  amount NUMERIC(12,2) NOT NULL DEFAULT 0, per_seat NUMERIC(12,2) NOT NULL DEFAULT 0, days INTEGER NOT NULL CHECK (days >= 1),
+  days_off INTEGER NOT NULL CHECK (days_off >= 0), trips_per_day INTEGER NOT NULL CHECK (trips_per_day >= 1), vat BOOLEAN NOT NULL,
+  note TEXT, from_date DATE, to_date DATE, fuel_pct NUMERIC(6,2), owner_pays TEXT[] NOT NULL DEFAULT '{}',
+  updated_at TIMESTAMPTZ NOT NULL, updated_by TEXT);
+CREATE TABLE meal_venues (id TEXT PRIMARY KEY, sort BIGSERIAL, name TEXT NOT NULL DEFAULT '', place TEXT, price_adult NUMERIC(12,2) NOT NULL,
+  price_child NUMERIC(12,2) NOT NULL, phone TEXT, eta TEXT, note TEXT, active BOOLEAN NOT NULL DEFAULT true);
+ALTER TABLE routes ADD COLUMN meal_venue_id TEXT REFERENCES meal_venues (id);
+CREATE TABLE trip_actuals (service_date DATE NOT NULL, boat_id TEXT NOT NULL REFERENCES boats (id),
+  venue_id TEXT REFERENCES meal_venues (id), no_meal BOOLEAN NOT NULL DEFAULT false,
+  meal_venue_id TEXT, meal_venue_name TEXT, meal_adults INTEGER, meal_children INTEGER, meal_price_adult NUMERIC(12,2),
+  meal_price_child NUMERIC(12,2), meal_amount NUMERIC(12,2), meal_at TIMESTAMPTZ, meal_by TEXT,
+  meal_note TEXT, meal_note_at TIMESTAMPTZ, meal_note_by TEXT,
+  ran BOOLEAN NOT NULL DEFAULT false, ran_at TIMESTAMPTZ, ran_by TEXT,
+  closed_at TIMESTAMPTZ, closed_by TEXT, closed_revenue NUMERIC(12,2), closed_cost NUMERIC(12,2), closed_profit NUMERIC(12,2),
+  closed_pax INTEGER, closed_rows JSONB,
+  PRIMARY KEY (service_date, boat_id), CHECK (NOT (no_meal AND venue_id IS NOT NULL)), CHECK ((closed_at IS NULL) = (closed_rows IS NULL)));
+CREATE TABLE trip_meal_overnight (service_date DATE NOT NULL, boat_id TEXT NOT NULL, booking_id TEXT NOT NULL REFERENCES bookings (id) ON DELETE CASCADE,
+  include TEXT NOT NULL CHECK (include IN ('in','out')), PRIMARY KEY (service_date, boat_id, booking_id),
+  FOREIGN KEY (service_date, boat_id) REFERENCES trip_actuals (service_date, boat_id) ON DELETE CASCADE);
+-- + change kind 'trip_actual', appended to changes_kind_check as migration 100 does.
+```
+
+`161_deposits_and_payouts.sql`:
+
+```sql
+CREATE TABLE refund_payouts (refund_id TEXT PRIMARY KEY REFERENCES refunds (id), paid_on DATE NOT NULL,
+  method TEXT NOT NULL CHECK (method IN ('transfer','cash','cheque')), ref TEXT, paid_out_by TEXT, recorded_at TIMESTAMPTZ NOT NULL);
+CREATE TABLE refund_payout_slips (refund_id TEXT NOT NULL REFERENCES refund_payouts (refund_id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+  attachment_id TEXT NOT NULL REFERENCES attachments (id), PRIMARY KEY (refund_id, seq));
+CREATE TABLE deposits (id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents (id), amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  method TEXT NOT NULL CHECK (method IN ('transfer','cash','card')), received_on DATE NOT NULL, ref TEXT, note TEXT,
+  recorded_by TEXT, recorded_at TIMESTAMPTZ NOT NULL, voided_at TIMESTAMPTZ, voided_by TEXT, void_reason TEXT,
+  CHECK ((voided_at IS NULL) = (void_reason IS NULL)));
+CREATE TABLE deposit_slips (deposit_id TEXT NOT NULL REFERENCES deposits (id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+  attachment_id TEXT NOT NULL REFERENCES attachments (id), PRIMARY KEY (deposit_id, seq));
+-- + change kinds 'deposit' and 'refund'.
+```
+
+### Contract
+
+All under Bearer login; writes as listed in `writeNeed`. Errors are `{ statusCode, error, message, code? }`.
+
+**Cost model** (`accounting`, legacy's costing menu sits under Accounting & Finance and had no guard):
+- `GET /v1/costing/template` → `{ vat_rate, lines: [{ id, group, label, vat, parts: [{ kind: 'fix'|'var'|'step', per?: 'boat', qty?, qty_4en?, unit?, unit_4en?, unit_th?, unit_ch?, unit_ch_th?, fuel?, mode?: 'every'|'over', every?, min?, over?, add? }], on_demand, on_demand_qty }], dropped, saved }`. With nothing stored, legacy's `CT_DEFAULT`.
+- `PUT /v1/costing/template` `{ vat_rate, lines }` replaces it. Legacy's short keys (`k q q4 u u4 uTH uCh uChTH g l od odQ`) are accepted. `400` on a bad shape, a duplicate id, a `fuel` part that is a `step`.
+- `GET /v1/costing/plans` → `{ plans: [plan + { seats, calc: { gross, vat_in, net, fixed_net, var_net, revenue, profit, rows[], rent }, break_even }] }`; `GET /v1/costing/plans/{id}?pax=` prices it at another head count.
+- `POST /v1/costing/plans` (fields, or `{ copy_of }`) `201`; `PATCH /v1/costing/plans/{id}`; `DELETE` `204`. Computed fields sent are `400`.
+- `GET /v1/costing/boat-rents`; `PUT /v1/costing/boat-rents/{boat_id}` (fields merge onto the stored one, or onto a blank that is **not** rented, §rentZero); `DELETE` `204`.
+- `GET /v1/meal-venues` → `{ venues, routes: { route_id: venue_id } }`; `POST /v1/meal-venues` `201`; `PATCH /v1/meal-venues/{id}`.
+- `PUT /v1/routes/{id}/meal-venue` `{ meal_venue_id | null }` → the route. Route reads show `meal_venue_id`; a route `PATCH` or create sending one is `400` naming this command.
+
+**Trip actuals and Trip P&L**:
+- `GET /v1/trip-actuals/{date}/{boat_id}` → the row as stored, plus `meal_preview` (what `meal-order` would send now: venue, adults, children, amount, `undecided_overnight`).
+- `PUT …/venue` `{ venue: id | 'none' | null }` (`pier`, `operations`; legacy's pier job sheet).
+- `POST …/meal-order` (`operations`) → the row. `409 no_meal_venue`, `409 overnight_meal_undecided` (lists the bookings), `409 nobody_aboard`.
+- `PUT …/meal-note` `{ text }` (empty/null clears), `PUT …/meal-overnight/{booking_id}` `{ include: 'in'|'out'|null }` (`operations`); the booking must be an overnight return leg on that boat and day (`400`).
+- `POST …/close`, `POST …/reopen`, `POST …/ran`, `POST …/not-ran` (`accounting`): `409 trip_closed`, `409 trip_not_closed`, `409 trip_not_sailed` (close a boat that did not sail), `409 trip_not_empty` (ran on a boat with passengers or bookings), `404` when the boat has no deployment that day.
+- `GET /v1/reports/trip-pl?date=&pier=` → `{ date, pier, trips: [trip], totals: { trips, revenue, cost, profit, pax, bookings, loss_trips, capacity }, by_route: [...], by_group: [...] }`.
+- `GET /v1/reports/trip-pl/{date}/{boat_id}` → one trip: `{ boat_id, name, route_id, route_name, departs, status: 'est'|'part'|'done'|'nosail', pax: { ad, chd, inf, foc, total, th, fr, bookings }, revenue_gross, upsell: { rows, sell, company, commission }, revenue, cost, profit, would_cost, ran, closed: { at, by, pax } | null, fuel_price: { price, src, from }, plan: { id, name } | null, longtail: { charter, join, upgrades, upgrades_due }, rows: [{ id, group, label, vat, estimate, actual, use, gross, source: 'actual'|'plan'|'formula'|'pending', why }], break_even, check_revenue }`.
+- `GET /v1/reports/trip-pl/month?month=YYYY-MM&pier=` → each day's totals and the month's.
+- Daily Report (`GET /v1/reports/daily`) gains `longtail: { charter_boats, join_pax, cost, by_route }`, `known_cost` and `net_before_boat_costs`.
+
+**Credit**:
+- `POST /v1/refunds/{id}/payout` `{ paid_on?, method, ref?, slip_ids? }` (`accounting`) → the refund with `payout`. `409 not_a_refund` (a credit), `409 refund_paid_out`. `DELETE /v1/refunds/{id}/payout` undoes it. `GET /v1/refunds?paid_out=true|false`.
+- `GET /v1/deposits?agent_id=&include_voided=`; `POST /v1/deposits` `{ agent_id, amount, method, received_on?, ref?, note?, slip_ids? }` `201`; `GET /v1/deposits/{id}`; `POST /v1/deposits/{id}/void` `{ reason }` → `409 deposit_spent` when the agent's balance would go below 0, `409 deposit_void`.
+- `credit_balance` everywhere becomes `{ credited, deposited, used, available }`; a `credit` payment spends it. Agent statement gains `deposits`; the accounting dashboard's `deposits_held` is the balances left, and it gains `refunds_to_pay: { count, amount, items }`.
+
+Example, a trip row:
+
+```json
+{ "id": "fuel", "group": "ค่าเชื้อเพลิง", "label": "น้ำมันเรือ", "vat": true, "estimate": 13457.94,
+  "actual": 15519.63, "use": 15519.63, "gross": 16606, "source": "actual", "why": "400 ลิตร × ฿41.515" }
+```
+
+### Import
+
+`npm run import:costing` (`src/tools/import-costing.ts`, mapping `src/tools/legacy-costing.ts`):
+template and plans and boat rents and venues are **replaced whole** (legacy is master until Money
+moves); routes' venue links set; trip actuals upserted on date and boat (legacy's meal, note,
+overnight choices; ours' close/ran survive a re-run); `pier_job.mv` becomes the trip's venue. Boats or
+bookings not here are skipped and listed. Run after `import-legacy.ts` (overnight choices name
+imported `lg_` bookings) and `seed:boats`.
+
 ## Open
 
 1. **Deposits and refunds.** The weather outcomes are built (migration 061, README "Weather closures,
