@@ -1,6 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { readdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
+import type { Change, ChangeInput } from './changes.js';
 import {
   assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds, retargetTrip,
   licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
@@ -453,7 +457,50 @@ export class PostgresOperationsStore {
   private readonly context = new AsyncLocalStorage<PoolClient>();
   constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
   private client(): Pool | PoolClient { return this.context.getStore() ?? this.pool; }
-  async close(): Promise<void> { await this.pool.end(); }
+  async close(): Promise<void> {
+    if (this.listener) { this.listener.release(); this.listener = undefined; }
+    await this.pool.end();
+  }
+
+  // ── The change feed (migration 044) ──
+  /**
+   * Writes a transaction's changes just before it commits: under one advisory lock, so version order
+   * is commit order and a client reading up to N never misses an N−1 still committing. `pg_notify`
+   * reaches the other instances only on commit.
+   */
+  async recordChanges(rows: readonly ChangeInput[]): Promise<void> {
+    if (!rows.length) return;
+    await this.client().query("SELECT pg_advisory_xact_lock(hashtext('changes'))");
+    for (const c of rows) {
+      await this.client().query(`INSERT INTO changes (version, kind, entity_id, action, route_days, changed_by) VALUES (nextval('changes_version_seq'), $1, $2, $3, $4, $5)`,
+        [c.kind, c.entity_id, c.action, c.route_days === null ? null : JSON.stringify(c.route_days), c.changed_by]);
+    }
+    await this.client().query("SELECT pg_notify('changes', '')");
+  }
+  async changesSince(since: number, limit: number): Promise<Change[]> {
+    const { rows } = await this.client().query('SELECT * FROM changes WHERE version > $1 ORDER BY version LIMIT $2', [since, limit]);
+    return rows.map((r) => ({ version: Number(r.version), kind: r.kind, entity_id: r.entity_id, action: r.action, route_days: r.route_days ?? null, changed_by: r.changed_by ?? null, changed_at: (r.changed_at as Date).toISOString() }));
+  }
+  async latestChangeVersion(): Promise<number> { return Number((await this.client().query('SELECT COALESCE(max(version), 0) AS v FROM changes')).rows[0].v); }
+  private listener: PoolClient | undefined;
+  private listeners = new Set<() => void>();
+  /** Calls `onChange` whenever any instance commits changes; one connection per instance listens for all. */
+  async subscribeChanges(onChange: () => void): Promise<() => void> {
+    this.listeners.add(onChange);
+    if (!this.listener) {
+      this.listener = await this.pool.connect();
+      this.listener.on('notification', () => { for (const fn of this.listeners) fn(); });
+      await this.listener.query('LISTEN changes');
+    }
+    return () => { this.listeners.delete(onChange); };
+  }
+  /** Migration files not yet applied here: the stream's health (legacy's /api/version reported it). */
+  async migrationsPending(): Promise<number> {
+    const dir = join(dirname(fileURLToPath(import.meta.url)), '../../migrations');
+    const files = (await readdir(dir)).filter((f) => f.endsWith('.sql'));
+    const { rows } = await this.client().query('SELECT count(*)::int AS n FROM schema_migrations');
+    return Math.max(0, files.length - Number(rows[0].n));
+  }
 
   /**
    * A serializable unit of work, retried when the database asks us to.

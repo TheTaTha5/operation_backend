@@ -13,9 +13,7 @@ wt-lk-inbox's `server.js` and `os-backend/src/mapping/os_repo.js`.
 
 ## 1. Identity and system
 
-```
-GET    /v1/changes?since=      what changed since version N (replaces /api/version, /api/events; change-feed-model.md)
-```
+Built: login and users, the change feed (`/v1/changes`, replacing `/api/version` and `/api/events`).
 
 ## 2. Catalogue: routes, boats
 
@@ -39,12 +37,7 @@ DELETE /v1/weather-closures/{id}
 
 ## 4. Bookings
 
-```
-GET    /v1/bookings/{id}/attachments  (replaces /api/attach*)
-POST   /v1/bookings/{id}/attachments
-GET    /v1/attachments/{id}           download one file
-DELETE /v1/attachments/{id}
-```
+Built, attachments included (`/v1/attachments`, replacing `/api/attach*`).
 
 ## 5. Seat locks
 
@@ -76,18 +69,9 @@ GET    /v1/reports/market-stats?from=&to=    computed from bookings, not stored
 
 ## 8. Pickups and vans
 
-Built (README → "Dispatch" to "Upgrades"); open items in `trip-ops-and-vans-model.md`.
-
-```
-GET    /v1/pickup-areas, PUT /v1/pickup-areas/{id}
-GET    /v1/pickup-time-profiles, PUT /v1/pickup-time-profiles/{id}
-GET    /v1/vehicles, POST /v1/vehicles, PATCH /v1/vehicles/{id}
-PUT    /v1/vehicles/{id}/days/{date}      that day's status or route
-GET    /v1/staff, POST /v1/staff, PATCH /v1/staff/{id}     drivers and other staff
-GET    /v1/van-board?date=                the board read
-PUT    /v1/van-board/{date}/assignments   assign bookings to van and driver
-POST   /v1/van-board/{date}/send          mark the job sheet sent (legacy vanjob_sent)
-```
+Built: pickup areas and times, vans and the month matrix, van groups and stops, dispatch, check-in
+(README → "Dispatch" to "Pickup areas and pickup times"). Open items in `trip-ops-and-vans-model.md`.
+Still to come: the computed van board and job orders for the Vue port.
 
 ## 9. Fleet maintenance (scope undecided)
 
@@ -113,7 +97,6 @@ GET/POST /v1/boats/{id}/documents,    GET /v1/boats/{id}/repair-history
 - **Is fleet maintenance ours?** Section 9 may belong in a separate service.
 - **The B2C booking sync** (`/api/b2c/raw`, `/reset`, `/health`): do we take it over?
   (`/v1/availability` already accepts Love Kingdom's `X-Api-Key`.)
-- **Live updates:** `change-feed-model.md`.
 - **Email images** (`/api/mailimg`, `/m/:id`) look like marketing, not operations. Confirm they can go.
 - **Resources mapped from field names only.** Check with someone who uses the screens:
   - `trips`: looks like the old per-day boat board, which deployments replace.

@@ -9,6 +9,7 @@ import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjust
 import type { AltPickup } from './alt-pickups.js';
 import { allergyCount, type Allergy } from './allergies.js';
 import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
+import type { Change, ChangeInput } from './changes.js';
 import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
@@ -603,6 +604,20 @@ export class OperationsStore {
     this.checkins.set(tripId, after);
     return after.length < before.length;
   }
+
+  // ── The change feed (migration 044) ──
+  private changeLog: Change[] = [];
+  private changeListeners = new Set<() => void>();
+  /** Transactions run one at a time here, so numbering on write is commit order. */
+  recordChanges(rows: readonly ChangeInput[]): void {
+    for (const c of rows) this.changeLog.push({ ...c, version: this.changeLog.length + 1, changed_at: this.now() });
+    if (rows.length) for (const fn of this.changeListeners) fn();
+  }
+  changesSince(since: number, limit: number): Change[] { return this.changeLog.filter((c) => c.version > since).slice(0, limit).map((c) => ({ ...c })); }
+  latestChangeVersion(): number { return this.changeLog.length; }
+  subscribeChanges(onChange: () => void): () => void { this.changeListeners.add(onChange); return () => { this.changeListeners.delete(onChange); }; }
+  /** No database, so nothing to migrate. */
+  migrationsPending(): number { return 0; }
 
   // ── Pickup areas and pickup times (migration 043) ──
   private pickupAreas = new Map<string, PickupArea>();
