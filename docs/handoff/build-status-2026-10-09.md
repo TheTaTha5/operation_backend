@@ -39,14 +39,18 @@ Merge fixes made by the lead (in the merge commits):
 | Money 2–4: proforma, pier money, after the trip | `feat/money-pier-and-after-trip` | 110–112 | `todo/money-model.md` |
 | Fleet B: stock, memos, Daily Log, projects, safety | `feat/fleet-stock-memos-log-projects` | 140–143 | `todo/fleet-maintenance-model.md` |
 
-After the last merge: 501 tests; in-process all pass (8 PostgreSQL-only skipped); PostgreSQL passes
-on a rerun, with the flake below on a first run. The change-kind list holds 10 kinds.
+The change-kind list holds 10 kinds.
 
-## In progress
+## Follow-up merged
 
-| Task | Branch |
-|---|---|
-| Reports gain the slice 3–4 figures; the PostgreSQL flake | `chore/reports-and-flake` (an agent worktree) |
+- **The reports** (Travel Summary, Daily Report, dashboard) read pier money and the after-trip
+  decisions (`chore/reports-and-flake`).
+- **The PostgreSQL flake is fixed:** a serialization retry now runs alone behind a gate (an advisory
+  lock held shared by every transaction, taken exclusively by a retry), so a long write can no longer
+  run out of retries (`src/domain/postgres-operations.ts` `transaction()`). After the merge: 503 tests,
+  PostgreSQL twice on fresh databases with 0 failures.
+
+Nothing is in progress.
 
 ## Known issues
 
