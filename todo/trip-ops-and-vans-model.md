@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`); slice B, reconfirm (`src/domain/reconfirm.ts`). Still to build: check-in (C), alternate pickups (D), upgrades (E).
+Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`); slice B, reconfirm (`src/domain/reconfirm.ts`); slice C, check-in (`src/domain/checkin.ts`). Still to build: alternate pickups (D), upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -270,15 +270,8 @@ For the cross-booking views:
 
 **Dispatch, van parts and van groups:** built (README → "Dispatch", "Van groups").
 
-**Check-in** (`operations:write`):
-- `PUT /operations/trip-ops/{trip_id}/checkins/{van|pier}/{slot}` replaces one record, events
-  included. That's how `ckWrite` already writes it: the whole record each time.
-- `DELETE` on the same path clears the record.
-- Errors:
-  - `slot` beyond the trip's van parts → 400.
-  - `actual_pax` above the booked pax, unless `self_add_pax` covers it → 400.
-  - An event whose `undone` is removed → 409 `event_undone_is_final`.
-  - Event order is append-only, so a PUT that shortens `events` → 409 `events_append_only`.
+**Check-in:** built (migration 036, `src/domain/checkin.ts`, README → "Check-in"). One addition to the
+schema above: `booking_trip_checkin_event_tries`, for legacy's "tried again, not found" (events[].tries).
 
 **Reconfirm:** built (migration 035, `src/domain/reconfirm.ts`, README → "Reconfirm").
 
@@ -300,10 +293,8 @@ Legacy keeps four things the 016 tables have no home for; see Open 8.
 ### What both stores need
 
 Pure functions in `src/domain/`, called by both stores (the `calendar.ts` pattern):
-- **`checkin.ts`:** the record parser and the append-only event rule.
 - **`altPickupParts(altPickups, tripPax, current)`:** port of `bkV2SyncAltPickupSplits` (Decision 4: the server builds them).
 
-A move clears a trip's check-ins too, once they exist (legacy `bkOpsClear`).
 
 ## Data check — 2026-10-06, legacy production, read-only
 
@@ -386,8 +377,6 @@ The questions as they were asked:
 5. **A deployment deleted under bookings assigned to that boat.** The deployment-delete endpoint
    and the import's mirror delete both leave `boat_id` pointing at a boat that no longer sails that
    day. Clear it, or refuse the delete?
-6. **Five check-in rows** where `noShow` ≠ `expected − actualPax`. The import recomputes, so these
-   change on import.
 7. **The split `returnSameVan`** is read (`L.sp.returnSameVan`) but never written, so it isn't
    stored.
 8. **Rented vans print as company vans on legacy's job order** (its owner tag checks `rental`/`charter`,
@@ -401,8 +390,8 @@ The questions as they were asked:
 
 ## Follow-ups
 
-- **The import** brings boats, splits, final pickups, pier notes, vans and reconfirmations. Until the
-  other slices extend it, legacy bookings arrive with **no check-in (3,778), alternate pickups (4) or
+- **The import** brings boats, splits, final pickups, pier notes, vans, reconfirmations and check-ins. Until the
+  other slices extend it, legacy bookings arrive with **no alternate pickups (4) or
   upgrades (11)**.
 
 ## From the van hand-off

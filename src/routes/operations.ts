@@ -22,6 +22,7 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checkin.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
   addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
@@ -893,6 +894,35 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return { trip: (await store.tripForDispatch(tripId))!.trip, warnings };
     });
   });
+
+  /**
+   * Check-in (todo/trip-ops-and-vans-model.md, slice C): one record per trip, side (van or pier) and
+   * van part, written whole as legacy's `ckWrite` writes it. Answers the trip with its `operations`.
+   */
+  const checkinTrip = async (request: { params: unknown }) => {
+    const params = request.params as { trip_id: string; kind: string; slot: string };
+    const target = parseCheckinTarget(params);
+    const found = (await store.tripForDispatch(params.trip_id)) ?? notFound('Trip not found');
+    const part = found.trip.operations.van_parts.find((p) => p.idx === target.slot)
+      ?? badRequest(`slot ${target.slot}: the trip has van parts ${found.trip.operations.van_parts.map((p) => p.idx).join(', ')}`);
+    return { ...target, found, booked: part!.ad + part!.chd + part!.inf + part!.foc };
+  };
+  app.put('/operations/trip-ops/:trip_id/checkins/:kind/:slot', async (request) => {
+    const input = parseCheckin(record(request.body));
+    return store.transaction(async () => {
+      const { kind, slot, found, booked } = await checkinTrip(request);
+      const current = found.trip.operations.checkins[kind].find((r) => r.slot === slot);
+      const stored = current && (({ no_show: _n, ...rest }) => rest)(current);
+      const next = applyCheckin(stored, input, { kind, slot, booked, now: new Date().toISOString(), by: actorOf(request.user) ?? null });
+      await store.setCheckin(found.trip.id, next);
+      return { trip: (await store.tripForDispatch(found.trip.id))!.trip, warnings: [] };
+    });
+  });
+  app.delete('/operations/trip-ops/:trip_id/checkins/:kind/:slot', async (request) => store.transaction(async () => {
+    const { kind, slot, found } = await checkinTrip(request);
+    if (!(await store.deleteCheckin(found.trip.id, kind, slot))) notFound(`No ${kind} check-in for slot ${slot}`);
+    return { trip: (await store.tripForDispatch(found.trip.id))!.trip, warnings: [] };
+  }));
 
   /**
    * Van groups (todo/trip-ops-and-vans-model.md, slice A2): the passengers who ride one outbound van run

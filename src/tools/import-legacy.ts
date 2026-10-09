@@ -397,6 +397,69 @@ async function main() {
     const groupMembers = new Map<string, { day: string; route: string; zone: string; number: number; vans: string[] }>();
     const hasVanOps = (src: Row): boolean => int(src.ops_vangroup) > 0 || !!str(src.ops_vanid) || !!str(src.ops_vanreturnid) || !!str(src.ops_boatid) || !!jsonValue(src.ops_boatsplits) || !!jsonValue(src.ops_piernote)
       || !!str(src.ops_pickuptimefinal) || src.ops_returnsamevan === true || Array.isArray(jsonValue(src.ops_vansplits));
+    // Check-in (migration 036): legacy's whole record per side, the main part's at the top and the
+    // split parts' under `_s` (§ckSlotFix). With no `_s[0]`, the top record seeds part 0 as legacy's
+    // `_ckLegacySeed` reads it. No-show counts are recomputed, so 5 records change (Open 6).
+    const clockOf = (v: unknown, what: string): string | null => {
+      const t = str(v);
+      if (!t) return null;
+      if (/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(t)) return t;
+      note(`check-in ${what} dropped: "${t}" is not HH:MM`);
+      return null;
+    };
+    const countOf = (v: unknown): number | null => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) || Number(v) < 0 ? null : Math.trunc(Number(v)));
+    const checkinsOf = (src: Row, tripId: string) => {
+      for (const kind of ['van', 'pier'] as const) {
+        const top = jsonValue(src[kind === 'van' ? 'ops_vancheckin' : 'ops_piercheckin']) as Row | null;
+        if (!top || typeof top !== 'object') continue;
+        const bag = top._s && typeof top._s === 'object' ? top._s as Record<string, Row> : null;
+        const slots = new Map<number, Row>();
+        if (bag) for (const [k, v] of Object.entries(bag)) if (v && typeof v === 'object' && /^\d+$/.test(k)) slots.set(Number(k), v);
+        if (!slots.has(0)) {
+          if (!bag) slots.set(0, top);
+          else if (top.at || top.arrivedAt || top.clearedAt) {
+            slots.set(0, { at: top.at, by: top.by, events: top.events, reasonCode: top.reasonCode, reasonNote: top.reasonNote, reasonAt: top.reasonAt,
+              arrivedAt: top.arrivedAt, arrivedBy: top.arrivedBy, clearedAt: top.clearedAt, clearedBy: top.clearedBy });
+          }
+        }
+        for (const [slot, r] of slots) {
+          const key = { booking_trip_id: tripId, kind, slot };
+          const reinstate = r.reinstate && typeof r.reinstate === 'object' ? r.reinstate as Row : null;
+          const self = r.selfAdd && typeof r.selfAdd === 'object' ? r.selfAdd as Row : null;
+          const flow = str(r.flow);
+          if (flow && flow !== 'standby' && flow !== 'pending') note(`check-in flow "${flow}" dropped`);
+          checkins.push({
+            ...key, expected: countOf(r.expected), actual_pax: countOf(r.actualPax), checked_in_at: instant(r.at) ?? null, checked_in_by: str(r.by) || null,
+            reason_code: str(r.reasonCode) || null, reason_note: str(r.reasonNote) || null, reason_at: clockOf(r.reasonAt, 'reason times'),
+            arrived_at: instant(r.arrivedAt) ?? null, arrived_by: str(r.arrivedBy) || null, cleared_at: instant(r.clearedAt) ?? null, cleared_by: str(r.clearedBy) || null,
+            flow: flow === 'standby' || flow === 'pending' ? flow : null, flow_at: clockOf(r.flowAt, 'flow times'), flow_by: str(r.flowBy) || null, flow_note: str(r.flowNote) || null,
+            reinstate_at: reinstate ? clockOf(reinstate.at, 'reinstate times') : null, reinstate_by: reinstate ? str(reinstate.by) || null : null, reinstate_ts: reinstate ? instant(reinstate.ts) ?? null : null,
+            self_add_pax: self ? countOf(self.pax) ?? 0 : null, self_add_ad: self ? countOf(self.ad) : null, self_add_chd: self ? countOf(self.chd) : null,
+            self_add_inf: self ? countOf(self.inf) : null, self_add_foc: self ? countOf(self.foc) : null, self_add_at: self ? str(self.at) || null : null,
+            self_add_by: self ? str(self.by) || null : null, self_add_ts: self ? instant(self.ts) ?? null : null, self_add_note: self ? str(self.note) || null : null,
+          });
+          let seq = 0;
+          for (const e of Array.isArray(r.events) ? r.events as Row[] : []) {
+            const type = str(e.type);
+            if (type !== 'no_show' && type !== 'cxl') { note(`check-in events dropped: type "${type}"`); continue; }
+            const pb = e.paxBreak && typeof e.paxBreak === 'object' ? e.paxBreak as Row : null;
+            const u = e.undone && typeof e.undone === 'object' ? e.undone as Row : null;
+            const why = u ? str(u.why) : '';
+            const eventSeq = seq++;
+            checkinEvents.push({
+              ...key, seq: eventSeq, type, pax: countOf(e.pax) ?? 0, ad: pb ? countOf(pb.ad) : null, chd: pb ? countOf(pb.chd) : null, inf: pb ? countOf(pb.inf) : null, foc: pb ? countOf(pb.foc) : null,
+              reason_code: str(e.reasonCode) || null, note: str(e.note) || null, at: clockOf(e.at, 'event times'), by: str(e.by) || null, ts: instant(e.ts) ?? null,
+              undone_why: u ? (why === 'mistake' ? 'mistake' : 'found') : null, undone_at: u ? str(u.at) || null : null, undone_by: u ? str(u.by) || null : null,
+              undone_ts: u ? instant(u.ts) ?? null : null, undone_note: u ? str(u.note) || null : null,
+            });
+            let trySeq = 0;
+            for (const x of Array.isArray(e.tries) ? e.tries as Row[] : []) {
+              checkinTries.push({ ...key, event_seq: eventSeq, seq: trySeq++, at: clockOf(x.at, 'try times'), by: str(x.by) || null, note: str(x.note) || null, ts: instant(x.ts) ?? null });
+            }
+          }
+        }
+      }
+    };
     const vanOpsOf = (src: Row, t: Row, tripId: string, counts: Counts, zone: string) => {
       const final = pickupWindow(src.ops_pickuptimefinal, 'final pickup times');
       // The boat (or boats) and the pier note (migration 033). A split names two boats or more, each in the catalogue.
@@ -449,6 +512,7 @@ async function main() {
     };
 
     const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [];
+    const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
     // Approvals (`legacy-approvals.ts`). Legacy's `licFree` goes to the approval day when this schema keeps it (025).
@@ -576,6 +640,8 @@ async function main() {
       const addOnTypes = addOnsOf.get(legacyId) ?? [];
       for (const { t, tripId, counts } of myVanTrips) {
         const src = str(t.date) === firstDay ? b : t;
+        // What happened at check-in is kept whatever the booking's status: an on-site cancel is one of its events.
+        checkinsOf(src, tripId);
         if (!holdsSeats(status)) { if (hasVanOps(src)) note('van data not imported: booking cancelled or rejected'); continue; }
         vanOpsOf(src, t, tripId, counts, groupZone(t, b, addOnTypes));
       }
@@ -881,6 +947,9 @@ async function main() {
     await insert('booking_passengers', passengers);
     await insert('booking_adjustments', adjustments);
     await insert('booking_reconfirmations', reconfirms);
+    await insert('booking_trip_checkins', checkins);
+    await insert('booking_trip_checkin_events', checkinEvents);
+    await insert('booking_trip_checkin_event_tries', checkinTries);
     await insert('booking_cancellations', cancellations);
     await insert('booking_reschedules', reschedules);
     await insert('booking_partial_cancels', partialCancels);
