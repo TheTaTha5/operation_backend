@@ -11,6 +11,7 @@
  */
 import { BOAT_MEASURES, type BoatDocument, type BoatRecord, type BoatStatus, type StatusEntry } from '../domain/catalogue.js';
 import { isIsoDate } from '../domain/calendar.js';
+import { plannedOverFromNote } from '../domain/fleet-availability.js';
 
 type Row = Record<string, unknown>;
 
@@ -84,6 +85,8 @@ export function boatFromLegacy(row: Row, docRows: readonly Row[] = [], logRows: 
     log.push({
       id: entryId, status: status as BoatStatus, from_date: from, to_date: to, loc: text(l.loc), province: text(l.province), loc_type: text(l.loctype),
       detail: text(l.detail), note: text(l.note), reason: text(l.reason), project_id: text(l.projectid),
+      // Legacy keeps "planned ahead" in the note, since its sync drops a new field (`LA_PLAN_MARK`).
+      planned_over: status === 'available' ? plannedOverFromNote(text(l.note)) : null,
     });
   }
 
