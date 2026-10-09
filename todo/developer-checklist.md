@@ -19,7 +19,7 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - 070 drops the `capacity <= license_pax` check;
    - 080 drops `van_days.sent_at` (each mark moves onto that van's groups);
    - 048 turns a lock naming no agent into an office lock.
-2. **Push `main`.** Deploying applies migrations 039–143 (`preDeployCommand`).
+2. **Push `main`.** Deploying applies migrations 039–143 and 160–161 (`preDeployCommand`).
 3. **Copy the files:** `npm run import:attachments -- --commit` (about 6,000 files, about 660 MB, about
    18 min; re-runnable). Run it before the imports, so slips, documents and project photos link.
 4. **Seed the catalogue once:** `npm run seed:routes -- --commit`, then `npm run seed:boats -- --commit`.
@@ -39,6 +39,12 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
      stock equals legacy's.
    - Legacy must stop editing assets, incidents, jobs, stock, memos, projects and the Daily Log at
      the same moment.
+6b. **Costing and trip actuals:** `npm run import:costing -- --commit` (migration 160), after step 5:
+   the overnight meal choices name the imported `lg_` bookings.
+   - Rehearsal 2026-10-10: 22 template lines, 10 plans, 2 rented boats, 3 restaurants, 6 routes
+     linked, 92 boat-days (90 meal orders, ฿774,730, as legacy), nothing skipped; a re-run identical.
+   - Replaying legacy's own `ctCalc` and `ctBreakEven` on the 94 imported trips: all 1,778 cost lines
+     and every break-even matched.
 7. **Validate the booking area keys:**
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 8. **Check:** `npm run verify:import`. Expected differences:
@@ -52,7 +58,9 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    what was recorded here on legacy's records for:
    - pier payments, on-tour sales and the cash-on-tour and no-show decisions;
    - the fleet records;
-   - van rates and the daily report settings.
+   - van rates and the daily report settings;
+   - the cost template, plans and rented boats (replaced whole by `import:costing`), and the pier's
+     meal orders, notes and overnight choices (a close or "ran" made here is kept).
 
    So decide when legacy stops writing each of these (`money-model.md`, `fleet-maintenance-model.md`).
 10. **Railway variables:**
@@ -113,7 +121,9 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
     - the catalogue (§3.14: Programs, the boat form, Boat Status and day seats; `409 seats_sold`,
       resend with `capacity_anyway`);
     - sales (§6.5–6.6: agents, templates, Team & Markets, add-ons, insurance);
-    - fleet (§3.13, §3.15, §6.7).
+    - fleet (§3.13, §3.15, §6.7);
+    - costing, the meal order, Trip P&L, deposits and refund payouts (§2.11: the P&L is read from
+      the server; close and "ran" are commands; `credit_balance` gains `deposited`).
 
     Each screen stops writing legacy's blob for its area.
   - **Legacy sync per area** (decided): keep saving to legacy only the areas that have not moved.
@@ -165,6 +175,8 @@ So, in this order:
 - **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
   pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
   invoice left overpaid by a cash-on-tour deduction.
+- **Money, the rest** (`money-model.md`, "Flagged"): who sends the meal order (legacy: operations,
+  not pier); whether a deposit should be spendable by one agent only (it is a pool per agent here).
 - **Fleet stock:** 18 duplicate items to merge (`POST /v1/fleet/stock-items/{id}/merge`), and 7
   stock lines whose history did not add up (item i25 most of all: 44 between Tub Lamu and Panwa),
   from the `import:fleet-stock` report. Legacy's 7 cancelled memos have no reason (it was never kept).

@@ -2408,7 +2408,8 @@ reschedule):
    are paid first, so only money the invoice no longer needs comes back.
 3. **The outcome:**
    - `cancel` (default, legacy "No refund"): nothing more; what was paid stays on the invoice.
-   - `refund`: a `refund` of that amount, owed to the agent. Paying it out is not modelled.
+   - `refund`: a `refund` of that amount, owed to the agent. Paying it out is its own step
+     (`POST /v1/refunds/{id}/payout`, "Deposits and refund payouts").
    - `credit`: a `credit` of that amount for the invoice's agent. Nothing paid is `409 nothing_paid`;
      an invoice with no agent is `409 no_agent`.
 4. `amount` cannot be sent (`400`): the server works it out.
@@ -2421,8 +2422,9 @@ reschedule):
 ```
 
 **The agent's credit balance** (legacy's deposits): `GET /v1/agents/{id}` carries
-`credit_balance: { credited, used, available }`: its credits, less its live payments with
-`method: "credit"`. Spend it with `POST /v1/invoices/{id}/payments` and `method: "credit"`.
+`credit_balance: { credited, deposited, used, available }`: its credits and live deposits ("Deposits
+and refund payouts"), less its live payments with `method: "credit"`. Spend it with
+`POST /v1/invoices/{id}/payments` and `method: "credit"`.
 
 **Restore** of a weather-cancelled booking puts its status back only: it stays off its old invoice
 (issue a new one), a refund or credit stays, and its follow-up keeps its outcome.
@@ -2561,12 +2563,14 @@ through the same rule as those screens (`pierMoney`). A login tied to an agent g
   `due_at`; `overdue_invoices` counts those with a balance past due. `paid_this_month` and
   `collections` (six Bangkok months) are live payments by `paid_on`, credit spent left out (legacy
   counted `type: payment` only). `credit_exposure` is every agent's credit `used`; `deposits_held`
-  every agent's credit balance (weather credits). `top_outstanding` is the five largest balances.
+  every agent's credit balance left (weather credits and deposits, less credit spent).
+  `refunds_to_pay { count, amount, items }` lists the refunds owed and not paid out yet, oldest
+  first. `top_outstanding` is the five largest balances.
   `extras_this_month` is legacy's "Extras · cash · month" (`acctExtrasMonthTotal`): every on-tour
   sale made this Bangkok month (by `sold_at`), whatever its method or trip day.
 - **Statement** `{ agent_id, name, code, pay_type, invoiced, paid, outstanding, credit_balance, credit,
-  invoices, credits }`: live invoices newest first, `paid` net of what refunds and credits took back,
-  `credits` the agent's weather credits.
+  invoices, credits, deposits }`: live invoices newest first, `paid` net of what refunds and credits
+  took back, `credits` the agent's weather credits, `deposits` its live deposits.
 - **Travel Summary** `{ date, bookings, booked, travelled, no_show, cxl, money, cot, noshow, collect_rows }`:
   `travelled` is booked less the last count (the pier's, else the van's); `no_show` and `cxl` are the
   check-in events.
@@ -2601,11 +2605,133 @@ through the same rule as those screens (`pierMoney`). A login tied to an agent g
   `van_cost` (legacy `drVanReal`) prices each van's day from the van rates by route and pickup zone,
   shared by heads when one van took two routes; with no van cost at all it is the vans × `van_cost`
   (`estimated: true`). `default_rate_vans` counts vans priced by the default, with no rate set.
+  `longtail { charter_boats, join_pax, cost, by_route }` (legacy `drData` §drReal, `drLtRate`): the
+  day's longtail boats chartered and join heads (booked heads, as legacy; an overnight return leg's
+  was paid on the way out), at the route plan's `ltc` and `ltj` prices (฿600 a boat with no `ltc`
+  line). `known_cost` is `van_cost.total + longtail.cost`; `net_before_boat_costs` is
+  `revenue − known_cost + extras` (legacy's "คงเหลือก่อนต้นทุนเรือ/ครัว").
 - **Settings** `{ van_cost, van_quota, target_per_pax, set, updated_at, updated_by }`: `PUT` takes
   whole numbers; 0 or `null` goes back to legacy's default (1,200, 6, 130). Writes: `operations` or
   `accounting`.
-- **Not here yet:** the Trip P&L, the longtail cost (and so the Daily Report's "net before boat
-  costs") and the cost model wait for Fleet.
+
+### Cost model and Trip P&L
+
+Legacy's costing menu and Trip P&L (todo/money-model.md, "Design: the rest of Money", migration 160;
+`src/domain/costing.ts`, `src/domain/trip-pl.ts`, `src/routes/costing.ts`). The maths is legacy's
+`ctCalc`, line for line; replayed on 94 imported trips, every one of 1,778 cost lines and every
+break-even matched legacy's own functions. Costing and P&L are staff screens: a login tied to an
+agent gets `403`.
+
+| Method + path | Body | Legacy | Writes |
+|---|---|---|---|
+| `GET`, `PUT /v1/costing/template` | `{ vat_rate, lines }` | `ctTpl`, `ctTplSave` | `accounting` |
+| `GET /v1/costing/plans`, `GET /v1/costing/plans/{id}?pax=` | — | `ctPlans`, `ctCalc`, `ctBreakEven` | |
+| `POST /v1/costing/plans` | fields, or `{ copy_of }` | `ctBlankPlan`, copy | `accounting` |
+| `PATCH`, `DELETE /v1/costing/plans/{id}` | fields | `ctPlanPut` | `accounting` |
+| `GET /v1/costing/boat-rents`, `PUT`, `DELETE /v1/costing/boat-rents/{boat_id}` | fields | `boat_rent`, `ctRentSet` | `accounting` |
+| `GET`, `POST /v1/meal-venues`, `PATCH /v1/meal-venues/{id}` | fields | `MEAL_VENUES`, `mvAdd`, `mvSet` | `accounting` |
+| `PUT /v1/routes/{id}/meal-venue` | `{ meal_venue_id \| null }` | `mvRouteSet` | `accounting` |
+| `GET /v1/trip-actuals?from=&to=`, `GET /v1/trip-actuals/{date}/{boat_id}` | — | `trip_actuals` | |
+| `PUT /v1/trip-actuals/{date}/{boat_id}/venue` | `{ venue: id \| "none" \| null }` | pier job sheet `pjMvSet` | `pier` or `operations` |
+| `POST …/meal-order` | — | `pckMealSend` | `operations` |
+| `PUT …/meal-note` | `{ text }` | `pckMealNoteSave` | `operations` |
+| `PUT …/meal-overnight/{booking_id}` | `{ include: "in" \| "out" \| null }` | `pckMealOvnSet` | `operations` |
+| `POST …/close`, `…/reopen`, `…/ran`, `…/not-ran` | — | `pxClose`, `pxRan` | `accounting` |
+| `GET /v1/reports/trip-pl?date=&pier=` | — | `pxDay`, `pxDayAgg` | |
+| `GET /v1/reports/trip-pl/{date}/{boat_id}` | — | `pxTrip` | |
+| `GET /v1/reports/trip-pl/month?month=YYYY-MM&pier=` | — | `pxMonth` (each day's totals, to today) | |
+
+**The template** `{ vat_rate, lines, dropped, saved }`: each line `{ id, group, label, vat, parts,
+on_demand, on_demand_qty }`; a part `{ kind: fix | var | step, per?: "boat", qty?, qty_4en?, unit?,
+unit_4en?, unit_th?, unit_ch?, unit_ch_th?, fuel?, mode?: every | over, every?, min?, over?, add? }`.
+`fix` is qty × unit (× boats per boat; a `fuel` part's unit is ฿/L); `var` is per head with four
+prices (adult/child × foreign/Thai, each falling back to a wider one); `step` adds one every N heads
+(at least `min`), or `add` over X heads. `on_demand` lines (van, longtail join and charter) are
+priced per item ordered: `on_demand_qty` is the default, a % of heads for a per-head line. With
+nothing saved it is legacy's `CT_DEFAULT`. `PUT` replaces it whole; a default line left out is
+`dropped` and stays out. Legacy's short keys (`k q q4 u u4 uTH uCh uChTH g l od odQ`) are accepted.
+
+**A plan** (a route's design sheet): `name, route_key` (a route or a family), `note, engines (3EN |
+4EN), boats, capacity, pax, pax_th, price, price_child, child_pct, commission_pct, fuel_price,
+boat_id, rent_off, overrides ({line: {off, parts: [partial part | null]}}), groups ({group: {off,
+pct}}), on_demand ({line: {agent_qty, agent_rev, upsell_qty, upsell_rev}}), itinerary, tiers` are
+the client's; `seats` (the pinned boat's, else `capacity`), `calc` (priced at `pax` or `?pax=`:
+`gross, vat_in, net, fixed_net, var_net, rows, rent, revenue, profit`) and `break_even` (the first
+head count with a profit, walked 1..seats) are computed, and refused when sent (`400`).
+
+**A rented boat** `{ rented, mode (lump | seat), amount, per_seat, days, days_off, trips_per_day, vat,
+note, from, to, fuel_pct, owner_pays }` plus computed `seats, total, run_days, per_day, per_trip,
+per_calendar_day`: per trip = rent ÷ (days − days off) ÷ trips. Inside `from..to`, with a rent, the
+lines in `owner_pays` (default depreciation, captain, crew) are left out and the rent is a row of
+its own. `fuel_pct` scales fuel parts whether rented or not. A `PUT` onto a boat with no record starts
+from a record that is **not** rented (§rentZero).
+
+**Trip actuals** (per boat and day): `venue_id` / `no_meal` (the day's restaurant, else the route's),
+`meal` (the order sent: `venue_id, venue_name, adults, children, price_adult, price_child, amount,
+at, by`), `meal_note`, `meal_overnight`, `ran`, `closed`; the read adds `meal_preview`.
+`meal-order` counts the heads on board of the boat's bookings (an overnight return leg only once
+marked `in`; infants do not order), prices them at the venue and freezes it; sending again replaces
+it. Refused `409`: `no_meal_venue`, `overnight_meal_undecided` (with `bookings`), `nobody_aboard`.
+
+**One trip** `{ boat_id, name, route_id, route_name, departs, status (est | part | done | nosail),
+pax { ad, chd, inf, foc, total, th, fr, bookings, revenue }, capacity, revenue_gross, upsell, revenue,
+cost, profit, would_cost, no_sail, ran, closed, fuel_price { price, src, from }, fuel_litres, plan,
+engines, longtail { charter, join, upgrades, upgrades_due }, vans, rows, break_even, check_revenue }`:
+- heads are those on board (the pier's count, else booked less those lost), Thai and foreign;
+  revenue the trips' amounts; `revenue` is net of VAT and adds what the company keeps of on-tour
+  sales (`upsell`);
+- the route's plan gives only its overrides and groups (its heads and price are for playing);
+- each row `{ id, group, label, vat, estimate, actual, use, gross, source, why }`, `source`:
+  `actual` (fuel = Daily Fleet Log litres × the effective ฿/L; meal = the order sent; van = each
+  van's day rate shared by heads; longtails = what was ordered; rent = the contract), `plan` (the
+  route's plan changed the line), `formula`, or `pending` (a restaurant is set but no order sent);
+  an actual with VAT counts net;
+- `close` freezes revenue, cost and every row; `reopen` lets it move again. A boat with nobody and
+  no booking did not sail (`nosail`, cost 0, `would_cost` what it would have been) unless marked
+  `ran`. Refused `409`: `trip_closed`, `trip_not_closed`, `trip_not_sailed`, `trip_not_empty`; a boat
+  with no deployment that day is `404`.
+
+The day adds `totals { trips, revenue, cost, profit, pax, bookings, loss_trips, capacity,
+did_not_sail }`, `by_route` and `by_group`; `check_revenue` flags a boat whose revenue a head is under
+30% of the day's (legacy §revFlag).
+
+**Change feed:** kind `trip_actual`, entity `{date}:{boat_id}`, on every write under
+`/v1/trip-actuals/{date}/{boat_id}/`; a route's restaurant is a `route` change.
+
+**Import:** `npm run import:costing` (after `import-legacy.ts`). Template, plans and rents are
+replaced whole on every run; venues and route links upserted; trip actuals upserted, a close or
+`ran` made here kept. Rehearsal 2026-10-10: 22 lines, 10 plans, 2 rents, 3 venues, 6 routes linked,
+92 boat-days (90 meals, ฿774,730, as legacy; 36 notes; 2 overnight choices; 1 day venue), nothing
+skipped.
+
+### Deposits and refund payouts
+
+An agent's money held with us (todo/money-model.md, "Design: the rest of Money", migration 161;
+`src/domain/credit.ts`, `src/routes/credit.ts`). Writes: `accounting`.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /v1/deposits?agent_id=&include_voided=true` | — | `{ deposits }` (an agent login: its own) |
+| `POST /v1/deposits` | `{ agent_id, amount, method?, received_on?, ref?, note?, slip_ids? }` | the deposit, `201` |
+| `GET /v1/deposits/{id}` | — | the deposit with the agent's `credit_balance` |
+| `POST /v1/deposits/{id}/void` | `{ reason }` | the deposit |
+| `POST /v1/refunds/{id}/payout` | `{ method, paid_on?, ref?, slip_ids? }` | the refund with `payout` |
+| `DELETE /v1/refunds/{id}/payout` | — | the refund, `payout: null` |
+
+- **A deposit** (legacy "รับมัดจำ") is money an agent paid with no invoice. It adds to the agent's
+  credit balance, the one weather credits fill, and is spent as a payment with `method: "credit"`.
+  `method` is `transfer` (default), `cash` or `card`; `received_on` defaults to today (Bangkok).
+  The balance is one pool: a deposit has no "remaining" of its own (legacy tracked which deposit a
+  payment used). Void needs a reason and is refused `409 deposit_spent` when it would leave the
+  balance below 0, `409 deposit_void` twice; a voided deposit stays listed with `include_voided`.
+- **A refund payout** records that a refund owed to the agent was paid: `method` `transfer`, `cash`
+  or `cheque`, `paid_on` (default today), `ref`, slips; `paid_out_by` is the login. Refused `409`:
+  `not_a_refund` (a credit is spent, not paid out), `refund_paid_out`; undoing one not paid out is
+  `409 refund_not_paid_out`. `GET /v1/refunds` shows each refund's `payout` and filters
+  `?paid_out=true|false`. The accounting dashboard lists the unpaid ones (`refunds_to_pay`).
+- **An overpaid invoice** stays a manual matter (decided 2026-10-10): the invoice reads `overpaid`,
+  nothing is credited or refunded by itself.
+- **Change feed:** kinds `deposit` and `refund` (a payout).
 ### Proforma (Daily PFM)
 
 Legacy's Daily PFM (todo/money-model.md slice 2, migration 110): a proforma agent pays before travel,

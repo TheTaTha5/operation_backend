@@ -572,6 +572,39 @@ server works out every amount** (README "Proforma (Daily PFM)", "Pier money", "A
 - **New screens, no legacy:** the pier's day-close hand-over (`/v1/pier-handovers`, accepted by
   accounting) and commission payouts (`/v1/commissions`, `/v1/commission-payouts`).
 
+### 2.11 Costing, the meal order, Trip P&L, deposits and refund payouts
+
+**Change: the costing menu, `trip_actuals` and the Trip P&L move to the server, which works out every
+cost line and total** (README "Cost model and Trip P&L", "Deposits and refund payouts").
+`cost_template`, `cost_plans`, `boat_rent`, `meal_venues`, `routes.mealVenueId`, `TRIP_ACT`,
+`PIER_JOB.mv` and `SB_DEPOSITS` move to these:
+
+| Legacy | API |
+|---|---|
+| `ctTpl`, `ctTplSave` (สูตรกลาง) | `GET`/`PUT /v1/costing/template` (the short keys are accepted) |
+| `ctPlans`, `ctPlanPut`, `ctBlankPlan`, copy, delete; `ctCalc`, `ctBreakEven` for a sheet | `GET /v1/costing/plans` (`calc`, `break_even`, `seats`), `GET …/{id}?pax=`, `POST` (`copy_of`), `PATCH`, `DELETE` |
+| `ctRentAll`, `ctRentSet`, `ctRentOf` | `GET /v1/costing/boat-rents`, `PUT`/`DELETE /v1/costing/boat-rents/{boat_id}` |
+| `mvAdd`, `mvSet`, `mvToggle`; `mvRouteSet` | `POST`/`PATCH /v1/meal-venues`; `PUT /v1/routes/{id}/meal-venue` |
+| `pjMvSet` (the pier job sheet's restaurant) | `PUT /v1/trip-actuals/{date}/{boat_id}/venue` `{ venue: id \| "none" \| null }` |
+| `pckMealCount` and the kitchen card's amount | `GET /v1/trip-actuals/{date}/{boat_id}` → `meal_preview` |
+| `pckMealSend` | `POST …/meal-order` (refusals `no_meal_venue`, `overnight_meal_undecided`, `nobody_aboard`, in legacy's Thai) |
+| `pckMealNoteSave`, `pckMealOvnSet` | `PUT …/meal-note` `{ text }`, `PUT …/meal-overnight/{booking_id}` `{ include }` |
+| `pxTrip`, `pxDay`, `pxDayAgg`, `pxMonth` | `GET /v1/reports/trip-pl/{date}/{boat_id}`, `GET /v1/reports/trip-pl?date=&pier=`, `GET /v1/reports/trip-pl/month?month=` |
+| `pxClose` (lock / re-open), `pxRan` | `POST …/close`, `…/reopen`, `…/ran`, `…/not-ran` |
+| `drLtRate`, the Daily Report's `ltCost` and "left before boat costs" | `GET /v1/reports/daily` → `longtail`, `known_cost`, `net_before_boat_costs` |
+| `acctDepositSubmit`, the statement's deposits | `POST /v1/deposits`, `GET /v1/deposits`, `POST /v1/deposits/{id}/void`; the statement's `deposits` |
+| (new) a refund paid out | `POST /v1/refunds/{id}/payout`, `DELETE …/payout`; the dashboard's `refunds_to_pay` |
+
+- **Delete client-side:** `ctCalc`, `ctBreakEven`, `ctRentOf`, `pxTrip` and every sum of the P&L;
+  `ctWrite` of the three keys; `taSet`; `mvPersist`; `sbDepositsPersist`, `acctApplyDeposit`.
+- **Source labels:** a row's `source` is `actual`, `plan`, `formula` or `pending` (legacy `r`, `p`,
+  `f`, `w`); `why` is legacy's Thai explanation.
+- **Refusals to show as they are:** `409 trip_closed`, `trip_not_closed`, `trip_not_sailed`,
+  `trip_not_empty`, `deposit_spent`, `deposit_void`, `not_a_refund`, `refund_paid_out`,
+  `refund_not_paid_out`; `400` for a computed field sent (a plan's `calc`, `break_even`, `seats`).
+- **Writes:** costing, close/ran, deposits and payouts need `accounting`; the meal order, note and
+  overnight choices `operations`; the day's restaurant `pier` or `operations`.
+
 ## 3. Day-of-operations
 
 **Change: every trip's `operations` is the truth for boats, vans, pickups and check-ins. Read it into
