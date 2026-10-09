@@ -49,6 +49,7 @@ import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
 import { lockDays, spansDays } from './legacy-locks.js';
 import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { parseBookingAddOns } from '../domain/booking-addons.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 
 const PREFIX = 'lg_';
@@ -168,7 +169,7 @@ async function main() {
     const legacyPassengers = await read('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx');
     const legacyAdjustments = await read('SELECT * FROM sb_bookings__adjustments ORDER BY sb_bookings_id, idx');
     const legacyUpgrades = await read('SELECT * FROM sb_bookings__upgrades ORDER BY sb_bookings_id, idx');
-    const legacyAddOns = await read('SELECT sb_bookings_id, type FROM sb_bookings__addons');
+    const legacyAddOns = await read('SELECT sb_bookings_id, idx, type, label, amount, qty, note, jad, jchd FROM sb_bookings__addons ORDER BY sb_bookings_id, idx');
     const legacyPartialCancels = await read('SELECT * FROM sb_bookings__partialcancels ORDER BY sb_bookings_id, idx');
     const legacyFeeItems = await read('SELECT * FROM sb_bookings__feeitems ORDER BY sb_bookings_id, idx');
     const legacyHistory = await read('SELECT * FROM sb_bookings__history ORDER BY sb_bookings_id, idx');
@@ -393,6 +394,7 @@ async function main() {
     const upgradesOf = childrenOf(legacyUpgrades);
     const addOnsOf = new Map<string, string[]>();
     for (const a of legacyAddOns) { const k = str(a.sb_bookings_id); (addOnsOf.get(k) ?? addOnsOf.set(k, []).get(k)!).push(str(a.type)); }
+    const addOnRowsOf = childrenOf(legacyAddOns);
 
     // ── Van assignment per trip. Groups are only known once every booking is read, so members are
     //    collected under a legacy key (date, route, zone, number) and resolved after the loop ──
@@ -536,7 +538,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -693,6 +695,23 @@ async function main() {
         adjustments.push({ booking_id: id, seq: adjustmentSeq++, kind, mode, value, label: str(a.label) || null, note: str(a.note) || null });
       }
       // Alternate pickups (migration 037), read by the API's own parser so legacy's spellings and old `qty` entries map the same way.
+      // Add-ons (migration 018), through the API's own parser. Legacy's numbers are bigint, which pg
+      // reads as text; a NULL count stays missing ("count every passenger"). Data check 2026-10-09:
+      // 712 rows, every one fits.
+      const legacyAddOnRows = addOnRowsOf.get(legacyId) ?? [];
+      if (legacyAddOnRows.length) {
+        const num = (v: unknown) => (v === null || v === undefined ? undefined : Number(v));
+        try {
+          parseBookingAddOns(legacyAddOnRows.map((a) => ({
+            type: str(a.type), label: a.label ?? undefined, amount: num(a.amount), qty: num(a.qty), note: a.note ?? undefined,
+            join_adults: num(a.jad), join_children: num(a.jchd),
+          }))).forEach((a, seq) => bookingAddOns.push({
+            booking_id: id, seq, type: a.type, label: a.label ?? null, amount: a.amount ?? null, qty: a.qty ?? null, note: a.note ?? null,
+            join_adults: a.join_adults ?? null, join_children: a.join_children ?? null,
+          }));
+          if (legacyAddOnRows.some((a) => Number(a.jad) === 0 && Number(a.jchd) === 0 && a.jad !== null)) note('add-ons imported with a join of 0 adults and 0 children: nobody joins');
+        } catch (error) { note(`add-ons dropped: ${(error as Error).message}`); }
+      }
       // On-tour upgrades (migration 038), with legacy's own fee and amount paid. Payment slips are
       // attachments, which have no home here yet: they are counted, not kept.
       let upgradeSeq = 0;
@@ -1000,6 +1019,7 @@ async function main() {
     await insert('booking_reconfirmations', reconfirms);
     await insert('booking_alt_pickups', altPickups);
     await insert('booking_upgrades', upgrades);
+    await insert('booking_addons', bookingAddOns);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);
     await insert('booking_trip_checkin_event_tries', checkinTries);

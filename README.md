@@ -1272,6 +1272,9 @@ Validation errors are `400` and name the key you used and the position, for exam
 negative`, `addOns[0].qty must be a positive integer`, `addOns[0].jAd must be a non-negative
 integer`. A refused request writes nothing.
 
+The legacy import brings every booking's add-ons through the same parser, as legacy saved them (a
+missing join count stays missing: every passenger joins).
+
 #### Prices
 
 The server prices a booking, with the same rule as `POST /v1/quote` ("Quote"):
