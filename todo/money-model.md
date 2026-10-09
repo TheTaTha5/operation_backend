@@ -1,8 +1,9 @@
 # Money, modelled
 
-**Status:** slice 1 (invoices and payments) is built: README → "Invoices and payments", migration 045,
-`src/domain/invoices.ts`. Slices 5 and 6 are built except what waits for slices 3–4 and Fleet (see
-"Slices 5 and 6: what is left"). Slices 2–4 are outlined below; each gets its own detail pass.
+**Status:** slices 1–6 are built, except Trip P&L and the cost model, which wait for Fleet. Slice 1
+(invoices and payments): README → "Invoices and payments", migration 045. Slices 2–4 (proforma, pier
+money, after the trip): README → "Proforma (Daily PFM)", "Pier money", "After the trip", migrations
+110–112. Slices 5–6 (partner van bills, money reports): migration 120, `src/routes/money-reports.ts`.
 
 - **Source:** wt-lk-inbox `allotment_v2/js/08-app.js`, read on 2026-10-09:
   - accounting block `acctCreateInvoice`, `acctRecordPayment`, `acctInvoiceState`, `acctVoidInvoice` and
@@ -22,51 +23,9 @@
   - the `attachments` table;
   - `npm run import:attachments`, which already copies the slips of `sb_payments`, `pierpayments`,
     `paymentslips`, `sb_extras` and `ts_cot`.
-- **Not here yet:** pier payments, on-tour sales, cash-on-tour decisions, no-show charge decisions,
-  proforma decisions, Trip P&L.
+- **Not here yet:** Trip P&L and the cost model (they wait for Fleet's fuel and meals).
 
-## What legacy does, in short (slices 2–6)
-
-**Proforma (PFM)**
-- **Who:** `proforma` agents, plus credit agents who have a prepay invoice.
-- **Deadline:** 18:00 the day before the first trip.
-- **When unpaid:** staff either approve travel or put it on hold. That decision is `ops.pfm`, which is lost
-  on every legacy save. Hold blocks nothing, and anyone can approve.
-
-**Pier payments (`bk.pierPayments`)**
-- **Data:** 158 payments on 156 bookings.
-  - Cash 122, ฿325,000.
-  - Card 27, ฿63,323, plus ฿2,698 in fees.
-  - Transfer 9, ฿13,990.
-- **Card fee:** kept apart from `amount`. `amount` pays the debt, and `amount + fee` is what the card
-  machine charged.
-- **Split:** one payment can be split across methods.
-- **Amount owed** (`pckMoney`): cash on tour + upgrades not collected + B2C balance + on-tour sales still
-  to collect − pier payments for that date. It counts 0 on an overnight return leg.
-- **Boarding:** the guard is a warning.
-- **Accounting:** pier money is never posted to accounts, and the day-close step was never built.
-
-**On-tour sales (`SB_EXTRAS`)**
-- **Data:** 159 rows, ฿253,500 in total, 26 sellers.
-- **Commission:** `commission = total − to_company`, ฿79,750 in all.
-- **Methods:** cash, transfer, card (fee up to 5%) or `cot`. `cot` means it is collected at the pier
-  later.
-- **Lost by legacy:** satang (decimals) and `collectedAt`.
-- `todo/legacy-replacement.md` called this the "add-on catalogue". It is not.
-
-**Cash on tour (COT)**
-- **The plan:** `cashOnTour` is set at booking. 307 `deduct` (฿984,646) and 61 `separate`. This is
-  already here.
-- **The decision after the trip** (`TS_COT`, per booking and date): `full`, `part`, `none`, `payout` or
-  `nocol`, with `deduct` (taken off the agent's invoice) and `payout` (paid back to the agent).
-  - 142 decisions. Only 138 of 354 active COT bookings have one.
-  - deduct + payout above the COT amount is only a warning.
-- **Invoice:** it ignores the decision, so the money is collected twice. `pfmCotWarn` only warns about it.
-
-**No-show charge (`travel_sum`)**
-- Per booking and date: `full`, `partial`, `none` or `postpone`, with `amount` and `note`.
-- Data: full 68 (฿335,400), postpone 5, none 2, partial 1.
-- It never creates an invoice. Postpone opens the reschedule screen.
+## What legacy does, in short (slices 5–6)
 
 **Reports not built yet**
 - Trip P&L with close/freeze (`trip_actuals.closed`, none closed yet).
@@ -84,11 +43,11 @@
 | # | Slice | What the server decides |
 |---|---|---|
 | 1 | **Invoices and payments** (built) | totals, VAT, number, due date, status, balance, the booking's payment state, credit used |
-| 2 | **Proforma** | who is in scope, the deadline, the travel/hold decision and who may make it |
-| 3 | **Pier money** | pier payments, on-tour sales, the amount owed at the pier, fees, commission |
-| 4 | **After the trip** | cash-on-tour decisions, no-show charge decisions, the invoice's COT deduction |
+| 2 | **Proforma** (built) | who is in scope, the deadline, the travel/hold decision and who may make it |
+| 3 | **Pier money** (built) | pier payments, on-tour sales, the amount owed at the pier, fees, commission |
+| 4 | **After the trip** (built) | cash-on-tour decisions, no-show charge decisions, the invoice's COT deduction |
 | 5 | **Partner van bills** (built) | the rows, the amounts and the overview |
-| 6 | **Reports** (built but Trip P&L and the slice 3–4 parts) | the accounting dashboard, agent statement, Travel Summary totals, Daily Report and Trip P&L, as computed `GET`s |
+| 6 | **Reports** (built but Trip P&L) | the accounting dashboard, agent statement, Travel Summary totals, Daily Report and Trip P&L, as computed `GET`s |
 
 Not in Money:
 - **Pier petty cash** (`po_cash_*`): a cash box per pier, so it belongs with pier operations.
@@ -97,49 +56,13 @@ Not in Money:
 - **Market stats:** these are data, not money.
 
 
-## Slices 2–4, outlined
-
-**2. Proforma**
-- `GET /v1/pfm?date=` lists the bookings in scope. For each it gives the deadline, the payment state and
-  the decision.
-- Commands:
-  - `POST /v1/bookings/{id}/pfm/approve-travel` `{ approver }`;
-  - `POST /v1/bookings/{id}/pfm/hold`;
-  - `POST /v1/pfm/remind`.
-- Table: `booking_pfm_decisions`, with every decision kept in history.
-- Open: who may decide, and whether hold blocks check-in (open 2).
-
-**3. Pier money**
-- **Pier payments:**
-  - table `booking_pier_payments`: id, booking, service_date, method, amount, fee, fee_pct, note, slips,
-    by, at;
-  - `POST /v1/bookings/{id}/pier-payments` takes lines split by method;
-  - fee maths are the server's.
-- **On-tour sales:**
-  - table `booking_tour_sales`, from `SB_EXTRAS`;
-  - `total`, `fee`, `customer_paid` and `commission` are computed;
-  - `settle` comes from the method plus a `collect` command.
-- **Amount owed:** `pier_owed` per trip date is computed (`pckMoney`) and shown on the check-in board.
-- **Upgrades:** their `collected` field moves under the same rule.
-
-**4. After the trip**
-- **COT decisions:** `booking_cot_decisions`, per booking and date, with `mode`, `deduct`, `payout`, `ref`
-  and slips. The rule is `deduct + payout ≤ COT amount` (a warning today).
-- **No-show charges:** `booking_noshow_charges`, per booking and date, with `decision`, `amount` and
-  `note`.
-- **Invoice:** Open 1 decides whether the invoice subtracts the COT `deduct`.
 
 
 
 ## Decided (2026-10-09)
 
-- **COT deduction (slice 4):** the invoice subtracts the cash-on-tour `deduct` once the after-trip
-  decision says so; legacy only warned. The design must handle an invoice already issued (PFM invoices
-  are issued before travel): a minus line, or a credit, decided in slice 4's detail pass.
-- **Proforma decisions (slice 2):** copy legacy: anyone may approve travel (free-text approver), and
-  hold is a label that blocks nothing.
-- **Settlement (slices 3 and 5):** build it with the slices: commission payouts, the pier cash
-  hand-over at day close, and van bills sent and paid.
+- **Settlement (slice 5):** van bills sent and paid (slice 3's commission payouts and pier hand-over
+  are built).
 
 ## Slices 5 and 6: what is left
 
@@ -232,4 +155,92 @@ settings methods; `users.ts` `writeNeed` gains three paths; `routes/operations.t
    balance, spent as a payment with method `credit`). Still open:
    - legacy's manual deposit ("รับมัดจำ", `acctDepositSubmit`): money received with no invoice. It fits
      as a `credit` with no invoice, which `refunds.invoice_id NOT NULL` does not allow yet;
-   - paying a refund out (method, date, slip): legacy had no step either.
+   - paying a refund out (method, date, slip): legacy had no step either;
+   - the agent statement's "Deposit held" (slice 6) reads `credit_balance`.
+
+2. **An invoice left overpaid by a cash-on-tour deduction** (slice 4). A proforma agent pays before
+   the trip, so a `deduct` decided afterwards leaves its invoice paid above the new total: the read
+   says `overpaid` and the decision warns `invoice_overpaid`. Nothing turns that into a refund or the
+   agent's credit yet (open 1's refund payout and a `credit` with no weather reason would). Until then
+   accounting decides by hand.
+3. **Love Kingdom's payment state** (`payment_paid`, `payment_paid_status`, `payment_deposit`,
+   `payment_balance`) is stored as sent. Love Kingdom must send it on every update
+   (`docs/love-kingdom-integration.md`), or the pier collects a stale balance.
+4. **When legacy stops writing** `pierPayments`, `SB_EXTRAS`, `TS_COT` and `travel_sum`: until then the
+   import replaces what was recorded here on imported bookings, as for invoices.
+
+## Flagged (slices 2–4, built 2026-10-09 without a second stop)
+
+Each is legacy's behaviour unless it says otherwise; say if one should change.
+
+**Behaviour changes against legacy**
+- **The invoice subtracts the COT `deduct`** (decided): a minus line per trip date (`invoice_lines.cot_date`)
+  on the booking's live booking or prepay invoice, kept in step with the decision, VAT worked out
+  again; added at issue for a booking not invoiced yet. It is allowed on a paid invoice (unlike a
+  discount), which then reads `overpaid`. A minus line takes no discount. **Imported invoices get no
+  minus lines**, so their totals stay legacy's; the rehearsal lists the invoiced bookings carrying a
+  deduction.
+- **Upgrades' `collected`** (decided "the same rule"): set on a new sale, then only by
+  `POST …/upgrades/{id}/collect`; a `PATCH` that flips it is `400`. Legacy's edit dialog ticked it
+  freely; the two existing tests that ticked it were changed.
+- **PFM amounts are the invoice's** when there is one (legacy took the booking's total and the
+  invoice's balance, which its own `bkV2PayOf` warns is wrong for deposits); without one, the
+  booking's total and fees less its COT deductions.
+- **The cutoff is from the booking's first trip** (decided); legacy used the first trip inside the
+  viewed range.
+- **A PFM decision may replace the other one** (hold, then extend); the same one twice is `409
+  pfm_decided`. Legacy hid both buttons once decided. Every decision and reminder is kept.
+- **Refused here, clamped or allowed in legacy:** `to_company` above the sale's total (legacy cut it
+  to the total), a card fee above 5% on a sale (legacy cut it to 5), a fee on a non-card pier payment,
+  a decision or payment on a day the booking does not travel, a pier payment or decision on a
+  cancelled booking, a COT decision on a booking with no cash on tour.
+- **A deleted pier payment stays** with `deleted_*` (legacy removed it), as invoice payments do.
+- **Every booking command here moves the booking's `version` and needs `If-Match`** (the brief);
+  remind does neither, as `/v1/reconfirm/sent`.
+
+**New, with no legacy**
+- **Pier hand-over:** per day and pier (`routes.pier`, `other` when none); `expected` computed by
+  method and source; cash counted by the pier; accepted by accounting; one live per day and pier;
+  void only before acceptance. A later payment is **not refused**: the read shows `changed`.
+  Upgrades count on the day they were sold if the booking travels then, else its first travel day
+  (legacy keeps no day on an upgrade).
+- **Commission payouts:** per seller, items named, amount computed, only collected items, each once
+  while live; method cash or transfer. A paid-out sale cannot change its commission or seller, nor be
+  deleted (`409 commission_paid`). Upgrades' own `settle` field stays the client's, unused, as in
+  legacy.
+- Change kinds `pier_handover` and `commission_payout` (migration 111, appended to the CHECK).
+
+**Rights** (`writeNeed`)
+- PFM decisions and remind, upgrade collect: `operations` or `accounting` (legacy
+  `acctPersistBookings`). Pier payments: `pier`, `operations` or `accounting` (legacy's pier screen
+  is `ckCanEdit`, but saving goes through `acctPersistBookings`, so a pier-only login saved nothing in
+  legacy). On-tour sales and the after-trip decisions: `operations` (`sbExtrasPersist`,
+  `laGuardEdit('operations')`). Hand-over: `pier` or `operations`; accepting it and payouts:
+  `accounting`.
+- A login tied to an agent (Love Kingdom's) may not write any of the booking money above (`403`), and
+  reads only its own bookings' PFM, pier money and after-trip rows; hand-overs and commissions not at
+  all.
+
+**Small choices**
+- Pier payment lines of 0 are dropped silently (legacy); a card line with neither `fee_pct` nor `fee`
+  pays no fee (legacy's dialog defaulted to 3%).
+- `approver` defaults to the booking's salesperson (`sold_by`, else the agent's); with neither it is
+  `400` (legacy stored "—").
+- Collecting a sale or an upgrade takes cash by default (legacy's button); transfer and card with fee
+  are allowed.
+- A sale's history lines are legacy's; deleting a sale is not logged (legacy).
+- No history line for COT or no-show decisions (legacy wrote none); the invoice change is logged.
+- No-show `postpone` moves nothing: the client opens the reschedule, as legacy.
+- PFM "Issue all" stays `POST /v1/invoices` per booking; legacy's chart buckets are not served (a
+  client asks `GET /v1/pfm` per period).
+
+**Import** (`legacy-pier-money.ts`)
+- Pier payments and on-tour sales keep legacy's ids, `lg_`-prefixed; everything hangs off the
+  imported bookings and is replaced with them.
+- PFM decisions come from history lines (legacy never saved `ops.pfm`): reminders, extensions, holds.
+- A `cot` sale legacy marked settled imports as cash, collected; a non-`cot` sale has no
+  `collected_at` (legacy lost it). Legacy's whole-baht card fees are kept as they are.
+- COT and no-show decisions import as legacy has them, including deduct + payout above the COT, on a
+  booking whose COT was since removed, and on a day the booking no longer travels; legacy's `—`
+  author is none.
+- Love Kingdom's `paymentSnapshot` paid, status, deposit and balance now import onto the booking.

@@ -182,7 +182,8 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 | `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat; van rates; engines, gearboxes, propellers, incidents and maintenance jobs (`/v1/fleet/…`) |
 | `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
 | `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
-| `accounting` | invoices, their discounts and payments; partner van bills; van rates; the daily report's settings |
+| `accounting` | invoices, their discounts and payments; accepting the pier's hand-over; commission payouts; also the Daily PFM decisions, pier payments and collecting an upgrade (legacy saves bookings for accounting too); partner van bills; van rates; the daily report's settings |
+| `pier` | pier payments (`/v1/bookings/{id}/pier-payments`), handing the pier's cash over, check-ins |
 
 - `role: admin` may do everything, including the user screens.
 - **Edit areas follow legacy's `editInfo`:** a list in `edit_areas` decides, and `can_edit` is read
@@ -205,7 +206,8 @@ any other is `400`.
 
 **A login tied to one agent** (`agent_id`, for Love Kingdom's service user, `a_b2c`) books for that
 agent only: a create without `agent_id` gets it, another agent is `403`, the list shows only its
-bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`, with one
+bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403` (so is the money
+kept beside a booking: its PFM decisions, pier payments, on-tour sales and after-trip decisions), with one
 exception: Love Kingdom's login (`a_b2c`) may also create routes, `POST /v1/routes`, without the
 `config` area (see "Editing routes"). The `a_b2c` login's bad input is held for ops rather than
 refused (`202`, see [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)).
@@ -1605,7 +1607,7 @@ send `guides: {english, russian, chinese, otherLang}` and read back `guide_engli
 | service | `pax_type`, `special_meals_veg`, `special_meals_vegan`, `special_meals_halal`, `special_meals_allergies`, `large_luggage` |
 | cash on tour | `cash_on_tour_amount`, `cash_on_tour_currency`, `cash_on_tour_handling`, `cash_on_tour_note` |
 | price | `price_mode`, `manual_total`, `total`, `price_seat`, `price_addon`, `price_foc_discount`, `price_discount`, `price_extra` |
-| payment | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version` |
+| payment | `payment_method`, `payment_net_days`, `payment_source`, `payment_contract_version`; Love Kingdom's payment state `payment_paid`, `payment_paid_status`, `payment_deposit`, `payment_balance` (legacy `paymentSnapshot.paid/paidStatus/deposit/balance`; the pier collects `payment_balance`, see [Pier money](#pier-money)) |
 | market | `market`, `market_sub`, `market_agent_id`, `market_at` |
 | lifecycle | `booking_date` |
 | free text | `notes`, `note` |
@@ -2194,8 +2196,14 @@ is billed and what was paid. Writes need the `accounting` area; any login may re
   - a booking of another agent: `400 booking_not_agents`;
   - a cancelled, rejected or weather-cancelled booking: `409 booking_cancelled`;
   - a booking already on a live invoice: `409 booking_already_invoiced`, naming the invoice.
-- **Lines:** one per booking at today's price (`total`), then one per fee item. From then on each
-  line keeps the amount it was issued for: a later price change does not move the invoice.
+- **Lines:** one per booking at today's price (`total`), then one per fee item, then a **minus line**
+  per trip date whose cash on tour was decided as taken off the agent's bill (`cot_date` set, label
+  `Cash on tour deducted · 2026-10-12`; see [After the trip](#after-the-trip-cash-on-tour-and-no-show-decisions)).
+  From then on each line keeps the amount it was issued for: a later price change does not move the
+  invoice. Only a cash-on-tour decision changes its own minus line afterwards. Every line carries
+  `cot_date` (`null` on the others); a minus line takes no discount (`400`).
+- **`overpaid`**: what was paid beyond the total (refunds and credits taken back), on every read. A
+  deduction made after the agent paid leaves it above 0.
 - **VAT** is the agent's `vat_mode`, copied at issue, at 7% in whole baht:
   - `include`: the total is the subtotal, and `net = round(subtotal / 1.07)`;
   - `exclude`: VAT is added on top;
@@ -2573,6 +2581,201 @@ stored.** A login tied to an agent gets `403` on the reports and reads only its 
   cash-on-tour and no-show decisions, and so Travel Summary's collected and still-due amounts, the
   Daily Report's due and collected, and the accounting dashboard's "Extras · cash · month". The Trip
   P&L, the longtail cost and the cost model wait for Fleet.
+### Proforma (Daily PFM)
+
+Legacy's Daily PFM (todo/money-model.md slice 2, migration 110): a proforma agent pays before travel,
+by **18:00 Bangkok the day before the booking's first trip**. Past that and still unpaid, staff
+extend travel or put the booking on hold. Hold is a label: it blocks nothing.
+
+| Method + path | Body | Answers | Area |
+|---|---|---|---|
+| `GET /v1/pfm?date=` or `?from=&to=` (≤ 400 days) | — | `{ from, to, rows, totals }` | any login (an agent's: its own) |
+| `POST /v1/bookings/{id}/pfm/approve-travel` | `{ approver?, version }` | the row | `operations` or `accounting` |
+| `POST /v1/bookings/{id}/pfm/hold` | `{ version }` | the row | same |
+| `POST /v1/pfm/remind` | `{ date }` or `{ from, to }` | `{ reminded: [booking ids] }` | same |
+
+```jsonc
+{ "booking_id": "BK-1", "version": 4, "voucher_ref": "V-881", "agent_id": "a12", "agent_name": "Andaman Tours", "sales_name": "Nok",
+  "kind": "proforma", "travel_date": "2026-10-12", "route_id": "r10", "pax": 4, "cutoff_at": "2026-10-11T11:00:00.000Z", "past_cutoff": true,
+  "total": 5600, "paid": 0, "balance": 5600, "invoice": { "id": "inv_…", "number": "INV-2610-0012", "status": "issued" },
+  "status": "alert", "decision": null, "reminded_at": null, "cot_deduct": 0 }
+// totals: { "count": 12, "total": 61200, "paid": 40000, "unpaid": 21200, "collected_pct": 65, "alert": 2, "by_status": { "paid": 7, … } }
+```
+
+- **Who is listed** (legacy `pfmInScope`): bookings holding seats with a trip in the range whose agent
+  is `proforma` (`kind: proforma`), or an `invoice` agent's booking paid ahead on its own `prepay`
+  invoice (`kind: prepay`, legacy §pfmPrepay: only what was received counts, no cutoff).
+- **All computed:** `total`, `paid` and `balance` are the invoice's; with no invoice, the booking's
+  total and fees less its cash-on-tour deductions. `status`, first that fits: `hold`, `approved`,
+  `paid`, `prepaid_part`, `alert` (past the cutoff, unpaid), `awaiting` (invoiced), `no_invoice`.
+- **Deciding** (legacy's Extend and Hold buttons): `approver` is free text, by default the booking's
+  salesperson (`400` with neither). Refused with `409`: `booking_cancelled`; `not_proforma` (a prepay
+  row); `pfm_paid`; `before_cutoff`; `pfm_decided` (the same decision again). The other decision may
+  replace one; every decision and reminder is kept. History: `PFM unpaid · travel EXTENDED by Nok`,
+  `PFM unpaid · put on hold`.
+- **Remind** logs `PFM payment reminder sent` on every proforma booking in the range still owing
+  (held and approved ones too, as legacy). It changes no booking's version.
+- "Issue all" is `POST /v1/invoices` per booking.
+- **Import:** legacy lost `ops.pfm` on every save; its history lines are read back as decisions and
+  reminders.
+
+### Pier money
+
+Money at the pier (todo/money-model.md slice 3, migration 111): what the pier still has to collect,
+what it took, the sales made on the day, and the settlement legacy never built.
+
+| Method + path | Body | Answers | Area |
+|---|---|---|---|
+| `GET /v1/pier-money?date=&route_id=&pier=` | — | `{ service_date, rows }`: every booking holding seats that day | any login (an agent's: its own) |
+| `GET /v1/bookings/{id}/pier-money?date=` | — | one row with `payments` (that day) and `tour_sales` | any login |
+| `POST /v1/bookings/{id}/pier-payments` | `{ service_date, lines: [{ method, amount, fee_pct? \| fee?, note?, slip_ids? }], overpay_anyway?, version }` | `201`, the row | `pier`, `operations` or `accounting` |
+| `POST /v1/bookings/{id}/pier-payments/{payment_id}/slips` | `{ slip_ids, version }` | the row | same |
+| `DELETE /v1/bookings/{id}/pier-payments/{payment_id}?reason=` | `If-Match` | the row | same |
+| `GET /v1/bookings/{id}/tour-sales` | — | `{ tour_sales }` | any login |
+| `POST /v1/bookings/{id}/tour-sales` | the sale, `version` | `201`, the sale | `operations` |
+| `PATCH /v1/bookings/{id}/tour-sales/{sale_id}` | what changes, `version` | the sale | `operations` |
+| `POST /v1/bookings/{id}/tour-sales/{sale_id}/collect` | `{ method?, fee_pct?, slip_ids?, version }` | the sale | `operations` |
+| `DELETE /v1/bookings/{id}/tour-sales/{sale_id}` | `If-Match` | `204` | `operations` |
+| `GET /v1/pier-handovers?from=&to=&pier=`, `GET /v1/pier-handovers/{id}` | — | `{ handovers }`, one | any login but an agent's |
+| `GET /v1/pier-handovers/preview?date=&pier=` | — | `{ service_date, pier, expected, handover }` | same |
+| `POST /v1/pier-handovers` | `{ service_date, pier, cash_counted, note? }` | `201` | `pier` or `operations` |
+| `POST /v1/pier-handovers/{id}/accept` | `{ note? }` | the hand-over | `accounting` |
+| `POST /v1/pier-handovers/{id}/void` | `{ reason? }` | the hand-over | `pier` or `operations` |
+| `GET /v1/commissions?from=&to=&seller=&paid=` | — | `{ items, totals }` | any login but an agent's |
+| `GET /v1/commission-payouts?seller=&from=&to=`, `GET …/{id}` | — | `{ payouts }`, one | same |
+| `POST /v1/commission-payouts` | `{ seller, items: [{ kind, booking_id, id }], method, paid_on?, ref?, note? }` | `201` | `accounting` |
+| `POST /v1/commission-payouts/{id}/void` | `{ reason? }` | the payout | `accounting` |
+
+```jsonc
+// GET /v1/bookings/BK-1/pier-money?date=2026-10-12
+{ "booking_id": "BK-1", "version": 6, "voucher_ref": "V-881", "lead_pax": "Ann", "agent_id": "a12", "route_id": "r10", "service_date": "2026-10-12",
+  "overnight_return": false, "cot": 3000, "cot_currency": "THB", "cot_handling": "deduct", "cot_note": null,
+  "upgrades_due": 1100, "upgrades_got": 0, "b2c_balance": 0, "tour_sales_due": 0, "tour_sales_got": 650,
+  "gross": 4100, "paid": 2000, "fees": 0, "due": 2100, "got": 2650, "no_slip": 0, "term": "invoice", "paid_status": null,
+  "payments": [ { "id": "pp_…", "booking_id": "BK-1", "service_date": "2026-10-12", "method": "cash", "amount": 2000, "fee": 0, "fee_pct": null,
+                  "note": null, "slips": [], "by": "GSA.PK01", "at": "…", "deleted_at": null, "deleted_by": null, "delete_reason": null } ],
+  "tour_sales": [ /* as below */ ] }
+```
+
+**The amount owed** (legacy `pckMoney`, never stored): `gross` = cash on tour + upgrades not
+collected + the B2C balance (`payment_balance`) + on-tour sales of that day still to collect (`cot`);
+`due` = `gross` − the day's pier payments, never below 0; `got` = sales and upgrades collected + pier
+payments; `no_slip` counts transfer and card payments with no slip. An **overnight return leg** owes
+none of the booking's cash on tour, upgrades or balance (`overnight_return: true`, legacy
+§ovnSettled). A sale of another day is not this day's; one with no day counts every day. `term` is
+Love Kingdom's own payment method on its bookings (legacy §b2cPayOne), else the agent's pay type.
+**Boarding is never refused** for money owed (legacy's guard is a warning): the board reads `due`.
+
+**Pier payments** (legacy `pckPaySave`): one payment per line, all at the same instant.
+- `amount` pays the debt; a card's `fee` (from `fee_pct`, to the satang, or sent in baht) is kept
+  apart: amount + fee is the card machine's figure. A fee on another method is `400`.
+- A line of 0 is dropped, as legacy drops it; none left is `400` ("ใส่จำนวนเงินก่อน").
+- Refused: a day the booking does not travel (`409 not_on_trip`); a cancelled booking (`409
+  booking_cancelled`); more than `due` (`409 overpayment`) unless `overpay_anyway: true` (legacy's
+  "บันทึกต่อไหม?").
+- History, legacy's words: `เก็บเงินหน้าท่า ฿3,000 · แบ่งจ่าย 2 วิธี (เงินสด ฿2,000 · บัตรเครดิต ฿1,000 +ธรรมเนียม ฿30)`.
+- **Delete** keeps the payment with `deleted_at`, `deleted_by`, `delete_reason` and out of every
+  total (legacy removed it); a second delete is `409 payment_deleted`.
+
+**On-tour sales** (legacy `SB_EXTRAS`, "Extra วันเดินทาง"):
+
+```jsonc
+{ "id": "ex_…", "booking_id": "BK-1", "trip_date": "2026-10-12", "service": "Longtail Join", "qty": 2, "unit_price": 650, "to_company": 910,
+  "seller": "BEST", "method": "card", "fee_pct": 3, "fee": 39, "total": 1300, "commission": 390, "customer_paid": 1339, "settle": "done",
+  "collected_at": "…", "collected_by": "ops1", "sold_at": "…", "sold_by": "ops1", "slips": [] }
+```
+
+- **The client's:** `service`, `qty` (≥ 1), `unit_price` (> 0, "ใส่ราคา"), `to_company` (at most the
+  total), `seller`, `method` (`cash`, `transfer`, `card`, or `cot`: sold now, collected on the travel
+  day), `fee_pct` (card only, at most 5, legacy's cap), `slip_ids`, `trip_date` (a day the booking
+  travels; its first by default).
+- **The server's:** `total` = qty × unit_price, `commission` = total − to_company, `fee`,
+  `customer_paid` = total + fee, `settle` (`pending` while `cot`, else `done`), `collected_*`,
+  `sold_*`. Sent with another value they are `400` naming what to use.
+- **Collect** (legacy's ✓ on a `cot` sale) takes the money as cash, or `method` transfer/card;
+  `409 already_collected` otherwise. Switching a sale back to `cot` makes it owed again.
+- A sale whose commission was paid out cannot change its commission or seller, nor be deleted
+  (`409 commission_paid`).
+- History: `Day-of extra · Longtail Join ×2 · ฿1,300 · คอม ฿390 (card · fee ฿39)`, `Edited extra · …`,
+  `Collected on tour · …`. A delete is not logged, as legacy.
+
+**The pier's cash handed over at day close** (new; legacy never built it), per day and pier
+(`routes.pier`, `other` when the route has none):
+- `expected` is computed when handed over: by method (`cash`, `transfer`, `card`, `card_fees`) and by
+  source (`pier_payments`, `tour_sales`, `upgrades`), plus `no_slip`. On-tour sales count on their
+  day once collected; an upgrade counts on the day it was sold if the booking travels then, else on
+  its first travel day.
+- `cash_counted` is the pier's; `cash_difference` = counted − expected cash.
+- One live hand-over per day and pier (`409 already_handed_over`); void it to redo, never once
+  accepted (`409 already_accepted`). Accounts accept it.
+- A later payment for that day is **not refused**: the read gives `expected_now` and `changed: true`.
+
+**Commission payouts** (new): a payout pays one seller the commission of the on-tour sales and
+upgrades it names. `amount` is computed. Refused: an item of another seller or with no commission
+(`400`), a `cot` sale or upgrade not collected (`409 not_collected`), an item on a live payout
+(`409 already_paid`). Void frees the items. `GET /v1/commissions` lists every commission in the range
+(a sale's trip date, an upgrade's day as above) with its `payout_id`, and `totals` per seller.
+
+**Change feed:** a booking command here is a `booking` change; kinds `pier_handover` and
+`commission_payout` announce hand-overs and payouts (`route_days: null`).
+
+### After the trip: cash on tour and no-show decisions
+
+Legacy's Travel Summary decisions, per booking and trip date (todo/money-model.md slice 4, migration
+112). Writes need `operations`, any login reads.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /v1/after-trip?date=` | — | `{ service_date, rows }`: each booking travelling that day with its cash on tour, `trip_amount` and both decisions |
+| `GET /v1/bookings/{id}/after-trip` | — | `{ cot_decisions, noshow_charges }` |
+| `PUT /v1/bookings/{id}/cot-decisions/{date}` | `{ mode, deduct?, payout?, ref?, slip_ids?, version }` | `{ decision, invoice, warnings }` |
+| `DELETE /v1/bookings/{id}/cot-decisions/{date}` | `If-Match` | `{ decision: null, invoice, warnings }` |
+| `PUT /v1/bookings/{id}/noshow-charges/{date}` | `{ decision, amount?, note?, version }` | the decision |
+| `DELETE /v1/bookings/{id}/noshow-charges/{date}` | `If-Match` | `204` |
+
+**Cash on tour** (legacy `TS_COT`): `mode` is `full` (deduct all of it from the agent's invoice),
+`part` (the client's `deduct` and `payout`, deduct-all to start), `none`, `payout` (all paid back to
+the agent) or `nocol` (never collected; `ref` says why). Except for `part`, `deduct` and `payout` are
+the server's (whole baht) and a different value is `400`. The decision answers `cot`, `kept` (what
+the company keeps) and `over`: deduct + payout above the cash on tour is a warning (`cot_over`), as
+legacy. `ref` and slips survive a change of mode. Refused: no cash on tour (`409 no_cash_on_tour`), a
+day the booking does not travel (`409 not_on_trip`), a cancelled booking.
+
+```jsonc
+// PUT /v1/bookings/BK-1/cot-decisions/2026-10-12  { "mode": "full", "ref": "KBank 123", "version": 6 }
+{ "decision": { "booking_id": "BK-1", "service_date": "2026-10-12", "mode": "full", "deduct": 1500, "payout": 0, "ref": "KBank 123",
+                "by": "ops1", "at": "…", "cot": 1500, "kept": 0, "over": false, "slips": [] },
+  "invoice": { "...": "the booking's invoice", "total": 4100, "overpaid": 0 }, "warnings": [] }
+```
+
+**The invoice subtracts `deduct`** (decided 2026-10-09; legacy only warned, so the money was
+collected twice). The booking's live booking or prepay invoice gets a minus line per trip date
+(`cot_date`), changed with the decision and taken off (`removed_reason: "cot"`) when it is cleared;
+its totals and VAT are worked out again, as for a discount. A booking not invoiced yet gets the lines
+when it is. A fee invoice is never touched. An invoice already paid can end up `overpaid`: the
+answer warns `invoice_overpaid`; refunding or crediting it is accounting's. History: `Invoice
+INV-2610-0012 · cash on tour deducted ฿1,500 · total ฿4,100`.
+
+**No-show charge** (legacy `travel_sum`): `decision` `full` (amount the trip's price, computed:
+legacy `tsTripAmount`, 0 on an overnight return leg, a trip's own subtotal on a multi-trip booking,
+else the booking's total), `partial` (the client's `amount`, whole baht, required), `none` or
+`postpone` (0); a different amount is `400`. It bills nothing and moves nothing: on `postpone` the
+screen opens the reschedule, as legacy.
+
+**Import.** `import-legacy.ts` mirrors legacy's pier payments, `SB_EXTRAS`, `TS_COT`, `travel_sum`,
+the PFM history lines and the B2C payment state (`legacy-pier-money.ts`), `lg_`-prefixed and hanging
+off the imported bookings, so they are replaced with them on every run; what was made here on an
+imported booking goes with it, as invoices' payments do. Imported invoices get no minus lines, so
+their totals stay legacy's; the run lists the invoiced bookings that carry a deduction.
+Rehearsal of 2026-10-09 (after `import:attachments`), every total equal to legacy's:
+- 158 pier payments on 156 bookings: cash 122 ฿325,000, card 27 ฿63,323 + ฿2,698 fees, transfer 9
+  ฿13,990; all 34 slips linked;
+- 160 on-tour sales, ฿256,000, commission ฿80,500; 49 slips;
+- 143 COT decisions (deduct ฿203,450, payout ฿20,750; 8 slips); 76 no-show decisions (฿349,000);
+- 71 PFM events (69 reminders, 2 extensions);
+- 56 bookings owing a B2C balance (฿417,079; legacy's other 2 are bookings the import skips, a test
+  order among them);
+- 11 invoiced bookings carry a deduction their invoice does not show.
 
 ### Upgrades
 
@@ -2604,6 +2807,12 @@ spellings (`sellPrice`, `toCompany`, `feePct`) are accepted.
   - a `slips` id that isn't an uploaded file (see "Attachments").
 
   `id` is the client's (`up_<ms>`), made by the server if absent. `settle` starts `pending`.
+- **`collected` is set once** (todo/money-model.md slice 3, the same rule as on-tour sales): a new sale
+  may say it was paid; an existing sale's `collected` sent different is `400` naming
+  `POST /v1/bookings/{id}/upgrades/{upgrade_id}/collect` (`{ method?, fee_pct?, slip_ids?, version }`,
+  cash by default, as legacy's collect button; a card pays its fee on top; slips are added). It answers
+  the booking, logs `Collected on tour · <label> · ฿1,100 (cash)`, and refuses one already collected
+  (`409 already_collected`). Areas: `operations` or `accounting`.
 - **History**, in legacy's words: "Upgrade · <label> · ขาย ฿2,000 · บริษัท ฿1,300 · คอม ฿700 ·
   <seller>" for a new sale; "Edited upgrade · …" for a changed one. Removing a sale isn't logged.
 

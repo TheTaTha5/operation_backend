@@ -76,6 +76,12 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/users' || path.startsWith('/v1/users/')) return { kind: 'admin' };
   // The document check's note: legacy lets anyone edit it (decision C3, 2026-10-09).
   if (/^\/v1\/bookings\/[^/]+\/doc-check\/note$/.test(path)) return { kind: 'self' };
+  // Money on a booking (todo/money-model.md slices 2–4), as legacy saves it: the Daily PFM and an
+  // upgrade's money through `acctPersistBookings` (operations or accounting); pier payments from the
+  // pier check-in (`ckCanEdit`: pier or operations; accounting saves bookings too). On-tour sales and
+  // the after-trip decisions are operations' (`sbExtrasPersist`, `laGuardEdit('operations')`), below.
+  if (/^\/v1\/bookings\/[^/]+\/pfm\//.test(path) || /^\/v1\/bookings\/[^/]+\/upgrades\/[^/]+\/collect$/.test(path)) return { kind: 'area', areas: ['operations', 'accounting'] };
+  if (/^\/v1\/bookings\/[^/]+\/pier-payments(\/|$)/.test(path)) return { kind: 'area', areas: ['pier', 'operations', 'accounting'] };
   if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-lock')) return { kind: 'area', areas: ['operations'] };
   // Files: booking documents (operations), pier and payment slips (pier, accounting); legacy let any editor upload.
   if (path === '/v1/attachments' || path.startsWith('/v1/attachments/')) return { kind: 'area', areas: ['operations', 'pier', 'accounting'] };
@@ -123,8 +129,17 @@ export function writeNeed(path: string): WriteNeed {
   if (path.startsWith('/v1/van-bills/')) return { kind: 'area', areas: ['accounting'] };
   if (path === '/v1/van-rates') return { kind: 'area', areas: ['accounting', 'fleet'] };
   if (path === '/v1/reports/daily/settings') return { kind: 'area', areas: ['operations', 'accounting'] };
+  // The Daily PFM's reminder; the pier's cash handed over at day close, accepted by accounts; sellers'
+  // commissions paid out by accounts (todo/money-model.md slices 2 and 3; legacy had no settlement).
+  if (path === '/v1/pfm/remind') return { kind: 'area', areas: ['operations', 'accounting'] };
+  if (/^\/v1\/pier-handovers\/[^/]+\/accept$/.test(path)) return { kind: 'area', areas: ['accounting'] };
+  if (path === '/v1/pier-handovers' || path.startsWith('/v1/pier-handovers/')) return { kind: 'area', areas: ['pier', 'operations'] };
+  if (path === '/v1/commission-payouts' || path.startsWith('/v1/commission-payouts/')) return { kind: 'area', areas: ['accounting'] };
   return { kind: 'admin' };
 }
+
+/** The money kept beside a booking: staff's, never a login tied to an agent, which books and nothing else. */
+const BOOKING_MONEY = /^\/v1\/bookings\/[^/]+\/(pfm|pier-payments|tour-sales|cot-decisions|noshow-charges|upgrades)(\/|$)/;
 
 /** Throws `403` naming what is missing, unless `user` may make a write to `path`. */
 export function assertMayWrite(user: StoredUser, path: string): void {
@@ -134,7 +149,7 @@ export function assertMayWrite(user: StoredUser, path: string): void {
   // todo/catalogue-editing-model.md; legacy's `POST /api/b2c/routes`), without the config area.
   if (user.agent_id === LOVE_KINGDOM_AGENT && path === '/v1/routes') return;
   // A login tied to one agent books for it and does nothing else (Love Kingdom's service user).
-  if (user.agent_id !== null && !(path === '/v1/bookings' || path.startsWith('/v1/bookings/'))) {
+  if (user.agent_id !== null && (!(path === '/v1/bookings' || path.startsWith('/v1/bookings/')) || BOOKING_MONEY.test(path))) {
     refuse(`This login books for agent ${user.agent_id} and may change nothing else`, 403, 'forbidden');
   }
   if (need.kind === 'admin') {

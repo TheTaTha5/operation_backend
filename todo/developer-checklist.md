@@ -54,6 +54,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    assets, incidents and jobs at the same moment** (integration branch §3.15); a re-run overwrites
    edits made here to legacy's records. From then on deploying a boat under repair needs
    `deploy_anyway` (Boat Operation, §3.13).
+1b8. **Money slices 2–4 (`feat/money-pier-and-after-trip`, migrations 110–112):** after deploying,
+   re-run `import-legacy` so legacy's 158 pier payments, 160 on-tour sales, 143 COT decisions, 76
+   no-show decisions, the PFM history and Love Kingdom's balances arrive (run `import:attachments`
+   first for their slips). 111 appends `pier_handover` and `commission_payout` to
+   `changes_kind_check` without restating it. Decide when legacy stops writing `pierPayments`,
+   `SB_EXTRAS`, `TS_COT` and `travel_sum`: until then each import replaces what was recorded here.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -166,6 +172,13 @@ it is missing here. So, in this order:
   New products' routes are created with `POST /v1/routes` instead of legacy's `/api/b2c/routes`
   (§3b): read `route.id`; `pricing` is no longer part of it (ops price routes in rate types).
 
+- **Love Kingdom:** four new optional booking fields, `payment_paid`, `payment_paid_status`,
+  `payment_deposit`, `payment_balance` (legacy's `paymentSnapshot`): send them on create and update so
+  the pier collects the right balance (`docs/love-kingdom-integration.md`). Its login may not touch a
+  booking's PFM, pier payments, on-tour sales or after-trip decisions (`403`).
+- **Legacy integration client:** handoff §2.9 (Daily PFM, pier money, on-tour sales, Travel Summary
+  decisions) and §3.9: an upgrade's "collected" tick is now `POST …/upgrades/{id}/collect`.
+
 ## Ask ops
 
 - **The 2027 route calendars.** Five Panwa routes close to bookings on 2027-01-01
@@ -175,6 +188,9 @@ it is missing here. So, in this order:
 - **B2C orphans:** cancel the 6 bookings of deleted Love Kingdom orders (2 in the future hold seats)
   and the 3 test bookings in legacy (`b2c-sync-model.md` 7).
 - **Fleet projects PRJ-001…007:** copies or real? (`fleet-maintenance-model.md` 10)
+- **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
+  pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
+  invoice left overpaid by a cash-on-tour deduction.
 
 ## Ask sales
 

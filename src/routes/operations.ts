@@ -51,6 +51,8 @@ import { registerSalesRoutes } from './sales-editing.js';
 import { registerMoneyReportRoutes } from './money-reports.js';
 import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
+import { registerMoneyRoutes } from './money.js';
+import { cotDeductions } from '../domain/after-trip.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
@@ -1445,7 +1447,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       for (const id of input.booking_ids) bookings.push((await store.booking(id)) ?? badRequest(`Booking ${id} not found`));
       const routes = new Map((await store.listRoutes()).map((r) => [r.id, r.name]));
       const now = new Date();
-      const invoice = issueInvoice({ id: newInvoiceId(), number: await nextNumber(now), request: input, agent, lines: invoiceLines(agent.id, bookings, (id) => routes.get(id)), now: now.toISOString(), by });
+      // Cash on tour already decided as taken off the agent's bill is a minus line (todo/money-model.md slice 4).
+      const cot = await store.cotDecisions(bookings.map((b) => b.id));
+      const issuable = bookings.map((b) => ({ ...b, cot_deductions: cotDeductions(cot.filter((d) => d.booking_id === b.id)) }));
+      const invoice = issueInvoice({ id: newInvoiceId(), number: await nextNumber(now), request: input, agent, lines: invoiceLines(agent.id, issuable, (id) => routes.get(id)), now: now.toISOString(), by });
       await store.putInvoice(invoice);
       await historyOn(invoice, issuedLine(by, invoice));
       return invoice;
@@ -1911,6 +1916,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   registerMoneyReportRoutes(app, { store });
   /** Fleet maintenance, part A: availability, engines/gearboxes/propellers, incidents, jobs (`fleet.ts`). */
   registerFleetRoutes(app, { store });
+  registerMoneyRoutes(app, { store, assertBookingFresh });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an

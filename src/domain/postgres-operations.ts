@@ -37,6 +37,9 @@ import type { AltPickup } from './alt-pickups.js';
 import type { Allergy } from './allergies.js';
 import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import type { InvoiceBrief, InvoiceLine, StoredInvoice, StoredPayment, StoredRefund } from './invoices.js';
+import type { PfmEvent } from './pfm.js';
+import type { PayoutItem, StoredHandover, StoredPayout, StoredPierPayment, StoredTourSale, Takings } from './pier-money.js';
+import type { StoredCotDecision, StoredNoshowCharge } from './after-trip.js';
 import { type ClosureListQuery, type WeatherCase, type WeatherClosure } from './weather.js';
 import { DOC_ITEMS, type DocCheck } from './doc-check.js';
 import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
@@ -248,6 +251,7 @@ const storedInvoice = (r: QueryResultRow): StoredInvoice => ({
   lines: ((r.lines as Record<string, unknown>[]) ?? []).map((l): InvoiceLine => ({
     seq: Number(l.seq), booking_id: (l.booking_id as string) ?? null, label: String(l.label), amount: Number(l.amount), discount: numOrNull(l.discount),
     removed_at: l.removed_at ? jsonInstant(l.removed_at) : null, removed_by: (l.removed_by as string) ?? null, removed_reason: (l.removed_reason as string) ?? null,
+    ...(l.cot_date ? { cot_date: String(l.cot_date) } : {}),
   })),
 });
 const storedRefund = (r: QueryResultRow): StoredRefund => ({
@@ -2260,14 +2264,15 @@ export class PostgresOperationsStore {
     [i.id, i.number, i.agent_id, i.kind, i.fee_type, i.vat_mode, i.vat_rate, i.subtotal, i.net_amount, i.vat_amount, i.total, i.wht_amount,
       i.issued_at, i.due_at, i.note, i.ref, i.dear, i.accept_at, i.remark, i.voided, i.voided_at, i.voided_by, i.void_reason, i.created_by]);
     await this.client().query('DELETE FROM invoice_lines WHERE invoice_id = $1', [i.id]);
-    await this.client().query(`INSERT INTO invoice_lines (invoice_id, seq, booking_id, label, amount, discount, removed_at, removed_by, removed_reason)
-      SELECT $1, l.seq, l.booking_id, l.label, l.amount, l.discount, l.removed_at, l.removed_by, l.removed_reason
-      FROM jsonb_to_recordset($2::jsonb) AS l(seq int, booking_id text, label text, amount numeric, discount numeric, removed_at timestamptz, removed_by text, removed_reason text)`,
+    await this.client().query(`INSERT INTO invoice_lines (invoice_id, seq, booking_id, label, amount, discount, removed_at, removed_by, removed_reason, cot_date)
+      SELECT $1, l.seq, l.booking_id, l.label, l.amount, l.discount, l.removed_at, l.removed_by, l.removed_reason, l.cot_date
+      FROM jsonb_to_recordset($2::jsonb) AS l(seq int, booking_id text, label text, amount numeric, discount numeric, removed_at timestamptz, removed_by text, removed_reason text, cot_date date)`,
     [i.id, JSON.stringify(i.lines)]);
   }
   private async invoicesWhere(where: string, params: unknown[]): Promise<StoredInvoice[]> {
     const { rows } = await this.client().query(`SELECT i.*, i.accept_at::text AS accept_at, COALESCE((SELECT jsonb_agg(jsonb_build_object('seq', l.seq, 'booking_id', l.booking_id,
-        'label', l.label, 'amount', l.amount, 'discount', l.discount, 'removed_at', l.removed_at, 'removed_by', l.removed_by, 'removed_reason', l.removed_reason) ORDER BY l.seq)
+        'label', l.label, 'amount', l.amount, 'discount', l.discount, 'removed_at', l.removed_at, 'removed_by', l.removed_by, 'removed_reason', l.removed_reason,
+        'cot_date', l.cot_date::text) ORDER BY l.seq)
         FROM invoice_lines l WHERE l.invoice_id = i.id), '[]'::jsonb) AS lines
       FROM invoices i WHERE ${where} ORDER BY i.issued_at, i.id`, params);
     return rows.map(storedInvoice);
@@ -2358,6 +2363,140 @@ export class PostgresOperationsStore {
     await this.client().query('DELETE FROM weather_cases WHERE closure_id = $1 AND booking_id = $2', [closureId, bookingId]);
   }
 
+  // ── Money: proforma, pier money, after the trip (migrations 110–112) ──
+  /** A command that writes beside the booking (a pier payment, a decision): the booking's version moves on. */
+  async bumpBooking(id: string, actor?: string): Promise<void> { await this.touch(id, actor); }
+  async pfmEvents(bookingIds: readonly string[]): Promise<PfmEvent[]> {
+    const { rows } = await this.client().query('SELECT * FROM booking_pfm_events WHERE booking_id = ANY($1::text[]) ORDER BY at, id', [bookingIds]);
+    return rows.map((r) => ({ id: Number(r.id), booking_id: String(r.booking_id), kind: r.kind, approver: r.approver ?? null, by: r.by ?? null, at: asIso(r.at) }));
+  }
+  async addPfmEvent(e: Omit<PfmEvent, 'id'>): Promise<void> {
+    await this.client().query('INSERT INTO booking_pfm_events (booking_id, kind, approver, by, at) VALUES ($1,$2,$3,$4,$5)', [e.booking_id, e.kind, e.approver, e.by, e.at]);
+  }
+  private async pierPaymentsWhere(where: string, params: unknown[]): Promise<StoredPierPayment[]> {
+    const { rows } = await this.client().query(`SELECT p.*, p.service_date::text AS day,
+        COALESCE((SELECT jsonb_agg(s.attachment_id ORDER BY s.seq) FROM booking_pier_payment_slips s WHERE s.payment_id = p.id), '[]'::jsonb) AS slips
+      FROM booking_pier_payments p WHERE ${where} ORDER BY p.at, p.id COLLATE "C"`, params);
+    return rows.map((r): StoredPierPayment => ({
+      id: String(r.id), booking_id: String(r.booking_id), service_date: String(r.day), method: r.method, amount: Number(r.amount), fee: Number(r.fee),
+      fee_pct: r.fee_pct === null ? null : Number(r.fee_pct), note: r.note ?? null, by: r.by ?? null, at: asIso(r.at),
+      deleted_at: r.deleted_at ? asIso(r.deleted_at) : null, deleted_by: r.deleted_by ?? null, delete_reason: r.delete_reason ?? null, slips: (r.slips as string[]) ?? [],
+    }));
+  }
+  /** Deleted ones too, oldest first. */
+  async pierPayments(bookingIds: readonly string[]): Promise<StoredPierPayment[]> { return this.pierPaymentsWhere('p.booking_id = ANY($1::text[])', [bookingIds]); }
+  async putPierPayment(p: StoredPierPayment): Promise<void> {
+    await this.client().query(`INSERT INTO booking_pier_payments (id, booking_id, service_date, method, amount, fee, fee_pct, note, by, at, deleted_at, deleted_by, delete_reason)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ON CONFLICT (id) DO UPDATE SET deleted_at = EXCLUDED.deleted_at, deleted_by = EXCLUDED.deleted_by, delete_reason = EXCLUDED.delete_reason, note = EXCLUDED.note`,
+    [p.id, p.booking_id, p.service_date, p.method, p.amount, p.fee, p.fee_pct, p.note, p.by, p.at, p.deleted_at, p.deleted_by, p.delete_reason]);
+    await this.client().query('DELETE FROM booking_pier_payment_slips WHERE payment_id = $1', [p.id]);
+    await this.client().query(`INSERT INTO booking_pier_payment_slips (payment_id, seq, attachment_id) SELECT $1, s.ordinality - 1, s.id
+      FROM jsonb_array_elements_text($2::jsonb) WITH ORDINALITY AS s(id, ordinality)`, [p.id, JSON.stringify(p.slips)]);
+  }
+  /** Oldest first. */
+  async tourSales(bookingIds: readonly string[]): Promise<StoredTourSale[]> {
+    const { rows } = await this.client().query(`SELECT t.*, t.trip_date::text AS day,
+        COALESCE((SELECT jsonb_agg(s.attachment_id ORDER BY s.seq) FROM booking_tour_sale_slips s WHERE s.sale_id = t.id), '[]'::jsonb) AS slips
+      FROM booking_tour_sales t WHERE t.booking_id = ANY($1::text[]) ORDER BY t.sold_at, t.id COLLATE "C"`, [bookingIds]);
+    return rows.map((r): StoredTourSale => ({
+      id: String(r.id), booking_id: String(r.booking_id), trip_date: r.day ?? null, service: String(r.service), qty: Number(r.qty), unit_price: Number(r.unit_price),
+      to_company: Number(r.to_company), seller: r.seller ?? null, method: r.method, fee_pct: Number(r.fee_pct), fee: Number(r.fee),
+      collected_at: r.collected_at ? asIso(r.collected_at) : null, collected_by: r.collected_by ?? null, sold_at: asIso(r.sold_at), sold_by: r.sold_by ?? null,
+      slips: (r.slips as string[]) ?? [],
+    }));
+  }
+  async putTourSale(s: StoredTourSale): Promise<void> {
+    await this.client().query(`INSERT INTO booking_tour_sales (id, booking_id, trip_date, service, qty, unit_price, to_company, seller, method, fee_pct, fee,
+        collected_at, collected_by, sold_at, sold_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (id) DO UPDATE SET trip_date = EXCLUDED.trip_date, service = EXCLUDED.service, qty = EXCLUDED.qty, unit_price = EXCLUDED.unit_price,
+        to_company = EXCLUDED.to_company, seller = EXCLUDED.seller, method = EXCLUDED.method, fee_pct = EXCLUDED.fee_pct, fee = EXCLUDED.fee,
+        collected_at = EXCLUDED.collected_at, collected_by = EXCLUDED.collected_by`,
+    [s.id, s.booking_id, s.trip_date, s.service, s.qty, s.unit_price, s.to_company, s.seller, s.method, s.fee_pct, s.fee, s.collected_at, s.collected_by, s.sold_at, s.sold_by]);
+    await this.client().query('DELETE FROM booking_tour_sale_slips WHERE sale_id = $1', [s.id]);
+    await this.client().query(`INSERT INTO booking_tour_sale_slips (sale_id, seq, attachment_id) SELECT $1, s.ordinality - 1, s.id
+      FROM jsonb_array_elements_text($2::jsonb) WITH ORDINALITY AS s(id, ordinality)`, [s.id, JSON.stringify(s.slips)]);
+  }
+  async deleteTourSale(id: string): Promise<void> { await this.client().query('DELETE FROM booking_tour_sales WHERE id = $1', [id]); }
+  async cotDecisions(bookingIds: readonly string[]): Promise<StoredCotDecision[]> {
+    const { rows } = await this.client().query(`SELECT d.*, d.service_date::text AS day,
+        COALESCE((SELECT jsonb_agg(s.attachment_id ORDER BY s.seq) FROM booking_cot_decision_slips s WHERE s.booking_id = d.booking_id AND s.service_date = d.service_date), '[]'::jsonb) AS slips
+      FROM booking_cot_decisions d WHERE d.booking_id = ANY($1::text[]) ORDER BY d.booking_id COLLATE "C", d.service_date`, [bookingIds]);
+    return rows.map((r): StoredCotDecision => ({
+      booking_id: String(r.booking_id), service_date: String(r.day), mode: r.mode, deduct: Number(r.deduct), payout: Number(r.payout), ref: r.ref ?? null,
+      by: r.by ?? null, at: asIso(r.at), slips: (r.slips as string[]) ?? [],
+    }));
+  }
+  async putCotDecision(d: StoredCotDecision): Promise<void> {
+    await this.client().query(`INSERT INTO booking_cot_decisions (booking_id, service_date, mode, deduct, payout, ref, by, at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (booking_id, service_date) DO UPDATE SET mode = EXCLUDED.mode, deduct = EXCLUDED.deduct, payout = EXCLUDED.payout, ref = EXCLUDED.ref, by = EXCLUDED.by, at = EXCLUDED.at`,
+    [d.booking_id, d.service_date, d.mode, d.deduct, d.payout, d.ref, d.by, d.at]);
+    await this.client().query('DELETE FROM booking_cot_decision_slips WHERE booking_id = $1 AND service_date = $2', [d.booking_id, d.service_date]);
+    await this.client().query(`INSERT INTO booking_cot_decision_slips (booking_id, service_date, seq, attachment_id) SELECT $1, $2, s.ordinality - 1, s.id
+      FROM jsonb_array_elements_text($3::jsonb) WITH ORDINALITY AS s(id, ordinality)`, [d.booking_id, d.service_date, JSON.stringify(d.slips)]);
+  }
+  async deleteCotDecision(bookingId: string, date: string): Promise<boolean> {
+    return ((await this.client().query('DELETE FROM booking_cot_decisions WHERE booking_id = $1 AND service_date = $2', [bookingId, date])).rowCount ?? 0) > 0;
+  }
+  async noshowCharges(bookingIds: readonly string[]): Promise<StoredNoshowCharge[]> {
+    const { rows } = await this.client().query(`SELECT c.*, c.service_date::text AS day FROM booking_noshow_charges c WHERE c.booking_id = ANY($1::text[])
+      ORDER BY c.booking_id COLLATE "C", c.service_date`, [bookingIds]);
+    return rows.map((r): StoredNoshowCharge => ({ booking_id: String(r.booking_id), service_date: String(r.day), decision: r.decision, amount: Number(r.amount), note: r.note ?? null, by: r.by ?? null, at: asIso(r.at) }));
+  }
+  async putNoshowCharge(c: StoredNoshowCharge): Promise<void> {
+    await this.client().query(`INSERT INTO booking_noshow_charges (booking_id, service_date, decision, amount, note, by, at) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (booking_id, service_date) DO UPDATE SET decision = EXCLUDED.decision, amount = EXCLUDED.amount, note = EXCLUDED.note, by = EXCLUDED.by, at = EXCLUDED.at`,
+    [c.booking_id, c.service_date, c.decision, c.amount, c.note, c.by, c.at]);
+  }
+  async deleteNoshowCharge(bookingId: string, date: string): Promise<boolean> {
+    return ((await this.client().query('DELETE FROM booking_noshow_charges WHERE booking_id = $1 AND service_date = $2', [bookingId, date])).rowCount ?? 0) > 0;
+  }
+  /** By day, then pier, then when handed over. */
+  async handovers(q: { from?: string; to?: string; pier?: string; ids?: readonly string[] } = {}): Promise<StoredHandover[]> {
+    const { rows } = await this.client().query(`SELECT h.*, h.service_date::text AS day FROM pier_handovers h
+      WHERE ($1::date IS NULL OR h.service_date >= $1) AND ($2::date IS NULL OR h.service_date <= $2) AND ($3::text IS NULL OR h.pier = $3) AND ($4::text[] IS NULL OR h.id = ANY($4))
+      ORDER BY h.service_date, h.pier COLLATE "C", h.handed_at, h.id COLLATE "C"`, [q.from ?? null, q.to ?? null, q.pier ?? null, q.ids ? [...q.ids] : null]);
+    return rows.map((r): StoredHandover => ({
+      id: String(r.id), service_date: String(r.day), pier: String(r.pier), expected: r.expected as Takings, cash_counted: Number(r.cash_counted), note: r.note ?? null,
+      handed_by: r.handed_by ?? null, handed_at: asIso(r.handed_at), accepted_by: r.accepted_by ?? null, accepted_at: r.accepted_at ? asIso(r.accepted_at) : null,
+      accept_note: r.accept_note ?? null, voided_by: r.voided_by ?? null, voided_at: r.voided_at ? asIso(r.voided_at) : null, void_reason: r.void_reason ?? null,
+    }));
+  }
+  /** One live hand-over per day and pier: the unique index's refusal is the route's `409`. */
+  async putHandover(h: StoredHandover): Promise<void> {
+    try {
+      await this.client().query(`INSERT INTO pier_handovers (id, service_date, pier, expected, cash_counted, note, handed_by, handed_at, accepted_by, accepted_at, accept_note, voided_by, voided_at, void_reason)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+        ON CONFLICT (id) DO UPDATE SET accepted_by = EXCLUDED.accepted_by, accepted_at = EXCLUDED.accepted_at, accept_note = EXCLUDED.accept_note,
+          voided_by = EXCLUDED.voided_by, voided_at = EXCLUDED.voided_at, void_reason = EXCLUDED.void_reason`,
+      [h.id, h.service_date, h.pier, JSON.stringify(h.expected), h.cash_counted, h.note, h.handed_by, h.handed_at, h.accepted_by, h.accepted_at, h.accept_note, h.voided_by, h.voided_at, h.void_reason]);
+    } catch (error) {
+      if ((error as { constraint?: string }).constraint !== 'pier_handovers_live') throw error;
+      refuse(`${h.pier} was already handed over for ${h.service_date}`, 409, 'already_handed_over');
+    }
+  }
+  /** Newest last. */
+  async payouts(q: { seller?: string; from?: string; to?: string; ids?: readonly string[] } = {}): Promise<StoredPayout[]> {
+    const { rows } = await this.client().query(`SELECT p.*, p.paid_on::text AS day, COALESCE((SELECT jsonb_agg(jsonb_build_object('kind', i.kind, 'booking_id', i.booking_id,
+        'item_id', i.item_id, 'amount', i.amount) ORDER BY i.kind, i.booking_id COLLATE "C", i.item_id COLLATE "C") FROM commission_payout_items i WHERE i.payout_id = p.id), '[]'::jsonb) AS items
+      FROM commission_payouts p WHERE ($1::text IS NULL OR p.seller = $1) AND ($2::date IS NULL OR p.paid_on >= $2) AND ($3::date IS NULL OR p.paid_on <= $3)
+        AND ($4::text[] IS NULL OR p.id = ANY($4)) ORDER BY p.created_at, p.id COLLATE "C"`, [q.seller ?? null, q.from ?? null, q.to ?? null, q.ids ? [...q.ids] : null]);
+    return rows.map((r): StoredPayout => ({
+      id: String(r.id), seller: String(r.seller), amount: Number(r.amount), method: r.method, paid_on: String(r.day), ref: r.ref ?? null, note: r.note ?? null,
+      created_by: r.created_by ?? null, created_at: asIso(r.created_at), voided_by: r.voided_by ?? null, voided_at: r.voided_at ? asIso(r.voided_at) : null,
+      void_reason: r.void_reason ?? null, items: ((r.items as PayoutItem[]) ?? []).map((i) => ({ ...i, amount: Number(i.amount) })),
+    }));
+  }
+  async putPayout(p: StoredPayout): Promise<void> {
+    await this.client().query(`INSERT INTO commission_payouts (id, seller, amount, method, paid_on, ref, note, created_by, created_at, voided_by, voided_at, void_reason)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT (id) DO UPDATE SET voided_by = EXCLUDED.voided_by, voided_at = EXCLUDED.voided_at, void_reason = EXCLUDED.void_reason`,
+    [p.id, p.seller, p.amount, p.method, p.paid_on, p.ref, p.note, p.created_by, p.created_at, p.voided_by, p.voided_at, p.void_reason]);
+    await this.client().query('DELETE FROM commission_payout_items WHERE payout_id = $1', [p.id]);
+    await this.client().query(`INSERT INTO commission_payout_items (payout_id, kind, booking_id, item_id, amount)
+      SELECT $1, i.kind, i.booking_id, i.item_id, i.amount FROM jsonb_to_recordset($2::jsonb) AS i(kind text, booking_id text, item_id text, amount numeric)`, [p.id, JSON.stringify(p.items)]);
+  }
+
   /** A boat's capacity for one day (migration 046 records who and when): the trip-ops raise. */
   async putBoatCapacityOverride(o: { boat_id: string; service_date: string; capacity: number; reason: string; set_by: string | null; set_at: string }): Promise<void> {
     await this.client().query(`INSERT INTO boat_capacity_overrides (boat_id, service_date, capacity, reason, set_by, set_at) VALUES ($1, $2, $3, $4, $5, $6)
@@ -2382,7 +2521,10 @@ export class PostgresOperationsStore {
   async attachmentBookings(id: string): Promise<Booking[]> {
     const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.id IN (SELECT booking_id FROM booking_documents WHERE attachment_id = $1
       UNION SELECT booking_id FROM booking_upgrade_slips WHERE attachment_id = $1
-      UNION SELECT l.booking_id FROM payment_slips s JOIN payments p ON p.id = s.payment_id JOIN invoice_lines l ON l.invoice_id = p.invoice_id WHERE s.attachment_id = $1)`, [id]);
+      UNION SELECT l.booking_id FROM payment_slips s JOIN payments p ON p.id = s.payment_id JOIN invoice_lines l ON l.invoice_id = p.invoice_id WHERE s.attachment_id = $1
+      UNION SELECT p.booking_id FROM booking_pier_payment_slips s JOIN booking_pier_payments p ON p.id = s.payment_id WHERE s.attachment_id = $1
+      UNION SELECT t.booking_id FROM booking_tour_sale_slips s JOIN booking_tour_sales t ON t.id = s.sale_id WHERE s.attachment_id = $1
+      UNION SELECT booking_id FROM booking_cot_decision_slips WHERE attachment_id = $1)`, [id]);
     return rows.map(booking);
   }
   async deleteAttachment(id: string): Promise<boolean> { return (await this.client().query('DELETE FROM attachments WHERE id = $1', [id])).rowCount === 1; }

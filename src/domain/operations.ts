@@ -15,6 +15,9 @@ import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocChec
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
 import { bookingIdsOf, bookingInvoice, copyInvoice, returnedOf, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment, type StoredRefund } from './invoices.js';
 import { matchesClosureQuery, planClose, sortClosures, type ClosureListQuery, type WeatherCase, type WeatherClosure } from './weather.js';
+import type { PfmEvent } from './pfm.js';
+import type { StoredHandover, StoredPayout, StoredPierPayment, StoredTourSale } from './pier-money.js';
+import type { StoredCotDecision, StoredNoshowCharge } from './after-trip.js';
 import { activeUpgrade, storedUpgrades, upgradeView, type StoredUpgrade, type TripUpgrade, type Upgrade, type UpgradeInput } from './upgrades.js';
 import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
@@ -937,6 +940,9 @@ export class OperationsStore {
   /** The bookings that point at a file, by their documents or their upgrade slips. */
   attachmentBookings(id: string): Booking[] {
     const slipped = new Set([...this.payments.values()].filter((p) => p.slips.includes(id)).flatMap((p) => bookingIdsOf(this.invoices.get(p.invoice_id) ?? { lines: [] })));
+    for (const p of this.pierRows.values()) if (p.slips.includes(id)) slipped.add(p.booking_id);
+    for (const s of this.saleRows.values()) if (s.slips.includes(id)) slipped.add(s.booking_id);
+    for (const d of this.cotRows) if (d.slips.includes(id)) slipped.add(d.booking_id);
     return [...this.bookings.values()].filter((b) => b.attachments.some((d) => d.attachment_id === id) || b.upgrades.some((u) => u.slips.includes(id)) || slipped.has(b.id)).map((b) => this.view(b));
   }
 
@@ -1011,6 +1017,77 @@ export class OperationsStore {
   deleteWeatherCase(closureId: string, bookingId: string): void {
     this.weatherCaseRows = this.weatherCaseRows.filter((r) => !(r.closure_id === closureId && r.booking_id === bookingId));
   }
+
+  // ── Money: proforma, pier money, after the trip (migrations 110–112) ──
+  private pfmRows: PfmEvent[] = [];
+  private pierRows = new Map<string, StoredPierPayment>();
+  private saleRows = new Map<string, StoredTourSale>();
+  private cotRows: StoredCotDecision[] = [];
+  private noshowRows: StoredNoshowCharge[] = [];
+  private handoverRows = new Map<string, StoredHandover>();
+  private payoutRows = new Map<string, StoredPayout>();
+  /** A command that writes beside the booking (a pier payment, a decision): the booking's version moves on. */
+  bumpBooking(id: string, actor?: string): void { const b = this.bookings.get(id); if (b) this.touch(b, actor); }
+  pfmEvents(bookingIds: readonly string[]): PfmEvent[] {
+    return this.pfmRows.filter((e) => bookingIds.includes(e.booking_id)).sort((a, b) => (a.at === b.at ? a.id - b.id : a.at < b.at ? -1 : 1)).map((e) => ({ ...e }));
+  }
+  addPfmEvent(e: Omit<PfmEvent, 'id'>): void { this.pfmRows.push({ ...e, id: this.pfmRows.length + 1 }); }
+  /** Deleted ones too, oldest first. */
+  pierPayments(bookingIds: readonly string[]): StoredPierPayment[] {
+    return [...this.pierRows.values()].filter((p) => bookingIds.includes(p.booking_id)).sort((a, b) => (a.at === b.at ? (a.id < b.id ? -1 : 1) : a.at < b.at ? -1 : 1))
+      .map((p) => ({ ...p, slips: [...p.slips] }));
+  }
+  putPierPayment(p: StoredPierPayment): void { this.pierRows.set(p.id, { ...p, slips: [...p.slips] }); }
+  /** Oldest first. */
+  tourSales(bookingIds: readonly string[]): StoredTourSale[] {
+    return [...this.saleRows.values()].filter((s) => bookingIds.includes(s.booking_id)).sort((a, b) => (a.sold_at === b.sold_at ? (a.id < b.id ? -1 : 1) : a.sold_at < b.sold_at ? -1 : 1))
+      .map((s) => ({ ...s, slips: [...s.slips] }));
+  }
+  putTourSale(s: StoredTourSale): void { this.saleRows.set(s.id, { ...s, slips: [...s.slips] }); }
+  deleteTourSale(id: string): void { this.saleRows.delete(id); }
+  cotDecisions(bookingIds: readonly string[]): StoredCotDecision[] {
+    return this.cotRows.filter((d) => bookingIds.includes(d.booking_id)).sort((a, b) => (a.booking_id === b.booking_id ? (a.service_date < b.service_date ? -1 : 1) : a.booking_id < b.booking_id ? -1 : 1))
+      .map((d) => ({ ...d, slips: [...d.slips] }));
+  }
+  putCotDecision(d: StoredCotDecision): void {
+    this.cotRows = [...this.cotRows.filter((x) => !(x.booking_id === d.booking_id && x.service_date === d.service_date)), { ...d, slips: [...d.slips] }];
+  }
+  deleteCotDecision(bookingId: string, date: string): boolean {
+    const before = this.cotRows.length;
+    this.cotRows = this.cotRows.filter((x) => !(x.booking_id === bookingId && x.service_date === date));
+    return this.cotRows.length < before;
+  }
+  noshowCharges(bookingIds: readonly string[]): StoredNoshowCharge[] {
+    return this.noshowRows.filter((c) => bookingIds.includes(c.booking_id)).sort((a, b) => (a.booking_id === b.booking_id ? (a.service_date < b.service_date ? -1 : 1) : a.booking_id < b.booking_id ? -1 : 1))
+      .map((c) => ({ ...c }));
+  }
+  putNoshowCharge(c: StoredNoshowCharge): void {
+    this.noshowRows = [...this.noshowRows.filter((x) => !(x.booking_id === c.booking_id && x.service_date === c.service_date)), { ...c }];
+  }
+  deleteNoshowCharge(bookingId: string, date: string): boolean {
+    const before = this.noshowRows.length;
+    this.noshowRows = this.noshowRows.filter((x) => !(x.booking_id === bookingId && x.service_date === date));
+    return this.noshowRows.length < before;
+  }
+  /** By day, then pier, then when handed over. */
+  handovers(q: { from?: string; to?: string; pier?: string; ids?: readonly string[] } = {}): StoredHandover[] {
+    return [...this.handoverRows.values()].filter((h) => (!q.from || h.service_date >= q.from) && (!q.to || h.service_date <= q.to) && (!q.pier || h.pier === q.pier) && (!q.ids || q.ids.includes(h.id)))
+      .sort((a, b) => (a.service_date !== b.service_date ? (a.service_date < b.service_date ? -1 : 1) : a.pier !== b.pier ? (a.pier < b.pier ? -1 : 1) : a.handed_at === b.handed_at ? (a.id < b.id ? -1 : 1) : a.handed_at < b.handed_at ? -1 : 1))
+      .map((h) => ({ ...h, expected: { ...h.expected } }));
+  }
+  /** As PostgreSQL's unique index: one live hand-over per day and pier. */
+  putHandover(h: StoredHandover): void {
+    const clash = [...this.handoverRows.values()].find((x) => x.id !== h.id && !x.voided_at && !h.voided_at && x.service_date === h.service_date && x.pier === h.pier);
+    if (clash) refuse(`${h.pier} was already handed over for ${h.service_date}`, 409, 'already_handed_over');
+    this.handoverRows.set(h.id, { ...h, expected: { ...h.expected } });
+  }
+  /** Newest last. */
+  payouts(q: { seller?: string; from?: string; to?: string; ids?: readonly string[] } = {}): StoredPayout[] {
+    return [...this.payoutRows.values()].filter((p) => (!q.seller || p.seller === q.seller) && (!q.from || p.paid_on >= q.from) && (!q.to || p.paid_on <= q.to) && (!q.ids || q.ids.includes(p.id)))
+      .sort((a, b) => (a.created_at === b.created_at ? (a.id < b.id ? -1 : 1) : a.created_at < b.created_at ? -1 : 1))
+      .map((p) => ({ ...p, items: [...p.items].sort((x, y) => (x.kind !== y.kind ? (x.kind < y.kind ? -1 : 1) : x.booking_id !== y.booking_id ? (x.booking_id < y.booking_id ? -1 : 1) : x.item_id < y.item_id ? -1 : 1)).map((i) => ({ ...i })) }));
+  }
+  putPayout(p: StoredPayout): void { this.payoutRows.set(p.id, { ...p, items: p.items.map((i) => ({ ...i })) }); }
 
   /** Route upgrades (migration 038), kept after an undo. */
   private tripUpgrades: TripUpgrade[] = [];
