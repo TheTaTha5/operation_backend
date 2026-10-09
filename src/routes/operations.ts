@@ -558,8 +558,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   });
 
   /**
-   * Settings → Programs: a route's calendar is edited here, and only here. `sync:routes` no longer
-   * copies it from legacy. A change that closes a day holding bookings or a boat is `409
+   * Settings → Programs: a route's calendar is edited here, and only here. `seed:routes` copies it
+   * only for a route new here. A change that closes a day holding bookings or a boat is `409
    * bookings_on_closed_day` unless it carries `close_anyway` (`assertCloseAllowed`).
    */
   const calendarRoute = (request: { params: unknown }): string => (request.params as { id: string }).id;
@@ -664,7 +664,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const route = await store.transaction(async () => {
       const current = (await store.route(id)) ?? notFound('Route not found');
       const next = patchedRoute(current, patch);
-      assertFamily(next.family_id, await familyIds());
+      if (patch.family_id !== undefined) assertFamily(next.family_id, await familyIds());
       if (next.ext_id) {
         const owner = await store.routeByExtId(next.ext_id);
         if (owner && owner.id !== id) extIdTaken(next.ext_id, owner.id);
