@@ -25,7 +25,9 @@
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from 'pg';
-import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { routeCalendar, todayInThailand, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
+import { isHolding, type LockRow } from '../domain/seat-locks.js';
+import { mapLegacyLocks } from './legacy-locks.js';
 import {
   BOOKING_HEADER, countDiff, legacyLockDays, legacyPax, legacyValue, RELEASED, same, samePickup, setDiff, targetPax, unreadColumns, type Row,
 } from './verify-legacy.js';
@@ -65,8 +67,9 @@ async function main() {
     const lTrips = groupBy(await L('SELECT * FROM sb_bookings__trips ORDER BY sb_bookings_id, idx'), 'sb_bookings_id');
     const lPassengers = groupBy(await L('SELECT * FROM sb_bookings__passengers ORDER BY sb_bookings_id, idx'), 'sb_bookings_id');
     const lHistory = new Map((await L('SELECT sb_bookings_id AS id, count(*)::int AS n FROM sb_bookings__history GROUP BY 1')).map((r) => [str(r.id), Number(r.n)]));
-    const lLocks = await L(`SELECT id, routeid, date, qty, status, scope, parentid, pendqty, pendby, datefrom, dateto, dow,
-      month, monthfrom, monthto, releaseddates FROM sb_seat_locks`);
+    const lLocks = await L('SELECT * FROM sb_seat_locks');
+    const lLockLog = await L('SELECT * FROM sb_seat_locks__log');
+    const lAgentIds = new Set((await L('SELECT id FROM sb_agents')).map((r) => str(r.id)).filter(Boolean));
     const lBoatDays = await L('SELECT trips_id, key, value FROM trips__boat');
     const lOverrides = await L('SELECT key FROM boat_capovr');
 
@@ -79,7 +82,9 @@ async function main() {
     const tPax = groupBy(await T(`SELECT p.* FROM booking_trip_pax p JOIN booking_trips t ON t.id = p.booking_trip_id WHERE t.booking_id LIKE '${PREFIX}%'`), 'booking_trip_id');
     const tPassengers = groupBy(await T(`SELECT * FROM booking_passengers WHERE booking_id LIKE '${PREFIX}%' ORDER BY booking_id, seq`), 'booking_id');
     const tHistory = new Map((await T(`SELECT booking_id AS id, count(*)::int AS n FROM booking_history WHERE booking_id LIKE '${PREFIX}%' GROUP BY 1`)).map((r) => [str(r.id), Number(r.n)]));
-    const tLocks = await T(`SELECT id, route_id, service_date::text AS day, pax, status FROM seat_locks WHERE id LIKE '${PREFIX}%'`);
+    const tLocks = await T(`SELECT id, route_id, service_date::text AS day, pax, pending_pax, released_pax, status, expiry::text AS expiry, boat_id, parent_id
+      FROM seat_locks WHERE id LIKE '${PREFIX}%'`);
+    const tLockEvents = Number((await T(`SELECT count(*)::int AS n FROM seat_lock_events WHERE imported AND (lock_id LIKE '${PREFIX}%' OR group_id LIKE '${PREFIX}%')`))[0].n);
     const tDeployments = await T('SELECT service_date::text AS day, boat_id, route_id FROM deployments');
     const tOverrides = await T('SELECT service_date::text AS day, boat_id FROM boat_capacity_overrides');
 
@@ -114,33 +119,27 @@ async function main() {
     check(1, 'history lines per booking', both.length, historyDiff);
 
     // ── level 1 · locks, deployments, overrides, catalogues ──
-    // A lock here is one route on one date: a legacy lock spanning days is expected as one lock per
-    // departure (`lg_<id>_<date>`), on the days its route runs here (legacyLockDays).
+    // Which locks the import should have written is the mapping's to say (legacy-locks.ts: a bulk lock
+    // as one lock per departure, sub-groups as their own locks, a lock with no seats asked skipped).
+    // This checks each one is there; level 4 checks the seats they hold against legacy's own count.
     const calendar = routeCalendar(
       (await T('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons')) as RouteSeason[],
       (await T('SELECT route_id, service_date::text, kind FROM route_day_overrides')) as RouteDayOverride[]);
-    const parents = lLocks.filter((l) => !str(l.parentid));
-    const spans = (l: Row) => ['bulk', 'month'].includes(str(l.scope));
-    const departures = new Map(parents.map((l) => [str(l.id), legacyLockDays(l, (date) => calendar.isOpen(str(l.routeid), date))]));
-    const expectedIds = new Map<string, Row>();   // imported id → its legacy lock
-    for (const l of parents) {
-      if (!spans(l)) { expectedIds.set(PREFIX + str(l.id), l); continue; }
-      for (const d of departures.get(str(l.id))!) expectedIds.set(`${PREFIX}${str(l.id)}_${d.date}`, l);
-    }
-    const lockPresence = setDiff(expectedIds.keys(), tLocks.map((l) => str(l.id)));
-    // One line per legacy lock, those still holding seats first: a released or empty one costs nothing.
-    const holding = (l: Row) => str(l.status) === 'active' && Number(l.qty) > 0;
-    const missingByLock = new Map<Row, number>();
-    for (const id of lockPresence.missing) { const l = expectedIds.get(id)!; missingByLock.set(l, (missingByLock.get(l) ?? 0) + 1); }
-    const missingLocks = [...missingByLock].sort((a, b) => Number(holding(b[0])) - Number(holding(a[0])));
-    const lockKinds = new Map<string, number>();
-    for (const [l] of missingLocks) add(lockKinds, `scope ${str(l.scope) || 'day'}, ${str(l.status) || '(blank)'}${Number(l.qty) > 0 ? '' : ', 0 seats'}`, 1);
-    const bulkDepartures = parents.filter(spans).reduce((n, l) => n + departures.get(str(l.id))!.length, 0);
-    check(1, 'seat locks present (sub-locks fold into their parent; bulk = one per departure)', expectedIds.size,
-      missingLocks.map(([l, n]) => `${str(l.id)} missing${spans(l) ? ` ${n} departure(s)` : ''} (scope ${str(l.scope) || 'day'}, status ${str(l.status)}, ${str(l.routeid)} ${str(l.date) || `${str(l.datefrom) || str(l.monthfrom) || str(l.month)}..`}, ${str(l.qty)} seat(s))`),
-      [`${parents.filter(spans).length} legacy lock(s) span days: ${bulkDepartures} departure(s) expected`,
-        ...[...lockKinds].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${String(n).padStart(5)} lock(s) missing: ${k}`),
+    const today = todayInThailand();
+    const mapSkips: string[] = [];
+    const mapped = mapLegacyLocks({ locks: lLocks, log: lLockLog }, {
+      prefix: PREFIX, agents: lAgentIds, routes: new Set((await T('SELECT id FROM routes')).map((r) => str(r.id))),
+      isOpen: (routeId, date) => calendar.isOpen(routeId, date), today, now: new Date().toISOString(),
+    }, { skip: (_kind, id, reason) => mapSkips.push(`${id}: ${reason}`), note: () => undefined });
+    const lockPresence = setDiff(mapped.locks.map((l) => str(l.id)), tLocks.map((l) => str(l.id)));
+    check(1, 'seat locks present (bulk = one per departure; sub-groups their own)', mapped.locks.length,
+      lockPresence.missing.map((id) => `${id} missing`),
+      [`${mapped.groups.length} bulk lock(s), ${mapped.locks.filter((l) => l.parent_id).length} sub-group(s)`, ...mapSkips.map((s) => `not imported: ${s}`),
         ...(lockPresence.extra.length ? [`${lockPresence.extra.length} imported lock(s) legacy does not have`] : [])]);
+    check(1, 'lock log lines present (imported)', mapped.events.length, mapped.events.length === tLockEvents ? [] : [`${mapped.events.length} expected, ${tLockEvents} here`],
+      [`${lLockLog.length - mapped.events.length} legacy line(s) of locks not imported, or with no day`]);
+    const parents = lLocks.filter((l) => !str(l.parentid));
+    const departures = new Map(parents.map((l) => [str(l.id), legacyLockDays(l, (date) => calendar.isOpen(str(l.routeid), date))]));
 
     const legacyDeployments = new Map<string, string>(); // day::boat → route
     for (const bd of lBoatDays) {
@@ -289,8 +288,10 @@ async function main() {
 
     const lLocked = new Map<string, number>(), tLocked = new Map<string, number>();
     for (const l of parents) for (const d of departures.get(str(l.id))!) if (d.holding) add(lLocked, `${str(l.routeid)} ${d.date}`, d.pax);
-    for (const l of tLocks) if (str(l.status) === 'active') add(tLocked, `${str(l.route_id)} ${str(l.day)}`, Number(l.pax) || 0);
-    check(4, 'locked seats per route and day (active locks, bulk ones per departure)', new Set([...lLocked.keys(), ...tLocked.keys()]).size, countDiff(lLocked, tLocked));
+    // Here: what a top-level lock still holding has, less released and pending: legacy's qty less pending.
+    const holdingHere = (l: Row) => !l.parent_id && isHolding({ status: str(l.status) as LockRow['status'], expiry: (l.expiry as string | null) ?? null, boat_id: (l.boat_id as string | null) ?? null }, today);
+    for (const l of tLocks) if (holdingHere(l)) add(tLocked, `${str(l.route_id)} ${str(l.day)}`, Number(l.pax) - Number(l.released_pax) - Number(l.pending_pax));
+    check(4, 'locked seats per route and day (active locks, bulk ones per departure; expiry worked out here)', new Set([...lLocked.keys(), ...tLocked.keys()]).size, countDiff(lLocked, tLocked));
     const lBoats = new Map<string, number>(), tBoats = new Map<string, number>();
     for (const [k, r] of legacyDeployments) if (r) add(lBoats, `${r} ${k.split('::')[0]}`, 1);
     for (const [k, r] of targetDeployments) add(tBoats, `${r} ${k.split('::')[0]}`, 1);
