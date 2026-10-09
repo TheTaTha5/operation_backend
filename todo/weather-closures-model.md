@@ -245,3 +245,219 @@ it is only tagged when someone opens the panel.
 9. **The 3 stale `awaiting` cases** import as they are.
 10. **Permission:** `operations` for everything, refund and credit included.
 11. **Past dates:** allowed (staff may record a closure after the day).
+
+## Design (2026-10-09, from the decisions above)
+
+In short: a closure is a row; the follow-up list is worked out on read from the bookings on the
+closed trip plus the follow-up rows; a row is written only when something happens to a booking
+(notified, resolved, or imported). Resolving is the booking's own `/reschedule` or `/cancel-weather`,
+which now also note the outcome on the closure. A weather cancel takes **only that booking's lines**
+off its invoice; what it had paid beyond what the invoice still asks becomes a refund (owed to the
+agent) or a credit (the agent's balance, spent as a payment method on a later invoice).
+
+### Fields and who decides them
+
+**Closure** (`weather_closures`)
+
+| Field | Kind | Rule |
+|---|---|---|
+| `id` | computed | `wx_<uuid>`; imported ones `lg_<legacy id>` |
+| `route_id`, `service_date` | client fact, validated | a route in the catalogue; a real `YYYY-MM-DD`; past dates allowed (decision 11); one open closure per route and date |
+| `note` | client fact | free text, blank is `null` |
+| `closed_by`, `closed_at` | computed | the login and the clock |
+| `updated_by`, `updated_at` | computed | the last note change |
+| `reopened_by`, `reopened_at` | computed | set by undo; a reopened closure is kept so its resolved rows keep a home |
+| `counts`, `pax` | computed | from the follow-up list (legacy `bkV2WeatherCountsFor`) |
+
+**Follow-up row** (`weather_cases`, one per booking per closure)
+
+| Field | Kind | Rule |
+|---|---|---|
+| `status` | validated | `awaiting` → `notified` (`/notify`) → `resolved` (by `/reschedule` or `/cancel-weather`). A booking on the trip with no row reads `awaiting` |
+| `notified_at/by` | computed | the notify |
+| `outcome` | validated | `reschedule`, `refund`, `credit` or `cancel`: what the booking command did |
+| `new_date` | computed | the reschedule's `to_date` |
+| `resolved_at/by` | computed | the booking command |
+
+**The follow-up list** (computed on every read): every booking with a trip on the closed route and
+date that does not hold back its seats (`cancelled`, `rejected`, `cancelled_weather` excluded, as
+legacy), charters included (decision 7), plus every booking that has a row (a resolved one that
+moved away or was cancelled, or an imported stale one). Each entry: the booking's id, voucher, agent,
+lead, status, mode, pax (its trip on that route, as legacy), whether it is still on the trip,
+`payment_state`, `refundable` (what a refund or credit would be now: legacy's "Paid ฿x") and the
+row's fields.
+
+**Refund or credit** (`refunds`)
+
+| Field | Kind | Rule |
+|---|---|---|
+| `kind` | validated | `refund` (owed back to the agent) or `credit` (kept as the agent's balance) |
+| `amount` | computed | never sent (`400`); see "The money" |
+| `invoice_id`, `booking_id`, `agent_id` | computed | the invoice it comes off, the booking, the invoice's agent |
+| `reason` | computed | `weather` |
+| `created_by`, `created_at` | computed | |
+
+**Invoice line** gains `removed_at`, `removed_by`, `removed_reason` (computed): a line taken off by a
+weather cancel. **Payment** `method` gains `credit` (validated: the agent must have the balance).
+
+### The money (decision 6)
+
+On `/cancel-weather`, for each live booking or prepay invoice carrying the booking's lines (fee
+invoices stand: a fee for an earlier reschedule is still owed):
+
+1. **Take the booking's share off.** If the booking is the only one with live lines on it, the
+   invoice is voided (`void_reason: "weather"`), as legacy does; otherwise only the booking's lines
+   are marked removed and the totals and VAT are worked out again from the lines left. The other
+   bookings on it keep owing exactly what they owed. (Legacy voided the whole invoice: bug 6.)
+2. **What it had paid** = the invoice's payments, less refunds and credits already taken from it,
+   less what the invoice still asks after step 1, never below 0. On a one-booking invoice that is
+   everything paid. On a shared invoice, payments go to the bookings that still travel first: only
+   money the invoice no longer needs comes back. (Chosen here; legacy had no per-booking amount.)
+3. **The outcome** (`outcome` in the body, default `cancel`):
+   - `cancel` ("No refund"): nothing more; money paid stays on the invoice (legacy).
+   - `refund`: a `refund` row of that amount. Paying it out is not modelled (legacy had no step
+     either): the row is what is owed.
+   - `credit`: a `credit` row of that amount on the invoice's agent. Refused when there is nothing to
+     credit (`409 nothing_paid`, legacy greys the option) or the invoice has no agent (`409 no_agent`).
+4. The invoice's `paid` stays what was paid; `refunded` and `credited` are new; `status` and `balance`
+   use `paid − refunded − credited`.
+
+**The agent's credit balance** = its `credit` rows − its live payments with `method: credit`. It is
+read on `GET /v1/agents/{id}` as `credit_balance: { credited, used, available }` and listed with
+`GET /v1/refunds?agent_id=&kind=credit`. **Spending it** is a payment: `POST /v1/invoices/{id}/payments`
+with `method: "credit"` (`409 credit_short` above the balance; the usual overpayment rule). A credit
+payment can be deleted by a correction (the balance comes back) but not edited (`409 credit_payment`).
+
+### Migrations
+
+`060_weather_closures.sql`:
+
+```sql
+CREATE TABLE weather_closures (
+  id TEXT PRIMARY KEY,
+  route_id TEXT NOT NULL REFERENCES routes (id),
+  service_date DATE NOT NULL,
+  note TEXT,
+  closed_by TEXT, closed_at TIMESTAMPTZ NOT NULL,
+  updated_by TEXT, updated_at TIMESTAMPTZ,
+  reopened_by TEXT, reopened_at TIMESTAMPTZ
+);
+-- One open closure per trip; a reopened one stays beside a new one.
+CREATE UNIQUE INDEX weather_closures_open ON weather_closures (route_id, service_date) WHERE reopened_at IS NULL;
+CREATE INDEX weather_closures_date ON weather_closures (service_date);
+
+CREATE TABLE weather_cases (
+  closure_id TEXT NOT NULL REFERENCES weather_closures (id) ON DELETE CASCADE,
+  booking_id TEXT NOT NULL REFERENCES bookings (id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('awaiting', 'notified', 'resolved')),
+  notified_at TIMESTAMPTZ, notified_by TEXT,
+  outcome TEXT CHECK (outcome IN ('reschedule', 'refund', 'credit', 'cancel')),
+  new_date DATE,
+  resolved_at TIMESTAMPTZ, resolved_by TEXT,
+  PRIMARY KEY (closure_id, booking_id),
+  CHECK ((status = 'resolved') = (outcome IS NOT NULL)),
+  CHECK (new_date IS NULL OR outcome = 'reschedule')
+);
+CREATE INDEX weather_cases_booking ON weather_cases (booking_id);
+
+ALTER TABLE changes DROP CONSTRAINT changes_kind_check;
+ALTER TABLE changes ADD CONSTRAINT changes_kind_check
+  CHECK (kind IN ('booking', 'seat_lock', 'deployment', 'route', 'invoice', 'weather_closure'));
+```
+
+`061_refunds_and_credit.sql`:
+
+```sql
+ALTER TABLE invoice_lines ADD COLUMN removed_at TIMESTAMPTZ, ADD COLUMN removed_by TEXT, ADD COLUMN removed_reason TEXT;
+
+CREATE TABLE refunds (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('refund', 'credit')),
+  invoice_id TEXT NOT NULL REFERENCES invoices (id),
+  booking_id TEXT REFERENCES bookings (id),
+  agent_id TEXT REFERENCES agents (id),
+  amount NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+  reason TEXT NOT NULL,
+  created_by TEXT, created_at TIMESTAMPTZ NOT NULL,
+  CHECK (kind = 'refund' OR agent_id IS NOT NULL)
+);
+CREATE INDEX refunds_invoice ON refunds (invoice_id);
+CREATE INDEX refunds_agent ON refunds (agent_id, kind);
+
+ALTER TABLE payments DROP CONSTRAINT payments_method_check;
+ALTER TABLE payments ADD CONSTRAINT payments_method_check CHECK (method IN ('transfer', 'cash', 'card', 'credit'));
+```
+
+### Contract
+
+All writes need the `operations` area (decision 10), the refund and credit included; spending a
+credit is an invoice payment and needs `accounting`, as every payment does. Any login may read.
+
+| Method + path | Does |
+|---|---|
+| `GET /v1/weather-closures?from=&to=&route_id=&include_reopened=true` | Closures by date, with `counts` and `pax`; open ones unless `include_reopened` |
+| `GET /v1/weather-closures/{id}` | One, with `bookings`: the follow-up list |
+| `POST /v1/weather-closures` | Close a trip: `{ route_id, service_date, note }` → `201` |
+| `PATCH /v1/weather-closures/{id}` | The note |
+| `POST /v1/weather-closures/{id}/bookings/{booking_id}/notify` | `awaiting` → `notified` |
+| `POST /v1/weather-closures/{id}/undo` | Re-open the trip: `{ undo_anyway }` |
+| `POST /v1/bookings/{id}/reschedule` | (existing) also resolves the booking's open rows on the day it leaves: `reschedule`, `new_date` |
+| `POST /v1/bookings/{id}/cancel-weather` | (existing) `{ note, outcome }`: also the money above, and resolves every open row of the booking |
+| `GET /v1/refunds?agent_id=&booking_id=&kind=&from=&to=` | Refunds and credits |
+| `POST /v1/invoices/{id}/payments` | (existing) `method: "credit"` spends the agent's balance |
+
+```jsonc
+// GET /v1/weather-closures/wx_…
+{ "id": "wx_…", "route_id": "r10", "service_date": "2026-07-02", "note": "high waves 3m",
+  "closed_by": "ops1", "closed_at": "2026-07-01T04:57:02.238Z", "updated_by": null, "updated_at": null,
+  "reopened_by": null, "reopened_at": null,
+  "counts": { "awaiting": 1, "notified": 1, "resolved": 2 },
+  "pax": { "pending": 6, "cancelled": 2, "rescheduled": 4, "total": 12 },
+  "bookings": [
+    { "booking_id": "BK-1", "voucher_ref": "V-881", "agent_id": "a01", "lead_pax": "Ann", "booking_status": "confirmed",
+      "booking_mode": "seat", "pax": 4, "on_trip": true, "payment_state": "paid", "refundable": 5600,
+      "status": "notified", "notified_at": "…", "notified_by": "ops1",
+      "outcome": null, "new_date": null, "resolved_at": null, "resolved_by": null } ] }
+
+// POST /v1/bookings/BK-1/cancel-weather  { "outcome": "credit", "note": "agent asked", "version": 7 }
+{ "...": "the booking", "status": "cancelled_weather", "warnings": [],
+  "refunds": [ { "id": "rf_…", "kind": "credit", "invoice_id": "inv_…", "booking_id": "BK-1", "agent_id": "a01",
+                 "amount": 5600, "reason": "weather", "created_by": "ops1", "created_at": "…" } ] }
+```
+
+Errors (`{ statusCode, code, error, message }`):
+
+| Status | `code` | When |
+|---|---|---|
+| `400` | — | bad `route_id`/`service_date`; a server field sent (`closed_by`, `amount`, …) with a value other than the stored one; bad `outcome` |
+| `404` | — | unknown closure or booking |
+| `404` | `not_on_closed_trip` | notify for a booking not on the list |
+| `409` | `already_closed` | a second open closure for the trip; the message names it and says to use `PATCH` |
+| `409` | `closure_reopened` | notify, `PATCH` or undo on a reopened closure |
+| `409` | `wrong_status` | notify on a row already notified or resolved |
+| `409` | `has_resolved` | undo when resolved bookings exist; the message lists them (`BK-1 · reschedule`); send `undo_anyway: true` |
+| `409` | `nothing_paid`, `no_agent` | credit with nothing to credit, or no agent |
+| `409` | `credit_short` | a credit payment above the agent's balance |
+| `409` | `credit_payment` | editing a credit payment's amount or method (delete it instead) |
+
+History lines (kind `weather`): close `Trip <route> · <date> cancelled due to weather` (tag
+`Weather`) on every booking then on the trip; notify `Notified agent · awaiting customer decision
+(reschedule/cancel)` (`Notify`); undo `Trip <route> · <date> re-opened · weather cancellation undone`
+(`Weather`) on every unresolved one; cancel-weather `Cancelled for weather · No refund` /
+`· Refund ฿x` / `· Kept as credit ฿x` (` · <note>`), tag `Cancel`/`Refund`/`Credit` (legacy's).
+
+Change feed: a new kind `weather_closure` (`route_days` = its trip) for every closure write and for
+a booking command that resolves one of its rows; the invoice and booking changes are recorded as
+before.
+
+### Import (`src/tools/legacy-weather.ts`, pure, with `test/legacy-weather.test.ts`)
+
+- `sb_weather` → `weather_closures`: `lg_<id>`, `routeid`, `date`, `note` (blank → `null`),
+  `closed_at = at`, `closed_by` null (legacy kept none). A route not in the catalogue or a bad date
+  is skipped and listed.
+- `sb_bookings.weatherresolve_*` → `weather_cases`: the closure by `event` (`<route>|<date>`), the
+  booking `lg_<id>`, `status`, `notified_at`, `outcome`, `new_date`, `resolved_at` as stored; the 3
+  stale `awaiting` ones as they are (decision 9). A row whose closure or booking did not import, or
+  whose status/outcome does not fit, is skipped and listed.
+- Replaced on every run, like the bookings: `lg_` closures (their rows cascade) go first. Refunds and
+  credits on imported invoices are deleted with them (legacy has none).
