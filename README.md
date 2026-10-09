@@ -1541,6 +1541,24 @@ them, `{ "van": [...], "pier": [...] }` by slot, empty until written.
   on-site cancel is one of its events. Split parts are kept, and `no_show` is recomputed, which
   changes 5 legacy records whose stored count disagreed.
 
+### Allergy list and pier meals
+
+**`allergy_list`** is who can't eat what, for the kitchen: `[{name, qty}]`, `qty` being people.
+- It is a booking field, accepted on `POST`/`PATCH /v1/bookings` and returned on every read.
+  Legacy's `specialMeals.allergyList` and `allergyList` spellings are read too.
+- The list replaces outright (`[]` clears it). The free text stays `special_meals_allergies`.
+- Two entries with the same name (any case) become one, their qty added, as legacy's add button does.
+- **Refused (`400`):** a blank `name`; a `qty` below 1 (a missing qty is 1).
+- **`allergy_count`** (computed) is what the kitchen counts (legacy `bkV2AllergyCount`): the list's
+  people, or 1 when there is only free text.
+- The import brings the 29 legacy lists.
+
+**`PUT /v1/bookings/{id}/meals`** is the pier's meal editor (legacy `pckMealSave`).
+- It takes `{veg?, vegan?, halal?, allergies?}`, sets those meal fields, and stamps
+  `special_meals_pier_at` and `special_meals_pier_by` from the login. It answers the booking.
+- Those two are the server's: a create or an edit may echo them unchanged; a different value is
+  `400`, naming this command. Legacy has no column for them, so no booking imports with them.
+
 ### Attachments
 
 Files: an agent's voucher, a passport, a payment slip. A file is uploaded once, then named by a

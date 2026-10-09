@@ -24,36 +24,10 @@ on-tour extras, invoice payments, cash-on-tour: their files are already copied) 
 project documents. Left behind in legacy: 248 files nobody names, the daily-report chart images, and
 9 files legacy's records name but lost.
 
-## 2. Allergy list
+## 2. Allergy list: built
 
-**Legacy.** `specialMeals.allergyList = [{name, qty}]`, beside the free-text `allergies`.
-- **Column:** `specialmeals_allergylist`, since 2026-08-15.
-- **Writers:** `bkV2AllergyAdd`, its preset buttons, `bkV2AllergySetQty` and `bkV2AllergyRemove`.
-  Each enforces `name` not blank and `qty` a whole number ≥ 1; adding a name already listed (any
-  case) adds to its qty.
-- **Kitchen count (`bkV2AllergyCount`):** the sum of `qty`, or 1 when the list is empty but the
-  free text isn't.
-- **Data:** 29 bookings have a list (5,341 bookings): 25 with one entry, at most 5; qty 1, 2 or 4.
-  Names are free text ("no spicy", Thai), so no fixed allergen list fits. qty never exceeds the
-  trip's passengers.
-
-**Proposed.** A booking field `allergy_list` (also legacy's `specialMeals.allergyList`), replacing
-outright.
-```sql
-CREATE TABLE booking_allergies (
-  booking_id TEXT NOT NULL REFERENCES bookings (id) ON DELETE CASCADE,
-  seq INTEGER NOT NULL, name TEXT NOT NULL, qty INTEGER NOT NULL CHECK (qty >= 1),
-  PRIMARY KEY (booking_id, seq)
-);
-```
-- **Kinds of field:** `name` and `qty` are client facts. `allergy_count` (on the read) is
-  computed, by legacy's kitchen rule.
-- **Refused (`400`):** a blank name; qty below 1.
-- **Merged:** two entries with the same name (any case) become one, qty added, as the add
-  button does.
-- **Import:** the 29 lists.
-- **Decision B1.** Legacy's pier meal editor also writes `pierAt`/`pierBy` (who changed the meals at
-  the pier), and legacy has no column for them, so they're lost. Give them a home?
+Migration 041, `src/domain/allergies.ts`, `PUT /v1/bookings/{id}/meals` for the pier (B1); README → "Allergy
+list and pier meals".
 
 ## 3. Document check
 

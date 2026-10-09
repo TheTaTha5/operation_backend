@@ -27,6 +27,8 @@ export type BookingHeader = {
   pax_type?: string;
   special_meals_veg?: number; special_meals_vegan?: number; special_meals_halal?: number;
   special_meals_allergies?: string; large_luggage?: number;
+  /** Who changed the meals at the pier, and when (migration 041): stamped by PUT /v1/bookings/{id}/meals. */
+  special_meals_pier_at?: string; special_meals_pier_by?: string;
   cash_on_tour_amount?: number; cash_on_tour_currency?: string; cash_on_tour_handling?: string; cash_on_tour_note?: string;
   price_mode?: string; manual_total?: number; total?: number;
   price_seat?: number; price_addon?: number; price_foc_discount?: number; price_discount?: number; price_extra?: number;
@@ -65,7 +67,7 @@ export const BOOKING_HEADER_COLUMNS = [
   'dropoff_same', 'dropoff_area_id', 'dropoff_area', 'dropoff_hotel_name',
   'guide_english', 'guide_russian', 'guide_chinese', 'guide_other_lang',
   'pax_type', 'special_meals_veg', 'special_meals_vegan', 'special_meals_halal',
-  'special_meals_allergies', 'large_luggage',
+  'special_meals_allergies', 'special_meals_pier_at', 'special_meals_pier_by', 'large_luggage',
   'cash_on_tour_amount', 'cash_on_tour_currency', 'cash_on_tour_handling', 'cash_on_tour_note',
   'price_mode', 'manual_total', 'total',
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
@@ -92,7 +94,7 @@ export const BOOKING_HEADER_NUMERIC_COLUMNS = [
   'price_seat', 'price_addon', 'price_foc_discount', 'price_discount', 'price_extra',
 ] as const;
 
-export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at'] as const;
+export const BOOKING_HEADER_TIMESTAMP_COLUMNS = ['booked_at', 'confirmed_at', 'special_meals_pier_at'] as const;
 //example ISO_DATE: 2024-06-01
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -197,6 +199,8 @@ function fields(document: Record<string, unknown>): readonly Field[] {
     ['special_meals_vegan', int, inside(meals, 'vegan', 'special_meals_vegan')],
     ['special_meals_halal', int, inside(meals, 'halal', 'special_meals_halal')],
     ['special_meals_allergies', text, inside(meals, 'allergies', 'special_meals_allergies')],
+    ['special_meals_pier_at', text, inside(meals, 'pierAt', 'special_meals_pier_at')],
+    ['special_meals_pier_by', text, inside(meals, 'pierBy', 'special_meals_pier_by')],
     ['large_luggage', int, own('largeLuggage', 'large_luggage')],
 
     ['cash_on_tour_amount', num, inside(cash, 'amount', 'cash_on_tour_amount')],

@@ -50,6 +50,7 @@ import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals
 import { lockDays, spansDays } from './legacy-locks.js';
 import { routeCalendar, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import { parseBookingAddOns } from '../domain/booking-addons.js';
+import { parseAllergyList } from '../domain/allergies.js';
 import { altPickupParts, parseAltPickups, type AltPickup } from '../domain/alt-pickups.js';
 
 const PREFIX = 'lg_';
@@ -538,7 +539,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [], altPickups: Row[] = [], upgrades: Row[] = [], bookingAddOns: Row[] = [], allergies: Row[] = [];
     const checkins: Row[] = [], checkinEvents: Row[] = [], checkinTries: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
@@ -714,6 +715,12 @@ async function main() {
           }));
           if (legacyAddOnRows.some((a) => Number(a.jad) === 0 && Number(a.jchd) === 0 && a.jad !== null)) note('add-ons imported with a join of 0 adults and 0 children: nobody joins');
         } catch (error) { note(`add-ons dropped: ${(error as Error).message}`); }
+      }
+      // The allergy list (migration 041), through the API's own parser: 29 legacy bookings have one.
+      const rawAllergies = jsonValue(b.specialmeals_allergylist);
+      if (Array.isArray(rawAllergies) && rawAllergies.length) {
+        try { parseAllergyList(rawAllergies).forEach((a, seq) => allergies.push({ booking_id: id, seq, ...a })); }
+        catch (error) { note(`allergy lists dropped: ${(error as Error).message}`); }
       }
       // The booking's documents (migration 040, legacy bk.attachments), linked to the files copied here.
       const legacyDocs = jsonValue(b.attachments);
@@ -1037,6 +1044,7 @@ async function main() {
     await insert('booking_upgrades', upgrades);
     await insert('booking_upgrade_slips', upgradeSlips);
     await insert('booking_documents', documents);
+    await insert('booking_allergies', allergies);
     await insert('booking_addons', bookingAddOns);
     await insert('booking_trip_checkins', checkins);
     await insert('booking_trip_checkin_events', checkinEvents);
