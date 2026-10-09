@@ -55,6 +55,8 @@ import { sortDocuments, sortTemplates, type ContractDocument, type ContractTempl
 import { sortAddonServices, type AddonService } from './addon-services.js';
 import type { StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
+import type { StoredVanBill, VanRate, VanRateField } from './van-bills.js';
+import type { DailySettings } from './money-reports.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
   type Agent, type AgentActivity, type AgentListQuery, type AgentProgram, type AgentSummary, type Market, type PayType, type SalesPerson, type StoredAgent, type VatMode,
@@ -1893,6 +1895,82 @@ export class PostgresOperationsStore {
   }
   async deletePickupNameTh(nameKey: string): Promise<boolean> {
     return (await this.client().query('DELETE FROM pickup_name_th WHERE name_key = $1', [nameKey])).rowCount === 1;
+  }
+
+  // ── Partner van bills, van rates, the daily report's settings (migration 120) ──
+  private async vanBillsWhere(where: string, params: unknown[]): Promise<StoredVanBill[]> {
+    const { rows } = await this.client().query(`SELECT b.*, b.paid_on::text AS paid_on,
+        COALESCE((SELECT jsonb_object_agg(r.code, r.rate) FROM van_bill_route_rates r WHERE r.bill_id = b.id), '{}'::jsonb) AS route_rates,
+        COALESCE((SELECT jsonb_object_agg(o.row_key, jsonb_build_object('rate', o.rate, 'ex', o.ex, 'cut', o.cut, 'per', o.per)) FROM van_bill_row_overrides o WHERE o.bill_id = b.id), '{}'::jsonb) AS row_overrides,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('id', x.id, 'date', x.line_date::text, 'note', x.note, 'vans', x.vans, 'pax', x.pax, 'rate', x.rate,
+          'ex', x.ex, 'cut', x.cut, 'per_pax', x.per_pax) ORDER BY x.seq) FROM van_bill_extra_lines x WHERE x.bill_id = b.id), '[]'::jsonb) AS extra_lines
+      FROM van_bills b WHERE ${where} ORDER BY b.partner COLLATE "C"`, params);
+    const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+    return rows.map((r): StoredVanBill => ({
+      id: String(r.id), partner: String(r.partner), month: String(r.month), period: Number(r.period) as StoredVanBill['period'],
+      per_pax: Number(r.per_pax), rate: Number(r.rate),
+      route_rates: Object.fromEntries(Object.entries(r.route_rates as Record<string, unknown>).map(([k, v]) => [k, Number(v)])),
+      row_overrides: Object.fromEntries(Object.entries(r.row_overrides as Record<string, Record<string, unknown>>)
+        .map(([k, o]) => [k, { rate: num(o.rate), ex: num(o.ex), cut: num(o.cut), per: num(o.per) }])),
+      extra_lines: (r.extra_lines as Record<string, unknown>[]).map((x) => ({
+        id: String(x.id), date: (x.date as string | null) ?? null, note: (x.note as string | null) ?? null, vans: Number(x.vans), pax: Number(x.pax),
+        rate: Number(x.rate), ex: Number(x.ex), cut: Number(x.cut), per_pax: Number(x.per_pax),
+      })),
+      seen: (r.seen as string[] | null) ?? null, updated_at: r.updated_at ? asIso(r.updated_at) : null, updated_by: r.updated_by ?? null,
+      sent_at: r.sent_at ? asIso(r.sent_at) : null, sent_by: r.sent_by ?? null, sent_bill: num(r.sent_bill),
+      paid_at: r.paid_at ? asIso(r.paid_at) : null, paid_by: r.paid_by ?? null, paid_on: r.paid_on ?? null, paid_via: r.paid_via ?? null,
+      paid_ref: r.paid_ref ?? null, paid_amount: num(r.paid_amount),
+    }));
+  }
+  async vanBill(partner: string, month: string, period: number): Promise<StoredVanBill | undefined> {
+    return (await this.vanBillsWhere('b.partner = $1 AND b.month = $2 AND b.period = $3', [partner, month, period]))[0];
+  }
+  async vanBillsOf(month: string, period: number): Promise<StoredVanBill[]> { return this.vanBillsWhere('b.month = $1 AND b.period = $2', [month, period]); }
+  /** Upserts the bill on its address and replaces its rates, overrides and lines. */
+  async putVanBill(b: StoredVanBill): Promise<void> {
+    const { rows: [saved] } = await this.client().query(`INSERT INTO van_bills (id, partner, month, period, per_pax, rate, seen, updated_at, updated_by,
+        sent_at, sent_by, sent_bill, paid_at, paid_by, paid_on, paid_via, paid_ref, paid_amount)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+      ON CONFLICT (partner, month, period) DO UPDATE SET per_pax = EXCLUDED.per_pax, rate = EXCLUDED.rate, seen = EXCLUDED.seen,
+        updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by, sent_at = EXCLUDED.sent_at, sent_by = EXCLUDED.sent_by, sent_bill = EXCLUDED.sent_bill,
+        paid_at = EXCLUDED.paid_at, paid_by = EXCLUDED.paid_by, paid_on = EXCLUDED.paid_on, paid_via = EXCLUDED.paid_via, paid_ref = EXCLUDED.paid_ref, paid_amount = EXCLUDED.paid_amount
+      RETURNING id`,
+    [b.id, b.partner, b.month, b.period, b.per_pax, b.rate, b.seen, b.updated_at, b.updated_by, b.sent_at, b.sent_by, b.sent_bill,
+      b.paid_at, b.paid_by, b.paid_on, b.paid_via, b.paid_ref, b.paid_amount]);
+    const id = String(saved.id);
+    for (const table of ['van_bill_route_rates', 'van_bill_row_overrides', 'van_bill_extra_lines']) await this.client().query(`DELETE FROM ${table} WHERE bill_id = $1`, [id]);
+    await this.client().query(`INSERT INTO van_bill_route_rates (bill_id, code, rate) SELECT $1, r.key, r.value::numeric FROM jsonb_each_text($2::jsonb) AS r`,
+      [id, JSON.stringify(b.route_rates)]);
+    await this.client().query(`INSERT INTO van_bill_row_overrides (bill_id, row_key, rate, ex, cut, per)
+      SELECT $1, o.key, (o.value->>'rate')::numeric, (o.value->>'ex')::numeric, (o.value->>'cut')::numeric, (o.value->>'per')::numeric FROM jsonb_each($2::jsonb) AS o`,
+    [id, JSON.stringify(b.row_overrides)]);
+    await this.client().query(`INSERT INTO van_bill_extra_lines (bill_id, id, seq, line_date, note, vans, pax, rate, ex, cut, per_pax)
+      SELECT $1, x.id, x.seq, x.date, x.note, x.vans, x.pax, x.rate, x.ex, x.cut, x.per_pax
+      FROM jsonb_to_recordset($2::jsonb) AS x(id text, seq int, date date, note text, vans int, pax int, rate numeric, ex numeric, cut numeric, per_pax numeric)`,
+    [id, JSON.stringify(b.extra_lines.map((x, seq) => ({ ...x, seq })))]);
+  }
+  async vanRates(): Promise<VanRate[]> {
+    const { rows } = await this.client().query(`SELECT group_key, route_id, field, rate, updated_at, updated_by FROM van_rates
+      ORDER BY group_key COLLATE "C", COALESCE(route_id, '') COLLATE "C", field COLLATE "C"`);
+    return rows.map((r) => ({ group_key: r.group_key, route_id: r.route_id ?? null, field: r.field, rate: Number(r.rate), updated_at: r.updated_at ? asIso(r.updated_at) : null, updated_by: r.updated_by ?? null }));
+  }
+  async putVanRate(r: VanRate): Promise<void> {
+    await this.client().query(`INSERT INTO van_rates (group_key, route_id, field, rate, updated_at, updated_by) VALUES ($1,$2,$3,$4,$5,$6)
+      ON CONFLICT (group_key, route_id, field) DO UPDATE SET rate = EXCLUDED.rate, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
+    [r.group_key, r.route_id, r.field, r.rate, r.updated_at, r.updated_by]);
+  }
+  async deleteVanRate(groupKey: string, routeId: string | null, field: VanRateField): Promise<boolean> {
+    return ((await this.client().query('DELETE FROM van_rates WHERE group_key = $1 AND route_id IS NOT DISTINCT FROM $2 AND field = $3', [groupKey, routeId, field])).rowCount ?? 0) > 0;
+  }
+  async dailyReportSettings(): Promise<DailySettings | undefined> {
+    const { rows: [r] } = await this.client().query('SELECT van_cost, van_quota, target_per_pax, updated_at, updated_by FROM daily_report_settings');
+    return r && { van_cost: r.van_cost === null ? null : Number(r.van_cost), van_quota: r.van_quota ?? null, target_per_pax: r.target_per_pax === null ? null : Number(r.target_per_pax),
+      updated_at: r.updated_at ? asIso(r.updated_at) : null, updated_by: r.updated_by ?? null };
+  }
+  async putDailyReportSettings(s: DailySettings): Promise<void> {
+    await this.client().query(`INSERT INTO daily_report_settings (id, van_cost, van_quota, target_per_pax, updated_at, updated_by) VALUES (true, $1, $2, $3, $4, $5)
+      ON CONFLICT (id) DO UPDATE SET van_cost = EXCLUDED.van_cost, van_quota = EXCLUDED.van_quota, target_per_pax = EXCLUDED.target_per_pax,
+        updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`, [s.van_cost, s.van_quota, s.target_per_pax, s.updated_at, s.updated_by]);
   }
   async deleteVanGroup(id: string): Promise<void> { await this.client().query('DELETE FROM van_groups WHERE id = $1', [id]); }
   /** `[]` is no rows: one whole, ungrouped part. */

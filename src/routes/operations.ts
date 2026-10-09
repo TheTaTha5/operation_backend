@@ -48,6 +48,7 @@ import {
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { parseJobDate, parsePickupNameTh, sendFor, vanJobsDay } from '../domain/van-jobs.js';
 import { registerSalesRoutes } from './sales-editing.js';
+import { registerMoneyReportRoutes } from './money-reports.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
 import { refuse as refuseWith } from '../domain/booking-actions.js';
@@ -1883,6 +1884,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * insurance: `sales-editing.ts` (todo/sales-editing-model.md).
    */
   registerSalesRoutes(app, { store, assertBookingFresh, agentCredit });
+  /** Partner van bills, van rates and the money reports: `money-reports.ts` (todo/money-model.md slices 5 and 6). */
+  registerMoneyReportRoutes(app, { store });
   /**
    * A booking's price, computed as legacy computes it (`priceBooking`, README "Quote"). The body
    * is a booking's, plus per trip `ovn_charge` and the charter price fields; `booking_id` makes it an
