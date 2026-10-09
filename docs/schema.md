@@ -1227,7 +1227,8 @@ erDiagram
 - **A bill names its partner by name, not by a key:** legacy's bill is per owner name, and vans carry
   that name (`vans.partner_name`). Renaming a partner's vans leaves its old bills under the old name.
 - **Every amount is `NUMERIC(12,2)` and 0 or more**; a deduction (`cut`) is stored positive.
-## 9. Fleet maintenance: assets, incidents, jobs
+
+## 10. Fleet maintenance, part A: assets, incidents, jobs
 
 Legacy's Fleet screens, part A (migration 130, `todo/fleet-maintenance-model.md`). The rules are in
 `src/domain/fleet-availability.ts`, `fleet-assets.ts` and `fleet-jobs.ts`. Each record is written
@@ -1434,6 +1435,88 @@ erDiagram
 - **`invoice_lines.cot_date`** (112): set on a cash-on-tour deduction's minus line, one per trip date.
 - **`changes.kind`** also takes `pier_handover` and `commission_payout` (111).
 
+## 11. Fleet maintenance, part B: stock, memos, projects, Daily Fleet Log, safety
+
+Migrations 140–143 (`todo/fleet-maintenance-model.md`, "Design — part B"). The rules are in
+`src/domain/fleet-*.ts`; both stores reach these tables through `store.fleetRepo` (`fleet-store.ts`,
+`fleet-postgres.ts`). Part A's jobs and engines are named by text ids (`job_id`, `engine_id`).
+
+```mermaid
+erDiagram
+  fleet_warehouses { text id PK "tublamu, panwa, ranong" text name "legacy's label" }
+  fleet_stock_items {
+    text id PK "legacy's id; inv_…"
+    text name "name + part_no unique among live items (checked by the API)"
+    text part_no
+    numeric min_qty
+    numeric cost
+    timestamptz deleted_at "never deleted: hidden"
+    text merged_into FK "a merged duplicate"
+  }
+  fleet_stock_movements {
+    bigserial seq PK
+    text id "lg_… imported"
+    text item_id FK
+    date date
+    text type "register, receive, withdraw, transfer-in/out, edit, merge, adjust, adjust_out, in, return, reverse, import"
+    text warehouse FK "required when delta is not 0"
+    numeric delta "signed; stock = sum by item and warehouse"
+    text memo_id FK
+    text job_id "part A, text"
+    text consumable_id FK
+    jsonb changes "an edit's [{field, from, to}]"
+  }
+  fleet_consumables { text id PK date date text item_id FK numeric qty numeric cost text warehouse FK text boat_id FK timestamptz voided_at }
+  fleet_memos {
+    text id PK
+    text no "client's number; not unique (legacy has two duplicates)"
+    text status "pending_approval, approved, ordered, received, paid, cancelled"
+    smallint current_step
+    numeric amount "computed; imported as legacy stored it"
+    text boat_id FK
+    text project_id FK
+    text job_id "part A, text"
+    jsonb short_closed
+    text cancel_reason
+  }
+  fleet_memo_lines { text id PK text memo_id FK numeric qty numeric price text category text item_id FK numeric received_qty }
+  fleet_memo_history { bigserial id PK text memo_id FK text type text by timestamptz at }
+  fleet_memo_receipts { text id PK text memo_id FK date date text warehouse FK jsonb lines }
+  fleet_projects { text id PK text no "client's" text boat_id FK "null = General" text status date original_plan_to "baseline" jsonb no_cost }
+  fleet_project_log { bigserial id PK text project_id FK date date text text }
+  fleet_project_plan { text project_id PK, FK text id PK boolean done }
+  fleet_project_documents { text project_id PK, FK text id PK text attachment_id FK text url text status }
+  fleet_project_vendor_visits { text project_id PK, FK text id PK text vendor }
+  fleet_daily_boats { date date PK text boat_id PK, FK numeric fuel_litres int pax_actual }
+  fleet_daily_meters { date date PK text boat_id PK, FK text trip_type PK text engine_id PK "part A, text" numeric reading }
+  fleet_fuel_prices { date date PK text key PK "pier or boat" numeric price }
+  fleet_daily_locks { date date PK text pier PK timestamptz locked_at }
+  fleet_water_meters { date date PK text boat_id PK, FK numeric open_reading numeric close_reading }
+  fleet_issue_items { text id PK text name text pier boolean off }
+  fleet_issues { date date PK text boat_id PK, FK text item_id PK, FK numeric qty }
+  fleet_daily_extras { text id PK date date text boat_id FK text name }
+  fleet_daily_requests { text id PK date date text pier text name jsonb issues }
+  fleet_safety_items { text id PK text boat_id FK text category date expiry_date date next_pm }
+  fleet_safety_inspections { text id PK text item_id FK date date text result date next_due }
+  fleet_safety_log { bigserial id PK text item_id FK text type }
+  fleet_stock_items ||--o{ fleet_stock_movements : "moves"
+  fleet_warehouses ||--o{ fleet_stock_movements : "in"
+  fleet_memos ||--o{ fleet_memo_lines : "lists"
+  fleet_memos ||--o{ fleet_memo_history : "logs"
+  fleet_memos ||--o{ fleet_memo_receipts : "received in"
+  fleet_memos |o--o{ fleet_stock_movements : "brought"
+  fleet_stock_items |o--o{ fleet_memo_lines : "for"
+  fleet_projects |o--o{ fleet_memos : "pays for"
+  fleet_projects ||--o{ fleet_project_documents : "files"
+  fleet_issue_items ||--o{ fleet_issues : "issued"
+  fleet_safety_items ||--o{ fleet_safety_inspections : "checked"
+```
+
+- **Movements are append-only in the schema:** a trigger refuses `UPDATE` and `DELETE`, except on
+  imported `lg_` rows inside the import's transaction (`SET LOCAL fleet.import_rewrite = 'on'`).
+- **`fleet_daily_locks`:** a row means the pier's day is locked; every Daily Log write to it is
+  refused (`409 day_locked`).
+- **A project's boat entries** are rows of the boat's status log with `project_id` set.
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration
@@ -1452,8 +1535,11 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
 | `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
+| `fleet_memos.job_id`, `fleet_stock_movements.job_id` | part A's maintenance jobs | Built in parallel with `fleet_jobs` (140); legacy's are imported as they are. Legacy names one deleted job (`mjmtsfprvltstem`). |
+| `fleet_daily_meters.engine_id`, `fleet_consumables.engine_id` | part A's engines | Same. |
+| `fleet_fuel_prices.key`, `fleet_daily_locks.pier`, `fleet_daily_requests.pier` | piers or `boats` | A price key is a pier or a boat; piers have no table. |
 | `fleet_incidents.job_id`, `fleet_jobs.incident_id` | `fleet_jobs`, `fleet_incidents` | Legacy keeps an incident linked to a deleted job, and deleting an incident leaves its job's link (130). |
-| `fleet_jobs.parent_project_id` | projects | Projects are part B of fleet (not built on this branch). |
+| `fleet_jobs.parent_project_id` | `fleet_projects` | The two were built in parallel (130, 141); legacy's are imported as they are. |
 | `commission_payout_items.booking_id`, `item_id` | `booking_tour_sales`, `booking_upgrades` | An upgrade list is rewritten whole on every save, and an import replaces bookings (111). |
 | `pier_handovers.pier` | `routes.pier` | A pier is a route's text field, `other` when none (111). |
 

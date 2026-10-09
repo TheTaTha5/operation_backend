@@ -1,7 +1,8 @@
 # Fleet maintenance, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Part A (availability,
-assets, incidents, jobs) is built; part B (stock, memos, Daily Fleet Log, projects, safety) is another branch.
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Both parts are built: part A
+(availability, assets, incidents, jobs) and part B (stock, memos, Daily Fleet Log, projects, safety);
+see the end. Data counted on 2026-10-09 through `ORIGINAL_DATABASE_URL`, read-only.
 
 Two corrections to what we assumed before:
 
@@ -66,99 +67,6 @@ renewal). `server.js` has no fleet logic. It stores whatever the browser sends.
 Engines, gearboxes, propellers, incidents and maintenance jobs: built (part A, below; README
 "Fleet maintenance").
 
-### Projects (drydock, overhaul)
-
-- **Number:** `PRJ-` plus `FL_PROJECTS.length + 1`. This is not even the highest number plus one,
-  and nothing checks for duplicates.
-- **Type:** `drydock`, `overhaul`, `refit`, `scheduled` or `other`.
-- **Status:** `planned` → `inprogress` ⇄ `on_hold` → `awaiting_bill` → `completed`, and
-  `cancelled` (reopen goes back to `planned`).
-  - **Start** (only from `planned`) marks the boat `unavailable` (`dry_dock`/`overhaul`).
-  - **Hold** needs a reason.
-  - **Cancel** needs a reason and asks whether to unlink open jobs.
-  - **Work done** closes the child jobs, sets `awaiting_bill` and frees the boat.
-- **Bill gate** (`flProjBillGate`): a project completes only when both are true:
-  - a document whose name looks like an invoice is attached;
-  - the computed cost is above ฿0.
-
-  Otherwise the user can close it with "no cost", which needs a written reason.
-- **Health score** (`flProjHealth`) is computed from budget used, schedule overrun, open jobs and
-  hold.
-- **Phases, plan checklist, vendor visits and documents with required presets** are kept per type.
-- **Files** go to `POST /api/attach` with `bookingId:'proj_<id>'`. The project's `docs` keep `attId`.
-- **Automatic writes on every visit** (`flProjMigrate`):
-  - Every `scheduled` job gets a project: it is linked to an overlapping one, or one is created.
-  - One-off cleanups run and write to `localStorage` directly, skipping the edit gate.
-
-### Purchase memos (`fleet_memos`)
-
-- **Number:** `MO-` plus 3 digits, the highest plus one. A duplicate number is refused by alert and
-  throw.
-- **Type:** `parts`, `labor` or `mixed`.
-- **Scope:** `vessel` (has a boat), or `general` with a category: `Office`, `Marketing`, `Pier`,
-  `Vehicle`, `Staff`, `License`, `Other`.
-- **Links:** to a job (`maintId`) or a project (`projectId`).
-- **Supplier** is free text, with suggestions drawn from past memos and stock items.
-- **Steps** (`flAdvanceMemo`, `currentStep` indexes the step list):
-  - Parts or mixed: `pending_approval`(1) → `approved`(2) → `ordered`(3) → `received`(4) →
-    `paid`(5).
-  - Labor only: `pending_approval`(1) → `approved`(2) → `paid`(3).
-  - **Approve** (`flSaveApprove`) needs a typed approver name and a position. No right is checked.
-  - **Ordered** and **paid** only flip the status. Nobody records who ordered or paid, when, or how.
-  - **Receive** (`flOpenReceiveMemo`) can be partial. The memo stays `ordered` until every line has
-    arrived. Stock goes to the boat's pier warehouse. **Short close** (a confirm) accepts what came
-    and recalculates the totals.
-  - **Cancel** needs a reason. It is refused once `paid`, but allowed after `received`, and the
-    stock already received is **not** reversed.
-  - **Edit** is refused once `paid`.
-- **Totals are computed** (`memoCalcTotal`, `_memoTotals`):
-  - line = qty × price − line discount %;
-  - then a memo discount (% plus a fixed amount);
-  - then VAT 7% (can be turned off).
-  - A line priced differently from stock cost only gets a warning badge.
-- **Lines with no stock item** register a new stock item when the memo is saved (`autoRegister`).
-
-### Inventory and consumables
-
-- **Item:** name + part number. It holds stock per warehouse (`stocks[]`): `คลัง Tub Lamu`,
-  `คลัง Visit Panwa`, `คลัง Ranong`.
-- **Movements** go into `history`: `register`, `receive`, `withdraw`, `transfer-out`/`transfer-in`,
-  `edit`, `merge`, `adjust_out`, plus the old `in`.
-- **Hard refusals:**
-  - a duplicate name + part number;
-  - a reused name with no part number;
-  - a transfer with the same warehouse at both ends, or more than is there;
-  - a job withdrawal beyond stock.
-- **Consumables** (`flConsumeSubmit`) draw oil, filters and the like for a boat.
-  - Hard refusals: no item, quantity below 1, no boat.
-  - Going below zero is only a **confirm**, so negative stock is allowed.
-  - Deleting puts the stock back and **erases** the history row.
-- **Fixers** for past damage: `invDupScan`/`invDupMerge` and `invLostScan`/`invLostFix`. They
-  rewrite history and can leave negative stock.
-
-### Daily Fleet Log and fuel
-
-- **Per day and boat** (`fleet_daily`): fuel litres, actual pax, and engine hour-meter readings
-  (`trips.normal.engines{engineId: reading}`).
-  - A meter that goes backwards shows a red Δ. It is not refused.
-- **Fuel price** (`fleet_fuelprice`) is ฿/L per day, per boat or pier.
-  - The P&L price falls back through: boat → pier → another boat at the same pier → the last 30
-    days → 0.
-- **Lock** (`fleet_drlock`): "Save day" locks a pier's day; "Edit" unlocks it. The lock only
-  disables inputs. No save function checks it.
-- **Extras** are stored as JSON strings in `app_meta`:
-  - water meter readings (`fl_water`);
-  - issued items (`fl_issue_items`, `fl_issue`);
-  - extra items (`fl_extra`);
-  - supplies drawn by people outside the fleet (`fl_req`).
-
-  `fl_extra` and `fl_req` **delete entries older than 120 days** on every save.
-- **Anomaly flags** are display only:
-  - Daily Log: more than 20 L per pax.
-  - Fuel Intelligence: a day above 1.3× the boat's monthly average.
-- **Monthly fuel budget:** `fleet_fuelbudget`. It has no server table and is not in `app_meta`, so it
-  is lost.
-
 ### Read-only reports
 
 All computed in the browser:
@@ -167,16 +75,6 @@ All computed in the browser:
   other. Memos without a job are counted as `memo` or "central".
 - **Upkeep** (`renderConsumables`): job cost plus consumables, per month.
 - **Fuel intelligence, insights, dashboard.**
-
-### Safety equipment
-
-- **Items per boat** (`fleet_safety`):
-  - Categories: bilge pump, life jacket, fire extinguisher, EPIRB, flare, VHF, first aid, anchor,
-    navigation light.
-  - Each item has an expiry and a next-PM date. Status is computed: `EXPIRED`, `DUE` (≤30 days),
-    `SOON` (≤90 days), `OK`.
-  - Inspections are recorded as pass or fail.
-- **The list was seeded** by `_generateSafetySeed` and is hardly used since (see Data).
 
 ### Crew
 
@@ -415,17 +313,10 @@ and `deploy_anyway`.
 
 ## Open (part A)
 
-1. **Seams to part B, wired at merge** (`src/routes/fleet.ts`):
-   - `openWork`: add projects `inprogress`/`on_hold` from `actual_from ?? plan_from`, status
-     `unavailable`, reason `dry_dock`/`overhaul` (legacy `boatJobBlock`), so a project holds its boat;
-   - `hoursOf`: the Daily Fleet Log's meter readings per engine (`engineHours(e, meters)`), so `hours`,
-     `service` and the gearbox lifetime count real running hours (today `base_hours`);
-   - `memosOf`: the job's memos (`{status, memo_type, amount, item_names}`), so `cost` includes them
-     (today parts only; `legacy_cost` shows legacy's figure);
-   - job parts from stock (`flMaintAddPart`, `flMaintRemovePart`, the "late edit"): a stock movement,
-     part B's. Parts are imported and shown; no command adds or removes one yet;
-   - a job made under a project writes onto the project's log (`_projCreateForId`); here it only
-     writes its own line naming the project id.
+1. **The seams to part B are wired** (`src/domain/fleet-seams.ts`): projects hold their boat,
+   engine hours read the Daily Log meters, a job's cost counts its memos, job parts come from stock.
+   Still open: a job made under a project does not write onto the project's log (`_projCreateForId`);
+   it writes its own line naming the project.
 2. **Pier assignments and certificate expiry/renewal** (catalogue open item 4) are not built.
 3. **Repair history** (`boats.repairHistory`, 60 legacy rows) is not stored: it is the boat's done
    jobs (`GET /v1/fleet/jobs?boat_id=&status=done`). Legacy's rows snapshot the cost at close; not
@@ -510,3 +401,111 @@ Decisions made while building, side effects, and where this differs from legacy.
 - Engine `retired` (legacy lost it) and gearbox `last_service_hours` (no legacy column) are stored.
 - `import:fleet` is a separate tool, a seed: legacy's ids upserted, lists replaced, re-runnable;
   a re-run overwrites edits made here to legacy's records (checklist 1b6).
+
+## Part B: built (branch `feat/fleet-stock-memos-log-projects`)
+
+Stock with append-only movements, consumables, purchase memos, projects, the Daily Fleet Log with the
+enforced day lock, safety equipment, the memo spend report and `npm run import:fleet-stock` (migrations
+140–143). The contract is README → "Fleet maintenance"; the legacy read of these screens is removed
+from this note. Rehearsed 2026-10-09 on a copy: 616 items, 1,267 movements (+7 reconciliation, 522
+receipts linked to their memo), 226 memos / 1,119 lines, 1 consumable, 21 projects (316 log lines,
+77 plan items, 75 photos), 123 log days (220 boat-days, 843 meter readings), 120 fuel-price days, 111
+locks, 61 issued-item boat-days, 49 water, 3 extras, 5 outside requests, 94 safety items; every
+item's stock equal to legacy's.
+
+## Open (part B)
+
+1. **Legacy writes a job log line** when a memo on the job is created, edited or cancelled
+   (`flPushLog`); not done. `job_id` and `engine_id` have no foreign keys yet.
+2. **Bill gate bugs copied from legacy** (bug 8): a pending "Final Invoice" entry with no file passes,
+   and the cost leaves out project memos although the message says to add one. Ask whether to fix.
+3. **Not built:** the safety replace wizard (it creates an incident, a job and a memo: part A);
+   cost analytics, upkeep, fuel intelligence, insights and the dashboard (only memo spend is a
+   report); the Daily Log anomaly flags; the monthly fuel budget (legacy loses it); `invLostScan` /
+   `invLostFix` (a legacy-bug repair: use `adjust`).
+4. **A boat's pier for the day lock** is its home `pier`. Legacy uses its pier assignment that day
+   (6 temporary Tub Lamu → Panwa moves); use it once assignments are built.
+5. **Fleet writes are not on the change feed** (no change kind added); screens refetch.
+
+## Flagged (part B)
+
+Behaviour changes against legacy:
+
+- `flSave` refused silently; here a write without `fleet` is `403`.
+- The item form's quantity is no longer a field: `PATCH` with a different `qty` is `400`, the count is
+  `POST …/adjust` (an `adjust` movement). The screen sends two calls.
+- A voided consumable stays listed with `?voided=true`; its stock comes back with a `return`
+  movement (legacy erased the history row).
+- A memo cancelled after receipt takes its stock back (`reverse`). If that stock was used, the cancel
+  is `409 stock_short` until resent with `allow_negative: true` (my choice: the same confirm as
+  consumables).
+- The day lock refuses every write to that pier's day: fuel, pax, meters, the pier's and its boats'
+  prices, water, issued and extra items, outside requests (legacy disabled the inputs only).
+- Taking a project document off deletes its file when nothing else names it (legacy deleted it
+  fire-and-forget). A file a project names cannot be deleted from `/v1/attachments` (`409`).
+- `fleet` may upload and delete attachments.
+- A project completes only from `inprogress` or `awaiting_bill` (legacy's buttons; bug 9 closed).
+- Deleting a stock item is new (legacy had none): it hides the item, keeps its history, and is
+  refused while the item holds stock.
+
+My own decisions (legacy copied where it has an answer):
+
+- Numbers are the client's. A memo number already used is `409 memo_no_taken` (legacy's
+  `flAssertUniqueNo`); a project number is not checked (legacy does not).
+- A new item's opening quantity is a `register` movement carrying it (legacy registered 0 and kept
+  the quantity beside).
+- Per-warehouse minimums (195 legacy stock rows have one) are not kept: legacy reads the item's.
+  `below_min` is legacy's `qty <= minQty`, so an empty item with minimum 0 reads low (478 of the
+  imported 616; the 181 in "Data" counted `<`).
+- Memo totals: the form counts a 0 qty as 1, a short close counts it as 0 (both legacy formulas).
+- A parts line without an item auto-registers one on create (not on edit, as legacy);
+  `auto_register: false` stops it. Receiving more than ordered is allowed (legacy's input has no max).
+- The approving login is stored as `approved_login` beside the typed approver.
+- A project's start pushes a boat status entry without trimming overlaps, as legacy does; such
+  entries have no province or location type, which the status-log form requires.
+- Safety item ids are the server's (`sf_…`); legacy numbered them in the browser.
+- A consumable's `engine_label` is taken as sent (legacy builds it from the engine: part A).
+- A fuel of 0 is no fuel (legacy `parseFloat(v)||null`).
+- Merge folds only exact name + part number duplicates (legacy's key); the dropped item's history
+  is read with the kept one rather than copied.
+
+Wiring part A and part B (after both merged; `fleet-seams.ts`):
+
+- **A project holds its boat** in `openWork` while `inprogress` or `on_hold`, from its actual
+  (else planned) start, as `unavailable` with reason `dry_dock` (a drydock) or `overhaul` (any other
+  type), legacy `boatJobBlock`. A general project (no boat) holds nothing.
+- **Engine hours** count every trip type's meter readings for the engine (latest − first above 0),
+  across boats (the meter travels with the engine, part A's rule).
+- **A job's cost** counts memos whose `job_id` is the job, any scope; a cancelled or pending memo
+  counts nothing (part A's `jobCost`).
+- **Job parts from stock** are `POST /v1/fleet/jobs/{id}/parts` and `DELETE …/parts/{idx}` in part B's
+  route file. A part's `location` is written as the warehouse's label, as legacy's and part A's
+  imported parts are. A closed job needs `late_anyway` (legacy's confirm), and the part is marked
+  late. Taking a part off a job returns it with a `return` movement (legacy wrote `receive`). A part
+  imported with no stock item only comes off. The answer is `{job, item}` with the job as stored; its
+  cost is on `GET /v1/fleet/jobs/{id}`.
+- **Project cost** is its child jobs' cost (`parent_project_id`), memos included.
+- **Project cascade:** completing from in progress and "work done" close the open child jobs as
+  legacy does: `done`, end date, a line, no outcome, no asset or boat status change (part A's
+  `/close` is not run). Cancelling takes `unlink_jobs: true` for legacy's "unlink them?" confirm.
+- **Renamed apart from part A:** part B's routes are `src/routes/fleet-stock.ts`, its import
+  `import:fleet-stock` (run after part A's `import:fleet`), its store field `store.fleetRepo`.
+
+Import:
+
+- The eight warehouse spellings map to the three. 62 movements with no warehouse get the item's
+  main one. 7 item-warehouses whose history did not add up to legacy's stock get an `import`
+  movement (i25: +44 Panwa, −44 Tub Lamu; five −1/+1), listed.
+- A receipt is linked to its memo by the number in its note (522); 3 name a duplicated number and
+  stay unlinked.
+- Memo totals are kept as legacy stored them; 3 differ from the formula (MO-005 ฿16,558.50 vs
+  ฿17,430, MO-002, MO-191 by cents), listed. Received and paid memos' parts lines count as fully
+  received (legacy lost `recvQty`); ordered memos' as nothing received.
+- MO-077 and MO-117 (twice each), 18 duplicate stock items, PRJ-001…007, the 7 cancelled memos with
+  no reason, project type `general` (PRJ-016) and the deleted job `mjmtsfprvltstem` come as they are,
+  listed.
+- Project photos link to their files only if `import:attachments` ran first; otherwise they keep
+  legacy's `/api/attach/…` link (the rehearsal did not copy files: 75 links).
+- Dropped: 3 boat-days with neither fuel (above 0) nor pax, 8 lock rows with no pier set to true.
+- A rerun upserts by legacy id and replaces imported child rows; it never deletes a row legacy dropped.
+

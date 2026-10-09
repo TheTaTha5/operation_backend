@@ -48,6 +48,7 @@ import {
 import { outboundSeats, parseStopFields, sortStops, type VanStop } from '../domain/van-stops.js';
 import { parseJobDate, parsePickupNameTh, sendFor, vanJobsDay } from '../domain/van-jobs.js';
 import { registerSalesRoutes } from './sales-editing.js';
+import { registerFleetStockRoutes } from './fleet-stock.js';
 import { registerMoneyReportRoutes } from './money-reports.js';
 import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
@@ -1671,6 +1672,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       if (!(await store.attachmentFile(id))) notFound(`Attachment ${id} not found`);
       const users = await store.attachmentBookings(id);
       if (users.length) refuseWith(`Attachment ${id} is still on booking ${users.map((b) => b.id).join(', ')}: take it off first`, 409, 'attachment_in_use');
+      const projects = await store.fleetRepo.attachmentProjects(id);
+      if (projects.length) refuseWith(`Attachment ${id} is still a document of fleet project ${projects.join(', ')}: take it off first`, 409, 'attachment_in_use');
       await store.deleteAttachment(id);
     });
     return reply.code(204).send();
@@ -1912,6 +1915,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
    * insurance: `sales-editing.ts` (todo/sales-editing-model.md).
    */
   registerSalesRoutes(app, { store, assertBookingFresh, agentCredit });
+  registerFleetStockRoutes(app, { store });
   /** Partner van bills, van rates and the money reports: `money-reports.ts` (todo/money-model.md slices 5 and 6). */
   registerMoneyReportRoutes(app, { store });
   /** Fleet maintenance, part A: availability, engines/gearboxes/propellers, incidents, jobs (`fleet.ts`). */

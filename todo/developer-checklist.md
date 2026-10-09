@@ -60,6 +60,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
    first for their slips). 111 appends `pier_handover` and `commission_payout` to
    `changes_kind_check` without restating it. Decide when legacy stops writing `pierPayments`,
    `SB_EXTRAS`, `TS_COT` and `travel_sum`: until then each import replaces what was recorded here.
+1b9. **Fleet part B (`feat/fleet-stock-memos-log-projects`, migrations 140–143):** after deploying,
+   run `npm run import:fleet-stock -- --commit` against Railway (after `seed:boats` and
+   `import:attachments`, so the 75 project photos link to their files). Rehearsed 2026-10-09: 616
+   items, 1,267 movements (+7 reconciliation), 226 memos, 21 projects, 123 log days, 94 safety items;
+   every item's stock equal to legacy's. Rerun it until the fleet area cuts over. Run it after `import:fleet` (part A),
+   so imported memos and movements find their jobs.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -191,6 +197,9 @@ it is missing here. So, in this order:
 - **Money slices 2–4** (`money-model.md`, "Flagged"): who hands the pier's cash over and per which
   pier; whether pier staff may sell on-tour extras (legacy: operations only); what accounts do with an
   invoice left overpaid by a cash-on-tour deduction.
+- **Fleet stock:** 18 duplicate items to merge (`POST /v1/fleet/stock-items/{id}/merge`), and 7
+  stock lines whose history did not add up (item i25 most of all: 44 between Tub Lamu and Panwa),
+  from the `import:fleet-stock` report. Legacy's 7 cancelled memos have no reason (it was never kept).
 
 ## Ask sales
 
