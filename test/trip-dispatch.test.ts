@@ -25,6 +25,7 @@ test('every trip shows its dispatch, empty until set; a boat must sail that day'
     pickup_final_at_pier: false, return_same_van: false, pier_note: null,
     van_parts: [{ idx: 0, source: 'main', ad: 4, chd: 0, inf: 0, foc: 0, group: null, sequence: null, return_van_id: null, alt: null }],
     checkins: { van: [], pier: [] },
+    upgrade: null,
   });
   const tripId = b.trips[0].id;
   const set = await ops(tripId, { boat_id: 'disp-a', pickup_time_final: '06:40', pickup_time_final_end: '06:55', pier_note: 'Late, call guide' });

@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import {
-  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds,
+  assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds, retargetTrip,
   licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type SeatLock, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
@@ -29,6 +29,7 @@ import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
 import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
+import { activeUpgrade, storedUpgrades, type StoredUpgrade, type TripUpgrade } from './upgrades.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
@@ -122,6 +123,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'van_parts', COALESCE((SELECT jsonb_agg(jsonb_build_object(${VAN_PART_FIELDS}, 'group', ${VAN_GROUP_JSON}) ORDER BY a.idx)
         FROM booking_trip_van_allocations a LEFT JOIN van_groups g ON g.id = a.van_group_id WHERE a.booking_trip_id = t.id), '[]'::jsonb),
       'checkins', ${CHECKINS_JSON},
+      'upgrades', COALESCE((SELECT jsonb_agg(to_jsonb(up)) FROM booking_trip_upgrades up WHERE up.booking_trip_id = t.id), '[]'::jsonb),
       'pax', COALESCE((SELECT jsonb_agg(jsonb_build_object('category', p.category, 'residency', p.residency, 'count', p.count) ORDER BY p.category, p.residency)
                        FROM booking_trip_pax p WHERE p.booking_trip_id = t.id), '[]'::jsonb),
       'lock_draws', COALESCE((SELECT jsonb_agg(jsonb_build_object('lock_id', d.seat_lock_id, 'qty', d.qty) ORDER BY d.seat_lock_id)
@@ -143,6 +145,8 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', x.seq, 'who', x.who, 'ad', x.ad, 'chd', x.chd, 'inf', x.inf, 'foc', x.foc, 'area_id', x.area_id, 'area', x.area, 'zone', x.zone, 'place', x.place,
       'drop_same', x.drop_same, 'drop_area_id', x.drop_area_id, 'drop_area', x.drop_area, 'drop_zone', x.drop_zone, 'drop_place', x.drop_place) ORDER BY x.seq)
     FROM booking_alt_pickups x WHERE x.booking_id = b.id), '[]'::jsonb) AS alt_pickups,
+  COALESCE((
+    SELECT jsonb_agg(to_jsonb(u) - 'booking_id' ORDER BY u.seq) FROM booking_upgrades u WHERE u.booking_id = b.id), '[]'::jsonb) AS upgrades,
   (SELECT jsonb_build_object('category', c.category, 'group', c.grp, 'note', c.note, 'charge_type', c.charge_type, 'charge_amount', c.charge_amount, 'at', c.at, 'by', c.by)
     FROM booking_cancellations c WHERE c.booking_id = b.id) AS cancellation,
   COALESCE((
@@ -231,6 +235,14 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(addOn.join_adults == null ? {} : { join_adults: Number(addOn.join_adults) }),
     ...(addOn.join_children == null ? {} : { join_children: Number(addOn.join_children) }),
   })),
+  upgrades: (row.upgrades as Record<string, unknown>[]).map((u): StoredUpgrade => {
+    const num = (v: unknown) => (v === null || v === undefined ? null : Number(v));
+    return {
+      id: String(u.id), label: String(u.label), sell_price: Number(u.sell_price), to_company: num(u.to_company), seller: (u.seller as string) ?? null,
+      note: (u.note as string) ?? null, collected: (u.collected as boolean) ?? null, settle: (u.settle as StoredUpgrade['settle']) ?? null,
+      method: (u.method as string) ?? null, fee_pct: num(u.fee_pct), fee: num(u.fee), customer_paid: num(u.customer_paid), at: u.at ? jsonInstant(u.at) : null,
+    };
+  }),
   alt_pickups: (row.alt_pickups as Record<string, unknown>[]).map(({ seq: _seq, ...a }) => ({
     ...a, ad: Number(a.ad ?? 0), chd: Number(a.chd ?? 0), inf: Number(a.inf ?? 0), foc: Number(a.foc ?? 0),
   }) as AltPickup),
@@ -297,7 +309,7 @@ const booking = (row: QueryResultRow): Booking => {
     const parts = (t.van_parts as Record<string, unknown>[]) ?? [];
     const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
     return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups),
-      checkinsView(((t.checkins as Record<string, unknown>[]) ?? []).map(storedCheckin)));
+      checkinsView(((t.checkins as Record<string, unknown>[]) ?? []).map(storedCheckin)), activeUpgrade(((t.upgrades as Record<string, unknown>[]) ?? []).map(tripUpgrade)));
   }, storedReconfirm(row.reconfirm));
 };
 /** A check-in record from `CHECKINS_JSON`: its columns as jsonb, timestamps as ISO text. */
@@ -324,6 +336,12 @@ const storedCheckin = (r: Record<string, unknown>): StoredCheckin => {
     updated_at: jsonInstant(r.updated_at), updated_by: t(r.updated_by),
   };
 };
+/** A route upgrade row (migration 038), from jsonb or a plain row. */
+const tripUpgrade = (r: Record<string, unknown>): TripUpgrade => ({
+  id: Number(r.id), booking_trip_id: String(r.booking_trip_id), from_route_id: String(r.from_route_id), to_route_id: String(r.to_route_id),
+  reason: String(r.reason), charge: Number(r.charge), upgrade_id: (r.upgrade_id as string) ?? null, at: jsonInstant(r.at), by: (r.by as string) ?? null,
+  undone_at: r.undone_at ? jsonInstant(r.undone_at) : null, undone_by: (r.undone_by as string) ?? null,
+});
 /** The booking's reconfirmation from `BOOKING_SELECT` (migration 035). */
 const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | null => r && {
   status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
@@ -611,6 +629,14 @@ export class PostgresOperationsStore {
   }
 
   /** Replaces the whole list, as `writeAddOns` does. */
+  private async writeUpgrades(bookingId: string, upgrades: readonly StoredUpgrade[]): Promise<void> {
+    await this.client().query('DELETE FROM booking_upgrades WHERE booking_id = $1', [bookingId]);
+    for (const [seq, u] of upgrades.entries()) {
+      await this.client().query(`INSERT INTO booking_upgrades (booking_id, seq, id, label, sell_price, to_company, seller, note, collected, settle, method, fee_pct, fee, customer_paid, at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [bookingId, seq, u.id, u.label, u.sell_price, u.to_company, u.seller, u.note, u.collected, u.settle, u.method, u.fee_pct, u.fee, u.customer_paid, u.at]);
+    }
+  }
   private async writeAltPickups(bookingId: string, alts: readonly AltPickup[]): Promise<void> {
     await this.client().query('DELETE FROM booking_alt_pickups WHERE booking_id = $1', [bookingId]);
     for (const [seq, a] of alts.entries()) {
@@ -770,9 +796,12 @@ export class PostgresOperationsStore {
     await this.writeAddOns(id, input.add_ons ?? []);
     await this.writeAdjustments(id, input.adjustments ?? []);
     await this.writeAltPickups(id, input.alt_pickups ?? []);
+    const sold = storedUpgrades(input.upgrades ?? [], [], new Date().toISOString(), actor ?? null);
+    await this.writeUpgrades(id, sold.upgrades);
     await this.requestApprovals(id, decision.approvals);
     await this.log(id, createdLine(actor));
     for (const line of decision.history) await this.log(id, line);
+    for (const line of sold.history) await this.log(id, line);
     return (await this.booking(id))!;
   }
 
@@ -841,6 +870,11 @@ export class PostgresOperationsStore {
     if (changes.add_ons) await this.writeAddOns(id, changes.add_ons);
     if (changes.adjustments) await this.writeAdjustments(id, changes.adjustments);
     if (changes.alt_pickups) await this.writeAltPickups(id, changes.alt_pickups);
+    if (changes.upgrades) {
+      const sold = storedUpgrades(changes.upgrades, current.upgrades, new Date().toISOString(), actor ?? null);
+      await this.writeUpgrades(id, sold.upgrades);
+      for (const line of sold.history) await this.log(id, line);
+    }
     if (reweighed?.request) await this.requestApprovals(id, [reweighed.request]);
     else if (reweighed) await this.replacePending(id, 'approval');
     for (const line of reweighed?.history ?? []) await this.log(id, line);
@@ -1428,6 +1462,25 @@ export class PostgresOperationsStore {
   }
   async deleteCheckin(tripId: string, kind: CheckinKind, slot: number): Promise<boolean> {
     return (await this.client().query('DELETE FROM booking_trip_checkins WHERE booking_trip_id = $1 AND kind = $2 AND slot = $3', [tripId, kind, slot])).rowCount === 1;
+  }
+
+  /** Moves one trip to another route through the ordinary edit, which checks the route's calendar and seats. */
+  async upgradeRoute(id: string, tripId: string, routeId: string, actor: string | undefined, entry: HistoryLine): Promise<Booking | undefined> {
+    const current = await this.storedBooking(id);
+    return current && this.amendBooking(id, { trips: retargetTrip(current.trips, tripId, routeId) }, actor, entry);
+  }
+  /** Replaces the upgrades list as given, writing no history (a route upgrade's charge). */
+  async setUpgrades(bookingId: string, upgrades: readonly StoredUpgrade[]): Promise<void> { await this.writeUpgrades(bookingId, upgrades); }
+  async tripUpgradesOf(tripId: string): Promise<TripUpgrade[]> {
+    return (await this.client().query('SELECT * FROM booking_trip_upgrades WHERE booking_trip_id = $1 ORDER BY id', [tripId])).rows.map(tripUpgrade);
+  }
+  async addTripUpgrade(row: Omit<TripUpgrade, 'id'>): Promise<TripUpgrade> {
+    const { rows: [saved] } = await this.client().query(`INSERT INTO booking_trip_upgrades (booking_trip_id, from_route_id, to_route_id, reason, charge, upgrade_id, at, by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, [row.booking_trip_id, row.from_route_id, row.to_route_id, row.reason, row.charge, row.upgrade_id, row.at, row.by]);
+    return tripUpgrade(saved);
+  }
+  async undoTripUpgrade(id: number, at: string, by: string | null): Promise<void> {
+    await this.client().query('UPDATE booking_trip_upgrades SET undone_at = $2, undone_by = $3 WHERE id = $1', [id, at, by]);
   }
 
   /** `null` removes it. */

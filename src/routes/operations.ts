@@ -23,6 +23,7 @@ import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
+import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeUndoneLine } from '../domain/upgrades.js';
 import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checkin.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
@@ -250,6 +251,7 @@ function bookingInput(body: unknown): BookingInput & { viaStatus: boolean } {
     add_ons: parseBookingAddOns(addOnsOf(input), addOnsLabel(input)),
     adjustments: parseBookingAdjustments(input.adjustments),
     alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups ?? []),
+    upgrades: parseUpgrades(input.upgrades ?? []),
     // booking_data: input,
   };
 }
@@ -316,6 +318,7 @@ function bookingChanges(body: unknown): BookingChanges {
     // Present replaces the list, `null` or `[]` clears it, absent leaves it.
     ...(input.adjustments === undefined ? {} : { adjustments: parseBookingAdjustments(input.adjustments) }),
     ...((input.alt_pickups ?? input.altPickups) === undefined ? {} : { alt_pickups: parseAltPickups(input.alt_pickups ?? input.altPickups) }),
+    ...(input.upgrades === undefined ? {} : { upgrades: parseUpgrades(input.upgrades) }),
   };
   if (input.trips !== undefined) return { trips: tripsInput(input), ...common };
   return {
@@ -747,6 +750,69 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     await store.setReconfirm(booking.id, withoutStatus(booking.reconfirm));
     return (await store.booking(booking.id))!;
   }));
+  /**
+   * Route upgrade (todo/trip-ops-and-vans-model.md, slice E; legacy `bkV2UpgApply`): one trip moves to
+   * another programme that sails that day, at the price it was booked at. A charge becomes an upgrade
+   * sale to collect on tour. Undo moves it back and drops the charge unless it was collected.
+   */
+  const routeName = async (id: string) => (await store.listRoutes()).find((r) => r.id === id)?.name ?? id;
+  /** Legacy's checks on the programme a trip moves to: a boat sails it that day, with seats for everyone. */
+  const assertRoomOn = async (routeId: string, date: string, pax: number, verb: string) => {
+    const capacity = await store.capacity(routeId, date);
+    if (capacity.deployed_capacity === 0 && !capacity.unlimited) refuseWith(`${verb}: ${await routeName(routeId)} has no boat on ${date}`, 409, 'route_not_sailing');
+    if (capacity.available_seats !== null && pax > capacity.available_seats) {
+      refuseWith(`${verb}: not enough free seats on ${await routeName(routeId)} (${date}). Needs ${pax}, free ${capacity.available_seats}.`, 409, 'not_enough_seats');
+    }
+  };
+  const upgradeTrip = async (request: { params: unknown }, tripId: string) => {
+    const booking = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+    const trip = booking.trips.find((t) => t.id === tripId) ?? badRequest(`Trip ${tripId} is not on booking ${booking.id}`);
+    return { booking, trip: trip! };
+  };
+  app.post('/v1/bookings/:id/upgrade', async (request) => {
+    const input = parseRouteUpgrade(record(request.body));
+    return store.transaction(async () => {
+      const { booking, trip } = await upgradeTrip(request, input.trip_id);
+      if (trip.booking_mode === 'charter') refuseWith(`No seat trip on ${trip.service_date} for this booking.`, 409, 'charter');
+      if (trip.ovn || trip.ovn_leg) refuseWith('Overnight trips cannot be upgraded here. Edit the booking instead.', 409, 'overnight');
+      if (Object.keys(trip.lock_draws).length) {
+        refuseWith(`This booking draws seats from a seat lock on ${await routeName(trip.route_id)}. Release the lock draw first (edit the booking), then upgrade.`, 409, 'lock_draw');
+      }
+      if (trip.operations.upgrade) refuseWith(`This trip is already upgraded to ${await routeName(trip.route_id)}: undo that first`, 409, 'already_upgraded');
+      if (input.to_route_id === trip.route_id) badRequest('to_route_id is the route the trip is already on');
+      await assertRoomOn(input.to_route_id, trip.service_date, trip.pax_total, 'Cannot upgrade');
+      const by = actorOf(request.user) ?? null, now = new Date().toISOString();
+      const [fromName, toName] = [await routeName(trip.route_id), await routeName(input.to_route_id)];
+      const moved = (await store.upgradeRoute(booking.id, trip.id, input.to_route_id, actorOf(request.user), routeUpgradeLine(by, fromName, toName, input.reason, input.charge)))!;
+      let upgradeId: string | null = null;
+      if (input.charge > 0) {
+        upgradeId = `up_${Date.now()}`;
+        await store.setUpgrades(booking.id, [...moved.upgrades.map(({ commission: _c, ...u }) => u), routeUpgradeSale(upgradeId, input.charge, toName, input.reason, now)]);
+      }
+      await store.addTripUpgrade({ booking_trip_id: trip.id, from_route_id: trip.route_id, to_route_id: input.to_route_id, reason: input.reason,
+        charge: input.charge, upgrade_id: upgradeId, at: now, by, undone_at: null, undone_by: null });
+      await syncAltParts((await store.booking(booking.id))!);
+      return (await store.booking(booking.id))!;
+    });
+  });
+  app.post('/v1/bookings/:id/upgrade/undo', async (request) => {
+    const body = record(request.body);
+    const tripId = typeof body.trip_id === 'string' && body.trip_id ? body.trip_id : badRequest('trip_id is required');
+    return store.transaction(async () => {
+      const { booking, trip } = await upgradeTrip(request, tripId as string);
+      const live = (await store.tripUpgradesOf(trip.id)).filter((u) => u.undone_at === null).sort((a, b) => b.id - a.id)[0]
+        ?? refuseWith('This trip has no upgrade to undo', 409, 'not_upgraded');
+      await assertRoomOn(live!.from_route_id, trip.service_date, trip.pax_total, 'Cannot undo');
+      const by = actorOf(request.user) ?? null;
+      const moved = (await store.upgradeRoute(booking.id, trip.id, live!.from_route_id, actorOf(request.user), upgradeUndoneLine(by, await routeName(live!.from_route_id))))!;
+      // A charge already collected stays on the booking; one not collected goes with the upgrade.
+      const sale = moved.upgrades.find((u) => u.id === live!.upgrade_id);
+      if (sale && !sale.collected) await store.setUpgrades(booking.id, moved.upgrades.filter((u) => u.id !== sale.id).map(({ commission: _c, ...u }) => u));
+      await store.undoTripUpgrade(live!.id, new Date().toISOString(), by);
+      await syncAltParts((await store.booking(booking.id))!);
+      return (await store.booking(booking.id))!;
+    });
+  });
   /**
    * The agent's re-confirm list sent, or the send undone, for the bookings named. Legacy sends an
    * agent's bookings of one day and passes over cancelled ones; so does this, listing them in `skipped`.
