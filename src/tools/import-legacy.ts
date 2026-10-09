@@ -448,7 +448,7 @@ async function main() {
       }
     };
 
-    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [];
+    const bookings: Row[] = [], trips: Row[] = [], pax: Row[] = [], draws: Row[] = [], passengers: Row[] = [], adjustments: Row[] = [], reconfirms: Row[] = [];
     // The action records (`legacy-records.ts`). The cutover runs once: what is not carried here is lost.
     const cancellations: Row[] = [], reschedules: Row[] = [], partialCancels: Row[] = [], feeItems: Row[] = [], historyLines: Row[] = [];
     // Approvals (`legacy-approvals.ts`). Legacy's `licFree` goes to the approval day when this schema keeps it (025).
@@ -592,6 +592,23 @@ async function main() {
         const kind = str(a.kind), mode = str(a.mode) || 'amount', value = Number(a.value);
         if ((kind !== 'discount' && kind !== 'extra') || (mode !== 'amount' && mode !== 'percent') || !(value > 0)) { note('adjustments dropped: kind, mode or value does not fit'); continue; }
         adjustments.push({ booking_id: id, seq: adjustmentSeq++, kind, mode, value, label: str(a.label) || null, note: str(a.note) || null });
+      }
+      // Reconfirmation (migration 035). A record saved before legacy split out `sent` (§rcSplit) has no
+      // such key; legacy reads a "done" one as sent, at the time and by the person who confirmed it.
+      const rc = jsonValue(b.ops_reconfirm) as Row | null;
+      if (rc && typeof rc === 'object') {
+        const status = ['wa', 'noans', 'off', 'callback', 'done'].includes(str(rc.status)) ? str(rc.status) : null;
+        if (str(rc.status) && !status) note(`reconfirm status "${str(rc.status)}" dropped`);
+        const at = instant(rc.at) ?? null, by = str(rc.by) || null;
+        const sent = 'sent' in rc ? rc.sent === true : status === 'done';
+        const sentAt = sent ? instant(rc.sentAt) ?? ('sent' in rc ? undefined : at ?? undefined) : undefined;
+        if (sent && !sentAt) note('reconfirm sent with no time: sent dropped');
+        if (status || sentAt) {
+          reconfirms.push({
+            booking_id: id, status, via: status ? (['reconfirm', 'phone', 'list'].includes(str(rc.via)) ? str(rc.via) : 'reconfirm') : null,
+            at: status ? at : null, by: status ? by : null, sent_at: sentAt ?? null, sent_by: sentAt ? str(rc.sentBy) || by : null,
+          });
+        }
       }
     }
 
@@ -863,6 +880,7 @@ async function main() {
     await insert('booking_trip_lock_draws', draws);
     await insert('booking_passengers', passengers);
     await insert('booking_adjustments', adjustments);
+    await insert('booking_reconfirmations', reconfirms);
     await insert('booking_cancellations', cancellations);
     await insert('booking_reschedules', reschedules);
     await insert('booking_partial_cancels', partialCancels);

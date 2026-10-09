@@ -73,6 +73,8 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/logout' || path === '/v1/me/password' || path === '/v1/quote') return { kind: 'self' };
   if (path === '/v1/users' || path.startsWith('/v1/users/')) return { kind: 'admin' };
   if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-locks')) return { kind: 'area', areas: ['operations'] };
+  // Legacy's Re-confirm page sends the agent's list.
+  if (path === '/v1/reconfirm/sent') return { kind: 'area', areas: ['operations'] };
   // Legacy assigns boats from "Boat Operation" (operations) and "Fleet Deployment" (fleet).
   if (path.startsWith('/operations/deployments')) return { kind: 'area', areas: ['operations', 'fleet'] };
   // Dispatch: which boat and van a trip goes on, its final pickup, the pier note.

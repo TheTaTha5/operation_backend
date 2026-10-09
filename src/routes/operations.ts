@@ -22,6 +22,7 @@ import { pickupFields, pickupProblem } from '../domain/pickup.js';
 import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
+import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
 import {
   addMembers, assertCapacity, clearRouteVans, createGroup, disbandGroup, groupView, orderGroup, parseVanParts, partsFromView, partsToStore, rezonedParts, setGroup, setTripParts,
   vanDayState, visibleGroups, type VanGroup, type VanPlan,
@@ -657,6 +658,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return store.transaction(async () => {
       await assertBookingFresh(request);
       const stored = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+      assertReconfirmEcho(body.reconfirm, stored.reconfirm);
       let header = changes.header;
       let warnings: PriceWarning[] = [];
       let priced: Awaited<ReturnType<typeof priceFor>> | undefined;
@@ -717,6 +719,46 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return store.transaction(async () => {
       await assertBookingFresh(request);
       return (await store.partialCancel(bookingId(request), partial, actorOf(request.user))) ?? notFound('Booking not found');
+    });
+  });
+  /**
+   * Reconfirmation (todo/trip-ops-and-vans-model.md, slice B): what the customer said when staff
+   * checked their pickup, and whether the agent's list was sent. Each answers the booking.
+   */
+  app.put('/v1/bookings/:id/reconfirm', async (request) => {
+    const { status, via } = parseReconfirmStatus(record(request.body));
+    return store.transaction(async () => {
+      const booking = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+      const { record: next, history } = withStatus(booking.reconfirm, status, via, new Date().toISOString(), actorOf(request.user) ?? null);
+      await store.setReconfirm(booking.id, next);
+      await store.addHistory(booking.id, history);
+      return (await store.booking(booking.id))!;
+    });
+  });
+  app.delete('/v1/bookings/:id/reconfirm', async (request) => store.transaction(async () => {
+    const booking = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
+    await store.setReconfirm(booking.id, withoutStatus(booking.reconfirm));
+    return (await store.booking(booking.id))!;
+  }));
+  /**
+   * The agent's re-confirm list sent, or the send undone, for the bookings named. Legacy sends an
+   * agent's bookings of one day and passes over cancelled ones; so does this, listing them in `skipped`.
+   */
+  app.post('/v1/reconfirm/sent', async (request) => {
+    const { booking_ids, sent } = parseSentRequest(record(request.body));
+    return store.transaction(async () => {
+      const bookings = [];
+      for (const id of booking_ids) bookings.push((await store.booking(id)) ?? badRequest(`Booking ${id} not found`));
+      const done: { id: string; reconfirm: Booking['reconfirm'] }[] = [], skipped: { id: string; reason: string }[] = [];
+      const now = new Date().toISOString(), by = actorOf(request.user) ?? null;
+      for (const booking of bookings) {
+        if (sent && (SEAT_RELEASING_STATUSES as readonly string[]).includes(booking.status)) { skipped.push({ id: booking.id, reason: booking.status }); continue; }
+        const { record: next, history } = withSent(booking.reconfirm, sent, now, by);
+        await store.setReconfirm(booking.id, next);
+        if (history) await store.addHistory(booking.id, history);
+        done.push({ id: booking.id, reconfirm: (await store.booking(booking.id))!.reconfirm });
+      }
+      return { bookings: done, skipped };
     });
   });
   app.post('/v1/bookings/:id/reschedule', async (request) => {

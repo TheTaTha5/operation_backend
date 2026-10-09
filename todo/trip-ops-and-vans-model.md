@@ -1,6 +1,6 @@
 # Trip operations and van assignment, modelled
 
-Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`). Still to build: reconfirm (B), check-in (C), alternate pickups (D), upgrades (E).
+Decided 2026-10-06 (see "Decisions"). **Built:** slice A1 (migration 033, `src/domain/dispatch.ts`, README → "Dispatch"): the boat, boat splits, final pickup, pier note, `operations` on every booking read, the move rule, and their import; slice A2, van parts and groups (`src/domain/van-groups.ts`); slice A3, the vans and month matrix (`src/domain/vans.ts`); slice B, reconfirm (`src/domain/reconfirm.ts`). Still to build: check-in (C), alternate pickups (D), upgrades (E).
 
 - **Why now:** in ops mode the frontend's integration layer keeps all of this local only.
   `mergeInto` (`allotment_v2/js/ops/40-ops-bookings.js`) keeps `ops`, `upgrades`, `altPickups` and
@@ -280,11 +280,7 @@ For the cross-booking views:
   - An event whose `undone` is removed → 409 `event_undone_is_final`.
   - Event order is append-only, so a PUT that shortens `events` → 409 `events_append_only`.
 
-**Reconfirm** (`booking:write`):
-- `PUT /v1/bookings/{id}/reconfirm {status, via?}`: the server stamps `at` and `by`.
-- `DELETE` on the same path clears it (keeping `sent_*` if the list was sent, as `rcSetStatus` does).
-- `POST /v1/reconfirm/sent {booking_ids:[…], sent:true|false}` is the agent-list send and undo
-  (`rcSendAgent` / `rcUnsendAgent`). It stamps `sent_at` and `sent_by`.
+**Reconfirm:** built (migration 035, `src/domain/reconfirm.ts`, README → "Reconfirm").
 
 **Booking fields** (`booking:write`): `altPickups`/`alt_pickups` and `upgrades` are accepted on
 `POST /v1/bookings` and `PATCH /v1/bookings/{id}`. Each list replaces outright, with absent =
@@ -405,8 +401,8 @@ The questions as they were asked:
 
 ## Follow-ups
 
-- **The import** brings boats, splits, final pickups and pier notes (A1). Until the other slices extend
-  it, legacy bookings arrive with **no reconfirm (2,669), check-in (3,778), alternate pickups (4) or
+- **The import** brings boats, splits, final pickups, pier notes, vans and reconfirmations. Until the
+  other slices extend it, legacy bookings arrive with **no check-in (3,778), alternate pickups (4) or
   upgrades (11)**.
 
 ## From the van hand-off

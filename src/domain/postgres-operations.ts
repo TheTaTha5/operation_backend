@@ -27,6 +27,7 @@ import type { BookingAdjustment, BookingAdjustmentInput } from './booking-adjust
 import { pickupFields } from './pickup.js';
 import { dispatchView, type BoatSplit, type StoredDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
+import type { StoredReconfirm } from './reconfirm.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
@@ -117,6 +118,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
                               FROM booking_trip_lock_draws d WHERE d.booking_trip_id = t.id), '[]'::jsonb)
     ) ORDER BY t.seq)
     FROM booking_trips t WHERE t.booking_id = b.id), '[]'::jsonb) AS trips,
+  (SELECT to_jsonb(rc) - 'booking_id' FROM booking_reconfirmations rc WHERE rc.booking_id = b.id) AS reconfirm,
   COALESCE((
     SELECT jsonb_agg(jsonb_build_object('seq', pg.seq, 'name', pg.name, 'nationality', pg.nationality, 'type', pg.type, 'foc', pg.foc) ORDER BY pg.seq)
     FROM booking_passengers pg WHERE pg.booking_id = b.id), '[]'::jsonb) AS passengers,
@@ -278,7 +280,12 @@ const booking = (row: QueryResultRow): Booking => {
     const parts = (t.van_parts as Record<string, unknown>[]) ?? [];
     const groups = new Map(parts.filter((p) => p.group).map((p) => [String(p.group_id), vanGroup(p.group as Record<string, unknown>)]));
     return dispatchView(storedDispatch(t), new Set((t.deployed as string[]) ?? []), vanPartsView(parts.map(vanPart), trip.pax, groups));
-  });
+  }, storedReconfirm(row.reconfirm));
+};
+/** The booking's reconfirmation from `BOOKING_SELECT` (migration 035). */
+const storedReconfirm = (r: Record<string, unknown> | null): StoredReconfirm | null => r && {
+  status: (r.status as StoredReconfirm['status']) ?? null, via: (r.via as StoredReconfirm['via']) ?? null,
+  at: r.at ? jsonInstant(r.at) : null, by: (r.by as string) ?? null, sent_at: r.sent_at ? jsonInstant(r.sent_at) : null, sent_by: (r.sent_by as string) ?? null,
 };
 const lock = (row: QueryResultRow): SeatLock => ({ id: String(row.id), route_id: String(row.route_id), service_date: dateOnly(row.service_date), pax: Number(row.pax), status: row.status as SeatLock['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at), released_at: row.released_at ? asIso(row.released_at) : undefined, agent_id: row.agent_id ?? undefined, drawn_pax: Number(row.drawn_pax ?? 0) });
 
@@ -1341,6 +1348,16 @@ export class PostgresOperationsStore {
         x.checked_in?.at ?? null, x.checked_in?.by ?? null, x.checked_in?.seats ?? null, x.created_at, x.created_by, x.updated_at, x.updated_by]);
   }
   async deleteVanStop(id: string): Promise<boolean> { return (await this.client().query('DELETE FROM van_stops WHERE id = $1', [id])).rowCount === 1; }
+
+  /** `null` removes it. */
+  async setReconfirm(bookingId: string, r: StoredReconfirm | null): Promise<void> {
+    if (!r) { await this.client().query('DELETE FROM booking_reconfirmations WHERE booking_id = $1', [bookingId]); return; }
+    await this.client().query(`INSERT INTO booking_reconfirmations (booking_id, status, via, at, by, sent_at, sent_by) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (booking_id) DO UPDATE SET status = EXCLUDED.status, via = EXCLUDED.via, at = EXCLUDED.at, by = EXCLUDED.by,
+        sent_at = EXCLUDED.sent_at, sent_by = EXCLUDED.sent_by`, [bookingId, r.status, r.via, r.at, r.by, r.sent_at, r.sent_by]);
+  }
+  /** Appends a line to a booking's history, inside the write it describes. */
+  async addHistory(bookingId: string, line: HistoryLine): Promise<void> { await this.log(bookingId, line); }
 
   async listUsers(): Promise<StoredUser[]> { return (await this.client().query('SELECT * FROM users ORDER BY id')).rows.map(storedUser); }
   async user(id: number): Promise<StoredUser | undefined> {
