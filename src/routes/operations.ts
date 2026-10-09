@@ -1878,6 +1878,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       today: todayInThailand(), admin: !user || user.role === 'admin', removeAnyway: anyway, boatName: boat?.name ?? boatId,
       catalogueLicense: boat?.license_pax,
       placedBefore: before ? placedOn(await store.bookingsOn(date, before.route_id), boatId, before.route_id, date) : { bookings: 0, pax: 0, charter: null },
+      heldBy: before ? (await store.lockRows({ serviceDate: date, routeId: before.route_id })).find((l) => l.boat_id === boatId && l.status === 'active')?.id ?? null : null,
     });
     // A boat not ready that day (fleet decision 2): legacy's Boat Operation offers only ready boats and its
     // bulk forms skip the rest, so putting one on a route (or another route) needs `deploy_anyway`.

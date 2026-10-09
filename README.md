@@ -862,6 +862,7 @@ Validation errors are `400` and name the path, for example:
 - **Guards** (legacy `bop2GuardPast`, `bop2UnassignBoat`; decided 2026-10-09):
   - a date before today (Asia/Bangkok) is `409 past_date`, except for an admin correcting history;
   - a boat a charter booking holds can't leave its route: `409 charter_boat` ("Cancel the charter booking first");
+  - nor can a boat an active whole-boat hold takes on its route that day: `409 boat_held` ("Release the hold on the Seat Locks page first"; legacy `opHoldOnly`);
   - removing a boat, moving it to another route, or shrinking it below the passengers **placed on it** that day (as legacy counts: not the whole route-day) is `409 seats_sold` ("N booking(s) (P pax) on it"), unless `remove_anyway: true` (legacy's confirm dialog). Then the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id, service_date, boat_id, bookings, pax}]`, and those bookings read `boat_pulled: true`.
   - a catalogue boat that is not ready that day (fixing, unavailable or retired in its log, held by a
     started job, or a charter boat not chartered that day: `GET /v1/fleet/availability`) is
@@ -3514,6 +3515,7 @@ an agent who has not confirmed numbers; `pax` is the minimum seats promised.
   - the boat's sellable and licensed seats leave the pool, whatever number was promised;
   - the boat reads `chartered` in `/v1/availability`;
   - a seat booking can't be put on it (`409 boat_chartered`), and neither can another charter;
+  - the boat can't be removed from that route or moved to another (`409 boat_held`, see Operations);
   - the hold holds nothing more, and nothing draws from it.
 - **On a boat not deployed that day,** it holds its `pax` as a plain lock.
 - **Who creates them:** only the legacy import, for now; only a full release applies to one here
