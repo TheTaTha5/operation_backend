@@ -6,7 +6,7 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 
 1. **Push `main`** again: deploying applies migrations 039–044 (add-on checks, attachments,
    allergies, document check, pickup areas, the change feed). Once `feat/invoices` is merged, 045
-   (invoices and payments) comes with it.
+   (invoices and payments) and 046 (who raised a boat's day capacity) come with it.
 1b. **Copy the files, then re-import:** `npm run import:attachments -- --commit` against Railway
    (5,887 files, ~660 MB; ~18 min locally, re-runnable), then a fresh `import-legacy` run. It brings
    the day-of-operations data, documents, slips, allergy lists, document checks and pickup areas,

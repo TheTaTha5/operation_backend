@@ -1429,6 +1429,28 @@ unchanged, `null` clears it. Answers `{ "trip": …, "warnings": [] }`.
 | `return_same_van` | The group comes back on the van it went out on |
 | `pier_note` | Text; the server stamps `at` and `by` (the login) |
 | `van_parts` | `[{idx, ad, chd, inf, foc, group_id?, sequence?, return_van_id?}]` replaces the trip's parts; `null` or `[]` is one whole, ungrouped part again (legacy unsplit). See below |
+| `raise_capacity` | `{ reason }`: raise the boat's capacity for the day so this assignment fits (see below) |
+
+**Which boat a trip may go on** (legacy `bkV2AssignBoat`; checked when `boat_id` or `boat_splits`
+is sent):
+- **A boat carries its capacity that day + 2.** Its load is every live booking's passengers on it that
+  day (a split counts its share), this trip's included. Past capacity + 2 the assignment is
+  `409 boat_full`, naming the numbers.
+- **Raising the day's capacity:** a login with the `act-capunlock` right, or an admin, sends
+  `raise_capacity: { "reason": "…" }`.
+  - The boat's capacity for that day becomes min(licence, load), and the login and time are recorded
+    (`boat_capacity_overrides.set_by`, `set_at`). Then the assignment goes through. Anyone else is
+    `403`.
+  - **The licence + 2 is the end:** past it the answer is `409 over_licence` ("assign another boat, or
+    add a boat").
+  - A raise made here survives the legacy import.
+  - Only a boat in the boat catalogue can be raised (`409 boat_not_catalogued`).
+- **A chartered boat takes no seat booking:** `409 boat_chartered`.
+- **A charter trip rides its charter boat.** Its `boat_id` is its `charter_boat_id`, set when the
+  booking is made and moved when the charter boat changes (legacy `§chOpsSync`). Another boat is
+  `400`. A split over several boats is kept.
+- **An edit that changes passengers only** is not weighed against the boat, as in legacy: the board
+  shows the load.
 
 **`van_parts`:**
 - They must add up to the trip's passengers, category by category, and each carries one or more,

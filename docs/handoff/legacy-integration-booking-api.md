@@ -1056,13 +1056,14 @@ work for the session only and save nowhere** (see "The one thing to know first")
 3. **Does `operations.boat_id` follow a charter's `charter_boat_id`?** Legacy forces
    `ops.boatId = charterBoatId` on save (`§chOpsSync` in `bookingV2CommitBooking`), and every screen
    reads `ops.boatId`. Until answered, the client can show `charter_boat_id` when `boat_id` is `null`.
-   *Answer (2026-10-09): yes, the server will copy legacy: a charter trip's boat is its charter boat,
-   and another is refused. Not built yet; until then keep the fallback.*
+   *Answer (2026-10-09): yes, built: a charter trip's `boat_id` is its `charter_boat_id`, kept in step
+   on every save; another boat is `400` (README "Dispatch").*
 4. **A boat's seats on assignment.** Legacy refuses assigning a booking to a boat that would go over
    its cap plus tolerance (`bookingV2AssignBoat`, `§baCapGate`, unlockable with `act-capunlock`).
    `PATCH /operations/trip-ops` checks only that the boat is deployed. Is that rule meant to move?
-   *Answer (2026-10-09): yes, the server will copy legacy (capacity + 2; `act-capunlock` or an admin
-   may override). Not built yet: keep the browser's check until it is.*
+   *Answer (2026-10-09): yes, built (README "Dispatch"): over capacity + 2 is `409 boat_full`; legacy's
+   emergency dialog resends with `raise_capacity: { reason }` (act-capunlock or admin, `403` otherwise);
+   past the licence `409 over_licence`; a chartered boat `409 boat_chartered`.*
 5. **Exact keys of `van_parts[].alt`, `reinstate`, `self_add` and `undone`.** README names them
    (`pick_*`, `drop_*`, `alt_who`, `pick_time`; `undone.why`) but shows them only as `null`. Please
    add one filled example each.

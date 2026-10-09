@@ -1083,7 +1083,8 @@ async function main() {
     await target.query('DELETE FROM vans WHERE id = ANY($1::text[])', [staleVans]);
     const removedDeployments = (await target.query(`DELETE FROM deployments WHERE service_date::text || '::' || boat_id <> ALL($1::text[])
       RETURNING service_date::text AS day, boat_id, route_id`, [boatDays.map((bd) => `${str(bd.trips_id)}::${str(bd.key)}`)])).rows;
-    const removedOverrides = (await target.query(`DELETE FROM boat_capacity_overrides WHERE service_date::text || '::' || boat_id <> ALL($1::text[])
+    // A raise made here by trip-ops (migration 046: `set_at`) is kept: legacy never had it.
+    const removedOverrides = (await target.query(`DELETE FROM boat_capacity_overrides WHERE set_at IS NULL AND service_date::text || '::' || boat_id <> ALL($1::text[])
       RETURNING service_date::text AS day, boat_id`, [capOverrides.map((o) => str(o.key))])).rows;
     const upsert = (rows: Row[], extra = '') => `ON CONFLICT (id) DO UPDATE SET ${Object.keys(rows[0] ?? { id: 0 }).filter((c) => c !== 'id').map((c) => `${c} = EXCLUDED.${c}`).concat(extra ? [extra] : []).join(', ')}`;
     await insert('vans', vans, upsert(vans));

@@ -101,6 +101,8 @@ erDiagram
     date service_date PK
     integer capacity "this day only"
     text reason
+    text set_by "a trip-ops raise (046); null from legacy"
+    timestamptz set_at
   }
   deployments {
     date service_date PK

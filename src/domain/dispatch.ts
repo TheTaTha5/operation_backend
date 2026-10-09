@@ -116,3 +116,74 @@ export function applyDispatch(current: StoredDispatch | undefined, patch: Dispat
   if (patch.pier_note !== undefined) next.pier_note = patch.pier_note === null ? null : { text: patch.pier_note, at: ctx.now, by: ctx.by };
   return next;
 }
+
+// ── Who may go on which boat (todo/boat-assignment-model.md, approved 2026-10-09) ──
+
+/** A boat may be filled to its capacity that day plus this (legacy `BA_CAP_TOL`); past it the assignment is refused. */
+export const BOAT_TOLERANCE = 2;
+export type BoatOnDay = { boat_id: string; sellable: number; license_pax?: number; chartered: boolean };
+export type CapacityRaise = { boat_id: string; capacity: number; reason: string };
+
+/** Each boat a trip's dispatch puts passengers on, with how many (`baAssignedPax`, a split counting its share). */
+export function paxByBoat(d: Pick<StoredDispatch, 'boat_id' | 'boat_splits'>, tripPax: number): Map<string, number> {
+  if (d.boat_id) return new Map([[d.boat_id, tripPax]]);
+  return new Map(d.boat_splits.map((s) => [s.boat_id, s.ad + s.chd + s.inf + s.foc]));
+}
+
+/** `raise_capacity: { reason }` on the trip-ops `PATCH`: absent is undefined. */
+export function parseRaise(value: unknown): { reason: string } | undefined {
+  if (value === undefined || value === null) return undefined;
+  const r = value !== null && typeof value === 'object' ? value as Record<string, unknown> : bad('raise_capacity must be { reason }');
+  return typeof r.reason === 'string' && r.reason.trim() ? { reason: r.reason.trim() } : bad('raise_capacity.reason is required');
+}
+
+/**
+ * Legacy `bkV2AssignBoat` and `§chOpsSync`, checked when a patch assigns a boat:
+ * - a charter trip's boat is its charter boat, so nothing else may be set;
+ * - a seat trip may not go on a boat chartered that day (`409 boat_chartered`);
+ * - a boat may carry its capacity that day + 2. Past that, `409 boat_full`, unless the caller may
+ *   raise the day's capacity (`act-capunlock` or admin) and sends `raise_capacity`: then the day's
+ *   capacity becomes min(licence, the load), as legacy's dialog proposes. Past the licence + 2
+ *   nothing helps (`409 over_licence`).
+ * Answers the capacity raises to write before the assignment.
+ */
+export function checkBoatAssignment(input: {
+  patch: DispatchPatch; next: StoredDispatch;
+  trip: { booking_mode: string; charter_boat_id?: string; service_date: string; pax_total: number };
+  boats: ReadonlyMap<string, BoatOnDay>;
+  /** Passengers already on each boat that day, this trip left out. */
+  others: ReadonlyMap<string, number>;
+  raise: { reason: string } | undefined; mayRaise: boolean;
+}): CapacityRaise[] {
+  const { patch, trip } = input;
+  if (patch.boat_id === undefined && patch.boat_splits === undefined) return [];
+  if (trip.booking_mode === 'charter') {
+    if (patch.boat_id !== undefined && patch.boat_id !== trip.charter_boat_id) {
+      bad(`A charter's boat is its charter_boat_id (${trip.charter_boat_id ?? 'none'}): change it on the booking`);
+    }
+    return [];
+  }
+  const raises: CapacityRaise[] = [];
+  for (const [boatId, mine] of paxByBoat(input.next, trip.pax_total)) {
+    const boat = input.boats.get(boatId);
+    if (!boat) continue;
+    if (boat.chartered) refuse(`Boat ${boatId} is a charter on ${trip.service_date}: a seat booking can't go on it`, 409, 'boat_chartered');
+    const load = (input.others.get(boatId) ?? 0) + mine;
+    if (load <= boat.sellable + BOAT_TOLERANCE) continue;
+    const at = `Boat ${boatId} would carry ${load} on ${trip.service_date} (capacity ${boat.sellable}, at most ${boat.sellable + BOAT_TOLERANCE})`;
+    const lic = boat.license_pax;
+    if (lic && load - BOAT_TOLERANCE > lic) refuse(`${at}; licensed seats ${lic}: assign another boat, or add a boat`, 409, 'over_licence');
+    if (!input.raise) refuse(`${at}. Raising the day's capacity needs act-capunlock: send raise_capacity with a reason`, 409, 'boat_full');
+    if (!input.mayRaise) refuse(`${at}. Raising the day's capacity needs an admin or the act-capunlock right`, 403, 'forbidden');
+    raises.push({ boat_id: boatId, capacity: lic ? Math.min(lic, load) : load, reason: input.raise!.reason });
+  }
+  return raises;
+}
+
+/** `§chOpsSync`: a charter trip's boat follows its charter boat, unless it is split over boats. Undefined when nothing changes. */
+export function charterSynced(trip: { booking_mode: string; charter_boat_id?: string }, d: StoredDispatch | undefined): StoredDispatch | undefined {
+  if (trip.booking_mode !== 'charter' || !trip.charter_boat_id) return undefined;
+  const current = d ?? EMPTY_DISPATCH;
+  if (current.boat_splits.length || current.boat_id === trip.charter_boat_id) return undefined;
+  return { ...copy(current), boat_id: trip.charter_boat_id };
+}

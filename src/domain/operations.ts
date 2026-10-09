@@ -57,7 +57,7 @@ export type Deployment = {
 };
 
 /** A per-day capacity change for one boat, from `boat_capacity_overrides`. */
-export type BoatCapacityOverride = { boat_id: string; service_date: string; capacity: number; reason?: string };
+export type BoatCapacityOverride = { boat_id: string; service_date: string; capacity: number; reason?: string; set_by?: string | null; set_at?: string };
 /**
  * The boat catalogue entry a deployment's licence is resolved from.
  *
@@ -765,6 +765,10 @@ export class OperationsStore {
       }
     }
     return undefined;
+  }
+  /** A boat's capacity for one day (migration 046 records who and when): the trip-ops raise. */
+  putBoatCapacityOverride(o: Required<Pick<BoatCapacityOverride, 'boat_id' | 'service_date' | 'capacity' | 'reason'>> & { set_by: string | null; set_at: string }): void {
+    this.catalogue.boatOverrides = [...this.catalogue.boatOverrides.filter((x) => !(x.boat_id === o.boat_id && x.service_date === o.service_date)), { ...o }];
   }
   setDispatch(tripId: string, dispatch: StoredDispatch): void { this.dispatch.set(tripId, { ...dispatch, boat_splits: dispatch.boat_splits.map((s) => ({ ...s })) }); }
 
