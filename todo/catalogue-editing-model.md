@@ -1,6 +1,6 @@
 # Catalogue editing, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); not designed yet.
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09; designed below.
 
 Scope: adding and editing routes and boats, and a boat's seats for one day. The route calendar
 (seasons, day overrides) is already built here and is only mentioned where it touches the rest.
@@ -312,3 +312,181 @@ Read 2026-10-09 from the legacy database.
     past days.
 12. **The stand-in boat:** ask ops what limit they want on no-boat days first (in the checklist).
 13. **Retire:** `POST /v1/boats/{id}/retire` and `/restore`; refused while the boat has future deployments.
+
+## Design (2026-10-09)
+
+The details below were designed from the decisions above without a further stop (the lead's
+instruction). Where legacy is silent the design copies legacy; every choice made here is listed
+under "Flagged" once built.
+
+### Fields and who decides them
+
+**Route** (`routes`):
+
+| Field | Kind | Rule |
+|---|---|---|
+| `id` | computed | `r<epoch ms>`, as legacy's form and `b2c-catalog.js` make it; bumped until free |
+| `name` | client fact | required, trimmed |
+| `islands` | client fact | free text |
+| `times` | client fact | list of `HH:MM`; blanks dropped; absent on create → `["08:00"]` (both legacy paths) |
+| `kind` | client fact | `marine`/`land`; `pier: "other"` means land (b2c); absent → `marine` when a pier is sent, else `400` |
+| `pier` | validated | `tublamu`/`panwa`/`ranong`; required for marine; optional for land (b2c allows a land pier) |
+| `family_id` | validated | must be a family in `route_families`, or `null` = "no family, not on the Booking calendar". Absent on create → guessed as b2c does (land: `citytour` if the name says City Tour, else `transfer`; marine: the name ladder), `400` when no guess |
+| `color` | client fact | `#rrggbb`; absent on create → the next of legacy's 8 `ROUTE_COLORS` |
+| `ext_id` | validated | Love Kingdom's code, `^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`, unique (new partial unique index) |
+| `sort` | validated (command) | new route → after the last; changed only by `POST /v1/routes/order` |
+| `daily_cap`, `code`, `meal_venue_id` | not here (decision 7) | an empty value is accepted and ignored; a real one is `400` saying it is not kept here |
+| `seasons` | client fact, create only | b2c's `seasons: [{kind|type, from_date|from, to_date|to}]`; afterwards the calendar endpoints |
+
+**Family** (`route_families`, new): `id` (client fact, slug `^[a-z0-9][a-z0-9_-]{0,31}$`, or made
+from the name), `name` (required), `color` (`#rrggbb`), `sort` (client fact). Seeded with legacy's
+ten (`_BKV2_FAMILIES`), names and colours included.
+
+**Boat** (`boats`), the whole legacy form (`saveBoat`):
+
+| Field | Kind | Rule |
+|---|---|---|
+| `id` | computed | `b<epoch ms>` (`LA_UID('b')`) |
+| `name` | client fact | required |
+| `name_th`, `brand`, `model`, `vessel_use`, `material`, `reg`, `callsign`, `imo`, `build_year`, `homeport_city`, `homeport`, `owner`, `owner_addr`, `note` | client facts | text (legacy's `use` and `year` renamed); `brand` and `model` now kept (legacy lost them) |
+| `type` | validated | `Catamaran`/`Speedboat`/`Big Boat`/`Longtail` (the form's list; pricing reads it) |
+| `pier` | validated | `tublamu`/`panwa`/`ranong`, required on create |
+| `ownership` | validated | `own`/`charter`, default `own` |
+| `engine_count` | validated | 1–5, default 4 (form) |
+| `capacity` | validated | positive whole number; absent on create → 40 (form). **May exceed the licence** (decision 4): sales are capped by `deploymentSeats`; the answer warns `capacity_above_licence` |
+| `license_pax`, `crew`, `fish_crew` | client facts | whole numbers; `0`/blank = none (`null`) |
+| `registered_persons` | client fact | legacy `totalcap`; absent on create → `license_pax + crew + fish_crew` (`fmCalcTotal`), else `null` |
+| `gt`, `nt`, `dwt`, `loa`, `beam`, `depth`, `draft`, `lbp`, `bhp` | client facts | numbers ≥ 0 or `null` |
+| `color` | client fact | `#rrggbb` |
+| `documents` | client fact | `[{name, expires_on?, renew_status?}]`, replaced whole; `renew_status` `processing`/`done`/`null` |
+| `status` | client fact (write-only) | the form's pick `available`/`fixing`/`unavailable`: on create the first log entry; on edit a new entry from today when it differs from today's stored status (`autoClosePrevLog` first), as `saveBoat` |
+| `status_log` | client fact (own endpoints) | entries `{id, status, from_date, to_date, loc, province, loc_type, detail, note, reason, project_id}` |
+| `status_today` | computed | legacy `getStoredStatus`: the latest entry covering today; none → `available`, or `unavailable` for a charter boat |
+| `charter_ceiling` | computed | as now |
+| `retired`, `retired_on`, `retired_reason`, `unretired_on` | validated (commands) | `/retire`, `/restore` |
+
+`PATCH` refuses every computed or command field with `400` naming what to use.
+
+**A boat's seats for one day** (`boat_capacity_overrides`): `capacity` validated, `reason` client
+fact (required when it differs from normal), `set_by`/`set_at` computed (the login, now).
+
+### Rules
+
+- **Route delete** (decision 6): `409 route_in_use`, naming counts of what refers to it: bookings,
+  deployments, seat locks, rate types, agents' programmes, contracts, van days, van groups, van
+  stops, upgrades, pickup times. Otherwise its times, seasons and day overrides go with it.
+- **Reorder** (`stApplyRouteOrder`): `{pier, route_ids}` must list every route of that group once
+  (`pier: null` = the land routes); the group takes those slots in that order and every route is
+  renumbered `0..n-1`.
+- **Love Kingdom create** (decision 9): a `POST /v1/routes` whose `ext_id` a route already has
+  answers `200 {created: false, route}` and changes nothing; new → `201 {created: true, route}`.
+  `warnings: [{code: "duplicate_name"}]` when another route has the name (b2c's warning). The login
+  tied to agent `a_b2c` may call `POST /v1/routes` (only that) without `config`.
+- **Families:** `DELETE` is `409 family_in_use` while a route uses it.
+- **Capacity change** (decision 5): a `PATCH` that changes `capacity`, `license_pax` or
+  `registered_persons` rewrites those on every deployment of the boat from today (Thai time) on. Before
+  it does, each such day is weighed (`capacityChange` in `src/domain/catalogue.ts`, with
+  `placedOn` from the deployment guards): passengers placed on the boat that day against its new
+  seats (the day override, if any, still wins; a chartered day is weighed against the licence). Any
+  day over is `409 seats_sold` listing the days, unless `capacity_anyway: true`; then the answer
+  carries `warnings: [{code: "oversold", route_id, service_date, boat_id, bookings, pax, seats}]`.
+- **Day seats** (decision 10): `PUT /v1/boats/{id}/capacity-overrides/{date}` `{capacity, reason}`.
+  Normal = the day's deployment capacity, else the boat's. Ceiling = `license_pax`, else `capacity`
+  (legacy `boatCapLicense`). Over the ceiling `400`; a past day `409 past_date`; no reason while it
+  differs `400`; raising above normal and above what the day already has needs `act-capunlock` or
+  admin (`403`, legacy's message); `capacity` equal to normal deletes the override (legacy). `DELETE`
+  restores normal (`204`, `404` when none). Area `operations`.
+- **Retire / restore** (decision 13): retire refused while the boat has deployments from today on
+  (`409 future_deployments`, naming the first days); `409` when already retired / not retired.
+  Retire appends a `retired` log entry and stamps `retired_on`, `retired_reason`; restore appends an
+  `available` entry and stamps `unretired_on` (legacy `flRetireBoat`/`flUnretireBoat`). Area `fleet`
+  (legacy's), admin always. A retired boat can't be deployed (`409 boat_retired`; legacy hides it).
+- **Status log endpoints** (`saveStatus`, `delStatus`): add needs `status`, `from_date`, `to_date`
+  (`to ≥ from`), `province`, `loc_type`, and `reason` when unavailable (legacy's alerts); adding
+  closes or trims what it overlaps (`autoClosePrevLog`); editing changes the entry in place. Fleet
+  rules (the open-job confirm, maintenance links) stay with fleet maintenance.
+
+### Permissions (`writeNeed`)
+
+`/v1/boats/{id}/capacity-overrides/…` → `operations`; `/v1/boats/{id}/retire|restore` → `fleet`;
+every other `/v1/boats…`, `/v1/routes` (exact) and `/v1/route-families…` → `config`. `/v1/routes/…`
+stays `config`. `assertMayWrite` lets the `a_b2c` login through on `/v1/routes` only.
+
+### Migration `070_catalogue_editing.sql`
+
+```sql
+CREATE TABLE route_families (id TEXT PRIMARY KEY, name TEXT NOT NULL CHECK (btrim(name) <> ''),
+  color TEXT CHECK (color ~ '^#[0-9a-fA-F]{6}$'), sort INTEGER NOT NULL DEFAULT 0);
+INSERT INTO route_families … legacy's ten …;
+INSERT INTO route_families (id, name, sort) SELECT DISTINCT family_id, family_id, 100 FROM routes
+  WHERE family_id IS NOT NULL ON CONFLICT (id) DO NOTHING;   -- any family a route already names
+ALTER TABLE routes ADD CONSTRAINT routes_family_fk FOREIGN KEY (family_id) REFERENCES route_families (id) ON UPDATE CASCADE;
+CREATE UNIQUE INDEX routes_ext_id_key ON routes (ext_id) WHERE ext_id IS NOT NULL;
+ALTER TABLE routes ADD COLUMN updated_at TIMESTAMPTZ;        -- set by an API write; null = legacy's copy
+
+ALTER TABLE boats DROP CONSTRAINT boats_check;               -- capacity <= license_pax (decision 4)
+ALTER TABLE boats ADD COLUMN name_th TEXT, … every form field …,
+  ADD COLUMN ownership TEXT NOT NULL DEFAULT 'own' CHECK (ownership IN ('own','charter')),
+  ADD COLUMN engine_count INTEGER CHECK (engine_count BETWEEN 1 AND 5), …,
+  ADD COLUMN retired BOOLEAN NOT NULL DEFAULT false, ADD COLUMN retired_on DATE,
+  ADD COLUMN retired_reason TEXT, ADD COLUMN unretired_on DATE, ADD COLUMN updated_at TIMESTAMPTZ;
+CREATE TABLE boat_documents (boat_id TEXT NOT NULL REFERENCES boats (id) ON DELETE CASCADE, idx INTEGER NOT NULL,
+  name TEXT NOT NULL, expires_on DATE, renew_status TEXT CHECK (renew_status IN ('processing','done')), PRIMARY KEY (boat_id, idx));
+CREATE TABLE boat_status_log (boat_id TEXT NOT NULL REFERENCES boats (id) ON DELETE CASCADE, id TEXT NOT NULL, seq INTEGER NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('available','fixing','unavailable','retired')), from_date DATE NOT NULL, to_date DATE,
+  loc TEXT, province TEXT, loc_type TEXT, detail TEXT, note TEXT, reason TEXT, project_id TEXT,
+  PRIMARY KEY (boat_id, id), CHECK (to_date IS NULL OR to_date >= from_date));
+ALTER TABLE changes … kind adds 'boat';
+```
+
+### Contract
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `GET /v1/route-families` | | `{families: [{id, name, color, sort}]}` by `sort`, `id` |
+| `POST /v1/route-families` | `{id?, name, color?, sort?}` | `201` family; `409 family_exists` |
+| `PATCH /v1/route-families/{id}` | `{name?, color?, sort?}` | `200`; `id` refused |
+| `DELETE /v1/route-families/{id}` | | `204`; `409 family_in_use` |
+| `GET /v1/routes/{id}` | | the route as the list shows it, with `seasons` and `overrides` |
+| `POST /v1/routes` | route fields, `seasons?` | `201 {created: true, route, warnings}`; same `ext_id` → `200 {created: false, route, warnings: []}` |
+| `PATCH /v1/routes/{id}` | route fields | `200` route; `sort`/`id`/`seasons` refused naming the endpoint |
+| `DELETE /v1/routes/{id}` | | `204`; `409 route_in_use` |
+| `POST /v1/routes/order` | `{pier, route_ids}` | `200 {routes: [{id, sort}]}` |
+| `GET /v1/boats`, `GET /v1/boats/{id}` | | every field above, `documents`, `status_log`, `status_today`, `charter_ceiling` |
+| `POST /v1/boats` | boat fields, `status?` | `201` boat (+ `warnings`) |
+| `PATCH /v1/boats/{id}` | boat fields, `status?`, `capacity_anyway?` | `200` boat, `deployments_updated`, `warnings`; `409 seats_sold` |
+| `POST /v1/boats/{id}/retire` | `{reason?}` | `200` boat; `409 future_deployments`/`already_retired` |
+| `POST /v1/boats/{id}/restore` | | `200` boat; `409 not_retired` |
+| `POST /v1/boats/{id}/status-log` | entry | `201` entry |
+| `PATCH /v1/boats/{id}/status-log/{entry_id}` | entry fields | `200` entry |
+| `DELETE /v1/boats/{id}/status-log/{entry_id}` | | `204` |
+| `GET /v1/boats/{id}/capacity-overrides?from=&to=` | | `{overrides: [day]}` |
+| `PUT /v1/boats/{id}/capacity-overrides/{date}` | `{capacity, reason}` | `200` day: `{boat_id, service_date, capacity, normal, ceiling, overridden, reason, set_by, set_at}` |
+| `DELETE /v1/boats/{id}/capacity-overrides/{date}` | | `204`; `404` none; `409 past_date` |
+
+Example, Love Kingdom:
+
+```json
+POST /v1/routes
+{"ext_id": "PTP-009:VT-001", "name": "Fantasea Show + Dinner", "kind": "land", "family_id": "activity"}
+→ 201 {"created": true, "route": {"id": "r1791234567890", "name": "Fantasea Show + Dinner", "kind": "land",
+       "ext_id": "PTP-009:VT-001", "family_id": "activity", "color": "#378ADD", "sort": 58, "times": ["08:00"],
+       "seasons": [], "overrides": []}, "warnings": []}
+```
+
+Example, a capacity cut over passengers already placed:
+
+```json
+PATCH /v1/boats/b10 {"capacity": 30}
+→ 409 {"code": "seats_sold", "message": "Aluminous2 would carry more passengers than its 30 seats on 2026-10-12 (r7: 2 bookings, 41 pax). Send capacity_anyway: true to go ahead"}
+```
+
+### Import and sync
+
+- `sync:routes` and `sync:boats` become **`seed:routes` and `seed:boats`**: they add what this API
+  lacks and refresh only rows never edited here (`updated_at` is null), so an edit made through the
+  API is never overwritten. Calendars are still copied for new routes only. `seed:routes` adds any
+  family legacy names that is missing. `seed:boats` copies every form field, the documents and the
+  status log (ids made unique per boat), and no longer skips a boat over its licence.
+- `import-legacy.ts` already reads routes and boats and writes neither. Its day-override upsert stops
+  overwriting an override set here (`set_at` not null), as its mirror delete already does.
