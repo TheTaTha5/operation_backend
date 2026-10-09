@@ -1,0 +1,45 @@
+import assert from 'node:assert/strict';
+import { after, test } from 'node:test';
+import type { InjectOptions } from 'fastify';
+import { buildApp } from '../src/app.js';
+import { createStore } from '../src/routes/operations.js';
+
+// Whole-boat holds (todo/boat-holds-model.md, approved 2026-10-09), on whichever store DATABASE_URL
+// selects. The API creates no holds yet (the import does), so the test makes one through the store.
+const store = createStore();
+const app = buildApp({ store });
+after(async () => app.close());
+const send = (method: InjectOptions['method'], url: string, payload?: object) => app.inject({ method, url, ...(payload ? { payload } : {}) });
+const day = async (date: string) => (await send('GET', `/v1/availability?route_id=r1&from=${date}&to=${date}`)).json().days[0];
+
+test('a hold takes its whole boat, as a charter does, whatever it promised', async () => {
+  const date = '2059-02-01';
+  await send('POST', '/operations/deployments', { boat_id: 'hb-held', route_id: 'r1', service_date: date, capacity: 38, license_pax: 47 });
+  await send('POST', '/operations/deployments', { boat_id: 'hb-open', route_id: 'r1', service_date: date, capacity: 20, license_pax: 25 });
+  const hold = await store.transaction(async () => store.createLock({ route_id: 'r1', service_date: date, pax: 30, agent_id: 'hb-agent', boat_id: 'hb-held' }));
+  const read = (await send('GET', `/v1/seat-locks?route_id=r1&service_date=${date}`)).json();
+  assert.equal(read.seat_locks.find((l: { id: string }) => l.id === hold.id).boat_id, 'hb-held');
+
+  const seats = await day(date);
+  assert.deepEqual([seats.available_seats, seats.locked_pax, seats.licensed_free], [20, 0, 25], 'all 38 (and its 47 licensed) out; the hold holds nothing more');
+  assert.equal(seats.deployments.find((b: { boat_id: string }) => b.boat_id === 'hb-held').chartered, true);
+
+  const seat = (await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 5 })).json();
+  const onHeld = await send('PATCH', `/operations/trip-ops/${seat.trips[0].id}`, { boat_id: 'hb-held' });
+  assert.deepEqual([onHeld.statusCode, onHeld.json().code], [409, 'boat_chartered']);
+  assert.equal((await send('PATCH', `/operations/trip-ops/${seat.trips[0].id}`, { boat_id: 'hb-open' })).statusCode, 200);
+
+  const charter = await send('POST', '/v1/bookings', { trips: [{ route_id: 'r1', date, pax: { ad: 10 }, booking_mode: 'charter', charter_boat_id: 'hb-held' }] });
+  assert.equal(charter.statusCode, 409);
+  assert.match(charter.json().message, /held whole/);
+  const big = await send('POST', '/v1/bookings', { route_id: 'r1', service_date: date, pax: 30 });
+  assert.equal(big.statusCode, 409, 'past the open boat\'s licence: refused, not sent to approval');
+});
+
+test('a hold whose boat is not deployed holds its seats as a plain lock', async () => {
+  const date = '2059-02-02';
+  await send('POST', '/operations/deployments', { boat_id: 'hb-only', route_id: 'r1', service_date: date, capacity: 40 });
+  await store.transaction(async () => store.createLock({ route_id: 'r1', service_date: date, pax: 12, agent_id: 'hb-agent', boat_id: 'hb-elsewhere' }));
+  const seats = await day(date);
+  assert.deepEqual([seats.available_seats, seats.locked_pax], [28, 12]);
+});

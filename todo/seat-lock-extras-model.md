@@ -197,10 +197,10 @@ old bookings).
   - expired/depleted/released become `released`;
   - reason, expiry, cutoff, sub-group names and the log are dropped;
   - day-lock `pendqty` is not subtracted (only bulk `pendby` is). Harmless today: none is set.
-  - **Whole-boat holds are imported as ordinary seat locks** of their "minimum promised" seats (the
-    `else` branch takes any non-bulk scope). The 5 active ones become locks holding 34–64 seats each,
-    on top of the boat legacy already took out of the pool. **This is a bug in the import**: skip
-    `scope = 'boat'` until holds are modelled.
+  - **Whole-boat holds** take their boat, as a charter does (built 2026-10-09: README "Agent seat
+    locks", migration 047). The import never double-counted them: it brought the boat as an ordinary
+    deployment and a lock of the promised seats, which matched legacy only while a hold promised its
+    whole boat.
   - A free-text holder (9 locks, 8 names such as `Aqua`, `GUIDE MAN`) is imported as an `agent_id`
     that matches no agent.
 - **Unmerged `feat/bulk-seat-locks`** (8c90c94, 2026-10-02; migration renumbered to 019):
@@ -259,7 +259,7 @@ old bookings).
    into the parent on import. A booking's draw names the sub-group; the pool counts the parent.*
 5. **Whole-boat holds:** a separate feature with its own refusals and a charter conversion.
    *Recommend: a design note of its own (it touches deployments and charters), not part of this
-   one. Meanwhile fix the import to skip `scope = 'boat'` (a bug fix, no design needed).*
+   one. (The pool side is built: a hold takes its boat, migration 047.)*
 6. **The log:** *Recommend: a `seat_lock_events` table written by the server on every command:
    create, add, release, release-departure, pend, pend-confirm, edit with old → new, draw and
    return from bookings, with time and user. `GET /v1/seat-locks/{id}/log`. Import legacy's 4,079

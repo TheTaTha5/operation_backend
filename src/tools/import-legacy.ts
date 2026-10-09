@@ -290,8 +290,11 @@ async function main() {
         if (rounds.length) note(`${scope} lock departures written`, rounds.length);
       } else {
         const id = PREFIX + legacyId;
+        // A whole-boat hold takes its boat (todo/boat-holds-model.md); `qty` is the minimum promised.
+        const boatId = scope === 'boat' ? str(l.boatid) || null : null;
+        if (scope === 'boat') note(boatId ? 'whole-boat holds imported with their boat' : 'whole-boat holds with no boat (a plain lock)');
         locks.push({
-          id, route_id: routeId, service_date: day, pax: qty, agent_id: agentId,
+          id, route_id: routeId, service_date: day, pax: qty, agent_id: agentId, boat_id: boatId,
           status: active ? 'active' : 'released', created_at: created, updated_at: created, released_at: null,
         });
         days.set(day, id);

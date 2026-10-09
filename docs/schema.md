@@ -118,6 +118,7 @@ erDiagram
     date service_date
     integer pax
     text agent_id "no FK"
+    text boat_id "a whole-boat hold (047); no FK"
     text status "active or released"
     timestamptz created_at
     timestamptz updated_at
@@ -868,6 +869,7 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_trip_operations.boat_id` | `boats` | Created without one (013). No API writes the column yet. |
 | `bookings.agent_id` | `agents` | Created (002) before the agents table (017). No key was added when it arrived. |
 | `seat_locks.agent_id` | `agents` | Same as `bookings.agent_id`. |
+| `seat_locks.boat_id` | `boats` | A whole-boat hold's boat (047), keyless like `deployments.boat_id`. |
 | `booking_partial_cancels.booking_trip_id` | `booking_trips` | Deliberate: the record must outlive a trip a later edit removes (020). |
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |

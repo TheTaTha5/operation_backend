@@ -73,7 +73,8 @@ export type DayDeployment = DeploymentLimits & { boat_id: string };
 /** A trip on the route that day, from a booking that holds seats. The caller applies any exclusion. */
 export type HeldTrip = { booking_mode: string; pax: number; charter_boat_id?: string };
 /** An active lock on the route that day, and how many of its seats holding bookings have drawn. */
-export type HeldLock = { id: string; pax: number; drawn: number };
+/** `boat_id`: a whole-boat hold (todo/boat-holds-model.md), which takes its boat as a charter does. */
+export type HeldLock = { id: string; pax: number; drawn: number; boat_id?: string };
 
 export type BoatDay = { boat_id: string; sellable: number; licensed: number; license_pax?: number; chartered: boolean };
 export type LockDay = HeldLock & { remaining: number };
@@ -104,11 +105,19 @@ export const sellsUngated = (day: DayState): boolean => day.unlimited || day.boa
  *   boat, so its passengers come out of the pool instead — an undercount, but never an overcount.
  * - A lock holds only what bookings have not yet drawn from it. The drawn seats are already in
  *   `booked_pax`; counting the whole lock as well would hold them twice.
+ * - A whole-boat hold (a lock with `boat_id`) takes its boat exactly as a charter does, and holds
+ *   nothing more (legacy §bkLock). If its boat is not deployed that day it takes no boat, and holds
+ *   its promised seats as a plain lock.
  * - A land route has no pool (`unlimited`), and a marine day with no boat has nothing to sell from
  *   yet: what it holds is `unplaced_pax`, and neither answers a negative `available_seats`.
  */
 export function dayCapacity(deployments: readonly DayDeployment[], trips: readonly HeldTrip[], locks: readonly HeldLock[], kind: RouteKind = 'marine'): DayState {
-  const chartered = new Set(trips.filter((trip) => trip.booking_mode === 'charter' && trip.charter_boat_id).map((trip) => trip.charter_boat_id));
+  const deployedIds = new Set(deployments.map((d) => d.boat_id));
+  const holding = new Set(locks.filter((l) => l.boat_id && deployedIds.has(l.boat_id)).map((l) => l.id));
+  const chartered = new Set([
+    ...trips.filter((trip) => trip.booking_mode === 'charter' && trip.charter_boat_id).map((trip) => trip.charter_boat_id),
+    ...locks.filter((l) => holding.has(l.id)).map((l) => l.boat_id),
+  ]);
   // Sorted here so both stores list a day's boats in the same order; SQL alone would promise none.
   const boats = deployments
     .map((d): BoatDay => ({ boat_id: d.boat_id, ...deploymentSeats(d), license_pax: d.license_pax, chartered: chartered.has(d.boat_id) }))
@@ -121,7 +130,7 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
     charter_pax += trip.pax;
     if (!trip.charter_boat_id || !deployed.has(trip.charter_boat_id)) unplaced += trip.pax;
   }
-  const lockDays = locks.map((l) => ({ ...l, remaining: Math.max(l.pax - l.drawn, 0) }));
+  const lockDays = locks.map((l) => ({ ...l, remaining: holding.has(l.id) ? 0 : Math.max(l.pax - l.drawn, 0) }));
   const locked_pax = lockDays.reduce((sum, l) => sum + l.remaining, 0);
   const open = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.sellable, 0);
   const openLicensed = boats.filter((boat) => !boat.chartered).reduce((sum, boat) => sum + boat.licensed, 0);
@@ -181,7 +190,7 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
     // Only an amendment carrying a charter recorded before `charter_boat_id` existed gets here.
     if (!charter.boat_id) { need += charter.pax; continue; }
     const boat = day.boats.find((b) => b.boat_id === charter.boat_id) ?? refuse(`Boat ${charter.boat_id} is not deployed ${where}`, 400);
-    if (boat.chartered || taking.has(boat.boat_id)) refuse(`Boat ${boat.boat_id} is already chartered ${where}`, 409);
+    if (boat.chartered || taking.has(boat.boat_id)) refuse(`Boat ${boat.boat_id} is already chartered or held whole ${where}`, 409);
     if (charter.pax > boat.licensed) refuse(`A charter of ${charter.pax} exceeds boat ${boat.boat_id}'s licensed ${boat.licensed} passengers`, 409);
     taking.add(boat.boat_id);
     need += boat.sellable;
@@ -218,7 +227,7 @@ export function weighDay(day: DayState, demand: DayDemand): { need: number; over
   for (const charter of demand.charters) {
     if (!charter.boat_id) { charterSeats += charter.pax; charterLicensed += charter.pax; continue; }
     const boat = day.boats.find((b) => b.boat_id === charter.boat_id) ?? refuse(`Boat ${charter.boat_id} is not deployed ${where}`, 400);
-    if (boat.chartered || taking.has(boat.boat_id)) refuse(`Boat ${boat.boat_id} is already chartered ${where}`, 409);
+    if (boat.chartered || taking.has(boat.boat_id)) refuse(`Boat ${boat.boat_id} is already chartered or held whole ${where}`, 409);
     if (charter.pax > boat.licensed) refuse(`A charter of ${charter.pax} exceeds boat ${boat.boat_id}'s licensed ${boat.licensed} passengers`, 409);
     taking.add(boat.boat_id);
     charterSeats += boat.sellable;
