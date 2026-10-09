@@ -50,6 +50,11 @@ test('sending the agent\'s list is its own fact: the status never clears it, and
   assert.equal((await rcOf(a))!.sent, true, 'confirming keeps the list sent');
   const cleared = await send('DELETE', `/v1/bookings/${a}/reconfirm`);
   assert.deepEqual([cleared.json().reconfirm.status, cleared.json().reconfirm.sent], [null, true], 'clearing the status keeps it too');
+  assert.equal((await send('DELETE', `/v1/bookings/${a}/reconfirm?all=true`)).json().reconfirm, null, 'the ops board\'s clear drops it all (legacy bkV2ReconfirmClear)');
+  await send('POST', '/v1/reconfirm/sent', { booking_ids: [a], sent: true });
+  const board = await send('PUT', `/v1/bookings/${a}/reconfirm`, { status: 'done', via: 'list' });
+  assert.deepEqual([board.json().reconfirm.status, board.json().reconfirm.sent], ['done', false], 'the board\'s confirm replaces the record whole (legacy bkV2Reconfirm)');
+  await send('DELETE', `/v1/bookings/${a}/reconfirm?all=true`);
 
   await send('POST', '/v1/reconfirm/sent', { booking_ids: [a, b], sent: false });
   assert.deepEqual([await rcOf(a), await rcOf(b)], [null, null], 'nothing left, no record');

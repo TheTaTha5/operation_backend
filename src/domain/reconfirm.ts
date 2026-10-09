@@ -36,17 +36,24 @@ export function parseReconfirmStatus(body: Record<string, unknown>): { status: R
   return { status: status!, via: via! };
 }
 
-/** What the customer said, stamped now by the login. Whether the list was sent stays as it was. */
+/**
+ * What the customer said, stamped now by the login. From the Re-confirm page (`via: reconfirm`) whether
+ * the list was sent stays as it was; from the ops board (`list`, `phone`) the record is replaced whole and
+ * the sent mark goes, as legacy's `bkV2Reconfirm` does (decided 2026-10-09).
+ */
 export function withStatus(current: StoredReconfirm | null, status: ReconfirmStatus, via: ReconfirmVia, now: string, by: string | null): { record: StoredReconfirm; history: HistoryLine } {
-  const record = { sent_at: null, sent_by: null, ...current, status, via, at: now, by };
+  const record = { sent_at: null, sent_by: null, ...(via === 'reconfirm' ? current : {}), status, via, at: now, by };
   // Legacy's two wordings: the reconfirm page names the status, the ops board says where it was confirmed.
   const text = via === 'reconfirm' ? `Re-confirm: ${LABEL[status]}` : `Re-confirmed pickup (${via})`;
   return { record, history: { by, kind: 'notify', tag: 'Notify', text } };
 }
 
-/** Clears what the customer said. A list already sent stays sent; with nothing left, there is no record. */
-export const withoutStatus = (current: StoredReconfirm | null): StoredReconfirm | null =>
-  current?.sent_at ? { ...current, status: null, via: null, at: null, by: null } : null;
+/**
+ * Clears what the customer said. From the Re-confirm page a list already sent stays sent (`rcSetStatus`);
+ * the ops board's clear (`all`) drops the whole record, as legacy's `bkV2ReconfirmClear` does.
+ */
+export const withoutStatus = (current: StoredReconfirm | null, all = false): StoredReconfirm | null =>
+  !all && current?.sent_at ? { ...current, status: null, via: null, at: null, by: null } : null;
 
 /** The agent's list sent (again: a resend restamps it) or unsent. Unsent with no status leaves no record. */
 export function withSent(current: StoredReconfirm | null, sent: boolean, now: string, by: string | null): { record: StoredReconfirm | null; history?: HistoryLine } {

@@ -69,9 +69,10 @@ const isAuto = (parts: readonly StoredVanPart[]): boolean => parts.some((p) => p
  * The trip's parts for these alternate pickups, or `undefined` to leave them as they are. Legacy's rules:
  * - a split made by hand is left alone;
  * - an entry counts if it has passengers and a place, area, name or drop-off;
- * - with none, or when they take everyone (or the trip has one passenger), an automatic split folds
- *   back into one part that keeps the main part's group, order and return van;
+ * - with none, when they ask for more passengers than the trip has, or when the trip has one passenger,
+ *   an automatic split folds back into one part that keeps the main part's group, order and return van;
  * - otherwise the main part keeps the rest, category by category, and each entry is a part of its own.
+ *   When the entries take everyone, there is no main part (decided 2026-10-09; legacy split nothing).
  *   Parts keep their van assignment by position. A drop-off-only entry rides with the main part; one
  *   with its own pickup starts ungrouped. A part's pickup time stays while its pickup point does.
  */
@@ -80,14 +81,17 @@ export function altPickupParts(alts: readonly AltPickup[], tripPax: Counts, curr
   if (current.length === 1 && current[0].source !== 'main') return undefined;
   const usable = alts.filter((a) => total(paxOf(a)) > 0 && (a.place || a.area_id || a.who || hasDrop(a)));
   const headcount = total(tripPax), altTotal = usable.reduce((s, a) => s + total(paxOf(a)), 0);
-  const main = current[0];
-  if (usable.length === 0 || altTotal >= headcount || headcount < 2) {
+  const main = current.find((p) => p.source === 'main');
+  // Entries that ask for more of a category than the trip has can't be split consistently.
+  const overflow = PAX_CATEGORIES.some((c) => usable.reduce((s, a) => s + a[c], 0) > tripPax[c]);
+  if (usable.length === 0 || overflow || altTotal > headcount || headcount < 2) {
     if (!isAuto(current)) return undefined;
-    return partsToStore([{ idx: 0, source: 'main', ...tripPax, group_id: main.group_id, sequence: main.sequence, return_van_id: main.return_van_id, alt: null }]);
+    return partsToStore([{ idx: 0, source: 'main', ...tripPax, group_id: main?.group_id ?? null, sequence: main?.sequence ?? null, return_van_id: main?.return_van_id ?? null, alt: null }]);
   }
-  const mainPax = Object.fromEntries(PAX_CATEGORIES.map((c) => [c, Math.max(0, tripPax[c] - usable.reduce((s, a) => s + a[c], 0))])) as Counts;
+  const mainPax = Object.fromEntries(PAX_CATEGORIES.map((c) => [c, tripPax[c] - usable.reduce((s, a) => s + a[c], 0)])) as Counts;
   const assign = (p: StoredVanPart | undefined) => ({ group_id: p?.group_id ?? null, sequence: p?.sequence ?? null, return_van_id: p?.return_van_id ?? null });
-  const parts: StoredVanPart[] = [{ idx: 0, source: 'main', ...mainPax, ...assign(main), alt: null }];
+  // Decided 2026-10-09: when the entries take every passenger, the main part, left with nobody, goes (legacy split nothing).
+  const parts: StoredVanPart[] = total(mainPax) > 0 ? [{ idx: 0, source: 'main', ...mainPax, ...assign(main), alt: null }] : [];
   usable.forEach((a, i) => {
     const was = current.find((p) => p.idx === i + 1);
     const keepTime = ownPick(a) && was?.alt?.pick_time && (was.alt.pick_area_id ?? null) === a.area_id && (was.alt.pick_hotel ?? null) === a.place;
@@ -104,16 +108,16 @@ export function altPickupParts(alts: readonly AltPickup[], tripPax: Counts, curr
 }
 
 /**
- * The van parts a booking's alternate pickups call for, if they differ from what is stored. Legacy keeps
- * them on day 1 only (`b.ops`), and leaves a cancelled booking alone (`bkV2HealAltSplits`); so does this.
+ * The van parts a booking's alternate pickups call for, trip by trip, where they differ from what is
+ * stored. Every trip gets them (decided 2026-10-09; legacy did day 1 only). A cancelled booking is left
+ * alone, as legacy's `bkV2HealAltSplits` leaves it.
  */
-export function altPartsPlan(booking: Booking): { tripId: string; parts: StoredVanPart[] } | undefined {
-  if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(booking.status)) return undefined;
-  const first = [...booking.trips].sort((a, b) => a.service_date.localeCompare(b.service_date))[0];
-  if (!first) return undefined;
-  const current = partsFromView(first.operations.van_parts);
-  if (booking.alt_pickups.length === 0 && !isAuto(current)) return undefined;
-  const parts = altPickupParts(booking.alt_pickups, countsOf(parsePaxGrid(first.pax)), current);
-  if (!parts || canon(parts) === canon(partsToStore(current))) return undefined;
-  return { tripId: first.id, parts };
+export function altPartsPlan(booking: Booking): { tripId: string; parts: StoredVanPart[] }[] {
+  if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(booking.status)) return [];
+  return booking.trips.flatMap((trip) => {
+    const current = partsFromView(trip.operations.van_parts);
+    if (booking.alt_pickups.length === 0 && !isAuto(current)) return [];
+    const parts = altPickupParts(booking.alt_pickups, countsOf(parsePaxGrid(trip.pax)), current);
+    return !parts || canon(parts) === canon(partsToStore(current)) ? [] : [{ tripId: trip.id, parts }];
+  });
 }

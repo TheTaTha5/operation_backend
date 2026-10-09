@@ -29,6 +29,8 @@ test('malformed add-ons are refused with the field and its position', () => {
   assert.throws(() => parseBookingAddOns([{ type: 'a', qty: 0 }]), /addOns\[0\]\.qty must be a positive integer/);
   assert.throws(() => parseBookingAddOns([{ type: 'a', jAd: 1.5 }]), /addOns\[0\]\.jAd must be a non-negative integer/);
   assert.throws(() => parseBookingAddOns([{ type: 'a', label: 7 }]), /addOns\[0\]\.label must be a string/);
+  assert.throws(() => parseBookingAddOns([{ type: 'international-park-fee', jAd: 2 }]), /join counts are only for a longtail-join add-on/);
+  assert.equal(parseBookingAddOns([{ type: 'longtail-join-3', jAd: 2 }])[0].join_adults, 2, 'any longtail join');
 });
 
 // Runs against whichever store `buildApp` picks, so `DATABASE_URL=… npm test` asks PostgreSQL the

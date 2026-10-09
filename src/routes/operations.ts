@@ -747,7 +747,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   });
   app.delete('/v1/bookings/:id/reconfirm', async (request) => store.transaction(async () => {
     const booking = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
-    await store.setReconfirm(booking.id, withoutStatus(booking.reconfirm));
+    const all = (request.query as Record<string, unknown>).all;
+    if (all !== undefined && all !== 'true' && all !== 'false') badRequest('all must be true or false');
+    await store.setReconfirm(booking.id, withoutStatus(booking.reconfirm, all === 'true'));
     return (await store.booking(booking.id))!;
   }));
   /**
@@ -970,9 +972,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
 
   /** Rebuilds the van parts a booking's alternate pickups call for (`altPartsPlan`); true when it changed them. */
   async function syncAltParts(booking: Booking): Promise<boolean> {
-    const plan = altPartsPlan(booking);
-    if (plan) await store.setVanParts(plan.tripId, plan.parts);
-    return plan !== undefined;
+    const plans = altPartsPlan(booking);
+    for (const plan of plans) await store.setVanParts(plan.tripId, plan.parts);
+    return plans.length > 0;
   }
 
   /**

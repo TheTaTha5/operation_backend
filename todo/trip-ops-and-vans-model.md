@@ -8,11 +8,6 @@ Everything this note designed is built (migrations 033–038; README → "Dispat
 
 1. **Payment slips** go with attachments (`booking-extras-model.md`, approved): upgrade sales take
    `slips` again, and the import keeps them.
-2. **Alternate pickups:** build their van parts on **every** trip of the booking, not day 1 only; and
-   split even when the entries take every passenger (the main part, left with nobody, goes).
-3. **Reconfirm from the ops board wipes the "sent to agent" mark**, as legacy's board buttons do:
-   marking confirmed by list or phone, and the board's clear. The Re-confirm page keeps it.
-
 Also decided: a deleted deployment keeps the trips' boat and shows `boat_pulled` (as built); the
 check-in tries table stays.
 

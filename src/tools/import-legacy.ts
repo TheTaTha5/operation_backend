@@ -678,7 +678,7 @@ async function main() {
         checkinsOf(src, tripId);
         if (!holdsSeats(status)) { if (hasVanOps(src)) note('van data not imported: booking cancelled or rejected'); continue; }
         vanOpsOf(src, t, tripId, counts, groupZone(t, b, addOnTypes));
-        if (str(t.date) === firstDay && bookingAlts.length) altPartsOf(tripId, counts, bookingAlts);
+        if (bookingAlts.length) altPartsOf(tripId, counts, bookingAlts);
       }
 
       let seq = 0;
