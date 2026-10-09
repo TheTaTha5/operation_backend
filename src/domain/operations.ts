@@ -57,6 +57,8 @@ import { sortDocuments, sortTemplates, type ContractDocument, type ContractTempl
 import { addonServiceView, sortAddonServices, type AddonService } from './addon-services.js';
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
+import { copyBill, type StoredVanBill, type VanRate, type VanRateField } from './van-bills.js';
+import type { DailySettings } from './money-reports.js';
 
 export type Deployment = {
   boat_id: string;
@@ -1090,6 +1092,32 @@ export class OperationsStore {
   pickupNamesTh(): PickupNameTh[] { return [...this.pickupNameRows.values()].sort((a, b) => (a.name_key < b.name_key ? -1 : a.name_key > b.name_key ? 1 : 0)).map((n) => ({ ...n })); }
   putPickupNameTh(n: PickupNameTh): void { this.pickupNameRows.set(n.name_key, { ...n }); }
   deletePickupNameTh(nameKey: string): boolean { return this.pickupNameRows.delete(nameKey); }
+
+  // ── Partner van bills, van rates, the daily report's settings (migration 120) ──
+  private vanBillRows = new Map<string, StoredVanBill>();
+  private vanRateRows: VanRate[] = [];
+  private dailySettings: DailySettings | undefined;
+  vanBill(partner: string, month: string, period: number): StoredVanBill | undefined {
+    const b = [...this.vanBillRows.values()].find((x) => x.partner === partner && x.month === month && x.period === period);
+    return b && copyBill(b);
+  }
+  vanBillsOf(month: string, period: number): StoredVanBill[] {
+    return [...this.vanBillRows.values()].filter((x) => x.month === month && x.period === period).sort((a, b) => (a.partner < b.partner ? -1 : 1)).map(copyBill);
+  }
+  putVanBill(bill: StoredVanBill): void { this.vanBillRows.set(bill.id, copyBill(bill)); }
+  /** By group, then route (a group's base first), then field: as PostgreSQL orders them (`COLLATE "C"`). */
+  vanRates(): VanRate[] {
+    const key = (r: VanRate) => `${r.group_key}\u0000${r.route_id ?? ''}\u0000${r.field}`;
+    return [...this.vanRateRows].sort((a, b) => (key(a) < key(b) ? -1 : 1)).map((r) => ({ ...r }));
+  }
+  putVanRate(rate: VanRate): void { this.deleteVanRate(rate.group_key, rate.route_id, rate.field); this.vanRateRows.push({ ...rate }); }
+  deleteVanRate(groupKey: string, routeId: string | null, field: VanRateField): boolean {
+    const before = this.vanRateRows.length;
+    this.vanRateRows = this.vanRateRows.filter((r) => !(r.group_key === groupKey && r.route_id === routeId && r.field === field));
+    return this.vanRateRows.length < before;
+  }
+  dailyReportSettings(): DailySettings | undefined { return this.dailySettings && { ...this.dailySettings }; }
+  putDailyReportSettings(s: DailySettings): void { this.dailySettings = { ...s }; }
 
   // ── Van stops (migration 034) ──
   private vanStops = new Map<string, VanStop>();

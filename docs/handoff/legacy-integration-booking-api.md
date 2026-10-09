@@ -505,6 +505,37 @@ to these:
 - **Writes need the `operations` area** (the refund and credit too); spending credit is an invoice
   payment and needs `accounting`.
 
+### 2.9 Partner van bills, van rates and the money reports
+
+**The server works out every van bill row and amount, and every report figure** (README "Partner van
+bills" and "Money reports"). `VAN_BILL`, `van_rates` and `dr_cfg` move to these:
+
+| Legacy | API |
+|---|---|
+| `vbAgg`, `vbRenderOv` (ภาพรวม) | `GET /v1/van-bills?month=&period=` → `partners[]` |
+| `vbRows`, `vbState`, the per-partner screen | `GET /v1/van-bills/{partner}/{month}/{period}?van_id=` → `rows`, `extra_lines`, `totals`, `by_code`, `codes`, `new_rows` |
+| `vbSet('perPax')`, `vbSetRateC`, `vbSetRow`, `vbAddExtra`/`vbSetExtra`/`vbDelExtra` | `PATCH …` with `per_pax`, `route_rates`, `row_overrides`, `extra_lines` (each replaces that whole field) |
+| `vbSave` (§vbSeen) | `PATCH …` with `mark_seen: true` (with the inputs, or alone) |
+| `vbPullRates` | `POST …/pull-rates` → the bill and `pulled: { got, none }` (a `generic: true` code is legacy's `*`) |
+| (new) sent / paid | `POST …/send`, `…/unsend`, `…/pay` `{ via, ref, paid_on }`, `…/unpay` |
+| `vanRates`, `vanRateSet` (Transfer Fleet "ราคาจริง") | `GET /v1/van-rates`, `PUT /v1/van-rates` `{ group, route_id, field, rate }` (`rate: null` clears) |
+| `renderAccounting` KPIs, `acctDashboardHtml` | `GET /v1/reports/accounting` |
+| `acctStatementOpen` | `GET /v1/agents/{id}/statement` |
+| `renderTravelSum` totals | `GET /v1/reports/travel-summary?date=` |
+| `drData` money, `drPaneFi`, `drVanReal` | `GET /v1/reports/daily?date=` |
+| `drCfg`, `drCfgSet` | `GET`/`PUT /v1/reports/daily/settings` |
+
+- **Delete client-side:** `vbPersist`, `vbStamp`, the edit snapshot (`_vb.snap`) and every amount the
+  screen adds up; keep the edit mode and the "fill an empty field at once" behaviour as UI only, and
+  send the field with `PATCH`.
+- **Refusals to show as they are:** `409 bill_paid` (undo the payment first), `409 bill_not_sent`,
+  `409 bill_not_paid`, `409 no_van_rates` (legacy's alert, in Thai), `400` naming a field.
+- **Writes:** van bills need `accounting`; van rates `accounting` or `fleet`; the daily report's
+  settings `operations` or `accounting`. A login tied to an agent gets `403` on the reports and reads
+  only its own statement.
+- **Not in the reports yet** (their sources are Money slices 3–4): pier payments, on-tour sales
+  (`SB_EXTRAS`), cash-on-tour and no-show decisions. Keep reading those from legacy until they move.
+
 ## 3. Day-of-operations
 
 **Change: every trip's `operations` is the truth for boats, vans, pickups and check-ins. Read it into

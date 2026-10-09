@@ -74,6 +74,7 @@ import { b2cSkipReason, parseB2CMode } from './legacy-b2c.js';
 import { mapLegacyWeather } from './legacy-weather.js';
 import { HOUSE_AGENT_IDS } from '../domain/agent-writes.js';
 import { applyLegacyInsurance, mapLegacyNationalities, mapLegacySales } from './legacy-sales.js';
+import { mapLegacyDailySettings, mapLegacyVanBills, mapLegacyVanRates } from './legacy-van-bills.js';
 
 const PREFIX = 'lg_';
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -227,6 +228,9 @@ async function main() {
     const vanSreq = await read('SELECT key, value FROM vanjob_sreq');
     const vanPickupTh = await read('SELECT key, value FROM vanjob_pickup_th');
     const groupOrderMeta = await read("SELECT value FROM app_meta WHERE key = 'bkv2_grp_order'");
+    // Partner van bills, Transfer Fleet's van rates and the daily report's settings (migration 120, legacy-van-bills.ts).
+    const legacyVanBills = await read('SELECT key, value FROM van_bill ORDER BY key');
+    const moneyMeta = new Map((await read("SELECT key, value FROM app_meta WHERE key IN ('van_rates', 'dr_cfg')")).map((m) => [str(m.key), m.value]));
     const legacyMarkets = await read('SELECT * FROM sb_markets');
     const legacyMarketSubs = await read('SELECT sb_markets_id, idx, value FROM sb_markets__subs ORDER BY sb_markets_id, idx');
     const legacySales = await read('SELECT * FROM sb_sales');
@@ -1075,6 +1079,9 @@ async function main() {
       }])),
     }, report);
     // ── Weather closures and their follow-ups (migration 060, `legacy-weather.ts`): after the bookings they name ──
+    const vanBills = mapLegacyVanBills(legacyVanBills, report);
+    const vanRates = mapLegacyVanRates(moneyMeta.get('van_rates'), routes, report);
+    const drSettings = mapLegacyDailySettings(moneyMeta.get('dr_cfg'));
     const weather = mapLegacyWeather({ closures: legacyWeather, bookings: legacyBookings }, { prefix: PREFIX, routes, bookings: new Set(bookings.map((b) => String(b.id))) }, report);
 
     // ── Write, in one transaction ──
@@ -1242,6 +1249,29 @@ async function main() {
     // Legacy is the Thai names' master until operations cuts over: replaced whole.
     await target.query('DELETE FROM pickup_name_th');
     await insert('pickup_name_th', pickupNames);
+    // Van bills are upserted on their address: legacy's inputs replace ours, the sent and paid state
+    // (ours alone) stays. A bill made here that legacy does not have is left alone.
+    let replacedVanBills = 0;
+    for (const b of vanBills) {
+      const { rows: [saved] } = await target.query(`INSERT INTO van_bills (id, partner, month, period, per_pax, rate, seen, updated_at, updated_by)
+        VALUES ('vb_' || md5($1 || '|' || $2 || '|' || $3::text), $1, $2, $3::smallint, $4, $5, $6, $7, $8)
+        ON CONFLICT (partner, month, period) DO UPDATE SET per_pax = EXCLUDED.per_pax, rate = EXCLUDED.rate, seen = EXCLUDED.seen,
+          updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by RETURNING id, (xmax <> 0) AS replaced`,
+      [b.partner, b.month, b.period, b.per_pax, b.rate, b.seen, b.updated_at, b.updated_by]);
+      const billId = String(saved.id);
+      if (saved.replaced) replacedVanBills += 1;
+      for (const table of ['van_bill_route_rates', 'van_bill_row_overrides', 'van_bill_extra_lines']) await target.query(`DELETE FROM ${table} WHERE bill_id = $1`, [billId]);
+      await insert('van_bill_route_rates', Object.entries(b.route_rates).map(([code, rate]) => ({ bill_id: billId, code, rate })));
+      await insert('van_bill_row_overrides', Object.entries(b.row_overrides).map(([row_key, o]) => ({ bill_id: billId, row_key, ...o })));
+      await insert('van_bill_extra_lines', b.extra_lines.map(({ date, ...x }, seq) => ({ bill_id: billId, seq, line_date: date, ...x })));
+    }
+    // Legacy is master of the van rates and the daily report's settings until Money moves: replaced whole.
+    await target.query('DELETE FROM van_rates');
+    await insert('van_rates', vanRates.map((r) => ({ ...r, updated_at: null, updated_by: null })));
+    if (drSettings) {
+      await target.query(`INSERT INTO daily_report_settings (id, van_cost, van_quota, target_per_pax) VALUES (true, $1, $2, $3)
+        ON CONFLICT (id) DO UPDATE SET van_cost = EXCLUDED.van_cost, van_quota = EXCLUDED.van_quota, target_per_pax = EXCLUDED.target_per_pax`, [drSettings.van_cost, drSettings.van_quota, drSettings.target_per_pax]);
+    }
 
     const { rows: [after] } = await target.query(`SELECT
       (SELECT count(*) FROM bookings)::int bookings, (SELECT count(*) FROM booking_trips)::int trips,
@@ -1272,6 +1302,8 @@ async function main() {
     console.log(`approvals: ${approvals.filter((a) => a.kind === 'approval').length} approvals (${approvalDays.length} days), ${approvals.filter((a) => a.kind === 'foc').length} FOC approvals; ${approvals.filter((a) => a.status === 'pending').length} pending`);
     console.log(`vans: ${vans.length} vans, ${dayRoutes.length} month-matrix cells, ${statusRanges.length} status ranges, ${vanDays.size} van-days; replaced ${replacedGroups} earlier-imported groups`);
     console.log(`van assignment: ${vanGroups.length} groups, ${allocations.length} allocations, ${tripOps.length} trip operations, ${vanLog.length} van log lines`);
+    console.log(`van bills: ${vanBills.length} of ${legacyVanBills.length} (${replacedVanBills} replaced), ${vanBills.reduce((n, b) => n + Object.keys(b.row_overrides).length, 0)} row overrides, `
+      + `${vanBills.reduce((n, b) => n + b.extra_lines.length, 0)} extra lines; van rates: ${vanRates.length} cells; daily report settings: ${drSettings ? JSON.stringify(drSettings) : 'none'}`);
     console.log(`van job orders: ${jobSends.length} of ${vanSent.length} sent marks (${jobSends.filter((s) => !s.group_id).length} return-only), `
       + `${bookings.filter((b) => b.job_note !== null).length} special requests (${bookings.filter((b) => b.job_note === '').length} blanked), `
       + `${pickupNames.length} of ${vanPickupTh.length} Thai pickup names, ${order.size} groups ordered`);

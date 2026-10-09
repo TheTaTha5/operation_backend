@@ -115,6 +115,11 @@ export function writeNeed(path: string): WriteNeed {
   if (path === '/v1/nationalities') return { kind: 'area', areas: ['operations'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.
   if (path === '/v1/invoices' || path.startsWith('/v1/invoices/')) return { kind: 'area', areas: ['accounting'] };
+  // Partner van bills (legacy `laGuardEdit('accounting')`). Van rates and the daily report's settings
+  // had no guard in legacy (`ctWrite`): given to those who pay the vans or run them (todo/money-model.md).
+  if (path.startsWith('/v1/van-bills/')) return { kind: 'area', areas: ['accounting'] };
+  if (path === '/v1/van-rates') return { kind: 'area', areas: ['accounting', 'fleet'] };
+  if (path === '/v1/reports/daily/settings') return { kind: 'area', areas: ['operations', 'accounting'] };
   return { kind: 'admin' };
 }
 
