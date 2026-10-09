@@ -19,6 +19,7 @@
     "import:users": "tsx src/tools/import-users.ts",
     "user:create": "tsx src/tools/create-user.ts",
     "import:contracts": "tsx src/tools/import-contracts.ts",
+    "import:attachments": "tsx src/tools/import-attachments.ts",
     "verify:import": "tsx src/tools/verify-import.ts"
   },
   "dependencies": {

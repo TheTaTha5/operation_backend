@@ -5,14 +5,17 @@
  * Pure, so both stores decide identically.
  */
 import { refuse, type HistoryLine } from './booking-actions.js';
+import { parseAttachmentIds, type AttachmentRef } from './attachments.js';
 
 export type StoredUpgrade = {
   id: string; label: string; sell_price: number; to_company: number | null; seller: string | null; note: string | null;
   collected: boolean | null; settle: 'pending' | 'done' | null; method: string | null;
   fee_pct: number | null; fee: number | null; customer_paid: number | null; at: string | null;
+  /** Payment-slip attachment ids (migration 040). */
+  slips: string[];
 };
-/** As a read shows it: `commission` is `sell_price − to_company`, never below 0. */
-export type Upgrade = StoredUpgrade & { commission: number };
+/** As a read shows it: `commission` is `sell_price − to_company`, never below 0; `slips` are the files. */
+export type Upgrade = Omit<StoredUpgrade, 'slips'> & { commission: number; slips: AttachmentRef[] };
 
 const bad = (message: string): never => refuse(message, 400);
 /** Legacy `pckN`: money to the satang. */
@@ -20,7 +23,12 @@ const money = (n: number): number => Math.round(n * 100 + (n < 0 ? -1e-9 : 1e-9)
 /** Legacy `pckNum`: "2,000", or "1,995.50". */
 const baht = (n: number): string => n.toLocaleString('en-US', { minimumFractionDigits: n % 1 ? 2 : 0, maximumFractionDigits: 2 });
 
-export const upgradeView = (u: StoredUpgrade): Upgrade => ({ ...u, commission: money(Math.max(0, u.sell_price - (u.to_company ?? 0))) });
+export const upgradeView = (u: StoredUpgrade, files: ReadonlyMap<string, AttachmentRef> = new Map()): Upgrade => ({
+  ...u, commission: money(Math.max(0, u.sell_price - (u.to_company ?? 0))),
+  slips: u.slips.map((id) => files.get(id) ?? { id, name: id, mime: 'application/octet-stream', size: 0 }),
+});
+/** Back to what a store writes. */
+export const upgradeStored = ({ commission: _c, slips, ...u }: Upgrade): StoredUpgrade => ({ ...u, slips: slips.map((s) => s.id) });
 
 /** The client's fields. `commission`, `fee` and `customer_paid` are the server's and are not read. */
 export type UpgradeInput = Omit<StoredUpgrade, 'fee' | 'customer_paid' | 'at'>;
@@ -43,9 +51,8 @@ export function parseUpgrades(value: unknown, label = 'upgrades'): UpgradeInput[
       const n = typeof v === 'string' ? Number(v) : v;
       return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? money(n) : bad(`${at}.${name} must be a number ≥ 0`);
     };
-    const slips = get('slips');
-    // Payment-slip attachments have no home here yet (todo/trip-ops-and-vans-model.md, Open 1).
-    if (Array.isArray(slips) && slips.length > 0) bad(`${at}.slips: payment-slip attachments are not stored yet`);
+    // Payment slips are uploaded files (POST /v1/attachments); the route checks they exist.
+    const slips = parseAttachmentIds(get('slips'), `${at}.slips`).map((s) => s.id);
     const sell = amount('sell_price', 'sell_price', 'sellPrice');
     if (sell === null || sell <= 0) bad(`${at}.sell_price is required: legacy says "ใส่ราคาขาย"`);
     const feePct = amount('fee_pct', 'fee_pct', 'feePct');
@@ -58,7 +65,7 @@ export function parseUpgrades(value: unknown, label = 'upgrades'): UpgradeInput[
       id: text('id', 'id') ?? `up_${Date.now()}_${i}`, label: text('label', 'label') ?? 'Upgrade', sell_price: sell!,
       to_company: amount('to_company', 'to_company', 'toCompany'), seller: text('seller', 'seller'), note: text('note', 'note'),
       collected: (collected as boolean | null | undefined) ?? null, settle: (settle as 'pending' | 'done' | null | undefined) ?? null,
-      method: text('method', 'method'), fee_pct: feePct,
+      method: text('method', 'method'), fee_pct: feePct, slips,
     };
   });
   const ids = list.map((u) => u.id);
@@ -126,5 +133,5 @@ export const upgradeUndoneLine = (by: string | null, from: string): HistoryLine 
 /** The sale a charged route upgrade adds: cash, not yet collected, all of it owed to the company. */
 export const routeUpgradeSale = (id: string, charge: number, toName: string, reason: string, now: string): StoredUpgrade => ({
   id, label: `Upgrade > ${toName}`, sell_price: charge, to_company: charge, seller: null, note: reason, collected: false, settle: 'pending',
-  method: 'cash', fee_pct: 0, fee: 0, customer_paid: charge, at: now,
+  method: 'cash', fee_pct: 0, fee: 0, customer_paid: charge, at: now, slips: [],
 });

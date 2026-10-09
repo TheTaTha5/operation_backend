@@ -23,7 +23,8 @@ import { assertFresh, expectedVersion } from '../domain/versions.js';
 import { parseContractListQuery } from '../domain/contracts.js';
 import { applyDispatch, parseDispatchPatch } from '../domain/dispatch.js';
 import { altPartsPlan, parseAltPickups } from '../domain/alt-pickups.js';
-import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeUndoneLine } from '../domain/upgrades.js';
+import { parseRouteUpgrade, parseUpgrades, routeUpgradeLine, routeUpgradeSale, upgradeStored, upgradeUndoneLine } from '../domain/upgrades.js';
+import { assertKnownFiles, documentRows, MAX_ATTACHMENT_BYTES, newAttachmentId, parseAttachmentIds, parseUpload } from '../domain/attachments.js';
 import { applyCheckin, parseCheckin, parseCheckinTarget } from '../domain/checkin.js';
 import { checkDeploymentChange, placedOn } from '../domain/deployment-guards.js';
 import { assertReconfirmEcho, parseReconfirmStatus, parseSentRequest, withSent, withStatus, withoutStatus } from '../domain/reconfirm.js';
@@ -644,8 +645,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const header = createHeader({ ...sentHeader, ...(priceHeader as BookingHeader), ...(manual === undefined ? {} : { manual_total: manual }) }, actor, new Date().toISOString());
     const q = priced?.quote;
     const created = await store.transaction(async () => {
+      const attachments = await bookingFiles(record(request.body), [], actor, input.upgrades);
       const booking = await store.createBooking({
-        ...input, header,
+        ...input, header, ...(attachments ? { attachments } : {}),
         ...(priced ? { rate_type_ref: priced.rateTypeRef ?? undefined } : {}),
         ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
       }, actor);
@@ -657,6 +659,17 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const warnings = priced ? [...replacedPrices(input.header, priced.header), ...priced.quote.warnings] : [];
     return reply.code(201).send(warnings.length ? { ...created, price_warnings: warnings } : created);
   });
+  /**
+   * A booking's documents (`attachments`) and its upgrades' payment slips name uploaded files: each must
+   * exist (`400`). Answers the documents to store, a kept one keeping who added it and when, or
+   * undefined when the body doesn't send `attachments`.
+   */
+  async function bookingFiles(body: Record<string, unknown>, current: Booking['attachments'], actor: string | undefined, upgrades?: readonly { slips: string[] }[]) {
+    const docs = body.attachments === undefined ? undefined : parseAttachmentIds(body.attachments, 'attachments');
+    const ids = [...(docs ?? []).map((d) => d.id), ...(upgrades ?? []).flatMap((u) => u.slips)];
+    if (ids.length) assertKnownFiles(ids, new Set((await store.attachmentRefs(ids)).keys()), 'attachments');
+    return docs && documentRows(docs, current, new Date().toISOString(), actor ?? null);
+  }
   app.patch('/v1/bookings/:id', { schema: docs.amendBooking }, async (request) => {
     const actor = actorOf(request.user);
     const { version: _version, rate, ...body } = record(request.body);
@@ -685,7 +698,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
           warnings = replacedPrices(sent, stored as unknown as Record<string, unknown>);
         }
       }
-      const signed = { ...changes, header: stampActor(header, actor) };
+      const attachments = await bookingFiles(body, stored.attachments, actor, changes.upgrades);
+      const signed = { ...changes, header: stampActor(header, actor), ...(attachments ? { attachments } : {}) };
       let amended = (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found');
       // A trip whose pickup zone changed leaves its van group, which holds one zone.
       const rezoned = rezonedParts(stored, amended);
@@ -732,6 +746,36 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       return (await syncAltParts(done)) ? (await store.booking(done.id))! : done;
     });
   });
+  /**
+   * Attachments (todo/booking-extras-model.md §1): a file uploaded once, then named by a booking's
+   * `attachments` or an upgrade's `slips`. Legacy's JSON upload, its 6 MB limit, JPEG, PNG or PDF.
+   */
+  app.post('/v1/attachments', { bodyLimit: Math.ceil(MAX_ATTACHMENT_BYTES * 1.4) + 4096 }, async (request, reply) => {
+    const upload = parseUpload(record(request.body));
+    const file = { id: newAttachmentId(), name: upload.filename, mime: upload.mime, size: upload.data.length, data: upload.data,
+      uploaded_by: actorOf(request.user) ?? null, uploaded_at: new Date().toISOString() };
+    await store.transaction(async () => store.putAttachment(file));
+    return reply.code(201).send({ id: file.id, name: file.name, mime: file.mime, size: file.size });
+  });
+  /** Any login may download (decided 2026-10-09); a login tied to an agent, only its own bookings' files. */
+  app.get('/v1/attachments/:id', async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    const file = (await store.attachmentFile(id)) ?? notFound(`Attachment ${id} not found`);
+    const agent = request.user?.user?.agent_id;
+    if (agent && !(await store.attachmentBookings(id)).some((b) => b.agent_id === agent)) notFound(`Attachment ${id} not found`);
+    return reply.header('content-type', file!.mime).header('content-disposition', `inline; filename="${encodeURIComponent(file!.name)}"`).send(file!.data);
+  });
+  app.delete('/v1/attachments/:id', async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    await store.transaction(async () => {
+      if (!(await store.attachmentFile(id))) notFound(`Attachment ${id} not found`);
+      const users = await store.attachmentBookings(id);
+      if (users.length) refuseWith(`Attachment ${id} is still on booking ${users.map((b) => b.id).join(', ')}: take it off first`, 409, 'attachment_in_use');
+      await store.deleteAttachment(id);
+    });
+    return reply.code(204).send();
+  });
+
   /**
    * Reconfirmation (todo/trip-ops-and-vans-model.md, slice B): what the customer said when staff
    * checked their pickup, and whether the agent's list was sent. Each answers the booking.
@@ -790,7 +834,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       let upgradeId: string | null = null;
       if (input.charge > 0) {
         upgradeId = `up_${Date.now()}`;
-        await store.setUpgrades(booking.id, [...moved.upgrades.map(({ commission: _c, ...u }) => u), routeUpgradeSale(upgradeId, input.charge, toName, input.reason, now)]);
+        await store.setUpgrades(booking.id, [...moved.upgrades.map(upgradeStored), routeUpgradeSale(upgradeId, input.charge, toName, input.reason, now)]);
       }
       await store.addTripUpgrade({ booking_trip_id: trip.id, from_route_id: trip.route_id, to_route_id: input.to_route_id, reason: input.reason,
         charge: input.charge, upgrade_id: upgradeId, at: now, by, undone_at: null, undone_by: null });
@@ -810,7 +854,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       const moved = (await store.upgradeRoute(booking.id, trip.id, live!.from_route_id, actorOf(request.user), upgradeUndoneLine(by, await routeName(live!.from_route_id))))!;
       // A charge already collected stays on the booking; one not collected goes with the upgrade.
       const sale = moved.upgrades.find((u) => u.id === live!.upgrade_id);
-      if (sale && !sale.collected) await store.setUpgrades(booking.id, moved.upgrades.filter((u) => u.id !== sale.id).map(({ commission: _c, ...u }) => u));
+      if (sale && !sale.collected) await store.setUpgrades(booking.id, moved.upgrades.filter((u) => u.id !== sale.id).map(upgradeStored));
       await store.undoTripUpgrade(live!.id, new Date().toISOString(), by);
       await syncAltParts((await store.booking(booking.id))!);
       return (await store.booking(booking.id))!;

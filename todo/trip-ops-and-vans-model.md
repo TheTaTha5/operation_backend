@@ -4,12 +4,9 @@ Everything this note designed is built (migrations 033–038; README → "Dispat
 "Vans and the month matrix", "Van stops", "Alternate pickups", "Check-in", "Upgrades",
 "Reconfirm"). Git history has the design. What is left:
 
-## Decided 2026-10-09, to build
-
-1. **Payment slips** go with attachments (`booking-extras-model.md`, approved): upgrade sales take
-   `slips` again, and the import keeps them.
-Also decided: a deleted deployment keeps the trips' boat and shows `boat_pulled` (as built); the
-check-in tries table stays.
+Decided 2026-10-09 and built: payment slips (attachments), alternate pickups on every day, the
+board's reconfirm; a deleted deployment keeps the trips' boat and shows `boat_pulled`; the check-in
+tries table stays.
 
 ## Later
 
