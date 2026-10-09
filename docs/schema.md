@@ -56,6 +56,8 @@ flowchart LR
   weather -- "weather_cases.booking_id, refunds.booking_id" --> bookings
   weather -- "refunds.invoice_id" --> money
   weather -- "refunds.agent_id" --> sales
+  fleet["Fleet maintenance<br/>fleet_engines, fleet_gearboxes, fleet_propellers,<br/>fleet_*_log, fleet_incidents, fleet_incident_assets,<br/>fleet_incident_log, fleet_jobs, fleet_job_assets,<br/>fleet_job_parts, fleet_job_log, fleet_job_steps"]
+  fleet -- "boat_id" --> catalogue
 ```
 
 ## 1. Catalogue and seat pool
@@ -136,6 +138,7 @@ erDiagram
     date to_date "null = open-ended"
     text loc
     text reason
+    text_array planned_over "work a person planned ahead of (130)"
   }
   boat_capacity_overrides {
     text boat_id PK, FK
@@ -237,7 +240,9 @@ erDiagram
   `seed:routes` and `seed:boats` never overwrite. `routes.ext_id` is unique (Love Kingdom's create
   is idempotent on it). `route_families` replaces legacy's hard-coded family list.
 - **A boat's status** is `boat_status_log`, legacy's date ranges; the status on a date is the latest
-  range covering it (`storedStatus` in `src/domain/catalogue.ts`).
+  range covering it (`storedStatus` in `src/domain/catalogue.ts`). Whether it can sail adds the open
+  work holding it (section 9, `availability` in `src/domain/fleet-availability.ts`), less the work an
+  entry's `planned_over` names.
 - **Seats left on a route-day are computed, not stored.** Each read sums what is deployed and
   subtracts what bookings and active locks hold. There is no counter column to fall out of step.
 - **Whether a route runs on a date** is decided from `route_seasons` and `route_day_overrides` by
@@ -1134,6 +1139,81 @@ erDiagram
 - **The agent's credit balance** is its `credit` rows less its live payments with `method = 'credit'`.
 - **`changes.kind`** also takes `weather_closure` (060).
 
+## 9. Fleet maintenance: assets, incidents, jobs
+
+Legacy's Fleet screens, part A (migration 130, `todo/fleet-maintenance-model.md`). The rules are in
+`src/domain/fleet-availability.ts`, `fleet-assets.ts` and `fleet-jobs.ts`. Each record is written
+whole: its row upserted, its lists (`*_log`, assets, parts, steps) replaced in order (`seq`/`idx`).
+
+```mermaid
+erDiagram
+  fleet_engines {
+    text id PK "legacy's (e1…); e<base36 ms> new"
+    text boat_id FK "null: off a boat"
+    text pos "Port, Std, C.Port…"
+    text status "ready, fixing, broken, spare, limited"
+    float base_hours "hours brought in; the Daily Fleet Log meter adds"
+    integer service_interval
+    float last_service_hours
+    boolean retired "a job closed as decommission"
+  }
+  fleet_gearboxes {
+    text id PK
+    text boat_id FK
+    text engine_id FK "at most one per engine (form rule)"
+    text on_boat_id FK "left on the boat waiting for an engine"
+    text status "ready, fixing, broken, spare, limited"
+    float base_hours "the engine's hours at fitting"
+  }
+  fleet_propellers {
+    text id PK
+    text boat_id FK
+    text gearbox_id FK "legacy has twin props on 6 gearboxes"
+    text status "active, fixing, broken, spare, damaged, limited"
+  }
+  fleet_incidents {
+    text id PK
+    text no "INC-…; not unique (legacy duplicates)"
+    text boat_id FK
+    date date
+    integer priority "1-5"
+    text severity "computed from priority; legacy high kept"
+    text status "open, resolved, closed, inprogress (legacy)"
+    text job_id "no key: legacy keeps one dangling"
+    text_array related_job_ids
+  }
+  fleet_jobs {
+    text id PK
+    text no "MJ-…; not unique"
+    text boat_id FK
+    text type "corrective, preventive, scheduled"
+    text status "pending, inprogress, done"
+    date start_date "holds the boat from here once started"
+    text boat_status "available, fixing, unavailable; null = fixing"
+    boolean set_fixing "false: runs alongside the boat"
+    text outcome "success, limited, rework, decommission, cancelled"
+    text incident_id "no key"
+    numeric legacy_cost "legacy's stored cost, read-only"
+    text board_lane "decide, wait, doing, close"
+  }
+  boats { text id PK }
+  boats |o--o{ fleet_engines : "carries"
+  fleet_engines |o--o| fleet_gearboxes : "drives"
+  fleet_gearboxes |o--o{ fleet_propellers : "turns"
+  boats ||--o{ fleet_incidents : "reported on"
+  boats ||--o{ fleet_jobs : "repaired by"
+```
+
+- **Child tables** (each `ON DELETE CASCADE`): `fleet_engine_log`, `fleet_gearbox_log`,
+  `fleet_propeller_log` (the same columns: `date, type, description, detail, text, hours,
+  engine_hours, used_hours, from_loc, to_loc, incident_id, outcome, cost, by`);
+  `fleet_incident_assets`, `fleet_incident_log`; `fleet_job_assets`, `fleet_job_parts`,
+  `fleet_job_log`, `fleet_job_steps`.
+- **Numbers are the client's** (decided 2026-10-09): a new one already used is refused by the API,
+  but legacy's duplicates are kept, so `no` has an index, not a unique one.
+- **A job holds its boat** while `inprogress`, from `start_date`, unless `set_fixing` is false or
+  `boat_status` is `available`. Nothing stores the effective status; it is computed on read.
+
 ## Ids with no foreign key
 
 These columns hold another table's id, but the database does not check it. Where a migration
@@ -1152,6 +1232,8 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `booking_approval_days.route_id` | `routes` | Created without one (023). |
 | `agents.rate_type_id` | `rate_types` | Created (017) before the rate types table (022). The key can only ship after the rate types import has run in production; until then agents hold ids `rate_types` does not have (`todo/rate-types-model.md`). |
 | `bookings.rate_type_ref` | `rate_types` | Free text for good: it is a historical snapshot, and a deleted rate must not break old bookings. |
+| `fleet_incidents.job_id`, `fleet_jobs.incident_id` | `fleet_jobs`, `fleet_incidents` | Legacy keeps an incident linked to a deleted job, and deleting an incident leaves its job's link (130). |
+| `fleet_jobs.parent_project_id` | projects | Projects are part B of fleet (not built on this branch). |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer

@@ -1,7 +1,7 @@
 # Fleet maintenance, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); not designed yet. Data counted on
-2026-10-09 through `ORIGINAL_DATABASE_URL`, read-only.
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Part A (availability,
+assets, incidents, jobs) is built; part B (stock, memos, Daily Fleet Log, projects, safety) is another branch.
 
 Two corrections to what we assumed before:
 
@@ -53,26 +53,7 @@ renewal). `server.js` has no fleet logic. It stores whatever the browser sends.
 
 ### Boats: status, certificates, assignments
 
-- **Boat status** is a log of date ranges `{s, from, to, reason, note}` stored in `boats__log`.
-  - Values: `available`, `fixing`, `unavailable`, `retired`.
-  - Unavailable reasons: `engine_repair`, `donor`, `docs_expired`, `dry_dock`, `off_season`,
-    `charter`, `scheduled_maint`, `other`.
-  - Hard refusals in `flSaveEditBoatStatus`: no status chosen, the same status as now, no date,
-    unavailable with no reason.
-- **Effective status is computed** (`boatEffStatus` / `boatJobBlock`, `04-data-core.js`):
-  - It takes the stricter of the boat log and the open work.
-  - Open work means a maintenance job that is `inprogress`, has started, and does not leave the
-    boat available; or a project that is `inprogress` or `on_hold`.
-  - Setting a boat to available while work is still open is a **confirm**, not a refusal. If the
-    user goes ahead, the boat is "planned ahead": those job numbers stop blocking it for that date
-    range. Legacy saves this marker as text inside the log note (`LA_PLAN_MARK`), because a new field
-    would not survive its sync.
-- **Who reads it:** Boat Operation's boat pool (`bop2FleetStatus`) lists a non-available boat under
-  "UNAVAILABLE / N/A" with the job numbers that block it. I did not confirm whether dropping that
-  boat onto a route is refused.
-- **Charter (rented) boats:** `ownership:'charter'`. A day not covered by their log counts as
-  unavailable, the opposite of company boats.
-- **Retire:** `flRetireBoat` has no caller anywhere in the UI. `flUnretireBoat` asks for a confirm.
+- **Boat status, effective status, plan ahead, retire:** built (catalogue editing; part A).
 - **Certificates** (`boats.docs[{name, exp, renewStatus}]`):
   - Status is computed: `processing`, `na` (no expiry), `exp`, `warn30`, `warn90`, `ok`.
   - Renewing (`depSave`) adds a new row and marks old `processing` rows `done`.
@@ -82,108 +63,8 @@ renewal). `server.js` has no fleet logic. It stores whatever the browser sends.
   - There is no overlap check.
   - `flAutoUpdateAssignments` is never called.
 
-### Mechanical assets: engines, gearboxes, propellers
-
-- **Statuses:**
-  - Engines and gearboxes: `ready`, `fixing`, `broken`, `spare`, and `limited` (set only by
-    closing a job).
-  - Propellers: `active`, `fixing`, `broken`, `spare`, and `damaged` (set only by a swap).
-- **Links:** an engine sits on a boat at a position. Each engine has at most one gearbox and each
-  gearbox at most one propeller. A spare has a `spareLocation`: `pier:<pier>` or `shop:<shop>`.
-- **Engine hours are computed** (`flEngHours`): `baseHours` plus the latest meter reading minus the
-  first non-zero meter reading in the Daily Log.
-- **Service due is computed:**
-  - Engines (`flEngServiceState`): the interval defaults to 100 h, counted from `lastServiceHours`.
-  - Gearboxes (`flGbServiceState`): the interval defaults to 200 h.
-  - Marking a service asks for the hour reading with `prompt()`.
-- **Swaps:** `flConfirmSwap`, `flStartGearSwap` and `flConfirmPropCascade`.
-  - The spare goes onto the boat and becomes `ready`/`active`. The damaged part is sent to a
-    hard-coded shop (`shop:honda-phuket`).
-  - Gearbox spares must match the brand; propeller spares must match the size.
-- **Logs:** every move, install, service and repair adds a row to the asset's log (`*__log`).
-- **Weak checks:** `flSaveEngine` requires a model and a serial but does not check that the serial
-  is unique. `flChangeEngStatus`, `flEquipSwapDo` and `flEquipRemove` check nothing.
-
-### Incidents
-
-- **Number:** `INC-` plus 3 digits, taken as the highest existing number plus one.
-- **Severity is computed from priority 1–5:** 4 or more is `critical`, 3 is `major`, anything else
-  `minor`.
-- **Stored status:** `open`; `resolved` for a Quick Fix (`quickFix`, `resolvedDate`); `closed`,
-  written by closing the last linked job.
-- **Shown status is computed** from the linked job (`maintId`):
-  - no job → open;
-  - `pending` → pending;
-  - `inprogress` → inprogress;
-  - anything else → resolved.
-- **Damaged assets:** an incident lists the parts that were damaged (`damagedAssets`). Its assets
-  can be swapped for spares.
-- **Creating a job from an incident** with 2 or more damaged assets offers a choice: one job, or one
-  job per asset (`relatedMaintIds`).
-- **Refusals:** missing fields → `กรุณากรอกข้อมูลให้ครบ` ("fill in every field"). Deleting asks for
-  a confirm and leaves the linked job in place.
-
-### Maintenance jobs (MJ)
-
-- **Number:** `MJ-` plus 3 digits, the highest existing number plus one, with no lock.
-  `flAssertUniqueNo` alerts and throws on a duplicate.
-- **Type:** `corrective`, `preventive` or `scheduled`. The type sets the default boat status
-  (`_defaultBoatStatusForType`):
-  - corrective → `fixing`;
-  - scheduled → `unavailable` with reason `scheduled_maint`;
-  - preventive → `available`.
-- **Status:** `pending` → `inprogress` (Start) → `done` (Close).
-  - There is no cancelled status. A cancel is `done` with `outcome:'cancelled'`.
-- **Create** (`flSaveCreateJob`):
-  - Hard refusal: no boat or no title.
-  - Confirm: the boat already has an open job.
-  - Hard refusal: the boat will be unavailable but no reason is given.
-  - Charter and retired boats are not offered.
-- **Start** (`flMaintStart`, `_flMaintStartProceed`):
-  - Opens a boat-log row with the job's boat status. If the boat already ran today, the row starts
-    tomorrow.
-  - Marks each asset `fixing` and logs `service-start` with engine hours.
-  - May stash or swap the engine's gearbox and propeller first.
-- **Close** (`flMaintClose`) picks an outcome, which sets the assets and the boat:
-
-  | Outcome | Engine | Gearbox | Propeller | Boat |
-  |---|---|---|---|---|
-  | `success` | ready | ready | active | available |
-  | `limited` | limited | limited | limited | available |
-  | `rework` | fixing | fixing | fixing | fixing |
-  | `decommission` | broken | broken | broken | available |
-  | `cancelled` | ready | ready | active | available |
-
-  For `decommission` the engine also gets `retired`. For `cancelled`, only parts that are `fixing`
-  change.
-
-  The boat does not simply become available. If other jobs or projects are still open
-  (`boatJobBlock`), it keeps their status. Closing also:
-  - appends a row to `boats.repairHistory`;
-  - writes the asset logs;
-  - closes the incident once all its jobs are done;
-  - may reset the service counter (`flMaintServiceReset`, a confirm, when the title looks like a
-    service).
-
-  `awaitingInvoice` keeps a closed job listed until its memos are paid.
-- **Parts** (`flMaintAddPart`) take stock out of one warehouse.
-  - Hard refusals: no part, no warehouse, or more than the warehouse holds
-    (`คลังนี้เหลือ N เท่านั้น`, "this warehouse only has N").
-  - Removing a part puts the stock back.
-  - On a closed job, parts can be changed only after a confirm ("late edit"), which marks them
-    `late`.
-- **Cost is computed** (`flMaintCalcCost`):
-  - It is the sum of linked memos in `approved`, `received` or `paid`, plus parts (qty × cost).
-  - A part is left out when a parts memo already carries the same name. The comment cites ฿271,041
-    double-counted across 18 jobs.
-  - It is recalculated on every render and written into `m.cost`.
-- **Delete:** a confirm, and only for jobs that are not done. It does **not** return parts to stock
-  or unlink the incident.
-- **Split:** one job per engine (`flEngSplitIntoJobs`, `flSplitExistingJob`).
-- **Job board:** four lanes, `decide` / `wait` / `doing` / `close`.
-  - A lane is computed from the last log line's date and words such as "waiting", "ordered",
-    "parts", "approval" (`flBoardLane`), unless set by hand.
-  - It also has sub-steps, owner, parking, and "silent for more than 60 days".
+Engines, gearboxes, propellers, incidents and maintenance jobs: built (part A, below; README
+"Fleet maintenance").
 
 ### Projects (drydock, overhaul)
 
@@ -356,10 +237,6 @@ Counted 2026-10-09.
 | Boats | 22 | 15 company boats with a licence, 7 newer ones (Ranong, LKC) without. `retired` is null on all. Status log: 174 rows (73 available, 61 fixing, 40 unavailable) |
 | Certificates | 76 rows, 57 current | Of the current ones (latest per boat and name), 12 have expired and 19 expire within 90 days. Names: boat licence, inspection certificate, national-park permits (Similan, Phi Phi, Surin, Phang Nga) |
 | Pier assignments | 6 | All temporary Tub Lamu → Panwa, 2026-05 to 2026-09. 5 active, 1 cancelled |
-| Engines / gearboxes / propellers | 53 / 59 / 62 | Engines: 30 ready, 20 fixing, 3 broken. Logs: 195 / 177 / 167. One serial appears twice (`BBNJ-8000285`) |
-| Incidents | 71 | 2026-02-10 to 2026-10-04. Stored status: 43 closed, 18 open, 9 resolved, 1 `inprogress` (not a value the code writes). Severity: 38 critical, 32 major, 1 `high` (also not a code value). 5 Quick Fixes; 65 linked to a job |
-| Maintenance jobs | 120 | `MJ-001`…; started 2025-12-01 to 2026-10-04. 78 done (67 success, 4 decommission, 7 no outcome), 41 inprogress (29 started before August), 1 pending. 70 corrective, 30 preventive, 20 scheduled. 75 have a cost, totalling ฿1,322,391. 364 parts lines (฿457,645). 847 progress lines. 3 awaiting invoice |
-| Repair history | 60 rows | Every row matches a job number |
 | Projects | 21 | `PRJ-001`…`021`: 9 completed, 9 inprogress, 3 awaiting_bill. `phase` is empty on all. 9 projects hold 75 files (`attId`) |
 | Purchase memos | 224, 1,116 lines | Created 2026-04-22 to 2026-10-08; 54 suppliers. Total ฿5,382,446: paid 84 (฿2.45M), received 74, ordered 10, pending approval 49 (฿1.71M), cancelled 7. No memo is currently `approved`. 109 are linked to a job, 76 to a project. 147 charge VAT |
 | Inventory | 615 items | 789 stock rows, 1,261 movements (2026-04-01 to 2026-10-08). Categories: general 333, engine 191, gearbox 79. 181 items below their minimum |
@@ -391,11 +268,9 @@ Odd rows:
 ## Already here
 
 - **Boats** (catalogue editing, migration 070): the whole boat form, `ownership`, certificates
-  (`documents`, as stored data), the status log with legacy's timeline checks, `retired` with
-  retire/restore commands, `seed:boats`. Not here: the computed effective status (log plus open
-  work), certificate expiry status and renewal, assignments, repair history.
-- **Deployments:** `/operations/deployments`, writable by `operations` or `fleet`. They **do not
-  check boat status**, so a boat in a drydock can be deployed here. Legacy shows it as N/A.
+  (`documents`, as stored data), the status log, `retired`, `seed:boats`. Not here: certificate
+  expiry status and renewal, assignments.
+- **Part A** (migration 130): availability, assets, incidents, jobs (see "Part A: built").
 - **Attachments:** `/v1/attachments` (6 MB, jpeg/png/pdf) fits project documents.
   `import-attachments` already copies the files fleet projects name. Upload and delete need
   `operations`, `pier` or `accounting`, not `fleet`.
@@ -442,20 +317,9 @@ Odd rows:
 
 Each slice is usable alone. The order puts first what other areas need.
 
-1. **Boat availability.**
-   - Status log, `retired`, `ownership`, and the computed effective status (log plus open work).
-   - Deployments read it (refuse, or warn with `deploy_anyway`).
-   - Smallest slice, and the one bookings feel.
+1. **Boat availability**, 3. **Assets**, 4. **Incidents and maintenance jobs**: built (part A, below).
 2. **Boat records.** Certificates with computed expiry status, registration particulars,
    assignments between piers, repair history (computed from closed jobs).
-3. **Assets.**
-   - Engines, gearboxes, propellers, their links and logs.
-   - Swap and stash commands.
-   - Computed engine hours and service due (these need slice 6's meters).
-4. **Incidents and maintenance jobs.**
-   - Server-assigned `INC-`/`MJ-` numbers.
-   - Commands: `start`, `close` (outcome), `split`, `add-part`/`remove-part`.
-   - Close sets asset and boat status, as in the outcome table above. Job cost is computed.
 5. **Stock and purchase memos.**
    - Per-warehouse stock with append-only movements.
    - Memo commands: `approve`, `order`, `receive` (partial), `short-close`, `pay`, `cancel`.
@@ -533,270 +397,116 @@ The Fleet Deployment planning board can stay a client draft unless shared plans 
 12. **The Fleet Deployment planning board stays out** (browser-only drafts).
 13. **`fleet` may upload files** once projects are built.
 
-## Design: part A — boat availability, assets, incidents, maintenance jobs (2026-10-09)
+## Part A: built
 
-Built on `feat/fleet-availability-and-jobs`. Part B (stock, purchase memos, Daily Fleet Log,
-projects, safety, consumables) is another branch; where part A needs its data (meter readings, memo
-costs, open projects, stock for job parts) the seam is named below and in "Flagged".
+Built 2026-10-09 on `feat/fleet-availability-and-jobs` (migration 130; README "Fleet maintenance:
+availability, engines, incidents, jobs"; handoff §3.15): boat availability (effective status,
+`deploy_anyway`, `plan_ahead`), engines/gearboxes/propellers with their commands, incidents with the
+quick swap, maintenance jobs with start/close/boat status/split/steps and the board's fields, and
+`npm run import:fleet`. Import rehearsal (2026-10-09, local copy, legacy read-only): 54 engines (198
+history lines), 59 gearboxes (177), 62 propellers (167), 73 incidents (83 damaged assets, 550
+progress lines), 122 jobs (135 assets, 367 parts, 858 progress lines, legacy cost ฿1,337,906),
+nothing skipped; `seed:boats` filled 15 plan-ahead entries.
 
-### What legacy's Boat Operation does with a boat under repair (decision 2)
+What legacy's Boat Operation does (decision 2): `bop2AssignBoat` checks nothing; its pool and popover
+offer only ready boats, the range and weekly forms skip days the boat is not ready, copy week/day,
+templates and the Fleet Deployment draft do not check. So it "only shows N/A": `409 boat_not_ready`
+and `deploy_anyway`.
 
-- `bop2AssignBoat` itself checks nothing about the boat's status. Its callers decide:
-  - the pool and the cell popover offer **only available boats** (`bop2FleetStatus`): a boat that is
-    fixing/unavailable (effective status, `boatEffStatus`) sits under "UNAVAILABLE" with its job
-    numbers and has no "+" button; the range form lists it greyed with "N/A" / "🔧 fixing";
-  - "Assign to date range" and the weekly pattern **skip** the days it is not ready
-    (`statusBlocked`, "skipped (boat not ready)");
-  - copy week, copy day, templates and the Fleet Deployment draft **do not check**.
-- So legacy only shows N/A and never refuses: per decision 2, deploying a boat that is not ready that
-  day answers `409 boat_not_ready` and goes ahead with `deploy_anyway: true` (then the answer warns).
-  A client's range form gets the 409 per day and skips it, as legacy's does.
+## Open (part A)
 
-### Fields and their authority
+1. **Seams to part B, wired at merge** (`src/routes/fleet.ts`):
+   - `openWork`: add projects `inprogress`/`on_hold` from `actual_from ?? plan_from`, status
+     `unavailable`, reason `dry_dock`/`overhaul` (legacy `boatJobBlock`), so a project holds its boat;
+   - `hoursOf`: the Daily Fleet Log's meter readings per engine (`engineHours(e, meters)`), so `hours`,
+     `service` and the gearbox lifetime count real running hours (today `base_hours`);
+   - `memosOf`: the job's memos (`{status, memo_type, amount, item_names}`), so `cost` includes them
+     (today parts only; `legacy_cost` shows legacy's figure);
+   - job parts from stock (`flMaintAddPart`, `flMaintRemovePart`, the "late edit"): a stock movement,
+     part B's. Parts are imported and shown; no command adds or removes one yet;
+   - a job made under a project writes onto the project's log (`_projCreateForId`); here it only
+     writes its own line naming the project id.
+2. **Pier assignments and certificate expiry/renewal** (catalogue open item 4) are not built.
+3. **Repair history** (`boats.repairHistory`, 60 legacy rows) is not stored: it is the boat's done
+   jobs (`GET /v1/fleet/jobs?boat_id=&status=done`). Legacy's rows snapshot the cost at close; not
+   imported. Say if a stored history is wanted.
+4. **Change feed:** a job's start, close and boat status emit a `boat` change; asset, incident and
+   job writes emit none (no new change kind). Add kinds if a screen needs live fleet updates.
+5. **Whole-boat holds** (`bkV2BoatLockBlockers` refuses a boat that is not ready) do not check
+   availability here yet.
 
-**Effective status** (computed, legacy `boatEffStatus` + `boatJobBlock`), per boat and day:
-- stored status = the status log entry covering the day (`storedStatus`, already built);
-- open work = jobs `inprogress` whose `boat_status` (default `fixing`) is not `available`, whose
-  `set_fixing` is not `false`, and whose `start_date` is on or before the day; plus projects
-  `inprogress`/`on_hold` from their start (part B: `openWork` takes them when projects merge);
-- work named in the covering entry's `planned_over` does not block that day ("planned ahead");
-- the stricter wins, but a stored fixing/unavailable/retired is never overridden by work (legacy keeps
-  the human's label), and a retired boat is its stored status. A charter boat with no entry that day is
-  `unavailable` with `not_chartered: true`.
+## Flagged
 
-**Status log entry** (catalogue, migration 070) gains `planned_over` (computed): the job/project
-numbers a person confirmed with `plan_ahead: true` when saving an `available` entry while open work
-blocks its first day (legacy `saveStatus` confirm, `ovrJobs`). Legacy also appends
-`วางล่วงหน้าทั้งที่ยังมีงานค้าง · MJ-… · PRJ-…` to the note; so does this, for its screens.
+Decisions made while building, side effects, and where this differs from legacy. Default was legacy.
 
-**Deployments**: `deploy_anyway` (validated confirm) on `POST /operations/deployments`.
+**Availability and deployments**
+- **New refusal:** `POST /operations/deployments` with a catalogue boat not ready that day is
+  `409 boat_not_ready` unless `deploy_anyway: true` (decision 2). Checked when a deployment is new or
+  changes route; a re-post on the same route (capacity) is not asked; a boat not in the catalogue is
+  not checked. A charter boat whose log does not cover the day counts as not ready (legacy's pool
+  says "ไม่ได้เช่าวันนี้").
+- `GET /v1/boats` and `/v1/boats/{id}` gain `status_effective` and `blocked_by` (today), beside the
+  unchanged `status_today`. Writes answer the boat without them.
+- **`plan_ahead`** on the status timeline (`POST`/`PATCH …/status-log`): `409 open_work` copies
+  legacy's confirm; the entry stores `planned_over` and the server appends legacy's note mark too (its
+  screens read the note). An edit re-asks (legacy reads raw) and an entry that is not `available`
+  drops the plan. The boat form's status pick does not ask (legacy's `saveBoat` does not).
+- A job start or close rewrites the boat's log as `autoClosePrevLog` does: entries starting today or
+  later are **removed**, a planned-ahead entry included (the test shows it). Copied as is.
+- Job start/close/boat-status write the boat through `writeBoat`, which stamps `updated_at`: such a
+  boat is then "edited here" and `seed:boats` stops refreshing it.
 
-**Engines** (`fleet_engines`)
-- client facts (form `flSaveEngine`): `brand`, `model`, `serial`, `hp`, `buy_date`, `price`,
-  `base_hours`, `service_interval` (blank → 100), `note`, `spare_location` (free text);
-- validated: `status` (`ready`, `fixing`, `broken`, `spare`; `limited` only by closing a job),
-  `boat_id` + `pos` (install/remove/swap commands; on create too, as the form);
-- server: `last_service_hours`, `last_service_date` (`service` command), `retired`, `retired_on`,
-  `retired_reason` (a job closed `decommission`; legacy lost `retired`);
-- computed: `hours` (`flEngHours`: `base_hours` + latest − first non-zero Daily Fleet Log meter),
-  `service` (`flEngServiceState`: interval, base, since, next, left, pct, overdue).
-  The meters are part B's; until it merges `hours = base_hours`.
-- `model` and `serial` are required (legacy's only check); a serial may repeat (legacy has one).
+**Numbers (decision 4)**
+- The client sends `no` (and `nos` for one-job-per-asset and split); the server never assigns one.
+  A number already used is `409 number_taken` (legacy's `flAssertUniqueNo`); legacy's duplicates
+  (INC-012 ×10) are kept and `no` is not unique. List answers carry `next_no` (legacy's highest + 1)
+  as a hint. `PATCH` may change `no` (legacy's renumber panel), refused if taken.
 
-**Gearboxes** (`fleet_gearboxes`)
-- client facts (`flSaveGearbox`): `brand`, `model`, `model_suffix`, `serial`, `buy_date`, `base_hours`,
-  `note`, `shaft_length`, `rotation`, `gear_ratio`, `oil_capacity`, `service_interval` (blank → 100),
-  `last_service_date` (on the form), `spare_location`;
-- validated: `status` (`ready`, `fixing`, `broken`, `spare`; `limited` by a job), `engine_id`
-  (install: an engine on a boat with no other gearbox, as the form's list);
-- server: `boat_id` (the engine's boat when installed, as swaps write it), `on_boat_id`/`on_boat_pos`
-  (left on the boat waiting for an engine, job start's swap), `install_hours`, `last_service_hours`;
-- computed: `lifetime_hours` (`flGbLifetimeHours`), `service` (`flGbServiceState`, interval default 200).
+**Legacy bugs not copied (say if you want legacy's behaviour)**
+- **Closing a job run alongside the boat** (`set_fixing: false`): legacy's `flMaintClose` calls
+  `autoClosePrevLog` first and then writes nothing, so it cuts the boat's current status entry (an
+  open-ended `off_season` ends yesterday). Here the boat's log is left alone, as its comment intends.
+- **One job per damaged asset:** legacy's split path reads a checkbox (`job-fixing`) the production
+  page no longer has, throws, and silently falls back to one job. Here `per_asset: true` makes one job
+  per asset; each takes the form's `boat_status`/reason (legacy's split path had none).
 
-**Propellers** (`fleet_propellers`)
-- client facts (`flSavePropeller`): `brand`, `serial`, `old_serial`, `diameter`, `pitch`, `size`
-  (computed `d×p` when both are sent, as the form), `blades`, `material`, `rotation`, `hub_size`,
-  `cupping`, `cost`, `buy_date`, `note`, `spare_location`, `prop_pos`;
-- validated: `status` (`active`, `fixing`, `broken`, `spare`; `damaged` only by a swap, `limited` by a
-  job), `gearbox_id` (install: a gearbox on an engine with no propeller yet, as the form's list);
-- server: `boat_id`, `install_hours`.
+**Kept as legacy (flag only)**
+- Deleting an incident leaves its job's `incident_id`; deleting a job leaves the incident's `job_id`
+  (legacy bug 11). Job parts were never moved here, so nothing is "left withdrawn".
+- An incident edit rebuilds `damaged_assets` from what is sent, losing a swap's marks, as the edit form
+  does; and writes the "✎ แก้ไขรายละเอียด" line with `by` = the remark, as legacy.
+- Incident `by` on the opening line is the remark text (`by: remark||'ระบบ'`), as legacy.
+- The quick swap sends the damaged part to `shop:honda-phuket`, hard-coded, as legacy.
+- `flSaveEditBoatStatus` ends the boat's open entries whose note contains the job number on the
+  effective date (not the day before) and does not close overlaps, as legacy; an end before an
+  entry's start is clamped to its start (legacy would store it backwards; the schema refuses that).
+- `jobs done with no outcome` (7) and the `inprogress`/`high` incident values are imported as is.
 
-**Asset log** (`fleet_engine_log`, `fleet_gearbox_log`, `fleet_propeller_log`): server, written by
-every command as legacy writes it (`date`, `type`, `desc`, `detail`, `text`, `hours`, `engine_hours`,
-`used_hours`, `from_loc`, `to_loc`, `incident_id`, `outcome`, `cost`, `by`).
-
-**Incidents** (`fleet_incidents`)
-- client facts: `no` (decision 4: the client numbers it, legacy's highest + 1; a number already used is
-  refused `409 number_taken` as `flAssertUniqueNo`, but nothing stops duplicates already there), `date`,
-  `time`, `title`, `detail`, `remark`, `priority` (1–5, default 5);
-- validated: `boat_id` (a company boat not retired, as the form's list), `damaged_assets` (an engine,
-  gearbox or propeller by id, labelled by the server as legacy; `hull`/`safety` by label), `quick_fix`
-  and `cause` (create only: status `resolved`, `resolved_on`, the remark and log lines legacy writes);
-- computed: `severity` (priority 4+ critical, 3 major, else minor; written on create and edit, an
-  imported `high` stays until edited), `shown_status` (legacy `effStatus`: `resolved` stored → resolved;
-  no job → open; job pending → pending; inprogress → inprogress; else resolved);
-- server: `status` (`open`, `resolved`, `closed`; imported `inprogress` kept), `job_id`,
-  `related_job_ids`, `closed_on`, `resolved_on`, `progress_log`, damaged assets' `swapped*`.
-
-**Maintenance jobs** (`fleet_jobs`)
-- client facts: `no` (as incidents), `type` (`corrective`, `preventive`, `scheduled`), `title`
-  (required), `detail`, `location`, `start_date` (default today), `parent_project_id`, and the board's
-  `owner`, `due_date`, `board_lane` (`decide`, `wait`, `doing`, `close` or null), `parked`, `pinned`
-  (legacy lost all of the board's fields; decision 5);
-- validated: `boat_id` (company boat, not retired), `incident_id` (exists, not linked to another job),
-  `boat_status` (`available`, `fixing`, `unavailable`; default by type: corrective fixing, scheduled
-  unavailable `scheduled_maint`, preventive available) and `boat_status_reason` (one of legacy's eight,
-  required when unavailable), `assets`;
-- computed: `set_fixing` (`boat_status` fixing/unavailable), `cost` (`flMaintCalcCost`: linked memos
-  approved/received/paid + parts not already in a parts memo; memos are part B's, so today parts only),
-  `parts_cost`, `lane` (`flBoardLane`), `silent_days`, `blocks_boat`;
-- server: `status` (`pending` → `inprogress` → `done`), `end_date`, `outcome`, `close_note`,
-  `awaiting_invoice` (close; afterwards a client fact), `pinned_on`, `parked_on`, `progress_log`,
-  `steps` (the board's sub-steps, legacy `subs`), `legacy_cost` (imported `cost`, read-only: legacy's
-  stale copy including memos and data patches).
-- `parts` are imported and shown; taking parts from stock (`flMaintAddPart`) is part B's (stock).
-
-### Migration 130 (`130_fleet_availability_assets_jobs.sql`)
-
-```sql
-ALTER TABLE boat_status_log ADD COLUMN planned_over TEXT[];
-
-CREATE TABLE fleet_engines (
-  id TEXT PRIMARY KEY, brand TEXT, model TEXT, serial TEXT, hp DOUBLE PRECISION CHECK (hp >= 0),
-  boat_id TEXT REFERENCES boats (id), pos TEXT,
-  status TEXT NOT NULL CHECK (status IN ('ready', 'fixing', 'broken', 'spare', 'limited')),
-  base_hours DOUBLE PRECISION NOT NULL DEFAULT 0, service_interval INTEGER CHECK (service_interval > 0),
-  buy_date DATE, price NUMERIC(12,2), note TEXT, spare_location TEXT,
-  last_service_hours DOUBLE PRECISION, last_service_date DATE,
-  retired BOOLEAN NOT NULL DEFAULT false, retired_on DATE, retired_reason TEXT
-);
-CREATE TABLE fleet_gearboxes (
-  id TEXT PRIMARY KEY, brand TEXT, model TEXT, model_suffix TEXT, serial TEXT,
-  boat_id TEXT REFERENCES boats (id), engine_id TEXT REFERENCES fleet_engines (id),
-  on_boat_id TEXT REFERENCES boats (id), on_boat_pos TEXT,
-  status TEXT NOT NULL CHECK (status IN ('ready', 'fixing', 'broken', 'spare', 'limited')),
-  base_hours DOUBLE PRECISION NOT NULL DEFAULT 0, install_hours DOUBLE PRECISION,
-  service_interval INTEGER CHECK (service_interval > 0), last_service_hours DOUBLE PRECISION, last_service_date DATE,
-  buy_date DATE, note TEXT, spare_location TEXT, shaft_length TEXT, rotation TEXT, gear_ratio TEXT, oil_capacity TEXT
-);
-CREATE TABLE fleet_propellers (
-  id TEXT PRIMARY KEY, brand TEXT, serial TEXT, old_serial TEXT,
-  boat_id TEXT REFERENCES boats (id), gearbox_id TEXT REFERENCES fleet_gearboxes (id), prop_pos TEXT,
-  diameter DOUBLE PRECISION, pitch DOUBLE PRECISION, size TEXT, blades TEXT, material TEXT, rotation TEXT,
-  hub_size TEXT, cupping TEXT, cost NUMERIC(12,2), install_hours DOUBLE PRECISION,
-  status TEXT NOT NULL CHECK (status IN ('active', 'fixing', 'broken', 'spare', 'damaged', 'limited')),
-  buy_date DATE, note TEXT, spare_location TEXT
-);
--- One log per kind, same columns: fleet_engine_log (engine_id), fleet_gearbox_log, fleet_propeller_log
-CREATE TABLE fleet_engine_log (
-  engine_id TEXT NOT NULL REFERENCES fleet_engines (id) ON DELETE CASCADE, seq INTEGER NOT NULL,
-  date DATE, type TEXT, description TEXT, detail TEXT, text TEXT, hours DOUBLE PRECISION,
-  engine_hours DOUBLE PRECISION, used_hours DOUBLE PRECISION, from_loc TEXT, to_loc TEXT,
-  incident_id TEXT, outcome TEXT, cost NUMERIC(12,2), by TEXT, PRIMARY KEY (engine_id, seq)
-);
-CREATE TABLE fleet_incidents (
-  id TEXT PRIMARY KEY, no TEXT NOT NULL, boat_id TEXT NOT NULL REFERENCES boats (id),
-  date DATE NOT NULL, time TEXT, title TEXT NOT NULL CHECK (btrim(title) <> ''), detail TEXT, remark TEXT,
-  priority INTEGER CHECK (priority BETWEEN 1 AND 5), severity TEXT,
-  status TEXT NOT NULL CHECK (status IN ('open', 'resolved', 'closed', 'inprogress')),
-  job_id TEXT, related_job_ids TEXT[] NOT NULL DEFAULT '{}',
-  closed_on DATE, quick_fix BOOLEAN NOT NULL DEFAULT false, resolved_on DATE
-);
-CREATE INDEX fleet_incidents_no ON fleet_incidents (no);       -- not unique (decision 4)
-CREATE TABLE fleet_incident_assets (
-  incident_id TEXT NOT NULL REFERENCES fleet_incidents (id) ON DELETE CASCADE, idx INTEGER NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('engine', 'gearbox', 'propeller', 'hull', 'safety')),
-  asset_id TEXT, label TEXT, swapped BOOLEAN NOT NULL DEFAULT false, swapped_to TEXT, swapped_on DATE,
-  PRIMARY KEY (incident_id, idx)
-);
-CREATE TABLE fleet_incident_log (
-  incident_id TEXT NOT NULL REFERENCES fleet_incidents (id) ON DELETE CASCADE, seq INTEGER NOT NULL,
-  date DATE, text TEXT, by TEXT, created_on DATE, PRIMARY KEY (incident_id, seq)
-);
-CREATE TABLE fleet_jobs (
-  id TEXT PRIMARY KEY, no TEXT NOT NULL, boat_id TEXT NOT NULL REFERENCES boats (id),
-  type TEXT NOT NULL CHECK (type IN ('corrective', 'preventive', 'scheduled')),
-  title TEXT NOT NULL CHECK (btrim(title) <> ''), detail TEXT, location TEXT,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'inprogress', 'done')),
-  start_date DATE, end_date DATE, incident_id TEXT,
-  boat_status TEXT CHECK (boat_status IN ('available', 'fixing', 'unavailable')), boat_status_reason TEXT,
-  set_fixing BOOLEAN NOT NULL DEFAULT true,
-  outcome TEXT CHECK (outcome IN ('success', 'limited', 'rework', 'decommission', 'cancelled')),
-  close_note TEXT, awaiting_invoice BOOLEAN NOT NULL DEFAULT false, parent_project_id TEXT,
-  legacy_cost NUMERIC(12,2),
-  board_lane TEXT CHECK (board_lane IN ('decide', 'wait', 'doing', 'close')), owner TEXT, due_date DATE,
-  parked_on DATE, pinned BOOLEAN NOT NULL DEFAULT false, pinned_on DATE
-);
-CREATE INDEX fleet_jobs_boat ON fleet_jobs (boat_id) WHERE status <> 'done';
-CREATE TABLE fleet_job_assets (job_id … ON DELETE CASCADE, idx, type CHECK (as incidents), asset_id, label,
-  detail, status, added_on DATE, PRIMARY KEY (job_id, idx));
-CREATE TABLE fleet_job_parts (job_id … ON DELETE CASCADE, idx, id TEXT, inv_id TEXT, name TEXT,
-  qty NUMERIC CHECK (qty >= 0), unit TEXT, cost NUMERIC(12,2), location TEXT, date DATE,
-  late BOOLEAN NOT NULL DEFAULT false, late_by TEXT, PRIMARY KEY (job_id, idx));
-CREATE TABLE fleet_job_log (job_id … ON DELETE CASCADE, seq, date DATE, text TEXT, by TEXT,
-  created_on DATE, PRIMARY KEY (job_id, seq));
-CREATE TABLE fleet_job_steps (job_id … ON DELETE CASCADE, idx, text TEXT NOT NULL, done BOOLEAN NOT NULL
-  DEFAULT false, done_by TEXT, done_on DATE, PRIMARY KEY (job_id, idx));
-```
-
-No foreign key from an incident to its job or a job to its incident: legacy keeps a dangling id
-(`mjmtsfprvltstem`), and deleting an incident leaves its job's link (copied).
-
-### Contract
-
-Writes need the `fleet` area (legacy `flSave`), except the status timeline (`config`, as built) and
-deployments (`operations` or `fleet`, as built). Errors: `{statusCode, code, error, message}`.
-
-**Availability**
-- `GET /v1/fleet/availability?from=&to=&boat_id=` (default today; at most 62 days) →
-  `{ days: [{ boat_id, service_date, status, stored_status, reason, not_chartered, blocked_by: [{kind,
-  id, no, status, reason}], planned_over }] }`.
-- `GET /v1/boats` and `/v1/boats/{id}` add `status_effective` and `blocked_by` (today) beside
-  `status_today` (the stored status, unchanged).
-- `POST /operations/deployments` with a boat not ready that day →
-  `409 boat_not_ready` "Okeanos is not ready on 2026-10-20: fixing (MJ-058). Send deploy_anyway: true to
-  deploy it anyway"; with `deploy_anyway: true` → `201 {…, warnings: [{code: 'boat_not_ready', boat_id,
-  service_date, status, blocked_by}]}`. Only a new deployment or a change of route is checked.
-- `POST/PATCH /v1/boats/{id}/status-log…` with `status: available` while open work blocks
-  `from_date` → `409 open_work` naming the numbers; `plan_ahead: true` saves it with `planned_over`.
-
-**Assets** — `{kind}` is `engines`, `gearboxes` or `propellers`:
-- `GET /v1/fleet/{kind}?boat_id=` → `{ engines: [...] }` (with computed fields, no log);
-  `GET /v1/fleet/{kind}/{id}` → the asset with its `log`.
-- `POST /v1/fleet/{kind}` → `201` (the form; may set `status` and the install fields).
-- `PATCH /v1/fleet/{kind}/{id}` → client facts; `status`, `boat_id`, `pos`, `engine_id`, `gearbox_id`,
-  `log`, computed fields → `400` naming the command.
-- `POST /v1/fleet/{kind}/{id}/status {status, note?}` (`flChangeEngStatus`): logs `Status: a → b`.
-- `POST /v1/fleet/{kind}/{id}/install` — engine `{boat_id, pos, job_id?}` (with `job_id`: legacy's
-  job-start swap: the engine sheds its own gearbox, a gearbox waiting at that position adopts it);
-  gearbox `{engine_id}`; propeller `{gearbox_id, prop_pos?}`. A spare becomes ready/active.
-- `POST /v1/fleet/{kind}/{id}/remove` (`flEquipRemove`): off its boat/engine/gearbox, as legacy.
-- `POST /v1/fleet/{gearboxes|propellers}/{id}/move {spare_location, note?}` (`flConfirmMove`):
-  `shop:` → fixing, else spare; logged transfer/repair.
-- `POST /v1/fleet/{engines|gearboxes}/{id}/service {hours}` (`flEngMarkService`, `flGbMarkService`).
-- `POST /v1/fleet/{kind}/{id}/swap {with_id}` (`flEquipSwapDo`): two of a kind trade places.
-
-**Incidents**
-- `GET /v1/fleet/incidents?boat_id=&status=` → `{ incidents, next_no }`; `GET …/{id}`.
-- `POST /v1/fleet/incidents {no, boat_id, date, time?, title, detail?, remark?, cause?, priority?,
-  damaged_assets?: [{type, asset_id} | {type: 'hull', label}], quick_fix?}` → `201`.
-- `PATCH /v1/fleet/incidents/{id}` (the edit form; writes legacy's "✎ แก้ไขรายละเอียด" line).
-- `DELETE /v1/fleet/incidents/{id}` → `204` (its job stays).
-- `POST /v1/fleet/incidents/{id}/log {text, by?}`.
-- `POST /v1/fleet/incidents/{id}/swap {asset_type: 'gearbox'|'propeller', asset_id, spare_id,
-  propellers?: [{id, action: 'keep'|'stock'|'repair', location?}]}` (quick swap + propeller cascade).
-
-**Jobs**
-- `GET /v1/fleet/jobs?boat_id=&status=&incident_id=` → `{ jobs, next_no }`; `GET …/{id}`.
-- `POST /v1/fleet/jobs {no, boat_id, type, title, …, incident_id?, per_asset?, nos?, assets?,
-  create_anyway?}` → `201 {jobs: [...]}`. The boat has an open job → `409 open_jobs` unless
-  `create_anyway` (legacy's confirm). An incident with 2+ damaged assets needs `per_asset` (legacy's
-  choice dialog): `true` makes one job per asset numbered by `nos`.
-- `PATCH /v1/fleet/jobs/{id}`; `DELETE` (not done; `409 job_done`).
-- `POST /v1/fleet/jobs/{id}/start {gear?: 'keep'|'stash'|'swap', stash_location?}` (pending only).
-- `POST /v1/fleet/jobs/{id}/close {outcome, note?, awaiting_invoice?, reset_service?}` (not done).
-  A service-looking job with engines/gearboxes (`flMaintServiceReset`) needs `reset_service` true or
-  false: `409 reset_service_choice`.
-- `POST /v1/fleet/jobs/{id}/reset-service` (the manual button).
-- `POST /v1/fleet/jobs/{id}/boat-status {status, reason?, effective_date, note?}`.
-- `POST /v1/fleet/jobs/{id}/assets {type, asset_id? | label, detail?}`; `DELETE …/assets/{idx}`.
-- `POST /v1/fleet/jobs/{id}/log {text, by?, date?}` (also onto its incident).
-- `POST /v1/fleet/jobs/{id}/split {by: 'job_engines'|'boat_engines', nos}`.
-- `POST /v1/fleet/jobs/{id}/steps {text}`, `POST …/steps/template`, `PATCH …/steps/{idx} {done}`,
-  `DELETE …/steps/{idx}`.
-
-Example: `POST /v1/fleet/jobs/mj1/close {"outcome": "success", "reset_service": false}` →
-`200 {"id": "mj1", "no": "MJ-121", "status": "done", "outcome": "success", "end_date": "2026-10-09",
-"boat_status_after": "available", "cost": 4200, …}`.
-
-### Import (`npm run import:fleet`, `src/tools/import-fleet.ts`, mapping `legacy-fleet.ts`)
-
-A seed, as `--sales`: legacy ids kept and upserted, children replaced; rows created here untouched.
-- assets ← `fleet_engines|gearboxes|propellers` + `__log`; `''` → null; a date that is not a date →
-  null and listed; `hp`, `serviceinterval`, `cost` read as numbers.
-- incidents ← `fleet_incidents` + `__damagedassets` (`asset_id = id ?? engid ?? gbid ?? propid`),
-  `__progresslog`, `__relatedmaintids`; `maintid` → `job_id` as is (dangling kept and listed);
-  `inprogress`/`high` kept and listed; duplicate numbers listed.
-- jobs ← `fleet_maintenance` + `__assets`, `__parts`, `__progresslog`; `cost` → `legacy_cost`;
-  `setfixing` null → true (legacy's default).
-- boats' status log: `seed:boats` reads the plan-ahead mark in a note into `planned_over`.
+**My decisions**
+- **Commands, not `PATCH`, for rule-bound asset fields:** status, install/remove/swap/move, service.
+  Legacy's forms saved status and place with the rest; a client splits that save.
+- Create accepts the form's status and place (validated as the form's lists: a gearbox only on an
+  engine that is on a boat and has none, a propeller only on an installed gearbox with none). The
+  "one propeller per gearbox" rule refuses a second though 6 legacy gearboxes have two (imported).
+- Installing a gearbox or propeller through the command sets its `base_hours`/`install_hours` to the
+  engine's hours (the quick swap's rule), so its lifetime counts from fitting; the form never did.
+- Removing a gearbox also clears its `boat_id`; legacy left it. An engine `install` with `job_id` is
+  legacy's job-start swap (shed own gearbox, adopt the waiting one); without it, only the place moves.
+  The swap flow's "where the old engine goes" picker (`fl-sg-engloc`) is not a parameter: `PATCH` the
+  engine's `spare_location`.
+- `start` defaults `gear` to `keep` (legacy's dialog always asked); `stash_location` must be one of
+  legacy's six places (default `pier:central`).
+- `close` from `pending` is allowed (legacy's close is the in-progress button; `flUpdateMaint` allows
+  it); `outcome` defaults to `success`. `reset_service` is required (`409 reset_service_choice`) when
+  legacy would ask.
+- `boat-status`, adding a job asset, and `close` refuse a closed job (`409 job_done`); legacy hid the
+  buttons.
+- Any new progress line (`POST …/log`) frees a lane dragged to `decide`/`wait` (legacy: only the
+  board's note did). `parked: false` unparks (legacy had no unpark); board lines are written for owner,
+  due date, lane and park, not for pin.
+- A job may be made for an incident whose `job_id` names a deleted job (legacy hid such an incident).
+- `boat_status_reason` must be one of the create form's eight reasons.
+- Ids: assets `e|g|p<base36 ms>`, incidents `inc…`, jobs `mj…` (legacy used `LA_UID`).
+- Engine `retired` (legacy lost it) and gearbox `last_service_hours` (no legacy column) are stored.
+- `import:fleet` is a separate tool, a seed: legacy's ids upserted, lists replaced, re-runnable;
+  a re-run overwrites edits made here to legacy's records (checklist 1b6).

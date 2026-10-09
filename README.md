@@ -83,6 +83,7 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:boats [-- --commit]` | Seed the boat catalogue the same way: every field of the boat form, its documents and status log. Dry run unless `--commit`; adds what is missing, refreshes a boat never edited here, never touches one edited here, never deletes. Legacy's `totalcap` becomes `registered_persons`, never a selling limit. Run the import afterwards so deployments on a new boat are imported. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:fleet [-- --commit]` | Seed fleet maintenance (engines, gearboxes, propellers and their histories, incidents, maintenance jobs) from legacy. Dry run unless `--commit`. A seed: run it once, after `seed:boats` and before anyone edits fleet here. Legacy's ids are upserted with their lists replaced; records created here are untouched. Lists what it skipped and legacy's oddities (duplicate numbers, a job link to a deleted job, `inprogress`/`high`). |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
 
 ### Checking an import
@@ -178,7 +179,7 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 | Area | Writes |
 |---|---|
 | `operations` | bookings and their commands (a weather cancel's refund and credit, and insurance, included), seat locks, deployments, weather closures, a boat's seats for one day, nationalities |
-| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat |
+| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat; engines, gearboxes, propellers, incidents and maintenance jobs (`/v1/fleet/…`) |
 | `sales` | rate types, agents, contract templates and documents, the add-on catalogue |
 | `config` | routes, their families and calendar; boats (the whole boat form and its status timeline); salespeople, markets |
 | `accounting` | invoices, their discounts and payments |
@@ -383,8 +384,8 @@ edited here.
 | `PATCH /v1/boats/{id}` | `config` | any of the fields, `status?`, `capacity_anyway?` | `200` the boat, `deployments_updated`, `warnings`; `409 seats_sold` |
 | `POST /v1/boats/{id}/retire` | `fleet` | `{ reason? }` | `200` the boat; `409 future_deployments`, `already_retired` |
 | `POST /v1/boats/{id}/restore` | `fleet` | | `200` the boat; `409 not_retired` |
-| `POST /v1/boats/{id}/status-log` | `config` | an entry | `201` the entry |
-| `PATCH /v1/boats/{id}/status-log/{entry_id}` | `config` | entry fields | `200` the entry |
+| `POST /v1/boats/{id}/status-log` | `config` | an entry, `plan_ahead?` | `201` the entry; `409 open_work` |
+| `PATCH /v1/boats/{id}/status-log/{entry_id}` | `config` | entry fields, `plan_ahead?` | `200` the entry; `409 open_work` |
 | `DELETE /v1/boats/{id}/status-log/{entry_id}` | `config` | | `204` |
 
 A boat:
@@ -400,14 +401,22 @@ A boat:
   "documents": [{ "name": "ใบอนุญาตใช้เรือ", "expires_on": "2027-03-09", "renew_status": null }],
   "status_log": [{ "id": "sl1779722337776", "status": "unavailable", "from_date": "2026-05-25", "to_date": "2026-05-30",
     "loc": "Visit Panwa Pier · Phuket", "province": "Phuket", "loc_type": "Visit Panwa Pier", "detail": null, "note": null,
-    "reason": "scheduled_maint", "project_id": null }],
-  "status_today": "available", "retired": false, "retired_on": null, "retired_reason": null, "unretired_on": null,
+    "reason": "scheduled_maint", "project_id": null, "planned_over": null }],
+  "status_today": "available", "status_effective": "fixing", "blocked_by": [{ "kind": "job", "id": "mj_…", "no": "MJ-058", "status": "fixing", "reason": "" }],
+  "retired": false, "retired_on": null, "retired_reason": null, "unretired_on": null,
   "updated_at": "2026-10-09T08:00:00.000Z" }
 ```
 
 - **Decided by the server:** `id` (`b<epoch ms>`), `charter_ceiling`, `status_today`, `updated_at`,
   and the retire fields (the commands set them). Sending any of them, or `status_log`, is `400`
   naming what to use.
+- **`status_today`** is the status log's own answer; **`status_effective`** is today's status with the
+  open work holding the boat (legacy `boatEffStatus`), and `blocked_by` that work (on `GET` only; see
+  "Fleet maintenance"). A log entry's `planned_over` is set by `plan_ahead: true`, never sent.
+- **Planned ahead** (legacy `saveStatus`'s confirm): saving an `available` entry while a started job
+  still holds the boat on its first day is `409 open_work` naming the jobs; with `plan_ahead: true` the
+  entry is saved with `planned_over` (those jobs stop holding the boat on its days; later work still
+  does) and legacy's mark `วางล่วงหน้าทั้งที่ยังมีงานค้าง · MJ-…` appended to its note.
 - **The form's defaults on create:** `capacity` 40, `engine_count` 4, `ownership: "own"`, and
   `registered_persons` = `license_pax + crew + fish_crew` (legacy `fmCalcTotal`) when not sent.
   `pier` (`tublamu`/`panwa`/`ranong`) and `name` are required; `type` is one of `Catamaran`,
@@ -845,12 +854,19 @@ Validation errors are `400` and name the path, for example:
 
 ### Operations
 
-- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons?, remove_anyway? }`; creates or replaces a boat's deployment for that date. `license_pax` is the boat catalogue's: taken from it when omitted, and a different value is `400` (a boat not in the catalogue keeps what is sent).
+- `POST /operations/deployments` — `{ boat_id, route_id, service_date, capacity, license_pax?, registered_persons?, remove_anyway?, deploy_anyway? }`; creates or replaces a boat's deployment for that date. `license_pax` is the boat catalogue's: taken from it when omitted, and a different value is `400` (a boat not in the catalogue keeps what is sent).
 - `DELETE /operations/deployments/{service_date}/{boat_id}[?remove_anyway=true]` — removes a deployment: `204`, or `200 { warnings }` when it went ahead with `remove_anyway`.
 - **Guards** (legacy `bop2GuardPast`, `bop2UnassignBoat`; decided 2026-10-09):
   - a date before today (Asia/Bangkok) is `409 past_date`, except for an admin correcting history;
   - a boat a charter booking holds can't leave its route: `409 charter_boat` ("Cancel the charter booking first");
   - removing a boat, moving it to another route, or shrinking it below the passengers **placed on it** that day (as legacy counts: not the whole route-day) is `409 seats_sold` ("N booking(s) (P pax) on it"), unless `remove_anyway: true` (legacy's confirm dialog). Then the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id, service_date, boat_id, bookings, pax}]`, and those bookings read `boat_pulled: true`.
+  - a catalogue boat that is not ready that day (fixing, unavailable or retired in its log, held by a
+    started job, or a charter boat not chartered that day: `GET /v1/fleet/availability`) is
+    `409 boat_not_ready` when it is put on a route or moved to another, unless `deploy_anyway: true`;
+    then the answer warns `{code: "boat_not_ready", boat_id, service_date, status, not_chartered,
+    blocked_by}`. Legacy's Boat Operation offers only ready boats and its bulk forms skip the rest, so a
+    range form gets the `409` per day and skips it. A deployment that stays on its route (a capacity
+    change) is not asked.
   - `available_seats` goes negative on an oversold day; it shows the oversell.
 - `GET /operations/deployments?from=&to=&route_id=` — lists deployments.
 - `GET /operations/allotment?route_id=&service_date=` — deployed, booked, locked, and available seat totals, with contributing deployments.
@@ -929,6 +945,120 @@ reported as it is rather than clamped to zero, so the oversell is visible.
 `total_capacity` and was used as the charter ceiling, which meant a boat registered for 45
 passengers and 3 crew could be sold 48 charter seats. `total_capacity`/`totalcap` are still accepted
 on input, since that is what legacy sends, and stored as `registered_persons`.
+
+### Fleet maintenance: availability, engines, incidents, jobs
+
+Legacy's Fleet screens (`05-fleet.js`), part A (todo/fleet-maintenance-model.md, decided
+2026-10-09): whether a boat can sail, its engines, gearboxes and propellers, incidents and
+maintenance jobs. Writes need the `fleet` area. Stock, purchase memos, the Daily Fleet Log, projects,
+safety equipment and consumables are part B.
+
+**Availability** (legacy `boatEffStatus`, `boatJobBlock`):
+
+- `GET /v1/fleet/availability?from=&to=&boat_id=` (default today; at most 62 days) →
+  `{ days: [{ boat_id, service_date, status, stored_status, reason, not_chartered, blocked_by, planned_over }] }`.
+- `stored_status` is the status log's; `blocked_by` the started jobs holding the boat that day
+  (`{kind, id, no, status, reason}`): a job `inprogress` whose `boat_status` is not `available`, from
+  its `start_date`. `status` is the stricter of the two, but a log already saying fixing, unavailable or
+  retired is kept as written. Work an entry is planned ahead of (`planned_over`) holds nothing on that
+  entry's days. A charter boat with no entry that day is `unavailable`, `not_chartered: true`.
+- Deploying a boat not ready that day needs `deploy_anyway` (see "Operations").
+
+**Engines, gearboxes, propellers** — `{kind}` is `engines`, `gearboxes` or `propellers`:
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `GET /v1/fleet/{kind}?boat_id=` | | `{ engines: [...] }` (or `gearboxes`, `propellers`), without histories |
+| `GET /v1/fleet/{kind}/{id}` | | the asset with its `log` |
+| `POST /v1/fleet/{kind}` | the form's fields, `status?`, install fields | `201` |
+| `PATCH /v1/fleet/{kind}/{id}` | the form's fields | `200`; a status, a place or a computed field is `400` naming the command |
+| `POST /v1/fleet/{kind}/{id}/status` | `{ status, note? }` | logged `Status: a → b` |
+| `POST /v1/fleet/{kind}/{id}/install` | engine `{ boat_id, pos, job_id? }`; gearbox `{ engine_id }`; propeller `{ gearbox_id, prop_pos? }` | `409 engine_not_installed`, `engine_has_gearbox`, `gearbox_not_installed`, `gearbox_has_propeller` |
+| `POST /v1/fleet/{kind}/{id}/remove` | `{ spare_location? }` | off its boat/engine/gearbox; `409 not_installed` |
+| `POST /v1/fleet/{kind}/{id}/swap` | `{ with_id }` | two of a kind trade places |
+| `POST /v1/fleet/{gearboxes,propellers}/{id}/move` | `{ spare_location, note? }` | a `shop:` place is fixing, any other spare |
+| `POST /v1/fleet/{engines,gearboxes}/{id}/service` | `{ hours }` | the service baseline |
+
+- **Fields** (legacy's camelCase accepted): engine `brand, model, serial, hp, buy_date, price,
+  base_hours, service_interval, note, spare_location`; gearbox `brand, model, model_suffix, serial,
+  buy_date, base_hours, note, shaft_length, rotation, gear_ratio, oil_capacity, service_interval,
+  last_service_date, spare_location`; propeller `brand, serial, old_serial, diameter, pitch, size,
+  blades, material, rotation, hub_size, cupping, cost, buy_date, note, spare_location, prop_pos`.
+  An engine needs `model` and `serial`; a blank `base_hours` is 0, a blank interval 100, a blank
+  propeller `cost` 0, and `size` is `diameter×pitch` when both are sent (the forms').
+- **Statuses:** engines and gearboxes `ready, fixing, broken, spare` (`limited` only by closing a job);
+  propellers `active, fixing, broken, spare` (`damaged` only by a quick swap, `limited` by a job).
+- **Computed:** an engine's `hours` (`base_hours` plus its Daily Fleet Log meter: part B, so today
+  `base_hours`) and `service` (`{current_hours, interval, base, since, next, left, pct, overdue}`); a
+  gearbox's `lifetime_hours` and `service` (interval 200 when none). Decommissioned engines carry
+  `retired`, `retired_on`, `retired_reason`.
+
+**Incidents:**
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `GET /v1/fleet/incidents?boat_id=&status=` | | `{ incidents, next_no }` |
+| `GET /v1/fleet/incidents/{id}` | | the incident |
+| `POST /v1/fleet/incidents` | `{ no, boat_id, date, time?, title, detail?, remark?, cause?, priority?, damaged_assets?, quick_fix? }` | `201`; `409 number_taken` |
+| `PATCH /v1/fleet/incidents/{id}` | the edit form's fields | `200` (writes legacy's "✎ แก้ไขรายละเอียด" line) |
+| `DELETE /v1/fleet/incidents/{id}` | | `204` (its job stays) |
+| `POST /v1/fleet/incidents/{id}/log` | `{ text, by? }` | `200` |
+| `POST /v1/fleet/incidents/{id}/swap` | `{ asset_type, asset_id, spare_id, propellers?: [{ id, action: keep\|stock\|repair, location? }] }` | `200`; `409 spare_not_compatible` |
+
+- **`no`** is the client's (decided: legacy numbers in the browser, highest + 1, three digits;
+  `next_no` says what that is). A number already used is `409 number_taken`; legacy's duplicates stay.
+- `damaged_assets`: `[{ type: engine|gearbox|propeller, asset_id }]` labelled by the server
+  (`serial · pos`), or `[{ type: hull|safety, label }]`. `severity` is computed from `priority` (1–5,
+  default 5: 4+ critical, 3 major, else minor). `quick_fix: true` resolves it at once (`resolved_on`).
+- `shown_status` is legacy's `effStatus`: resolved, or its job's (`open` with none, `pending`,
+  `inprogress`, else `resolved`). `status` (`open`, `resolved`, `closed`) is the server's: the last of
+  its jobs closing closes it.
+- The quick swap fits a spare kept at a pier or on this boat (same brand of gearbox, same size of
+  propeller); the damaged part goes to `shop:honda-phuket`. After a gearbox, each propeller on the
+  old one is kept on the new one (default), stocked or sent with it for repair.
+
+**Maintenance jobs:**
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `GET /v1/fleet/jobs?boat_id=&status=&incident_id=` | | `{ jobs, next_no }` |
+| `GET /v1/fleet/jobs/{id}` | | the job |
+| `POST /v1/fleet/jobs` | `{ no, boat_id, type?, title, detail?, location?, start_date?, boat_status?, boat_status_reason?, incident_id?, per_asset?, nos?, assets?, parent_project_id?, create_anyway? }` | `201 { jobs }`; `409 open_jobs`, `incident_linked`, `number_taken` |
+| `PATCH /v1/fleet/jobs/{id}` | `title, detail, location, type, start_date, no, parent_project_id, awaiting_invoice`, the board's `owner, due_date, board_lane, parked, pinned` | `200` |
+| `DELETE /v1/fleet/jobs/{id}` | | `204`; `409 job_done` |
+| `POST /v1/fleet/jobs/{id}/start` | `{ gear?: keep\|stash\|swap, stash_location? }` | `409 job_started`, `job_done` |
+| `POST /v1/fleet/jobs/{id}/close` | `{ outcome?, note?, awaiting_invoice?, reset_service? }` | adds `boat_status_after`, `service_reset`; `409 reset_service_choice`, `job_done` |
+| `POST /v1/fleet/jobs/{id}/reset-service` | | `409 not_a_service` |
+| `POST /v1/fleet/jobs/{id}/boat-status` | `{ status, reason?, effective_date, note? }` | `200` |
+| `POST /v1/fleet/jobs/{id}/assets` | `{ type, asset_id? \| label, detail? }` | `200`; `DELETE …/assets/{idx}` |
+| `POST /v1/fleet/jobs/{id}/log` | `{ text, by?, date? }` | onto its incident too |
+| `POST /v1/fleet/jobs/{id}/split` | `{ by: job_engines\|boat_engines, nos }` | adds `created` |
+| `POST /v1/fleet/jobs/{id}/steps`, `…/steps/template`, `PATCH …/steps/{idx}`, `DELETE …/steps/{idx}` | `{ text }`, —, `{ done }`, — | the board's sub-steps |
+
+- **Create:** `type` (default `corrective`) sets the default `boat_status`: corrective `fixing`,
+  scheduled `unavailable` (`scheduled_maint`), preventive `available` (the job runs alongside, holds
+  nothing: `set_fixing: false`). `boat_status_reason` is one of `engine_repair, donor, docs_expired,
+  dry_dock, off_season, charter, scheduled_maint, other`, required when unavailable. The boat must be a
+  company boat not retired. An open job on the boat is legacy's confirm: `create_anyway: true`. From an
+  incident, its damaged assets come along; with 2 or more, `per_asset` is required (legacy's choice):
+  `true` makes one job per asset, numbered by `nos`.
+- **Start** writes the boat's log: the job's status from today (tomorrow when the boat already sailed
+  today), closing what it overlaps as legacy's `autoClosePrevLog`; its parts go fixing. `gear`: keep
+  the gearbox/propeller on its engines (default), `stash` them as spares, or `swap` the engine out
+  (its gearbox waits on the boat; fit the replacement with `POST /v1/fleet/engines/{id}/install` and
+  `job_id`).
+- **Close** (`outcome`: `success` default, `limited`, `rework`, `decommission`, `cancelled`) sets the
+  parts (legacy's table) and the boat: the outcome's status unless other started work still holds it.
+  A job that reads like a service (scheduled, or "oil/service/gear…" in its words) with engines or
+  gearboxes needs `reset_service` true or false (legacy's confirm). The incident closes with its last
+  job (not on a cancel).
+- **Computed:** `cost` (parts not already in a parts memo, plus approved/received/paid memos: part B,
+  so today parts only), `parts_cost`, `memo_cost`, `parts_covered`, `lane` (the board's
+  `flBoardLane`), `silent_days`, `blocks_boat`. `legacy_cost` is legacy's stored cost, read-only.
+  `status`, `end_date`, `outcome`, `set_fixing`, `pinned_on`, `parked_on`, the logs and steps are the
+  server's; sending them to `PATCH` is `400` naming the command.
+- A board field change writes the line legacy's board writes (owner, due date, lane, park), and a new
+  progress line frees a lane dragged to `decide` or `wait`.
 
 ### Bookings
 
