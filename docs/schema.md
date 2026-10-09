@@ -30,7 +30,7 @@ flowchart LR
   catalogue["Catalogue and seat pool<br/>routes, route_times, route_seasons,<br/>route_day_overrides, boats,<br/>boat_capacity_overrides, deployments, seat_locks"]
   bookings["Bookings<br/>bookings, booking_trips, booking_trip_pax,<br/>booking_trip_lock_draws,<br/>booking_passengers, booking_addons,<br/>booking_approvals, booking_approval_days,<br/>booking_reconfirmations, booking_alt_pickups,<br/>booking_upgrades, booking_trip_upgrades,<br/>attachments, booking_documents, booking_upgrade_slips,<br/>booking_allergies, booking_doc_checks,<br/>booking_doc_check_results, pickup_areas,<br/>pickup_time_profiles, pickup_times, changes"]
   actions["Booking action records<br/>booking_history, booking_cancellations,<br/>booking_reschedules, booking_partial_cancels,<br/>booking_fee_items"]
-  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops,<br/>booking_trip_checkins, booking_trip_checkin_events,<br/>booking_trip_checkin_event_tries"]
+  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops,<br/>van_job_sends, pickup_name_th,<br/>booking_trip_checkins, booking_trip_checkin_events,<br/>booking_trip_checkin_event_tries"]
   sales["Agents and sales<br/>agents, agent_programs, agent_activity,<br/>markets, market_subs, sales_people"]
   money["Invoices and payments<br/>invoices, invoice_lines,<br/>invoice_number_counters,<br/>payments, payment_slips"]
   rates["Rate types<br/>rate_types, rate_type_routes,<br/>rate_type_seat_prices, rate_type_charter_prices,<br/>rate_type_longtail_prices, rate_type_transfer_prices"]
@@ -167,6 +167,7 @@ erDiagram
     text price_mode
     numeric manual_total
     numeric total "stored as sent"
+    text job_note "van job order special request; empty = blanked"
     text cancellation_reason
     jsonb booking_data "legacy blob, being removed"
     timestamptz created_at
@@ -462,6 +463,22 @@ erDiagram
     text pickup_time "HH:MM, or window start"
     text pickup_time_end "HH:MM, window end or pier deadline"
     boolean pickup_at_pier "meet at the pier by pickup_time_end"
+    integer display_order "place among the zone's groups"
+  }
+  van_job_sends {
+    bigint id PK
+    text group_id FK, UK "an outbound job"
+    date service_date "a return-only job"
+    text route_id FK
+    text van_id FK
+    timestamptz sent_at
+    text sent_by
+    text fingerprint "the sheet as sent"
+  }
+  pickup_name_th {
+    text name_key PK "trimmed, lower-cased"
+    text name
+    text name_th
   }
   vans {
     text id PK
@@ -486,7 +503,6 @@ erDiagram
     text driver
     text driver_phone
     text plate
-    timestamptz sent_at "job order sent"
   }
   van_day_routes {
     text van_id PK, FK
@@ -544,6 +560,8 @@ erDiagram
   vans ||--o{ van_zone_ranges : "works from"
   vans ||--o{ van_log : "changes"
   van_groups |o--o{ van_stops : "stops on the way"
+  van_groups ||--o| van_job_sends : "sent to the driver"
+  vans ||--o{ van_job_sends : "return-only run sent"
   routes ||--o{ van_day_routes : "served by"
   vans ||--o{ van_status_ranges : "out of service"
   boats |o..o{ booking_trip_operations : "boards"
@@ -561,6 +579,11 @@ erDiagram
   `ON DELETE`, so a van still in use can't be removed anyway.
 - **Moving a trip to another route or day clears its van data,** because it was arranged for the
   old departure (`writeTrips` in `src/domain/postgres-operations.ts`).
+- **Van job orders are computed, not stored** (`src/domain/van-jobs.ts`, README "Van job orders").
+  What is stored is around them: `van_job_sends` (sent to the driver, one per job: on the group, or
+  on date, route and van for a van that only brings people back; it goes with its group or van),
+  `pickup_name_th` (Thai names printed under a pickup, keyed by the place trimmed and
+  lower-cased), `van_groups.display_order` and `bookings.job_note`.
 
 ## 5. Agents and sales
 

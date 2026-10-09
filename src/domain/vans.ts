@@ -32,7 +32,7 @@ export type VanZoneRangeInput = Omit<VanZoneRange, 'id' | 'van_id'>;
 /** One van on one date as stored: its programmes and its overrides. Every field null/empty = no row. */
 export type StoredVanDay = {
   van_id: string; service_date: string; route_ids: string[];
-  status: VanDayStatus | null; zone: Zone | null; driver: string | null; driver_phone: string | null; plate: string | null; sent_at: string | null;
+  status: VanDayStatus | null; zone: Zone | null; driver: string | null; driver_phone: string | null; plate: string | null;
 };
 export type VanDayPatch = Partial<Omit<StoredVanDay, 'van_id' | 'service_date'>>;
 
@@ -165,19 +165,17 @@ export function parseVanDayPatch(raw: Record<string, unknown>, knownRoutes: Read
     const v = text(body, key);
     if (v !== undefined) patch[key] = v;
   }
-  if (body.sent_at !== undefined) {
-    if (body.sent_at !== null && (typeof body.sent_at !== 'string' || Number.isNaN(Date.parse(body.sent_at)))) bad('sent_at must be an ISO 8601 instant, or null');
-    patch.sent_at = body.sent_at === null ? null : new Date(body.sent_at as string).toISOString();
-  }
+  // "Sent to the driver" is per job now (migration 080), stamped by the server.
+  if (body.sent_at !== undefined) bad('sent_at is no longer a van-day field: a job is marked sent with PUT /operations/van-jobs/{date}/{key}/sent');
   return patch;
 }
 
 export const emptyVanDay = (vanId: string, date: string): StoredVanDay =>
-  ({ van_id: vanId, service_date: date, route_ids: [], status: null, zone: null, driver: null, driver_phone: null, plate: null, sent_at: null });
+  ({ van_id: vanId, service_date: date, route_ids: [], status: null, zone: null, driver: null, driver_phone: null, plate: null });
 export const applyVanDayPatch = (day: StoredVanDay, patch: VanDayPatch): StoredVanDay => ({ ...day, ...patch, route_ids: [...(patch.route_ids ?? day.route_ids)] });
 /** Nothing set: the stores keep no row for it. */
 export const isEmptyVanDay = (d: StoredVanDay): boolean =>
-  d.route_ids.length === 0 && d.status === null && d.zone === null && d.driver === null && d.driver_phone === null && d.plate === null && d.sent_at === null;
+  d.route_ids.length === 0 && d.status === null && d.zone === null && d.driver === null && d.driver_phone === null && d.plate === null;
 
 /** Legacy `vehStatusOn`: the day's own status wins, then the latest range covering the date, else none. */
 export function vanStatusOn(ranges: readonly VanStatusRange[], day: StoredVanDay | undefined, date: string): VanDayStatus | null {

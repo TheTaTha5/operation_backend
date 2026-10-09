@@ -42,6 +42,7 @@ import type { AttachmentRef, DocumentRow, StoredFile } from './attachments.js';
 import { checkinsView, type CheckinKind, type StoredCheckin } from './checkin.js';
 import { applyVanPatch, isEmptyVanDay, nextVanId, type StoredVanDay, type Van, type VanInput, type VanLogEntry, type VanPatch, type VanStatusRange, type VanStatusRangeInput, type VanZoneRange, type VanZoneRangeInput } from './vans.js';
 import type { VanStop } from './van-stops.js';
+import type { PickupNameTh, VanJobSend } from './van-jobs.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { contractView, selectContracts, type Contract, type ContractListQuery, type ContractPeriod, type ContractSeatPrice } from './contracts.js';
 import type { RateSeason } from './rate-seasons.js';
@@ -116,7 +117,7 @@ const VAN_PART_FIELDS = `'idx', a.idx, 'source', a.source, 'ad', a.ad, 'chd', a.
   'sequence', a.sequence, 'return_van_id', a.return_van_id, 'pick_area_id', a.pick_area_id, 'pick_hotel', a.pick_hotel, 'pick_zone', a.pick_zone,
   'drop_area_id', a.drop_area_id, 'drop_hotel', a.drop_hotel, 'drop_zone', a.drop_zone, 'pick_time', a.pick_time, 'alt_who', a.alt_who`;
 const VAN_GROUP_JSON = `CASE WHEN g.id IS NULL THEN NULL ELSE jsonb_build_object('id', g.id, 'service_date', g.service_date::text, 'route_id', g.route_id,
-  'zone', g.zone, 'number', g.number, 'van_id', g.van_id, 'return_van_id', g.return_van_id, 'pickup_time', g.pickup_time) END`;
+  'zone', g.zone, 'number', g.number, 'van_id', g.van_id, 'return_van_id', g.return_van_id, 'pickup_time', g.pickup_time, 'display_order', g.display_order) END`;
 
 const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
     SELECT jsonb_agg(jsonb_build_object(
@@ -340,6 +341,7 @@ const vanPart = (p: Record<string, unknown>): StoredVanPart => ({
 const vanGroup = (g: Record<string, unknown>): VanGroup => ({
   id: String(g.id), service_date: String(g.service_date), route_id: String(g.route_id), zone: String(g.zone), number: Number(g.number),
   van_id: text(g.van_id), return_van_id: text(g.return_van_id), pickup_time: text(g.pickup_time),
+  display_order: g.display_order === null || g.display_order === undefined ? null : Number(g.display_order),
 });
 const booking = (row: QueryResultRow): Booking => {
   const raw = new Map((row.trips as Record<string, unknown>[]).map((t) => [String(t.id), t]));
@@ -1485,9 +1487,51 @@ export class PostgresOperationsStore {
     return (await this.client().query(`SELECT jsonb_build_object(${VAN_PART_FIELDS}) AS p FROM booking_trip_van_allocations a WHERE booking_trip_id = $1 ORDER BY idx`, [tripId])).rows.map((r) => vanPart(r.p));
   }
   async writeVanGroup(g: VanGroup): Promise<void> {
-    await this.client().query(`INSERT INTO van_groups (id, service_date, route_id, zone, number, van_id, return_van_id, pickup_time) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-      ON CONFLICT (id) DO UPDATE SET zone = EXCLUDED.zone, number = EXCLUDED.number, van_id = EXCLUDED.van_id, return_van_id = EXCLUDED.return_van_id, pickup_time = EXCLUDED.pickup_time`,
-      [g.id, g.service_date, g.route_id, g.zone, g.number, g.van_id, g.return_van_id, g.pickup_time]);
+    await this.client().query(`INSERT INTO van_groups (id, service_date, route_id, zone, number, van_id, return_van_id, pickup_time, display_order) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      ON CONFLICT (id) DO UPDATE SET zone = EXCLUDED.zone, number = EXCLUDED.number, van_id = EXCLUDED.van_id, return_van_id = EXCLUDED.return_van_id, pickup_time = EXCLUDED.pickup_time,
+        display_order = EXCLUDED.display_order`,
+      [g.id, g.service_date, g.route_id, g.zone, g.number, g.van_id, g.return_van_id, g.pickup_time, g.display_order]);
+  }
+
+  // ── Van job orders (migration 080) ──
+  /** Every booking with a trip on the date, on any route. */
+  async bookingsOnDate(date: string): Promise<Booking[]> {
+    const { rows } = await this.client().query(`${BOOKING_SELECT} WHERE b.id IN (SELECT booking_id FROM booking_trips WHERE service_date = $1) ORDER BY b.id`, [date]);
+    return rows.map(booking);
+  }
+  async vanGroupsOnDate(date: string): Promise<VanGroup[]> {
+    return (await this.client().query(`SELECT ${VAN_GROUP_JSON} AS g FROM van_groups g WHERE service_date = $1 ORDER BY route_id, number`, [date])).rows.map((r) => vanGroup(r.g));
+  }
+  /** The day's marks: those on its groups, and the return-only ones dated that day. */
+  async vanJobSends(date: string): Promise<VanJobSend[]> {
+    const { rows } = await this.client().query(`SELECT s.group_id, s.service_date::text AS service_date, s.route_id, s.van_id, s.sent_at, s.sent_by, s.fingerprint
+      FROM van_job_sends s LEFT JOIN van_groups g ON g.id = s.group_id WHERE g.service_date = $1 OR s.service_date = $1 ORDER BY s.id`, [date]);
+    return rows.map((r) => ({
+      group_id: r.group_id ?? null, service_date: r.service_date ?? null, route_id: r.route_id ?? null, van_id: r.van_id ?? null,
+      sent_at: (r.sent_at as Date).toISOString(), sent_by: r.sent_by ?? null, fingerprint: r.fingerprint ?? null,
+    }));
+  }
+  /** Replaces the job's mark (a job is one group, or one date, route and van). */
+  async putVanJobSend(s: VanJobSend): Promise<void> {
+    await this.deleteVanJobSend(s);
+    await this.client().query('INSERT INTO van_job_sends (group_id, service_date, route_id, van_id, sent_at, sent_by, fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [s.group_id, s.service_date, s.route_id, s.van_id, s.sent_at, s.sent_by, s.fingerprint]);
+  }
+  async deleteVanJobSend(s: Pick<VanJobSend, 'group_id' | 'service_date' | 'route_id' | 'van_id'>): Promise<void> {
+    if (s.group_id) await this.client().query('DELETE FROM van_job_sends WHERE group_id = $1', [s.group_id]);
+    else await this.client().query('DELETE FROM van_job_sends WHERE group_id IS NULL AND service_date = $1 AND route_id = $2 AND van_id = $3', [s.service_date, s.route_id, s.van_id]);
+  }
+  async pickupNamesTh(): Promise<PickupNameTh[]> {
+    const { rows } = await this.client().query('SELECT name_key, name, name_th, updated_at, updated_by FROM pickup_name_th ORDER BY name_key');
+    return rows.map((r) => ({ name_key: r.name_key, name: r.name, name_th: r.name_th, updated_at: (r.updated_at as Date).toISOString(), updated_by: r.updated_by ?? null }));
+  }
+  async putPickupNameTh(n: PickupNameTh): Promise<void> {
+    await this.client().query(`INSERT INTO pickup_name_th (name_key, name, name_th, updated_at, updated_by) VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (name_key) DO UPDATE SET name = EXCLUDED.name, name_th = EXCLUDED.name_th, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
+      [n.name_key, n.name, n.name_th, n.updated_at, n.updated_by]);
+  }
+  async deletePickupNameTh(nameKey: string): Promise<boolean> {
+    return (await this.client().query('DELETE FROM pickup_name_th WHERE name_key = $1', [nameKey])).rowCount === 1;
   }
   async deleteVanGroup(id: string): Promise<void> { await this.client().query('DELETE FROM van_groups WHERE id = $1', [id]); }
   /** `[]` is no rows: one whole, ungrouped part. */
@@ -1552,13 +1596,13 @@ export class PostgresOperationsStore {
     const { rows } = await this.client().query(`
       SELECT van_id, service_date::text AS service_date,
         COALESCE((SELECT array_agg(r.route_id ORDER BY r.route_id) FROM van_day_routes r WHERE r.van_id = c.van_id AND r.service_date = c.service_date), '{}') AS route_ids,
-        d.status, d.zone, d.driver, d.driver_phone, d.plate, d.sent_at
+        d.status, d.zone, d.driver, d.driver_phone, d.plate
       FROM (SELECT van_id, service_date FROM van_days WHERE ${where} UNION SELECT van_id, service_date FROM van_day_routes WHERE ${where}) c
       LEFT JOIN van_days d USING (van_id, service_date)
       ORDER BY van_id, service_date`, params);
     return rows.map((r) => ({
       van_id: r.van_id, service_date: r.service_date, route_ids: r.route_ids, status: r.status ?? null, zone: r.zone ?? null, driver: r.driver ?? null,
-      driver_phone: r.driver_phone ?? null, plate: r.plate ?? null, sent_at: r.sent_at ? (r.sent_at as Date).toISOString() : null,
+      driver_phone: r.driver_phone ?? null, plate: r.plate ?? null,
     }));
   }
   async setVanDay(day: StoredVanDay): Promise<void> {
@@ -1567,9 +1611,9 @@ export class PostgresOperationsStore {
     for (const routeId of day.route_ids) await this.client().query('INSERT INTO van_day_routes (van_id, service_date, route_id) VALUES ($1,$2,$3)', [...key, routeId]);
     const { route_ids: _r, ...fields } = day;
     if (isEmptyVanDay({ ...day, route_ids: [] })) { await this.client().query('DELETE FROM van_days WHERE van_id = $1 AND service_date = $2', key); return; }
-    await this.client().query(`INSERT INTO van_days (van_id, service_date, status, zone, driver, driver_phone, plate, sent_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    await this.client().query(`INSERT INTO van_days (van_id, service_date, status, zone, driver, driver_phone, plate) VALUES ($1,$2,$3,$4,$5,$6,$7)
       ON CONFLICT (van_id, service_date) DO UPDATE SET status = EXCLUDED.status, zone = EXCLUDED.zone, driver = EXCLUDED.driver, driver_phone = EXCLUDED.driver_phone,
-        plate = EXCLUDED.plate, sent_at = EXCLUDED.sent_at`, [...key, fields.status, fields.zone, fields.driver, fields.driver_phone, fields.plate, fields.sent_at]);
+        plate = EXCLUDED.plate`, [...key, fields.status, fields.zone, fields.driver, fields.driver_phone, fields.plate]);
   }
 
   /** A van no group uses (outbound, return, or a part's return van) and with no day in the matrix. */

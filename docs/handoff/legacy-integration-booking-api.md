@@ -579,7 +579,8 @@ GET /operations/van-groups?service_date=2026-10-02&route_id=r1
 | `bookingV2VanGroupClearSeq` | `PUT …/{id}/order` `{clear: true}` |
 | `bookingV2VanGroupDisband` | `DELETE /operations/van-groups/{id}` → `204` |
 | `bookingV2VanClearRoute` | `POST /operations/van-groups/clear` `{service_date, route_id}` |
-| `bookingV2GrpMove`, `bookingV2GrpOrderSet`, `bookingV2GrpOrderReset` (the order groups are listed in, `bkv2_grp_order`) | not in the API (§7) |
+| `bookingV2GrpOrderSet`, `bookingV2GrpMove` (the order groups are listed in, `bkv2_grp_order`) | `PUT /operations/van-groups/order` `{service_date, route_id, zone, group_ids}` → the day's groups, in that order |
+| `bookingV2GrpOrderReset` | `PUT /operations/van-groups/order` `{service_date, route_id, zone, clear: true}` |
 
 - **"Run another round" dialog** (`§vgRound` in `bookingV2VanGroupSetVan`): send without
   `allow_second_round`; on `409 van_in_other_group` show legacy's confirm (the message names the
@@ -613,7 +614,7 @@ Today `SB_VEHICLES` is the seed at `08-app.js:180`, and `sbVehiclesPersist` save
 | `vehDaySetStatus`, `vehStatusCycleDay` | `PUT …/van-days/{date}/{van_id}` `{status}` |
 | `vehDaySetZone` | `PUT …` `{zone}` |
 | driver of the day (`VANJOB_DRIVER`, `vanJobsDriverPersist`) | `PUT …` `{driver, driver_phone, plate}` |
-| job order sent (`VANJOB_SENT`, `vanJobsSentPersist`) | `PUT …` `{sent_at}` |
+| job order sent (`VANJOB_SENT`, `vanJobsToggleSent`) | per job now: `PUT` / `DELETE /operations/van-jobs/{date}/{key}/sent` (§3.4b). `sent_at` on a van day is `400` |
 | `vehStatusAdd` / `vehStatusSet` / `vehStatusDel` | `POST /operations/vans/{id}/status-ranges` `{status: "off"\|"maintenance", from_date, to_date?, note?}`, `PATCH …/status-ranges/{range_id}`, `DELETE …` |
 | `vehZoneAdd` / `vehZoneSet` / `vehZoneDel` | `POST /operations/vans/{id}/zone-ranges` `{zone: "PK"\|"KL", from_date?, to_date?}`, `PATCH`, `DELETE` |
 | the van's log | `GET /operations/vans/{id}/log?limit=` |
@@ -621,7 +622,7 @@ Today `SB_VEHICLES` is the seed at `08-app.js:180`, and `sbVehiclesPersist` save
 ```jsonc
 // GET /operations/van-days?from=2026-10-01&to=2026-10-31 (one day row)
 { "van_id": "veh07", "service_date": "2026-10-01", "route_ids": ["r1", "r5"], "status": null, "zone": null,
-  "driver": null, "driver_phone": null, "plate": null, "sent_at": null,
+  "driver": null, "driver_phone": null, "plate": null,
   "status_on": "maintenance", "usable": false, "zone_on": "KL" }
 ```
 
@@ -631,6 +632,32 @@ Today `SB_VEHICLES` is the seed at `08-app.js:180`, and `sbVehiclesPersist` save
 - **Delete:** `vehStatusOn`, `vehEffectiveZone` (read `status_on`, `usable`, `zone_on`), and `vehLog`
   (the server writes the log in legacy's words).
 - Vans are **not in the change feed** yet: refetch on opening the page.
+
+### 3.4b Van job orders (Van Job Orders page)
+
+**Change: the job list and each sheet come from the server; the sent tick, the special request and
+the Thai pickup names are saved there.** README "Van job orders" has the shapes.
+
+| Legacy function | API |
+|---|---|
+| `renderVanJobs` (the rows, hero banner, `selfWarn`) | `GET /operations/van-jobs?date=` → `{jobs, unassigned, return_unarranged, self_arrive, struck}` |
+| `vanJobsOrderInner` (one sheet, both legs) | `GET /operations/van-jobs/{date}/{key}` → `{job, out, ret, ret_on_round_1, unassigned_on_route}` |
+| `vanJobsToggleSent` | tick: `PUT /operations/van-jobs/{date}/{key}/sent`; untick: `DELETE …/sent` |
+| `vanJobsSetSreq` / `vanJobsResetSreq` (`VANJOB_SREQ`) | `PATCH /v1/bookings/{id}` `{job_note, version}`: text, `""` blank, `null` reset |
+| `vanJobsSetPickupTh` (`VANJOB_PICKUP_TH`) | `PUT /operations/pickup-names-th` `{name, name_th}` (empty `name_th` deletes) |
+| driver of the day (`vanJobsSetDriver`) | unchanged: `PUT /operations/van-days/{date}/{van_id}` (§3.4) |
+| `vjTpl`, `vjHl*` (template, row highlights) | not in the API: the client's |
+
+- A job's `key` is the van group's id, or `<van_id>~<route_id>` for a van that only brings people
+  back; legacy's `van~route[~group]` keys are gone. Rounds are `job.round` `{no, of, time}`.
+- `sent.changed_since_sent: true` is new: the sheet changed after it was sent. Show it next to the
+  tick (the tick stays); ticking again re-sends. `null` = sent in legacy, unknown.
+- Every booking read has `special_request` (the override, else the notes): van check-in
+  (`ckRowHtml`) and the pier (`pckJobNote`) read that instead of `vanJobsSreqFinal`.
+- A struck-through row (`struck: "cancelled"`) is cleared with `PATCH /operations/trip-ops/{trip_id}`
+  `{van_parts: null}` (legacy "ล้างออก").
+- **Delete:** `VANJOB_SENT`, `VANJOB_SREQ`, `VANJOB_PICKUP_TH`, `bkv2_grp_order` and their
+  `*Persist`; `vjRoundAll`, `vjRoundPick`, `vanJobsBookingsFor`, `vanJobsSreqFinal` as deciders.
 
 ### 3.5 Van stops
 
@@ -1039,7 +1066,7 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | Agent create/edit, programs, contracts, markets, salespeople, add-on catalogue, nationalities, insurance overrides | `ag*` (already shown read-only), `ct*`, `insPersist` | `legacy-replacement.md` §6, `agents.md` |
 | Seat-lock extras: sub-groups, pending seats, cutoff, expiry, reason, log, bulk grouping | `bookingV2Lock*` | `ops/30-ops-locks.js` header; `legacy-replacement.md` §5 (log) |
 | Fleet maintenance | `05-fleet.js` | `legacy-replacement.md` §9 (scope undecided) |
-| The computed van board and job orders; van-job special requests and Thai pickup names; the order van groups are listed in | `vehJobsFor`, `VANJOB_SREQ`, `VANJOB_PICKUP_TH`, `bkv2_grp_order` (`bookingV2GrpOrderSet`) | `trip-ops-and-vans-model.md` 9; see "Questions" |
+| The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
 
@@ -1075,8 +1102,12 @@ work for the session only and save nowhere** (see "The one thing to know first")
 8. **Job order "sent" per round.** Legacy marks a van's job order sent per route or group
    (`VANJOB_SENT` key `date::van~route~group`); the API keeps one `sent_at` per van and day. Is losing
    the per-round mark intended?
+   *Answer (2026-10-09): no, built: sent is per job (the van group, so a second round no longer
+   orphans the first), flagged `changed_since_sent` when the sheet changes after (§3.4b).*
 9. **`VANJOB_SREQ`, `VANJOB_PICKUP_TH` and `bkv2_grp_order`** (the order van groups are listed in)
    have no home in README. Planned, or dropped?
+   *Answer (2026-10-09): built (§3.4b): the booking's `job_note`, `/operations/pickup-names-th`, and
+   `PUT /operations/van-groups/order`, which the job orders follow too.*
 10. **`SB_EXTRAS`.** In the client it is day-of extras sold on tour (`bookingV2ExtraSave`: service,
     qty, price, to-company, commission, payment). `legacy-replacement.md` §6 calls `sb_extras` the
     add-on catalogue. Which is it, and where will day-of extras live?

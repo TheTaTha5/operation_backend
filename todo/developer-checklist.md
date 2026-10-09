@@ -15,6 +15,10 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
 1b2. **Rate types are this API's now** (`feat/rate-types-cutover`): the import no longer touches
    them. If Railway has none yet (`SELECT count(*) FROM rate_types`), run the import once with
    `--rate-types`. From then on prices are edited here, not in legacy.
+1b3. **Van job orders (`feat/van-job-orders`, migration 080):** 080 drops `van_days.sent_at`, moving
+   each mark onto every group that van had that day; re-run `import-legacy` after deploying it so the
+   marks land per job (rehearsed: 438 of legacy's 449), with the special requests, the 760 Thai
+   pickup names and the group order.
 1c. **After that import,** validate the booking area keys on Railway:
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 2. **Railway variables:** remove `OIDC_ISSUER`, `OIDC_AUDIENCE`, `AUTH_PASSWORD_USERS`; keep
@@ -64,6 +68,12 @@ What only you can do: decisions, pushes, Railway, the other repos. Tick by delet
     Cancel and restore now issue and void the fee invoice on the server: stop calling
     `acctCreateFeeInvoice` and `acctVoidInvoice` from the booking screen. Show `409 overpayment` as
     legacy's "Save anyway?" and resend with `overpay_anyway: true`.
+  - van job orders (once 080 is deployed, `feat/van-job-orders`): the Van Job Orders page reads
+    `GET /operations/van-jobs?date=` and `/operations/van-jobs/{date}/{key}` instead of building the
+    sheets; the sent tick is `PUT`/`DELETE …/{key}/sent` (not `sent_at` on the van day, now `400`);
+    the special request is the booking's `job_note` and every screen prints `special_request`; Thai
+    names save to `/operations/pickup-names-th`; the group drag saves to
+    `PUT /operations/van-groups/order` (handoff §3.4b).
 - **Love Kingdom:** log in as the service user (the old test login stops); availability may use the
   `X-Api-Key` it already has (`docs/love-kingdom-integration.md` §2). Must send `If-Match` on amend
   and cancel: without it they are `428 version_required` once `feat/if-match-required` is deployed.

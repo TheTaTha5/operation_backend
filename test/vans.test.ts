@@ -69,10 +69,13 @@ test('the month matrix: a van\'s programmes, its day status, zone and driver, an
   const put = await send('PUT', `/operations/van-days/${day}/${van.id}`, { route_ids: ['r1', 'r2', 'r1'], driver: 'Somchai', phone: '081' });
   assert.equal(put.statusCode, 200, put.body);
   assert.deepEqual(put.json(), {
-    van_id: van.id, service_date: day, route_ids: ['r1', 'r2'], status: null, zone: null, driver: 'Somchai', driver_phone: '081', plate: null, sent_at: null,
+    van_id: van.id, service_date: day, route_ids: ['r1', 'r2'], status: null, zone: null, driver: 'Somchai', driver_phone: '081', plate: null,
     status_on: null, usable: true, zone_on: 'KL',
   }, 'r1 sails from Tap Lamu, so the van works from KL that day');
   assert.equal((await send('PUT', `/operations/van-days/${day}/${van.id}`, { route_ids: ['nowhere'] })).statusCode, 400, 'an unknown route');
+  const sent = await send('PUT', `/operations/van-days/${day}/${van.id}`, { sent_at: '2047-02-01T00:00:00Z' });
+  assert.equal(sent.statusCode, 400, 'sent to the driver is per job now');
+  assert.match(sent.json().message, /PUT \/operations\/van-jobs\/\{date\}\/\{key\}\/sent/);
   assert.equal((await send('PUT', `/operations/van-days/${day}/${van.id}`, { zone: 'NoTransfer' })).statusCode, 400);
   assert.equal((await send('PUT', `/operations/van-days/${day}/veh_nowhere`, { driver: 'X' })).statusCode, 404);
 

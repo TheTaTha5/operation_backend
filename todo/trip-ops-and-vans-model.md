@@ -19,13 +19,11 @@ tries table stays.
 9. **The day's van board.** `GET /operations/van-groups` needs a `route_id`; the hand-off's computed
    `GET /operations/van-board` (pools, rounds, return alerts, warnings across routes) is a later
    phase for the Vue port (`operation_frontend/apps/web/docs/handoff/van-endpoints.md`, its §8
-   checklist is the definition of done).
+   checklist is the definition of done). The job orders, with their rounds, are built (README "Van job orders").
 10. **Overnight legs on the van board (R16).** Legacy skips an overnight return leg in its
     second-round check and shows "no pickup leg" for it; here a return-leg trip can be grouped.
 11. **The split `returnSameVan`** is read by legacy (`L.sp.returnSameVan`) but never written, so it
     isn't stored.
-12. **Rented vans print as company vans on legacy's job order** (its owner tag checks
-    `rental`/`charter`, not `rented`). A legacy display bug, noted only.
 
 ## Before the import runs on production
 

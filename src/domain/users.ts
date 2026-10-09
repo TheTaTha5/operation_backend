@@ -90,8 +90,9 @@ export function writeNeed(path: string): WriteNeed {
   // Check-in: legacy `ckCanEdit` lets the pier staff in too.
   if (/^\/operations\/trip-ops\/[^/]+\/checkins\//.test(path)) return { kind: 'area', areas: ['operations', 'pier'] };
   if (path.startsWith('/operations/trip-ops/')) return { kind: 'area', areas: ['operations'] };
-  // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`).
-  if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-')) return { kind: 'area', areas: ['operations'] };
+  // Legacy's Vans page and month matrix are guarded by "operations" (`laGuardEdit('operations')`), and so
+  // are its van job orders: the sent tick, the group order, the Thai pickup names (`vanJobs*Persist`).
+  if (path.startsWith('/operations/vans') || path.startsWith('/operations/van-') || path === '/operations/pickup-names-th') return { kind: 'area', areas: ['operations'] };
   if (path.startsWith('/v1/rate-types') || path.startsWith('/v1/agents')) return { kind: 'area', areas: ['sales'] };
   if (path.startsWith('/v1/routes/')) return { kind: 'area', areas: ['config'] };
   // Legacy's accounting (`laCanEditArea('accounting')`): invoices, their discounts and payments.

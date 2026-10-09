@@ -67,7 +67,9 @@ reports. `sb_market_stats` / `sb_market_monthly` are imported arrival figures, n
 
 Built: pickup areas and times, vans and the month matrix, van groups and stops, dispatch, check-in
 (README → "Dispatch" to "Pickup areas and pickup times"). Open items in `trip-ops-and-vans-model.md`.
-Still to come: the computed van board and job orders for the Vue port.
+Built too: the van job orders, with the sent tick, special requests, Thai pickup names and the
+group order (README "Van job orders"; open items in `van-job-orders-model.md`). Still to come: the
+computed van board for the Vue port.
 
 ## 9. Fleet maintenance (scope undecided)
 
