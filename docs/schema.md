@@ -30,7 +30,7 @@ flowchart LR
   catalogue["Catalogue and seat pool<br/>routes, route_times, route_seasons,<br/>route_day_overrides, boats,<br/>boat_capacity_overrides, deployments, seat_locks"]
   bookings["Bookings<br/>bookings, booking_trips, booking_trip_pax,<br/>booking_trip_lock_draws,<br/>booking_passengers, booking_addons,<br/>booking_approvals, booking_approval_days"]
   actions["Booking action records<br/>booking_history, booking_cancellations,<br/>booking_reschedules, booking_partial_cancels,<br/>booking_fee_items"]
-  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges"]
+  ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops"]
   sales["Agents and sales<br/>agents, agent_programs, agent_activity,<br/>markets, market_subs, sales_people"]
   rates["Rate types<br/>rate_types, rate_type_routes,<br/>rate_type_seat_prices, rate_type_charter_prices,<br/>rate_type_longtail_prices, rate_type_transfer_prices"]
 
@@ -462,18 +462,20 @@ erDiagram
     text plate
     text type
     integer capacity
-    text ownership "own or partner"
+    text ownership "own, rented or partner"
     text partner_name
     text zone_base "PK or KL"
     text color
     text driver
     text driver_phone
     boolean active
+    text note
   }
   van_days {
     text van_id PK, FK
     date service_date PK
     text status "available, off, maintenance"
+    text zone "PK or KL, over the base"
     text driver
     text driver_phone
     text plate
@@ -492,6 +494,35 @@ erDiagram
     date to_date "empty means open-ended"
     text note
   }
+  van_zone_ranges {
+    bigint id PK
+    text van_id FK
+    text zone "PK or KL"
+    date from_date "empty means open"
+    date to_date "empty means open"
+  }
+  van_log {
+    bigint id PK
+    text van_id FK
+    timestamptz at
+    text kind
+    text text "legacy wording"
+    text by
+  }
+  van_stops {
+    text id PK
+    date service_date
+    text route_id FK
+    text group_id FK "rides this group van"
+    text kind "staff or cargo"
+    text label
+    integer pax "seats, staff only"
+    text time "HH:MM"
+    text place
+    text leg "out, ret or both"
+    integer sequence
+    timestamptz checked_at
+  }
 
   routes ||--o{ booking_trips : "sailed by"
   booking_trips ||--o| booking_trip_operations : "ops board row"
@@ -503,6 +534,9 @@ erDiagram
   vans |o--o{ booking_trip_van_allocations : "return van override"
   vans ||--o{ van_days : "driver and status per day"
   vans ||--o{ van_day_routes : "serves"
+  vans ||--o{ van_zone_ranges : "works from"
+  vans ||--o{ van_log : "changes"
+  van_groups |o--o{ van_stops : "stops on the way"
   routes ||--o{ van_day_routes : "served by"
   vans ||--o{ van_status_ranges : "out of service"
   boats |o..o{ booking_trip_operations : "boards"

@@ -1463,7 +1463,8 @@ edit area. Every write answers the group as `GET` shows it, except `DELETE` (`20
 ```jsonc
 { "id": "vgrp_…", "service_date": "2026-10-02", "route_id": "r1", "zone": "PK", "number": 3,
   "van_id": "veh07", "return_van_id": null, "pickup_time": "06:40",
-  "pax": 11, "capacity": 12, "over_capacity": false,
+  "pax": 12, "customer_pax": 11, "stop_seats": 1, "capacity": 12, "over_capacity": false,
+  "stops": [ … ],
   "members": [ { "trip_id": "trip_…", "booking_id": "lg_…", "idx": 0, "source": "main", "ad": 2, "chd": 1, "inf": 0, "foc": 0,
                  "sequence": 1, "pickup_time": "06:40", "return_van_id": null } ] }
 ```
@@ -1479,61 +1480,126 @@ edit area. Every write answers the group as `GET` shows it, except `DELETE` (`20
   same route and day is a second round, refused (`409 van_in_other_group`, naming those groups and
   times) unless `allow_second_round: true`. Seats are checked per round, never summed.
 - **`return_van_id`** must be in the return pool (`409 van_not_in_pool`): the outbound pool, plus
-  usable vans whose zone that day is the group's (the pier of the first route they serve, else
-  their base). A charter takes any usable van, NoTransfer none. Setting it sets the members'
+  usable vans whose zone that day is the group's (`zone_on` in the month matrix). A charter takes any usable van, NoTransfer none. Setting it sets the members'
   `return_same_van` to false.
 - **`pickup_time`** (`HH:MM`) is also written as every member's `pickup_time_final`, as legacy does
   (an alternate-pickup part's own time comes with alternate pickups).
-- **Seats** are checked when a van is set and when members join a group with a van. `pax`,
-  `capacity` and `over_capacity` (computed) show a group pushed over later, e.g. by an edit.
+- **Seats** are checked when a van is set, when members join a group with a van, and when a van
+  stop is added (see "Van stops"). `pax` (computed) is every seat taken: `customer_pax` plus
+  `stop_seats`, the guides riding along on the outbound leg, as legacy counts them. `capacity` and
+  `over_capacity` show a group pushed over later, e.g. by an edit. `stops` are its van stops.
 - **Cancelled bookings** take no part: not in `members`, `pax` or a second-round check.
-- **A group with nobody riding** (its members moved, removed or cancelled) is kept, with its van and
+- **A group with nobody riding and no stop** (its members moved, removed or cancelled) is kept, with its van and
   number, and left out of `GET` until a member joins again. A new group never reuses its number.
 
 ### Vans and the month matrix
 
-Legacy's Vans page: the fleet, which programmes each van serves on a date, its days off and its
-driver of the day. Writes need the `operations` edit area. Every field is the client's; the server
-checks shapes and works out what each day comes to.
+Legacy's Vans page: the fleet, which programmes each van serves on a date, its days off, its zone
+and its driver of the day. Writes need the `operations` edit area. Every field is the client's; the
+server checks shapes, works out what each day comes to, and keeps each van's log.
 
 | Method + path | Body | Answers |
 |---|---|---|
 | `GET /operations/vans` | — | `{ vans: [Van] }`, by id |
-| `GET /operations/vans/{id}` | — | the van and its `status_ranges` |
-| `POST /operations/vans` | `{name, capacity?, plate?, type?, ownership?, partner_name?, zone_base?, color?, driver?, driver_phone?, active?}` | `201` the van |
+| `GET /operations/vans/{id}` | — | the van, its `status_ranges` and its `zone_ranges` |
+| `GET /operations/vans/{id}/log?limit=` | — | `{ log: [{at, kind, text, by}] }`, newest first; `limit` 1–500, default 100 |
+| `POST /operations/vans` | `{name, capacity?, plate?, type?, ownership?, partner_name?, zone_base?, color?, driver?, driver_phone?, active?, note?}` | `201` the van |
 | `PATCH /operations/vans/{id}` | any of the same | the van |
+| `DELETE /operations/vans/{id}` | — | `204`; see below |
 | `POST /operations/vans/{id}/status-ranges` | `{status: "off"\|"maintenance", from_date, to_date?, note?}` | `201` the range |
 | `PATCH /operations/vans/{id}/status-ranges/{range_id}` | any of the same | the range |
 | `DELETE /operations/vans/{id}/status-ranges/{range_id}` | — | `204` |
+| `POST /operations/vans/{id}/zone-ranges` | `{zone: "PK"\|"KL", from_date?, to_date?}` | `201` the range |
+| `PATCH /operations/vans/{id}/zone-ranges/{range_id}` | any of the same | the range |
+| `DELETE /operations/vans/{id}/zone-ranges/{range_id}` | — | `204` |
 | `GET /operations/van-days?from=&to=` | — | the matrix, at most 93 days |
-| `PUT /operations/van-days/{date}/{van_id}` | `{route_ids?, status?, driver?, driver_phone?, plate?, sent_at?}` | the day |
+| `PUT /operations/van-days/{date}/{van_id}` | `{route_ids?, status?, zone?, driver?, driver_phone?, plate?, sent_at?}` | the day |
 
 ```jsonc
 // Van
 { "id": "veh07", "name": "Van 7", "plate": "นข 1234", "type": "van", "capacity": 12, "ownership": "own",
-  "partner_name": null, "zone_base": "PK", "color": "#0f6e56", "driver": "Somchai", "driver_phone": "081…", "active": true }
+  "partner_name": null, "zone_base": "PK", "color": "#0f6e56", "driver": "Somchai", "driver_phone": "081…",
+  "active": true, "note": null }
 // GET /operations/van-days?from=2026-10-01&to=2026-10-31
 { "from": "2026-10-01", "to": "2026-10-31", "vans": [ … ],
-  "days": [ { "van_id": "veh07", "service_date": "2026-10-01", "route_ids": ["r1", "r5"], "status": null,
+  "days": [ { "van_id": "veh07", "service_date": "2026-10-01", "route_ids": ["r1", "r5"], "status": null, "zone": null,
               "driver": null, "driver_phone": null, "plate": null, "sent_at": null,
-              "status_on": "maintenance", "usable": false } ],
-  "status_ranges": [ { "id": 3, "van_id": "veh07", "status": "maintenance", "from_date": "2026-09-28", "to_date": null, "note": "gearbox" } ] }
+              "status_on": "maintenance", "usable": false, "zone_on": "KL" } ],
+  "status_ranges": [ { "id": 3, "van_id": "veh07", "status": "maintenance", "from_date": "2026-09-28", "to_date": null, "note": "gearbox" } ],
+  "zone_ranges": [ { "id": 1, "van_id": "veh07", "zone": "KL", "from_date": "2026-10-05", "to_date": "2026-10-20" } ] }
 ```
 
 - **A new van** gets legacy's defaults (9 seats, a van, own, zone PK, active) and legacy's id: `veh`
   and one more than the highest number in use. `name` is required (`400`, legacy's "Please enter a
-  vehicle name"). An `own` van has no `partner_name`. Legacy's spellings `partnerName`, `zoneBase`
-  and `driverPhone` are accepted.
-- **There is no delete:** a retired van is `active: false`. Legacy deletes; vans that groups point at
-  cannot be.
-- **`days`** has every van × every date, in van then date order. `status`, `driver`, `driver_phone`
-  and `plate` are that day's overrides (`null` = none). **`status_on`** (computed, legacy
-  `vehStatusOn`) is the day's own status if set, else the latest-added status range covering the
-  date, else `null`. **`usable`** (computed) is active and not `off` or `maintenance` that day: only
-  usable vans enter a route's van pool.
+  vehicle name"). Legacy's spellings `partnerName`, `zoneBase` and `driverPhone` are accepted.
+- **`ownership`** is `own` (บริษัท), `rented` (เช่า) or `partner` (ร่วม). An `own` van has no
+  `partner_name`; a rented van keeps its lessor's there.
+- **Delete** removes a van no van group uses (as outbound van, return van, or a part's return van)
+  and with no day in the month matrix, together with its log and ranges. Otherwise
+  `409 van_in_use` ("… set it inactive instead"): a retired van is `active: false`.
+- **`days`** has every van × every date, in van then date order. `status`, `zone`, `driver`,
+  `driver_phone` and `plate` are that day's overrides (`null` = none). Computed:
+  - **`status_on`** (legacy `vehStatusOn`): the day's own status if set, else the latest-added
+    status range covering the date, else `null`.
+  - **`usable`**: active, and not `off` or `maintenance` that day. Only usable vans enter a route's
+    van pool.
+  - **`zone_on`** (legacy `vehEffectiveZone`): the pier zone of the van's first route that day
+    (Panwa PK, Tap Lamu KL), else the day's `zone`, else the first-added zone range covering the
+    date, else `zone_base`. The return-van pool reads it.
 - **`route_ids`** are the programmes the van serves that day, the only source of a route's van pool
   (no zone fallback, as legacy). A `PUT` replaces the list; `[]` clears it; an unknown route is `400`.
-- `to_date: null` is open-ended. A range ending before it starts is `400`.
+- A status range's `to_date: null` is open-ended; a zone range may be open at either end. A range
+  ending before it starts is `400`.
+- **The log** is written by the server, in legacy's words, on the changes legacy logs:
+  - a new van;
+  - `active`, `zone_base`, `driver` or `color` changing;
+  - a day's routes, status or zone;
+  - a status range given both ends;
+  - a zone range given both ends, or deleted.
+
+  For example "ย้ายโซนหลัก PK → KL" or "2026-10-05 · เพิ่มเส้นทาง Phi Phi Bamboo". `kind` is
+  `created`, `edit`, `status`, `zone` or `driver`; `by` is the login (`null` on imported lines).
+  Every line is kept.
+
+### Van stops
+
+A stop a van makes that isn't a booking: a guide riding to the pier (`staff`), or something to
+pick up (`cargo`). A stop rides its group's van. Writes need the `operations` edit area.
+
+| Method + path | Body | Answers |
+|---|---|---|
+| `GET /operations/van-stops?service_date=&route_id=` | — | `{ stops }` in pickup order (manual `sequence`, then `time`, untimed last); `route_id` optional |
+| `POST /operations/van-stops` | `{group_id, kind?, label, pax?, time?, place, area_id?, area?, leg?, phone?, note?, sequence?, seats_anyway?}` | `201` the stop |
+| `PATCH /operations/van-stops/{id}` | any of the same | the stop |
+| `DELETE /operations/van-stops/{id}` | — | `204` |
+| `PUT /operations/van-stops/{id}/check-in` | — | the stop, checked in now by the login |
+| `DELETE /operations/van-stops/{id}/check-in` | — | the stop, not checked in |
+
+```jsonc
+{ "id": "vs_…", "service_date": "2026-10-02", "route_id": "r1", "group_id": "vgrp_…", "kind": "staff",
+  "label": "Guide Nok", "pax": 1, "time": "06:20", "place": "Office", "area_id": "pa_patong", "area": "Patong",
+  "leg": "out", "phone": "089…", "note": null, "sequence": null,
+  "checked_in": { "at": "2026-10-02T23:15:00.000Z", "by": "Ploy", "seats": 1 },
+  "created_at": "…", "created_by": "Ploy", "updated_at": null, "updated_by": null }
+```
+
+- **Legacy's form rules**, `400` with its messages:
+  - `label` is required ("Type what this stop is for");
+  - `place` is required ("Type where the van stops");
+  - a `staff` stop needs `pax` of 1 or more ("How many people ride along? Enter at least 1");
+  - a `cargo` stop carries nobody (`pax` 0);
+  - `time` is `HH:MM`;
+  - `kind` defaults to `staff`, `leg` (`out`, `ret` or `both`) to `out`.
+- **`group_id`** must be a van group (`400`) that has a van (`409 group_has_no_van`: legacy's
+  "เลือกรถก่อน"). The stop takes the group's date and route, and rides whatever van the group has.
+- **Seats:** a `staff` stop on the outbound leg (`out` or `both`) takes `pax` seats in its group.
+  Adding it, or an edit that takes more seats, is refused when the group's van can't seat everyone
+  (`409 van_over_capacity`), unless `seats_anyway: true` (legacy's "Add anyway?"). Van groups count
+  these seats in every check, and show them as `stop_seats` (see "Van groups").
+- **Check-in** records when, by whom, and the seats taken then (a `staff` stop's `pax`, 0 for cargo).
+- **A disbanded group** leaves its stops on the day with `group_id: null`; a `PATCH` with a
+  `group_id` puts one on another group. `area_id` is not checked yet: the pickup-area catalogue has
+  no home here.
 
 ### Agent seat locks
 

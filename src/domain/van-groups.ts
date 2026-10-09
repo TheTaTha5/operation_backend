@@ -11,6 +11,7 @@ import { SEAT_RELEASING_STATUSES } from './booking-status.js';
 import { isIsoTime } from './calendar.js';
 import type { Booking, BookingTrip } from './operations.js';
 import { PAX_CATEGORIES, parsePaxGrid, type PaxCategory, type PaxRow } from './pax.js';
+import { outboundSeats, sortStops, type VanStop } from './van-stops.js';
 import type { Van } from './vans.js';
 
 export type Counts = Record<PaxCategory, number>;
@@ -99,14 +100,14 @@ export type DayTrip = {
   /** The final pickup, else the booked one: what orders a group and its rounds (R6, R12). */
   pickup_time: string | null; return_same_van: boolean; parts: StoredVanPart[];
 };
-export type VanDayState = { service_date: string; route_id: string; groups: VanGroup[]; trips: DayTrip[] };
+export type VanDayState = { service_date: string; route_id: string; groups: VanGroup[]; trips: DayTrip[]; stops: VanStop[] };
 
 /** A booking read's parts back as stored (a whole, ungrouped part reads the same either way). */
 export const partsFromView = (parts: readonly VanPartView[]): StoredVanPart[] =>
   parts.map(({ group, ...p }) => ({ ...p, alt: p.alt && { ...p.alt }, group_id: group?.id ?? null }));
 
 /** One route's day from its bookings (as read) and groups. */
-export function vanDayState(bookings: readonly Booking[], groups: readonly VanGroup[], date: string, routeId: string): VanDayState {
+export function vanDayState(bookings: readonly Booking[], groups: readonly VanGroup[], stops: readonly VanStop[], date: string, routeId: string): VanDayState {
   const trips = bookings.flatMap((b) => b.trips.filter((t) => t.service_date === date && t.route_id === routeId).map((t): DayTrip => {
     const pax = countsOf(parsePaxGrid(t.pax));
     return {
@@ -115,31 +116,30 @@ export function vanDayState(bookings: readonly Booking[], groups: readonly VanGr
       parts: partsFromView(t.operations.van_parts),
     };
   }));
-  return { service_date: date, route_id: routeId, groups: groups.map((g) => ({ ...g })), trips };
+  return { service_date: date, route_id: routeId, groups: groups.map((g) => ({ ...g })), trips, stops: stops.map((x) => ({ ...x })) };
 }
 
 type Member = { trip: DayTrip; part: StoredVanPart };
 /** The parts of a group that ride (R1: a cancelled booking takes no part). */
 const membersOf = (state: VanDayState, groupId: string): Member[] =>
   state.trips.filter((t) => t.active).flatMap((trip) => trip.parts.filter((p) => p.group_id === groupId).map((part) => ({ trip, part })));
-const groupPax = (state: VanDayState, groupId: string): number => membersOf(state, groupId).reduce((s, m) => s + partPax(m.part), 0);
+const customerPax = (state: VanDayState, groupId: string): number => membersOf(state, groupId).reduce((s, m) => s + partPax(m.part), 0);
+const stopsOf = (state: VanDayState, groupId: string): VanStop[] => sortStops(state.stops.filter((x) => x.group_id === groupId));
+/** R5 plus van stops: customers and the guides riding along take seats (legacy `bkV2VanGroupPax`). */
+const groupPax = (state: VanDayState, groupId: string): number => customerPax(state, groupId) + stopsOf(state, groupId).reduce((s, x) => s + outboundSeats(x), 0);
 
 // ── Vans that day ──
 
-/** A van as the pools see it on one date: usable or not, and the programmes it serves. */
-export type VanOnDay = { van: Van; usable: boolean; route_ids: string[] };
-const PIER_ZONE: Record<string, string> = { panwa: 'PK', tublamu: 'KL' };
-/** Legacy `vehEffectiveZone` without its day-zone override (not modelled): the first programme's pier, else the base. */
-const vanZone = (v: VanOnDay, routePiers: ReadonlyMap<string, string | undefined>): string | null =>
-  v.route_ids.map((id) => PIER_ZONE[routePiers.get(id) ?? '']).find(Boolean) ?? v.van.zone_base;
+/** A van as the pools see it on one date: usable or not, its programmes, and its zone that day (`vanZoneOn`). */
+export type VanOnDay = { van: Van; usable: boolean; route_ids: string[]; zone: string | null };
 /** R2 (`vanVehiclesForRoute`): usable vans the month matrix puts on this programme. No zone fallback. */
 export const outboundPool = (vans: readonly VanOnDay[], routeId: string): VanOnDay[] => vans.filter((v) => v.usable && v.route_ids.includes(routeId));
 /** R3 (`vanVehiclesForZone`): the outbound pool, plus usable vans based in the zone; a charter or other zone takes any usable van. */
-export function returnPool(vans: readonly VanOnDay[], routeId: string, zone: string, routePiers: ReadonlyMap<string, string | undefined>): VanOnDay[] {
+export function returnPool(vans: readonly VanOnDay[], routeId: string, zone: string): VanOnDay[] {
   if (isSelfArrive(zone)) return [];
   const outbound = new Set(outboundPool(vans, routeId).map((v) => v.van.id));
   if (zone !== 'PK' && zone !== 'KL') return vans.filter((v) => v.usable);
-  return vans.filter((v) => outbound.has(v.van.id) || (v.usable && vanZone(v, routePiers) === zone));
+  return vans.filter((v) => outbound.has(v.van.id) || (v.usable && v.zone === zone));
 }
 
 // ── Plans: what a command changes ──
@@ -187,12 +187,12 @@ function joinable(state: VanDayState, ref: MemberRef, zone: string, label: strin
   return { trip: trip!, part: part! };
 }
 
-function assertCapacity(state: VanDayState, group: VanGroup, vans: readonly VanOnDay[]): void {
+export function assertCapacity(state: VanDayState, group: VanGroup, vans: readonly VanOnDay[]): void {
   if (!group.van_id) return;
   const van = vans.find((v) => v.van.id === group.van_id)?.van;
   const pax = groupPax(state, group.id);
   if (van && pax > van.capacity) {
-    refuse(`Not enough seats: group ${group.number} has ${pax} passengers and ${van.name} seats ${van.capacity}. Split the passengers, make a new group, or pick a bigger van`, 409, 'van_over_capacity');
+    refuse(`Not enough seats: group ${group.number} needs ${pax} seats and ${van.name} seats ${van.capacity}. Split the passengers, make a new group, or pick a bigger van`, 409, 'van_over_capacity');
   }
 }
 
@@ -215,7 +215,7 @@ export function createGroup(state: VanDayState, body: Record<string, unknown>, v
   putGroup(state, plan, group);
   addParts(state, plan, group, refs, vans);
   if (body.van_id !== undefined && body.van_id !== null) {
-    return { plan, group: setGroup(state, group.id, { van_id: body.van_id, allow_second_round: body.allow_second_round }, vans, new Map(), plan) };
+    return { plan, group: setGroup(state, group.id, { van_id: body.van_id, allow_second_round: body.allow_second_round }, vans, plan) };
   }
   return { plan, group };
 }
@@ -238,8 +238,7 @@ const vanIdField = (body: Record<string, unknown>, key: string): string | null |
  * `allow_second_round`), the return van (R3 pool; members stop coming back on the same van, R11) and
  * the pickup time, which is also every member's final pickup (legacy `bkV2VanGroupSetTime`).
  */
-export function setGroup(state: VanDayState, groupId: string, body: Record<string, unknown>, vans: readonly VanOnDay[],
-  routePiers: ReadonlyMap<string, string | undefined>, plan: VanPlan = emptyPlan()): VanGroup {
+export function setGroup(state: VanDayState, groupId: string, body: Record<string, unknown>, vans: readonly VanOnDay[], plan: VanPlan = emptyPlan()): VanGroup {
   let group = { ...groupOf(state, groupId) };
   const vanId = vanIdField(body, 'van_id'), returnId = vanIdField(body, 'return_van_id');
   if (body.allow_second_round !== undefined && typeof body.allow_second_round !== 'boolean') bad('allow_second_round must be true or false');
@@ -254,7 +253,7 @@ export function setGroup(state: VanDayState, groupId: string, body: Record<strin
   }
   if (vanId !== undefined) group.van_id = vanId;
   if (returnId) {
-    if (!returnPool(vans, state.route_id, group.zone, routePiers).some((v) => v.van.id === returnId)) {
+    if (!returnPool(vans, state.route_id, group.zone).some((v) => v.van.id === returnId)) {
       refuse(`Van ${returnId} cannot bring zone ${group.zone} back on ${state.service_date}`, 409, 'van_not_in_pool');
     }
     for (const { trip } of membersOf(state, group.id)) plan.dispatch.set(trip.trip_id, { ...plan.dispatch.get(trip.trip_id), return_same_van: false });
@@ -352,7 +351,7 @@ export function parseVanParts(value: unknown): PartInput[] {
  * booking's alternate pickups, so they stay as they are apart from their group, order and return van.
  */
 export function setTripParts(state: VanDayState, tripId: string, input: PartInput[], returnSameVan: boolean,
-  vans: readonly VanOnDay[], routePiers: ReadonlyMap<string, string | undefined>): { plan: VanPlan; warnings: string[] } {
+  vans: readonly VanOnDay[]): { plan: VanPlan; warnings: string[] } {
   const plan = emptyPlan();
   const trip = state.trips.find((t) => t.trip_id === tripId)!;
   const alt = trip.parts.filter((p) => p.source === 'alt_pickup');
@@ -388,7 +387,7 @@ export function setTripParts(state: VanDayState, tripId: string, input: PartInpu
       if (group!.zone !== trip.zone) refuse(`Trip ${tripId} is picked up in zone ${trip.zone || '(none)'}, not group ${group!.number}'s ${group!.zone}`, 409, 'zone_mismatch');
       touched.add(group!.id);
     }
-    if (p.return_van_id && !returnPool(vans, state.route_id, trip.zone, routePiers).some((v) => v.van.id === p.return_van_id)) {
+    if (p.return_van_id && !returnPool(vans, state.route_id, trip.zone).some((v) => v.van.id === p.return_van_id)) {
       refuse(`Van ${p.return_van_id} cannot bring zone ${trip.zone || '(none)'} back on ${state.service_date}`, 409, 'van_not_in_pool');
     }
   }
@@ -417,21 +416,25 @@ export function rezonedParts(before: Booking, after: Booking): Map<string, Store
 // ── GET /operations/van-groups ──
 
 export type VanGroupView = VanGroup & {
-  pax: number; capacity: number | null; over_capacity: boolean;
+  /** Every seat taken: `customer_pax` plus `stop_seats` (guides riding along on the outbound leg). */
+  pax: number; customer_pax: number; stop_seats: number; capacity: number | null; over_capacity: boolean;
+  stops: VanStop[];
   members: (Counts & { trip_id: string; booking_id: string; idx: number; source: PartSource; sequence: number | null; pickup_time: string | null; return_van_id: string | null })[];
 };
 /** A group and its riding members in pickup order: the manual order, then pickup time (R12). */
 export function groupView(state: VanDayState, group: VanGroup, vans: readonly Van[]): VanGroupView {
   const members = membersOf(state, group.id).sort((a, b) => (a.part.sequence ?? Infinity) - (b.part.sequence ?? Infinity)
     || cmp(a.trip.pickup_time ?? '~', b.trip.pickup_time ?? '~') || cmp(a.trip.trip_id, b.trip.trip_id) || a.part.idx - b.part.idx);
-  const pax = members.reduce((s, m) => s + partPax(m.part), 0);
+  const customers = members.reduce((s, m) => s + partPax(m.part), 0);
+  const stops = stopsOf(state, group.id);
+  const seats = stops.reduce((s, x) => s + outboundSeats(x), 0);
   const capacity = vans.find((v) => v.id === group.van_id)?.capacity ?? null;
   return {
-    ...group, pax, capacity, over_capacity: capacity !== null && pax > capacity,
+    ...group, pax: customers + seats, customer_pax: customers, stop_seats: seats, capacity, over_capacity: capacity !== null && customers + seats > capacity, stops,
     members: members.map(({ trip, part }) => ({ trip_id: trip.trip_id, booking_id: trip.booking_id, idx: part.idx, source: part.source,
       ad: part.ad, chd: part.chd, inf: part.inf, foc: part.foc, sequence: part.sequence, pickup_time: trip.pickup_time, return_van_id: part.return_van_id })),
   };
 }
-/** The day's groups by number, leaving out one with nobody riding (decided 2026-10-09: it is kept, and hidden). */
+/** The day's groups by number, leaving out one with nobody riding and no stop (decided 2026-10-09: it is kept, and hidden). */
 export const visibleGroups = (state: VanDayState, vans: readonly Van[]): VanGroupView[] =>
-  [...state.groups].sort((a, b) => a.number - b.number).map((g) => groupView(state, g, vans)).filter((g) => g.members.length > 0);
+  [...state.groups].sort((a, b) => a.number - b.number).map((g) => groupView(state, g, vans)).filter((g) => g.members.length > 0 || g.stops.length > 0);
