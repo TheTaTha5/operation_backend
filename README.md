@@ -59,11 +59,11 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
   `curl -X POST localhost:3000/v1/login -H 'content-type: application/json' -d '{"username":"admin","password":"admin"}'`.
   `LOCAL_CORS_ORIGIN` in `.env` changes the browser origins allowed to call it (default
   `http://localhost:8791,http://localhost:5173`).
-- **The sync tools and the import** run from the host against the local copies:
+- **The seed tools and the import** run from the host against the local copies:
 
   ```bash
   SOURCE_DATABASE_URL=postgres://postgres:postgres@localhost:55433/legacy \
-  TARGET_DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations npm run sync:routes
+  TARGET_DATABASE_URL=postgres://postgres:postgres@localhost:55433/operations npm run seed:routes
   ```
 
 - **Tests** want an empty database, not the copy: `docker compose exec db createdb -U postgres
@@ -81,8 +81,8 @@ docker compose --profile pull run --rm pull  # copy Railway's and legacy's data 
 | `DATABASE_URL=… npm test` | Run the same tests against PostgreSQL instead of the in-process store. Use a fresh, empty database. Three test files run at a time (`--test-concurrency=3`), as on CI's runner: with a test-sized database PostgreSQL watches whole tables for serialization conflicts, so eleven files at once on a many-core machine made unrelated bookings collide until a request ran out of retries (`40001`, a `500`), about one test per run, on `main` too. |
 | `npm run check` | Type-check the source. |
 | `npm run db:migrate` | Apply PostgreSQL migrations. |
-| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:routes [-- --commit]` | Copy the route catalogue (routes and times) from the legacy database. A dry run that prints the diff unless `--commit` is given. Re-runnable: legacy wins for every route it has, and a route only this service has is reported, never deleted. Seasons and day overrides are copied only for a route new to this service; after that the calendar is edited here (see "Editing the calendar"), and the run only reports where legacy's differs. |
-| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run sync:boats [-- --commit]` | Copy the boat catalogue from the legacy database, the same way: dry run unless `--commit`, legacy wins, never deletes. Legacy's `totalcap` is never read, and a boat selling more seats than its licence is skipped and listed, not clamped. Run the import afterwards so deployments pick up new or changed boats. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:routes [-- --commit]` | Seed the route catalogue (routes, times, and the families they name) from the legacy database. A dry run that prints the diff unless `--commit` is given. Routes are edited here (see "Editing routes"): a route missing here is added with its calendar, one never edited here (`updated_at` null) is refreshed (not its calendar), and **one edited here is never touched**; the run lists where legacy differs. Never deletes. |
+| `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run seed:boats [-- --commit]` | Seed the boat catalogue the same way: every field of the boat form, its documents and status log. Dry run unless `--commit`; adds what is missing, refreshes a boat never edited here, never touches one edited here, never deletes. Legacy's `totalcap` becomes `registered_persons`, never a selling limit. Run the import afterwards so deployments on a new boat are imported. |
 | `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run verify:import [-- --limit=N] [--json=file]` | Check what `import-legacy.ts` wrote against what legacy holds, read-only on both. Run it after an import with `--commit` into a local copy (see "Checking an import" below). Exit code 1 when anything differs. |
 
 ### Checking an import
@@ -177,10 +177,10 @@ Any login may read everything. A write needs an **edit area**, as legacy assigns
 
 | Area | Writes |
 |---|---|
-| `operations` | bookings and their commands (a weather cancel's refund and credit included), seat locks, deployments, weather closures |
-| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys) |
+| `operations` | bookings and their commands (a weather cancel's refund and credit included), seat locks, deployments, weather closures, a boat's seats for one day |
+| `fleet` | deployments, as well as `operations` (legacy's Fleet Deployment page saved nothing; Boat Operation deploys); retiring and restoring a boat |
 | `sales` | rate types, agents |
-| `config` | the route calendar |
+| `config` | routes, their families and calendar; boats (the whole boat form and its status timeline) |
 | `accounting` | invoices, their discounts and payments |
 
 - `role: admin` may do everything, including the user screens.
@@ -204,9 +204,10 @@ any other is `400`.
 
 **A login tied to one agent** (`agent_id`, for Love Kingdom's service user, `a_b2c`) books for that
 agent only: a create without `agent_id` gets it, another agent is `403`, the list shows only its
-bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`. The `a_b2c`
-login's bad input is held for ops rather than refused (`202`, see
-[Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)).
+bookings, any other booking is `404`, and every write outside `/v1/bookings` is `403`, with one
+exception: Love Kingdom's login (`a_b2c`) may also create routes, `POST /v1/routes`, without the
+`config` area (see "Editing routes"). The `a_b2c` login's bad input is held for ops rather than
+refused (`202`, see [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)).
 
 ### Love Kingdom's API key
 
@@ -247,8 +248,11 @@ Reference data every other endpoint refers to by id.
   `kind=marine` or `kind=land` lists only that kind (`400` for anything else).
   Each route also carries its calendar as stored, for the screen that edits it:
   `seasons: [{ id, kind, from_date, to_date }]` by start date, and `overrides: [{ service_date, kind }]`.
-- `GET /v1/boats` — the boat catalogue: `{ id, name, type?, pier?, capacity, license_pax,
-  charter_ceiling, crew? }`.
+- `GET /v1/routes/{id}` — one route, as the list shows it (`404` for an unknown one).
+- `GET /v1/route-families` — the programme families the Booking calendar groups routes by:
+  `{ families: [{ id, name, color, sort }] }`, by `sort` then `id`.
+- `GET /v1/boats`, `GET /v1/boats/{id}` — the boat catalogue, every field of the boat form (see
+  "Editing boats"), with `charter_ceiling` and `status_today` computed.
 
 **Not every route is a boat trip.** `kind` is `marine` for a boat programme (it has a pier,
 deployments and seats) and `land` for a transfer, city tour or show/park ticket, which has none of
@@ -281,8 +285,8 @@ Seasons may overlap; the one that starts first decides a day, as in legacy.
 
 #### Editing the calendar
 
-Legacy's Settings → Programs, as an API. The calendar is edited here and only here: `sync:routes`
-no longer copies it from legacy. Every write needs the `config` edit area.
+Legacy's Settings → Programs, as an API. The calendar is edited here and only here: `seed:routes`
+copies it only for a route new here. Every write needs the `config` edit area.
 
 - `POST /v1/routes/{id}/seasons` `{ kind: "open"|"closed", from_date, to_date, close_anyway? }` →
   `201` with the season and its `id`. A season is added or deleted, never edited, as in legacy.
@@ -318,21 +322,157 @@ Both sell without a seat check, as legacy does (`hasAllotment` false):
 
 Seats drawn from a lock are still limited by the lock, and a charter still needs its boat deployed.
 
-Routes and boats are still edited in legacy (the calendar is not: see "Editing the calendar").
-`npm run sync:routes` and `npm run sync:boats` copy them here, and are meant to be run again whenever legacy has changed (see
-Commands). A boat missing here is not just a missing row: the import skips every deployment on it,
-so its seats are absent from `GET /v1/availability`. Run `sync:boats` before the import.
+#### Editing routes
 
-`GET /v1/boats` is deliberately **not** date-aware. `boat_capacity_overrides` changes one boat's
-seats for one day, but `GET /v1/availability` already resolves that against the day's deployment,
-and answering the same question in two places invites the two answers to disagree.
+Routes are edited here since 2026-10-09 (legacy's Settings → Programs and Love Kingdom's
+`POST /api/b2c/routes`; `todo/catalogue-editing-model.md`). `seed:routes` fills a new database from
+legacy and never overwrites a route edited here. Every write needs `config`, except Love Kingdom's
+create.
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `POST /v1/routes` | `{ name, kind?, pier?, family_id?, islands?, times?, color?, ext_id?, seasons? }` | `201 { created: true, route, warnings }`; an `ext_id` a route already has → `200 { created: false, route, warnings: [] }`, nothing changed |
+| `PATCH /v1/routes/{id}` | any of `name, kind, pier, family_id, islands, times, color, ext_id` | `200` the route |
+| `DELETE /v1/routes/{id}` | | `204`; `409 route_in_use` |
+| `POST /v1/routes/order` | `{ pier, route_ids }` | `200 { routes: [{ id, sort }] }` |
+
+- **Decided by the server:** `id` (`r<epoch ms>`, as legacy), `sort` (a new route goes last), and a
+  `color` when none is sent (the next of legacy's eight). `id` and `sort` sent are `400`.
+- **`kind` and `pier`:** a marine route sails from `tublamu`, `panwa` or `ranong` (required); a
+  land route needs none but may name one. `pier: "other"` is legacy's old land marker and means
+  `kind: "land"`. Legacy lets a route switch pier or kind with bookings on it; so does this.
+- **`family_id`** must be a family (`GET /v1/route-families`); `null` means "no family", which hides
+  the route from the Booking calendar, as legacy's blank choice does. **Left out on create**, it is
+  guessed as Love Kingdom's create guessed it: a land route is `citytour` when its name says City
+  Tour, else `transfer`; a marine one by its name (Similan, Surin, Phi Phi, Whale, …). No guess →
+  `400`.
+- **`times`** are `HH:MM`; blanks are dropped; a new route without any starts at `["08:00"]`.
+- **`seasons`** on create only: `[{ kind, from_date, to_date }]` (Love Kingdom's `type`, `from`, `to`
+  are accepted). After that the calendar has its own endpoints ("Editing the calendar").
+- **Not kept here** (decided 2026-10-09): `daily_cap`, `code`, `meal_venue_id`. An empty one (`null`,
+  `""`, `0`) is accepted and ignored; a real one is `400` saying so.
+- **`ext_id`** (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`) is unique: another route's is `409 ext_id_taken`.
+  `externalId` and `familyId` are accepted as legacy spells them.
+- **`warnings`:** `duplicate_name` when another route has the same name (Love Kingdom's warning).
+- **Delete** is refused while anything refers to the route, `409 route_in_use` naming what:
+  `Route Surin (r5) is used by 3 bookings, 12 boat deployments, 1 rate type: it can't be deleted`.
+  Counted: bookings, deployments, seat locks, rate types, agents' programme lists, contracts, van
+  days, van groups, van stops, upgrades, pickup times. Otherwise its times, seasons and day
+  overrides go with it. (Legacy deleted with no check.)
+- **Order** is legacy's drag within one pier: `route_ids` lists every route of that pier once
+  (`pier: null` = the routes with no pier, the land ones); they take those places in the new order
+  and every route is renumbered `0…n-1`. Anything else in `route_ids` is `400`.
+
+**Love Kingdom** creates its products with its service login (`agent_id: a_b2c`), which may call
+`POST /v1/routes` and nothing else in the catalogue: see `docs/love-kingdom-integration.md`.
+
+**Families** (`config`): `POST /v1/route-families { id?, name, color?, sort? }` → `201` (an `id` left
+out is made from the name; one taken is `409 family_exists`); `PATCH /v1/route-families/{id}
+{ name?, color?, sort? }` (the id is permanent, `400`); `DELETE /v1/route-families/{id}` → `204`, or
+`409 family_in_use` while a route uses it. Migration 070 seeds legacy's ten.
+
+#### Editing boats
+
+Boats are edited here since 2026-10-09: legacy's boat form (`saveBoat`), its status timeline
+(`saveStatus`) and its retire/restore. `seed:boats` fills a new database and never overwrites a boat
+edited here.
+
+| Endpoint | Area | Body | Answers |
+|---|---|---|---|
+| `POST /v1/boats` | `config` | the boat's fields, `status?` | `201` the boat, `warnings` |
+| `PATCH /v1/boats/{id}` | `config` | any of the fields, `status?`, `capacity_anyway?` | `200` the boat, `deployments_updated`, `warnings`; `409 seats_sold` |
+| `POST /v1/boats/{id}/retire` | `fleet` | `{ reason? }` | `200` the boat; `409 future_deployments`, `already_retired` |
+| `POST /v1/boats/{id}/restore` | `fleet` | | `200` the boat; `409 not_retired` |
+| `POST /v1/boats/{id}/status-log` | `config` | an entry | `201` the entry |
+| `PATCH /v1/boats/{id}/status-log/{entry_id}` | `config` | entry fields | `200` the entry |
+| `DELETE /v1/boats/{id}/status-log/{entry_id}` | `config` | | `204` |
+
+A boat:
+
+```jsonc
+{ "id": "b12", "name": "Hermetis", "name_th": null, "type": "Speedboat", "pier": "panwa", "ownership": "own",
+  "color": "#dfa006", "engine_count": 4, "capacity": 65, "license_pax": 75, "crew": 5, "fish_crew": null,
+  "registered_persons": 80, "charter_ceiling": 75,
+  "vessel_use": "บรรทุกคนโดยสาร (เร็ว)", "material": "อลูมิเนียม", "brand": null, "model": null,
+  "reg": "6051/0244/7", "callsign": "HSB7808", "imo": null, "build_year": null, "homeport_city": "ภูเก็ต",
+  "homeport": "ท่าการ ภูเก็ต", "owner": "บริษัท เลิฟ ไอแลนด์ จำกัด", "owner_addr": "9/244 …",
+  "gt": 22.33, "nt": 15.18, "dwt": null, "loa": 18, "beam": 4.2, "depth": 1.2, "draft": null, "lbp": 16, "bhp": 186.5, "note": null,
+  "documents": [{ "name": "ใบอนุญาตใช้เรือ", "expires_on": "2027-03-09", "renew_status": null }],
+  "status_log": [{ "id": "sl1779722337776", "status": "unavailable", "from_date": "2026-05-25", "to_date": "2026-05-30",
+    "loc": "Visit Panwa Pier · Phuket", "province": "Phuket", "loc_type": "Visit Panwa Pier", "detail": null, "note": null,
+    "reason": "scheduled_maint", "project_id": null }],
+  "status_today": "available", "retired": false, "retired_on": null, "retired_reason": null, "unretired_on": null,
+  "updated_at": "2026-10-09T08:00:00.000Z" }
+```
+
+- **Decided by the server:** `id` (`b<epoch ms>`), `charter_ceiling`, `status_today`, `updated_at`,
+  and the retire fields (the commands set them). Sending any of them, or `status_log`, is `400`
+  naming what to use.
+- **The form's defaults on create:** `capacity` 40, `engine_count` 4, `ownership: "own"`, and
+  `registered_persons` = `license_pax + crew + fish_crew` (legacy `fmCalcTotal`) when not sent.
+  `pier` (`tublamu`/`panwa`/`ranong`) and `name` are required; `type` is one of `Catamaran`,
+  `Speedboat`, `Big Boat`, `Longtail`; `engine_count` 1–5; `license_pax`, `crew`, `fish_crew` `0` or
+  blank mean none. Legacy's spellings (`cap`, `licensePax`, `totalcap`, `nameTh`, `use`, `year`,
+  `docs`, …) are accepted.
+- **Capacity above the licence is accepted**, as legacy accepts it: the answer warns
+  `capacity_above_licence`, and a day sells at most the licence (`deploymentSeats`).
+- **`documents`** replace the list: `[{ name, expires_on?, renew_status? }]`, `renew_status`
+  `processing`, `done` or none.
+- **`status`** is the form's pick (`available`, `fixing`, `unavailable`). A new boat starts its log
+  with it (default `available`); on an edit, when it differs from today's stored status, an
+  open-ended entry from today is added at the boat's pier, after closing what it overlaps (legacy
+  `autoClosePrevLog`: an entry running into it ends yesterday; one starting today or later is
+  removed).
+- **A capacity change reaches the boat's deployments** from today (Thai time) on: a `PATCH` that
+  changes `capacity`, `license_pax` or `registered_persons` rewrites them on every such deployment
+  (legacy reads the boat live; here a deployment copies it). Before it does, each day that loses
+  seats is weighed: the passengers placed on the boat that day against its new seats (a day's own
+  seats, below, still win; a chartered day counts against the licence). A day over is
+  `409 seats_sold` listing the days, unless `capacity_anyway: true`; then the answer carries
+  `warnings: [{ code: "oversold", route_id, service_date, boat_id, bookings, pax, seats }]`.
+- **Retire** is refused while the boat is deployed from today on (`409 future_deployments`, naming
+  the days). It stamps `retired_on` and `retired_reason` and logs a `retired` entry; restore stamps
+  `unretired_on` and logs `available`. A retired boat can't be deployed (`409 boat_retired`).
+- **The status timeline:** an entry is `{ status, from_date, to_date, province, loc_type, loc?,
+  detail?, note?, reason? }`; `to_date`, `province` and `loc_type` are required, and `reason` when
+  `unavailable` (legacy's checks). Adding one closes or trims what it overlaps first; editing changes
+  it in place. Fleet's own rules (open jobs, maintenance links) come with fleet maintenance.
 
 `charter_ceiling` is how many passengers a charter may fill the boat to, resolved for you.
-`license_pax` is `null` for a boat with no licence on file — three Ranong boats have none — and in
+`license_pax` is `null` for a boat with no licence on file — the charter boats have none — and in
 that case `charter_ceiling` falls back to `capacity`. **A missing licence is not a licence of zero.**
 The null is reported rather than quietly replaced by `capacity`, because claiming a registration a
 vessel does not hold is worse than saying it has none; read `charter_ceiling` for the number and
 `license_pax` for whether it is a legal figure or a fallback.
+
+#### A boat's seats for one day
+
+Legacy's "cap" dialog on Boat Operation (`boatCapSet`): one boat's seats on one date, instead of its
+normal number. Area `operations`.
+
+| Endpoint | Body | Answers |
+|---|---|---|
+| `GET /v1/boats/{id}/capacity-overrides[?from=&to=]` | | `{ overrides: [day] }` |
+| `PUT /v1/boats/{id}/capacity-overrides/{date}` | `{ capacity, reason }` | `200` the day |
+| `DELETE /v1/boats/{id}/capacity-overrides/{date}` | | `204`; `404` when the day has none |
+
+```jsonc
+// day
+{ "boat_id": "b12", "service_date": "2026-10-12", "capacity": 67, "normal": 65, "ceiling": 75,
+  "overridden": true, "reason": "รับเกินมา 2", "set_by": "ops1", "set_at": "2026-10-09T08:00:00.000Z" }
+```
+
+- **Normal** is the day's deployment capacity, else the boat's. **The ceiling** is the licence, else
+  the boat's capacity (legacy `boatCapLicense`): above it is `400` (legacy clamped silently).
+- **Raising** above normal and above what the day already has needs the `act-capunlock` right or an
+  admin: `403` with legacy's message. Lowering, or keeping part of a raise someone else set, needs
+  only `operations`.
+- **A reason** is required when the number differs from normal. Sending the normal number removes
+  the day's seats, as legacy does.
+- **No past day** (Thai time): `409 past_date`, for `PUT` and `DELETE`.
+- Who and when are the server's: `set_by` the login, `set_at` now. (Legacy recorded `—`.)
+- Availability applies it (`deployed_capacity`), clamped to the licence; the trip-ops raise writes
+  the same row. A day set here survives the legacy import.
 
 ### Agents
 
@@ -450,7 +590,7 @@ until the quote (`todo/pricing-model.md`). Any login may read them.
 | `seat_prices` | An own-price promo's prices, in rate types' vocabulary (`ad`/`chd` × `thai`/`foreign`) |
 
 **Importing them:** `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npm run import:contracts [-- --commit]`,
-a dry run unless `--commit`, after `sync:routes` and the agents and rate types imports. Rerunnable:
+a dry run unless `--commit`, after `seed:routes` and the agents and rate types imports. Rerunnable:
 legacy wins for every contract it has (its periods and prices are replaced whole); one only this
 service has is left alone. What does not fit is listed: a contract whose agent is gone is skipped, a
 rate type that no longer exists becomes `null`, a period whose window runs backwards is dropped
@@ -596,7 +736,7 @@ Availability returns `deployed_capacity` and `licensed_capacity`, and they are n
 
 | | meaning |
 | --- | --- |
-| `capacity` | seats the company sells. A commercial decision, set per deployment. |
+| `capacity` | seats the company sells. A commercial decision, copied from the boat to each deployment (a boat edit rewrites its future ones). It may be above the licence; the licence still caps what is sold. |
 | `license_pax` | the registered maximum **passengers**. The legal ceiling. |
 | `registered_persons` | `license_pax + crew` — total persons the vessel may carry. **Never a selling ceiling.** |
 
@@ -1411,7 +1551,7 @@ refuses; `404` for an unknown `booking_id`. A booking is priced by this same rul
 "Prices").
 
 **Rebuilding the proof** after a deliberate pricing change: load a scratch database with
-`sync:routes`, `sync:boats`, `import-legacy.ts --commit` and `import:contracts --commit`, then
+`seed:routes`, `seed:boats`, `import-legacy.ts --commit` and `import:contracts --commit`, then
 `SOURCE_DATABASE_URL=… TARGET_DATABASE_URL=… npx tsx src/tools/build-quote-fixture.ts`. It lists what
 it could not reproduce and why.
 
@@ -2480,15 +2620,17 @@ the last number it saw and refetches only the records named.
     reconfirm, upgrades, its document check;
   - `seat_lock`;
   - `deployment`, with `entity_id` `<date>:<boat>`;
-  - `route`: its calendar;
+  - `route`: created, edited, deleted, reordered, or its calendar;
   - `invoice`: issued, changed, voided, or a payment recorded or corrected. Its bookings are in the
-    feed as well, since their `invoice` and `payment_state` changed.
-  - `b2c_held_order`: Love Kingdom's write held for review, retried, resolved or dismissed (see
-    [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)). `route_days` is `null`.
     feed as well, since their `invoice` and `payment_state` changed. A weather cancel's lines taken
     off, refund or credit count as a change;
+  - `b2c_held_order`: Love Kingdom's write held for review, retried, resolved or dismissed (see
+    [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)). `route_days` is `null`;
   - `weather_closure`: closed, its note, a notify, undo, or a booking command that resolved one of
-    its follow-ups (`route_days` is its trip).
+    its follow-ups (`route_days` is its trip);
+  - `boat`: created or edited, its status timeline, retire and restore, and a day's seats. Its
+    `route_days` are the days whose seats moved: the deployments a capacity change rewrote, and the
+    day of a day's seats (when the boat is deployed); `null` when none did.
 
   `action` is `created`, `updated` or `deleted`.
 - **`route_days`** are the days whose seats the write touched, before *and* after: a moved booking
@@ -2507,7 +2649,7 @@ the last number it saw and refetches only the records named.
   - It works with any number of server instances (PostgreSQL `LISTEN`/`NOTIFY`).
 - **`health`** carries what bumps no version, as legacy's `/api/version` did: today
   `migrations_pending`.
-- **Not in the feed yet:** vans, van stops, pickup areas, attachments, users, agents and rate types.
+- **Not in the feed yet:** vans, van stops, pickup areas, attachments, users, agents, rate types and route families.
   The legacy import writes no changes either: reload after an import.
 
 ### Agent seat locks

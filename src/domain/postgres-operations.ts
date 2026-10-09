@@ -57,6 +57,7 @@ import {
   type BundleAppliesTo, type BundleMode, type NationalityScope, type RateTier, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows,
   type RateTypeSummary, type RouteBlock, type RouteRows, type SeatPriceRow,
 } from './rate-types.js';
+import { BOAT_MEASURES, BOAT_TEXT_FIELDS, sortFamilies, type BoatRecord, type RouteFamily, type RouteFields, type RouteUsage, type StoredOverride } from './catalogue.js';
 import {
   decidedRecord, decideStatus, discountOf, focCountOf, reweigh,
   type ApprovalDay, type ApprovalKind, type ApprovalStatus, type ApprovalWarning, type BookingApproval, type NewApproval,
@@ -1325,6 +1326,119 @@ export class PostgresOperationsStore {
   async listSeasons(): Promise<RouteSeason[]> {
     const { rows } = await this.client().query('SELECT id, route_id, kind, from_date::text, to_date::text FROM route_seasons ORDER BY route_id, from_date');
     return rows.map(season);
+  }
+
+  // ── Editing the catalogue (migration 070, todo/catalogue-editing-model.md; the rules are `catalogue.ts`'s) ──
+  async listRouteFamilies(): Promise<RouteFamily[]> {
+    const { rows } = await this.client().query('SELECT id, name, color, sort FROM route_families');
+    return sortFamilies(rows.map((r) => ({ id: String(r.id), name: String(r.name), color: r.color ?? null, sort: Number(r.sort) })));
+  }
+  async insertRouteFamily(f: RouteFamily): Promise<void> {
+    await this.client().query('INSERT INTO route_families (id, name, color, sort) VALUES ($1, $2, $3, $4)', [f.id, f.name, f.color, f.sort]);
+  }
+  async updateRouteFamily(id: string, patch: Partial<Omit<RouteFamily, 'id'>>): Promise<RouteFamily | undefined> {
+    const { rows: [r] } = await this.client().query(`UPDATE route_families SET name = COALESCE($2, name), color = CASE WHEN $3 THEN $4 ELSE color END,
+      sort = COALESCE($5, sort) WHERE id = $1 RETURNING id, name, color, sort`, [id, patch.name ?? null, patch.color !== undefined, patch.color ?? null, patch.sort ?? null]);
+    return r && { id: String(r.id), name: String(r.name), color: r.color ?? null, sort: Number(r.sort) };
+  }
+  async familyUsage(id: string): Promise<number> { return Number((await this.client().query('SELECT count(*)::int AS n FROM routes WHERE family_id = $1', [id])).rows[0].n); }
+  async deleteRouteFamily(id: string): Promise<boolean> { return ((await this.client().query('DELETE FROM route_families WHERE id = $1', [id])).rowCount ?? 0) > 0; }
+
+  async route(id: string): Promise<Route | undefined> { return (await this.listRoutes()).find((r) => r.id === id); }
+  async routeByExtId(extId: string): Promise<Route | undefined> { return (await this.listRoutes()).find((r) => r.ext_id === extId); }
+  private async writeTimes(routeId: string, times: readonly string[]): Promise<void> {
+    await this.client().query('DELETE FROM route_times WHERE route_id = $1', [routeId]);
+    for (const [idx, at] of times.entries()) await this.client().query('INSERT INTO route_times (route_id, idx, departs_at) VALUES ($1, $2, $3)', [routeId, idx, at]);
+  }
+  async insertRoute(r: Route, seasons: readonly RouteSeason[]): Promise<void> {
+    await this.client().query(`INSERT INTO routes (id, name, kind, ext_id, pier, family_id, color, islands, sort, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, now())`,
+      [r.id, r.name, r.kind ?? 'marine', r.ext_id ?? null, r.pier ?? null, r.family_id ?? null, r.color ?? null, r.islands ?? null, r.sort ?? null]);
+    await this.writeTimes(r.id, r.times ?? []);
+    for (const s of seasons) await this.client().query('INSERT INTO route_seasons (id, route_id, kind, from_date, to_date) VALUES ($1,$2,$3,$4,$5)', [s.id, r.id, s.kind, s.from_date, s.to_date]);
+  }
+  async updateRoute(id: string, f: RouteFields): Promise<void> {
+    await this.client().query(`UPDATE routes SET name = $2, kind = $3, ext_id = $4, pier = $5, family_id = $6, color = $7, islands = $8, updated_at = now() WHERE id = $1`,
+      [id, f.name, f.kind, f.ext_id, f.pier, f.family_id, f.color, f.islands]);
+    await this.writeTimes(id, f.times);
+  }
+  async setRouteSorts(sorts: ReadonlyMap<string, number>): Promise<void> {
+    await this.client().query(`UPDATE routes r SET sort = s.sort, updated_at = now() FROM jsonb_to_recordset($1::jsonb) AS s(id text, sort bigint)
+      WHERE r.id = s.id AND r.sort IS DISTINCT FROM s.sort`, [JSON.stringify([...sorts].map(([id, sort]) => ({ id, sort })))]);
+  }
+  /** Its times, seasons and day overrides go with it (ON DELETE CASCADE). */
+  async deleteRoute(id: string): Promise<boolean> { return ((await this.client().query('DELETE FROM routes WHERE id = $1', [id])).rowCount ?? 0) > 0; }
+  async routeUsage(id: string): Promise<RouteUsage> {
+    const { rows: [u] } = await this.client().query(`SELECT
+      (SELECT count(DISTINCT booking_id) FROM booking_trips WHERE route_id = $1)::int AS bookings,
+      (SELECT count(*) FROM deployments WHERE route_id = $1)::int AS deployments,
+      (SELECT count(*) FROM seat_locks WHERE route_id = $1)::int AS seat_locks,
+      (SELECT count(DISTINCT rate_type_id) FROM rate_type_routes WHERE route_id = $1)::int AS rate_types,
+      (SELECT count(DISTINCT agent_id) FROM agent_programs WHERE route_id = $1)::int AS agents,
+      (SELECT count(*) FROM (SELECT contract_id FROM contract_program_periods WHERE route_id = $1 UNION SELECT contract_id FROM contract_seat_prices WHERE route_id = $1) c)::int AS contracts,
+      (SELECT count(*) FROM van_day_routes WHERE route_id = $1)::int AS van_days,
+      (SELECT count(*) FROM van_groups WHERE route_id = $1)::int AS van_groups,
+      (SELECT count(*) FROM van_stops WHERE route_id = $1)::int AS van_stops,
+      (SELECT count(*) FROM booking_trip_upgrades WHERE from_route_id = $1 OR to_route_id = $1)::int AS upgrades,
+      (SELECT count(*) FROM pickup_times WHERE route_id = $1)::int AS pickup_times`, [id]);
+    return u as RouteUsage;
+  }
+
+  /** Every field of every boat, its documents and status log in order, by name then id. */
+  async boatRecords(id?: string): Promise<BoatRecord[]> {
+    const { rows } = await this.client().query(`SELECT b.*, b.retired_on::text AS retired_on_text, b.unretired_on::text AS unretired_on_text,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('name', d.name, 'expires_on', d.expires_on::text, 'renew_status', d.renew_status) ORDER BY d.idx)
+        FROM boat_documents d WHERE d.boat_id = b.id), '[]'::jsonb) AS documents_json,
+      COALESCE((SELECT jsonb_agg(jsonb_build_object('id', l.id, 'status', l.status, 'from_date', l.from_date::text, 'to_date', l.to_date::text, 'loc', l.loc,
+          'province', l.province, 'loc_type', l.loc_type, 'detail', l.detail, 'note', l.note, 'reason', l.reason, 'project_id', l.project_id) ORDER BY l.seq)
+        FROM boat_status_log l WHERE l.boat_id = b.id), '[]'::jsonb) AS log_json
+      FROM boats b WHERE ($1::text IS NULL OR b.id = $1) ORDER BY b.name, b.id`, [id ?? null]);
+    const num = (v: unknown): number | null => (v === null || v === undefined ? null : Number(v));
+    return rows.map((r): BoatRecord => ({
+      ...Object.fromEntries(BOAT_TEXT_FIELDS.map((k) => [k, r[k] ?? null])) as Pick<BoatRecord, typeof BOAT_TEXT_FIELDS[number]>,
+      ...Object.fromEntries(BOAT_MEASURES.map((k) => [k, num(r[k])])) as Pick<BoatRecord, typeof BOAT_MEASURES[number]>,
+      id: String(r.id), name: String(r.name), type: r.type ?? null, pier: r.pier ?? null, ownership: r.ownership, color: r.color ?? null,
+      engine_count: num(r.engine_count), capacity: Number(r.capacity), license_pax: num(r.license_pax), crew: num(r.crew), fish_crew: num(r.fish_crew),
+      registered_persons: num(r.registered_persons), retired: r.retired === true, retired_on: r.retired_on_text ?? null, retired_reason: r.retired_reason ?? null,
+      unretired_on: r.unretired_on_text ?? null, documents: r.documents_json as BoatRecord['documents'], status_log: r.log_json as BoatRecord['status_log'],
+      updated_at: isoOrNull(r.updated_at),
+    }));
+  }
+  async boatRecord(id: string): Promise<BoatRecord | undefined> { return (await this.boatRecords(id))[0]; }
+  /** Creates or replaces the boat with its documents and status log, stamped as edited here. */
+  async writeBoat(b: BoatRecord, now: string): Promise<BoatRecord> {
+    const columns = ['name', 'type', 'pier', 'ownership', 'color', 'engine_count', 'capacity', 'license_pax', 'crew', 'fish_crew', 'registered_persons',
+      ...BOAT_TEXT_FIELDS, ...BOAT_MEASURES, 'retired', 'retired_on', 'retired_reason', 'unretired_on'] as const;
+    const values = columns.map((c) => b[c]);
+    await this.client().query(`INSERT INTO boats (id, ${columns.join(', ')}, updated_at) VALUES ($1, ${columns.map((_, i) => `$${i + 2}`).join(', ')}, $${columns.length + 2})
+      ON CONFLICT (id) DO UPDATE SET ${columns.map((c) => `${c} = EXCLUDED.${c}`).join(', ')}, updated_at = EXCLUDED.updated_at`, [b.id, ...values, now]);
+    await this.client().query('DELETE FROM boat_documents WHERE boat_id = $1', [b.id]);
+    // Positions are the list's: `idx` and `seq` are assigned here from the order sent.
+    await this.client().query('INSERT INTO boat_documents SELECT * FROM jsonb_populate_recordset(NULL::boat_documents, $1::jsonb)',
+      [JSON.stringify(b.documents.map((d, idx) => ({ boat_id: b.id, idx, ...d })))]);
+    await this.client().query('DELETE FROM boat_status_log WHERE boat_id = $1', [b.id]);
+    await this.client().query('INSERT INTO boat_status_log SELECT * FROM jsonb_populate_recordset(NULL::boat_status_log, $1::jsonb)',
+      [JSON.stringify(b.status_log.map((e, seq) => ({ boat_id: b.id, seq, ...e })))]);
+    return (await this.boatRecord(b.id))!;
+  }
+  /** The boat's numbers onto each of its deployments from `from` on; answers the days changed. */
+  async updateBoatDeployments(boatId: string, from: string, n: Pick<Deployment, 'capacity' | 'license_pax' | 'registered_persons'>): Promise<Deployment[]> {
+    const { rows } = await this.client().query(`UPDATE deployments SET capacity = $3, license_pax = $4, registered_persons = $5 WHERE boat_id = $1 AND service_date >= $2
+      RETURNING boat_id, route_id, service_date::text, capacity, license_pax, registered_persons`, [boatId, from, n.capacity, n.license_pax ?? null, n.registered_persons ?? n.capacity]);
+    return rows.map((row) => ({ boat_id: String(row.boat_id), route_id: String(row.route_id), service_date: String(row.service_date), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) }))
+      .sort((a, b) => (a.service_date < b.service_date ? -1 : a.service_date > b.service_date ? 1 : 0));
+  }
+  async boatDeploymentsFrom(boatId: string, from: string): Promise<Deployment[]> {
+    const { rows } = await this.client().query(`SELECT boat_id, route_id, service_date::text, capacity, license_pax, registered_persons FROM deployments
+      WHERE boat_id = $1 AND service_date >= $2 ORDER BY service_date`, [boatId, from]);
+    return rows.map((row) => ({ boat_id: String(row.boat_id), route_id: String(row.route_id), service_date: String(row.service_date), capacity: Number(row.capacity), license_pax: optionalInt(row.license_pax), registered_persons: optionalInt(row.registered_persons) }));
+  }
+  async boatCapacityOverrides(boatId: string, from?: string, to?: string): Promise<StoredOverride[]> {
+    const { rows } = await this.client().query(`SELECT boat_id, service_date::text, capacity, reason, set_by, set_at FROM boat_capacity_overrides
+      WHERE boat_id = $1 AND ($2::date IS NULL OR service_date >= $2) AND ($3::date IS NULL OR service_date <= $3) ORDER BY service_date`, [boatId, from ?? null, to ?? null]);
+    return rows.map((r) => ({ boat_id: String(r.boat_id), service_date: String(r.service_date), capacity: Number(r.capacity), reason: r.reason ?? null, set_by: r.set_by ?? null, set_at: isoOrNull(r.set_at) }));
+  }
+  async deleteBoatCapacityOverride(boatId: string, date: string): Promise<boolean> {
+    return ((await this.client().query('DELETE FROM boat_capacity_overrides WHERE boat_id = $1 AND service_date = $2', [boatId, date])).rowCount ?? 0) > 0;
   }
   /**
    * Agents, markets and salespeople. There are about 130 agents, so the list is read whole and handed

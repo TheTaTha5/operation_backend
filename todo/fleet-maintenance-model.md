@@ -390,9 +390,10 @@ Odd rows:
 
 ## Already here
 
-- **Boats:** `GET /v1/boats` and `sync-boats` cover name, type, pier, capacity, `license_pax` and
-  crew only. Not here: status log, `retired`, `ownership` (charter), certificates, registration
-  particulars, assignments, repair history.
+- **Boats** (catalogue editing, migration 070): the whole boat form, `ownership`, certificates
+  (`documents`, as stored data), the status log with legacy's timeline checks, `retired` with
+  retire/restore commands, `seed:boats`. Not here: the computed effective status (log plus open
+  work), certificate expiry status and renewal, assignments, repair history.
 - **Deployments:** `/operations/deployments`, writable by `operations` or `fleet`. They **do not
   check boat status**, so a boat in a drydock can be deployed here. Legacy shows it as N/A.
 - **Attachments:** `/v1/attachments` (6 MB, jpeg/png/pdf) fits project documents.

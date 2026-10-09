@@ -27,7 +27,7 @@ An arrow points from the area holding an id to the area it names.
 
 ```mermaid
 flowchart LR
-  catalogue["Catalogue and seat pool<br/>routes, route_times, route_seasons,<br/>route_day_overrides, boats,<br/>boat_capacity_overrides, deployments, seat_locks"]
+  catalogue["Catalogue and seat pool<br/>routes, route_families, route_times, route_seasons,<br/>route_day_overrides, boats, boat_documents, boat_status_log,<br/>boat_capacity_overrides, deployments, seat_locks"]
   bookings["Bookings<br/>bookings, booking_trips, booking_trip_pax,<br/>booking_trip_lock_draws,<br/>booking_passengers, booking_addons,<br/>booking_approvals, booking_approval_days,<br/>booking_reconfirmations, booking_alt_pickups,<br/>booking_upgrades, booking_trip_upgrades,<br/>attachments, booking_documents, booking_upgrade_slips,<br/>booking_allergies, booking_doc_checks,<br/>booking_doc_check_results, pickup_areas,<br/>pickup_time_profiles, pickup_times, changes"]
   actions["Booking action records<br/>booking_history, booking_cancellations,<br/>booking_reschedules, booking_partial_cancels,<br/>booking_fee_items"]
   ops["Day-of-operations and vans<br/>booking_trip_operations,<br/>booking_trip_van_allocations, van_groups,<br/>vans, van_days, van_day_routes, van_status_ranges,<br/>van_zone_ranges, van_log, van_stops,<br/>van_job_sends, pickup_name_th,<br/>booking_trip_checkins, booking_trip_checkin_events,<br/>booking_trip_checkin_event_tries"]
@@ -71,10 +71,17 @@ erDiagram
     text kind "marine or land"
     text ext_id "Love Kingdom product code"
     text pier
-    text family_id
+    text family_id FK
     text color
     text islands
     bigint sort
+    timestamptz updated_at "an API write; null = legacy's copy (070)"
+  }
+  route_families {
+    text id PK
+    text name
+    text color
+    integer sort
   }
   route_times {
     text route_id PK, FK
@@ -98,16 +105,44 @@ erDiagram
     text name
     text type
     text pier
-    integer capacity "seats the company sells"
+    integer capacity "seats the company sells; may exceed the licence (070)"
     integer license_pax "legal passenger maximum"
     integer crew
+    integer fish_crew
+    integer registered_persons "legacy totalcap, never sold"
+    text ownership "own or charter"
+    integer engine_count "1 to 5"
+    text name_th_brand_model_etc "the form's registration text fields"
+    float gt_nt_dwt_loa_etc "the form's measurements"
+    boolean retired
+    date retired_on
+    text retired_reason
+    date unretired_on
+    timestamptz updated_at "an API write; null = legacy's copy (070)"
+  }
+  boat_documents {
+    text boat_id PK, FK
+    integer idx PK
+    text name
+    date expires_on
+    text renew_status "processing or done"
+  }
+  boat_status_log {
+    text boat_id PK, FK
+    text id PK
+    integer seq "the log's order"
+    text status "available, fixing, unavailable, retired"
+    date from_date
+    date to_date "null = open-ended"
+    text loc
+    text reason
   }
   boat_capacity_overrides {
     text boat_id PK, FK
     date service_date PK
     integer capacity "this day only"
     text reason
-    text set_by "a trip-ops raise (046); null from legacy"
+    text set_by "the login (046, 070); null from legacy"
     timestamptz set_at
   }
   deployments {
@@ -134,7 +169,10 @@ erDiagram
   routes ||--o{ route_times : "departs at"
   routes ||--o{ route_seasons : "open or closed in"
   routes ||--o{ route_day_overrides : "one-day exception"
+  route_families |o--o{ routes : "groups"
   boats ||--o{ boat_capacity_overrides : "per-day capacity"
+  boats ||--o{ boat_documents : "certificates"
+  boats ||--o{ boat_status_log : "status ranges"
   routes ||..o{ deployments : "sails"
   boats ||..o{ deployments : "deployed as"
   deployments |o..o| boat_capacity_overrides : "same boat and day"
@@ -145,7 +183,15 @@ erDiagram
   deploying the same boat again that day *moves* it rather than adding a second row.
 - **Seats a boat sells** = the day's override capacity (or else the deployment's capacity), capped
   at `license_pax`. `registered_persons` is passengers plus crew and is never a selling limit. The
-  rule is written once, in `src/domain/capacity.ts`.
+  rule is written once, in `src/domain/capacity.ts`. Since 070 `boats.capacity` may exceed
+  `license_pax` (legacy allows it); the cap above is what keeps sales legal.
+- **A deployment copies its boat's numbers** (`capacity`, `license_pax`, `registered_persons`). A boat
+  edit rewrites them on the boat's deployments from today on (`PATCH /v1/boats/{id}`).
+- **The catalogue is edited here** (070): `updated_at` marks a row edited through the API, which
+  `seed:routes` and `seed:boats` never overwrite. `routes.ext_id` is unique (Love Kingdom's create
+  is idempotent on it). `route_families` replaces legacy's hard-coded family list.
+- **A boat's status** is `boat_status_log`, legacy's date ranges; the status on a date is the latest
+  range covering it (`storedStatus` in `src/domain/catalogue.ts`).
 - **Seats left on a route-day are computed, not stored.** Each read sums what is deployed and
   subtracts what bookings and active locks hold. There is no counter column to fall out of step.
 - **Whether a route runs on a date** is decided from `route_seasons` and `route_day_overrides` by

@@ -8,7 +8,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { FastifyRequest } from 'fastify';
 import { actorOf } from '../domain/booking-actions.js';
-import { bookingDays, mergeChanges, type ChangeInput } from '../domain/changes.js';
+import { bookingDays, mergeChanges, type ChangeInput, type RouteDay } from '../domain/changes.js';
+import { todayInThailand } from '../domain/calendar.js';
 import type { Booking } from '../domain/operations.js';
 import type { Store } from './operations.js';
 
@@ -35,6 +36,10 @@ type Snapshot = {
   deployment?: { route_id: string } | undefined;
   /** Love Kingdom's open held orders a create may settle, by id, with their status. */
   held: Map<string, string>;
+  /** A boat write: its deployments from today, as comparable strings by day; and the route on an override's day. */
+  boat?: { id: string; days: Map<string, string>; overrideRoute?: string };
+  /** A reorder: every route's place before it. */
+  sorts?: Map<string, number | undefined>;
 };
 
 const params = (r: FastifyRequest) => (r.params ?? {}) as Record<string, string>;
@@ -98,7 +103,19 @@ async function snapshot(store: Store, r: FastifyRequest): Promise<Snapshot> {
   const held = new Map<string, string>();
   const externalId = url(r) === '/v1/bookings' && r.method === 'POST' ? body(r).external_id ?? body(r).id : undefined;
   if (typeof externalId === 'string' && externalId) for (const h of await store.listHeldOrders({ status: 'open', externalId })) held.set(h.id, h.status);
-  return { bookings, invoices, vanDay, deployment, held };
+  let boat: Snapshot['boat'];
+  if (url(r).startsWith('/v1/boats/:id')) {
+    const id = params(r).id;
+    boat = { id, days: await boatDays(store, id) };
+    if (params(r).date) boat.overrideRoute = (await store.listDeployments(params(r).date, params(r).date)).find((d) => d.boat_id === id)?.route_id;
+  }
+  const sorts = url(r) === '/v1/routes/order' ? new Map((await store.listRoutes()).map((x) => [x.id, x.sort])) : undefined;
+  return { bookings, invoices, vanDay, deployment, held, boat, sorts };
+}
+
+/** A boat's deployments from today, each as one comparable string, by `date|route`. */
+async function boatDays(store: Store, boatId: string): Promise<Map<string, string>> {
+  return new Map((await store.boatDeploymentsFrom(boatId, todayInThailand())).map((d) => [`${d.service_date}|${d.route_id}`, JSON.stringify([d.capacity, d.license_pax ?? null, d.registered_persons ?? null])]));
 }
 
 async function describe(store: Store, r: FastifyRequest, before: Snapshot, result: unknown): Promise<ChangeInput[]> {
@@ -157,6 +174,29 @@ async function describe(store: Store, r: FastifyRequest, before: Snapshot, resul
     if (!closure) continue;
     out.push({ kind: 'weather_closure', entity_id: id, action: path === '/v1/weather-closures' && r.method === 'POST' ? 'created' : 'updated',
       route_days: [{ route_id: closure.route_id, service_date: closure.service_date }], changed_by: by });
+  }
+  // The catalogue (todo/catalogue-editing-model.md).
+  if (path === '/v1/routes' && r.method === 'POST') {
+    const created = result as { created?: boolean; route?: { id: string } } | undefined;
+    if (created?.created && created.route) out.push({ kind: 'route', entity_id: created.route.id, action: 'created', route_days: null, changed_by: by });
+  }
+  if (path === '/v1/routes/:id') out.push({ kind: 'route', entity_id: params(r).id, action: r.method === 'DELETE' ? 'deleted' : 'updated', route_days: null, changed_by: by });
+  if (before.sorts) {
+    for (const route of await store.listRoutes()) {
+      if (before.sorts.get(route.id) !== route.sort) out.push({ kind: 'route', entity_id: route.id, action: 'updated', route_days: null, changed_by: by });
+    }
+  }
+  if (path === '/v1/boats' && r.method === 'POST') {
+    const id = (result as { id?: string } | undefined)?.id;
+    if (id) out.push({ kind: 'boat', entity_id: id, action: 'created', route_days: null, changed_by: by });
+  }
+  if (before.boat) {
+    // The route-days whose seats moved: deployments the write changed, and an override's day.
+    const after = await boatDays(store, before.boat.id);
+    const days: RouteDay[] = [...new Set([...before.boat.days.keys(), ...after.keys()])].filter((k) => before.boat!.days.get(k) !== after.get(k))
+      .map((k) => { const [service_date, route_id] = k.split('|'); return { route_id, service_date }; });
+    if (before.boat.overrideRoute) days.push({ route_id: before.boat.overrideRoute, service_date: params(r).date });
+    out.push({ kind: 'boat', entity_id: before.boat.id, action: 'updated', route_days: days.length ? days : null, changed_by: by });
   }
   return mergeChanges(out);
 }

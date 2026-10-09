@@ -21,6 +21,10 @@
  * programmes and activity and a market's sub-markets are replaced. Nothing else is touched except the
  * bookings named in `--remove`.
  *
+ * Routes and boats are this API's since 2026-10-09 (`seed:routes`, `seed:boats`): the import reads
+ * them and writes neither. A boat's seats for a day set here (`set_at`) are neither replaced nor
+ * deleted by legacy's.
+ *
  * Rate types moved here on 2026-10-09: this API is their master, and a run leaves them alone. Only
  * `--rate-types` imports them, to seed a database that has none yet. Then they keep legacy's ids and
  * are upserted (mapping: `legacy-rate-types.ts`). Under each one,
@@ -1161,7 +1165,8 @@ async function main() {
     await insert('van_log', vanLog);
     await insert('deployments', deployments,
       'ON CONFLICT (service_date, boat_id) DO UPDATE SET route_id = EXCLUDED.route_id, capacity = EXCLUDED.capacity, license_pax = EXCLUDED.license_pax, registered_persons = EXCLUDED.registered_persons');
-    await insert('boat_capacity_overrides', overrides, 'ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason');
+    // A day's seats set here (trip-ops raise, PUT /v1/boats/{id}/capacity-overrides: `set_at`) win over legacy's.
+    await insert('boat_capacity_overrides', overrides, 'ON CONFLICT (boat_id, service_date) DO UPDATE SET capacity = EXCLUDED.capacity, reason = EXCLUDED.reason WHERE boat_capacity_overrides.set_at IS NULL');
     await insert('seat_locks', locks);
     await insert('pickup_areas', pickupAreas, upsert(pickupAreas));
     await insert('pickup_time_profiles', timeProfiles, upsert(timeProfiles));
