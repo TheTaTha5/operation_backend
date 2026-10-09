@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { PostgresFleetRepo } from './fleet-postgres.js';
 import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -535,6 +536,8 @@ const stopRow = (r: Record<string, unknown>): VanStop => ({
 export class PostgresOperationsStore {
   private readonly pool: Pool;
   private readonly context = new AsyncLocalStorage<PoolClient>();
+  /** Fleet part B (todo/fleet-maintenance-model.md), in the same transaction as everything else. */
+  readonly fleet = new PostgresFleetRepo(() => this.client());
   constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
   private client(): Pool | PoolClient { return this.context.getStore() ?? this.pool; }
   async close(): Promise<void> {

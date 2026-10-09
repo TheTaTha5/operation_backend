@@ -57,6 +57,7 @@ import { sortDocuments, sortTemplates, type ContractDocument, type ContractTempl
 import { addonServiceView, sortAddonServices, type AddonService } from './addon-services.js';
 import { builtinNationalities, type StoredNationality } from './nationalities.js';
 import { carryInsurance, type InsuranceFields } from './insurance.js';
+import { MemoryFleetRepo } from './fleet-store.js';
 
 export type Deployment = {
   boat_id: string;
@@ -392,6 +393,8 @@ export function drawnByLock(bookings: Iterable<StoredBooking>, exclude: Exclusio
 
 /** A small serialized in-memory unit of work. Replace this adapter with a DB transaction in production. */
 export class OperationsStore {
+  /** Fleet part B (todo/fleet-maintenance-model.md): stock, memos, projects, the Daily Fleet Log, safety. */
+  readonly fleet = new MemoryFleetRepo();
   private deployments: Deployment[] = [];
   private bookings = new Map<string, StoredBooking>();
   private histories = new Map<string, HistoryEntry[]>();

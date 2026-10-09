@@ -77,8 +77,15 @@ export function writeNeed(path: string): WriteNeed {
   // The document check's note: legacy lets anyone edit it (decision C3, 2026-10-09).
   if (/^\/v1\/bookings\/[^/]+\/doc-check\/note$/.test(path)) return { kind: 'self' };
   if (path === '/v1/bookings' || path.startsWith('/v1/bookings/') || path.startsWith('/v1/seat-lock')) return { kind: 'area', areas: ['operations'] };
-  // Files: booking documents (operations), pier and payment slips (pier, accounting); legacy let any editor upload.
-  if (path === '/v1/attachments' || path.startsWith('/v1/attachments/')) return { kind: 'area', areas: ['operations', 'pier', 'accounting'] };
+  // Files: booking documents (operations), pier and payment slips (pier, accounting), fleet project
+  // documents (fleet, decision 13 of todo/fleet-maintenance-model.md); legacy let any editor upload.
+  if (path === '/v1/attachments' || path.startsWith('/v1/attachments/')) return { kind: 'area', areas: ['operations', 'pier', 'accounting', 'fleet'] };
+  // Fleet maintenance, part B (todo/fleet-maintenance-model.md): legacy's `flSave` guards `fleet`. The
+  // Daily Log's water meters, issued and extra items, outside requests and the issue-item list also
+  // take `operations`, as legacy's `_flJsonSave` does.
+  if (/^\/v1\/fleet\/daily-log\/[^/]+\/(boats\/[^/]+\/(water|issues|extras)|piers\/[^/]+\/requests)(\/|$)/.test(path)
+    || path === '/v1/fleet/issue-items' || path.startsWith('/v1/fleet/issue-items/')) return { kind: 'area', areas: ['fleet', 'operations'] };
+  if (path.startsWith('/v1/fleet/')) return { kind: 'area', areas: ['fleet'] };
   // Legacy's "Pickup time setup" (psuPersist guards operations).
   if (path.startsWith('/v1/pickup-areas') || path.startsWith('/v1/pickup-time-profiles')) return { kind: 'area', areas: ['operations'] };
   // Love Kingdom's held orders: ops resolve or dismiss them (todo/b2c-sync-model.md). Its own login is
