@@ -168,13 +168,8 @@ Not in Money:
   hold is a label that blocks nothing.
 - **Settlement (slices 3 and 5):** build it with the slices: commission payouts, the pier cash
   hand-over at day close, and van bills sent and paid.
-- **A reschedule fee charged after the booking is invoiced** gets a fee invoice of its own
-  (`fee_type: reschedule`), as a cancellation charge does. To build on slice 1; see Open 1.
 
 ## Open
 
-1. **The late reschedule fee and fee items.** If the fee is billed by its own invoice and also stays a
-   fee item, the booking's next invoice (after a void and re-issue) bills it twice. Proposal: a fee
-   billed by its own invoice is not added as a fee item; the reschedule record keeps it.
-2. **Deposits and refunds** (`SB_DEPOSITS`, the weather outcomes refund and credit): never saved by
+1. **Deposits and refunds** (`SB_DEPOSITS`, the weather outcomes refund and credit): never saved by
    legacy, not built here.

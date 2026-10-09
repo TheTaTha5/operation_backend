@@ -1779,9 +1779,11 @@ worked out from the lines`). An unchanged echo of it is accepted.
 - **Nothing changed** writes nothing.
 
 **On the booking.** Every booking read carries two fields the server works out:
-- `invoice`: the booking's live invoice, the newest one not void, as
-  `{ id, number, kind, fee_type, status, total, paid, balance }`, or `null`.
-- `payment_state`: `none`, `invoiced`, `partial` or `paid`.
+- `invoice`: the booking's live invoice as `{ id, number, kind, fee_type, status, total, paid, balance }`,
+  or `null`. That is its booking or prepay invoice, else its newest live fee invoice (a cancelled
+  booking's cancellation fee).
+- `payment_state`: `none`, `invoiced`, `partial` or `paid`, over every live invoice of the booking: `paid`
+  once all are paid, `partial` once anything is.
 
 They replace legacy's stored `invoiceId` and `paymentStatus`. A booking `PATCH` that sends any of
 `invoice`, `invoice_id`, `invoiceId`, `payment_state` or `paymentStatus` with a different value is
@@ -1794,8 +1796,10 @@ refused with `400`; an unchanged echo is accepted.
   - no VAT, due now, whole baht;
   - only when the booking's agent is in the catalogue.
 - **Restore** voids that fee invoice.
-- **A reschedule fee** collected on the invoice is a fee item on the booking. It is billed by the
-  booking's next invoice.
+- **A reschedule fee** collected on the invoice (`collect: "invoice"`):
+  - booking not invoiced yet: a fee item, billed by its next invoice;
+  - booking already on a live invoice: a fee invoice of its own (`fee_type: "reschedule"`, no VAT, due
+    now), and no fee item, so it is never billed twice. Legacy left this fee unbilled.
 
 **The agent's credit** (legacy `agCreditState`):
 - **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`.
