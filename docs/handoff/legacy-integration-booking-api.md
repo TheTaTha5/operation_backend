@@ -533,8 +533,11 @@ bills" and "Money reports"). `VAN_BILL`, `van_rates` and `dr_cfg` move to these:
 - **Writes:** van bills need `accounting`; van rates `accounting` or `fleet`; the daily report's
   settings `operations` or `accounting`. A login tied to an agent gets `403` on the reports and reads
   only its own statement.
-- **Not in the reports yet** (their sources are Money slices 3–4): pier payments, on-tour sales
-  (`SB_EXTRAS`), cash-on-tour and no-show decisions. Keep reading those from legacy until they move.
+- **The reports read the pier's money and the after-trip decisions** (§2.10): Travel Summary's
+  collected, still-due, slip, sale, COT and no-show figures (`money`, `cot`, `noshow`, `collect_rows`),
+  the Daily Report's `due`, `got`, `no_slip`, `extras` and each agent's `due`, and the dashboard's
+  `extras_this_month`. Delete `tsMoneyOf`, `tsSaleList`, `tsNoCollect`, `drData`'s money and
+  `acctExtrasMonthTotal` client-side and show these.
 
 ### 2.10 Daily PFM, pier money, on-tour sales, Travel Summary decisions
 

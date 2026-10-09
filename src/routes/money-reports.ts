@@ -1,7 +1,8 @@
 /**
  * Money slices 5 and 6 (todo/money-model.md, decided 2026-10-09): partner van bills with their sent and
  * paid state, Transfer Fleet's van rates, and the money reports (accounting dashboard, agent
- * statement, Travel Summary totals, the Daily Report's money pane and its settings).
+ * statement, Travel Summary totals, the Daily Report's money pane and its settings). The reports read
+ * the pier's money and the decisions after the trip (Money slices 3 and 4) as well.
  *
  * The rules are in `src/domain/van-bills.ts` and `src/domain/money-reports.ts`. A handler reads what the
  * rule needs from the store, asks the rule, and writes what it answers in one transaction. Who may
@@ -19,7 +20,7 @@ import {
   applyPatch, billPeriod, billRows, billView, blankBill, overviewLine, parseBillAddress, parseBillPatch, parseMonthPeriod, parsePay, parseVanRate, partnersOf,
   partnerVans, pay, pullRates, send, sortOverview, unpay, unsend, vanRateGroups, VAN_RATE_DEFAULT, assertEditable, type BillAddress, type StoredVanBill,
 } from '../domain/van-bills.js';
-import { accountingDashboard, agentStatement, dailyMoney, dailySettingsView, parseDailySettings, travelSummary } from '../domain/money-reports.js';
+import { accountingDashboard, agentStatement, dailyMoney, dailySettingsView, parseDailySettings, travelSummary, type DayMoneyInput } from '../domain/money-reports.js';
 
 type Request = FastifyRequest;
 const bad = (message: string): never => refuse(message, 400);
@@ -58,6 +59,11 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
     const ids = invoices.map((i) => i.id);
     const payments = await store.paymentsOf(ids), refunds = await store.listRefunds({ invoiceIds: ids });
     return invoices.map((i) => invoiceView(i, payments.filter((p) => p.invoice_id === i.id), new Map(), refunds.filter((r) => r.invoice_id === i.id)));
+  };
+  /** A day's pier payments, on-tour sales and decisions after the trip, for these bookings. */
+  const dayMoney = async (bookings: readonly Booking[]): Promise<DayMoneyInput> => {
+    const ids = bookings.map((b) => b.id);
+    return { sales: await store.tourSales(ids), payments: await store.pierPayments(ids), cot: await store.cotDecisions(ids), noshow: await store.noshowCharges(ids) };
   };
   const areaNames = async () => ({ areas: new Map((await store.listPickupAreas()).map((a) => [a.id, a])) });
 
@@ -169,7 +175,8 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
       exposure += creditOf(a, byAgent.get(a.id) ?? []).used;
       held += creditBalance(refunds.filter((r) => r.agent_id === a.id), payments.filter((p) => agentOf.get(p.invoice_id) === a.id)).available;
     }
-    return accountingDashboard({ invoices, payments, agents, credit_exposure: exposure, deposits_held: held, now: new Date() });
+    const sales = await store.tourSales(bookings.map((b) => b.id));
+    return accountingDashboard({ invoices, payments, agents, credit_exposure: exposure, deposits_held: held, now: new Date(), sales });
   });
   /** Legacy `acctStatementOpen`. A login tied to an agent reads its own; a salesperson their agents'. */
   app.get('/v1/agents/:id/statement', async (request) => {
@@ -187,13 +194,15 @@ export function registerMoneyReportRoutes(app: FastifyInstance, deps: { store: S
   app.get('/v1/reports/travel-summary', async (request) => {
     staffOnly(request);
     const date = dateParam(query(request).date ?? todayInThailand());
-    return travelSummary(date, await store.bookingsOnDate(date));
+    const bookings = await store.bookingsOnDate(date);
+    return travelSummary(date, bookings, await dayMoney(bookings));
   });
   app.get('/v1/reports/daily', async (request) => {
     staffOnly(request);
     const date = dateParam(query(request).date ?? todayInThailand());
+    const bookings = await store.bookingsOnDate(date);
     return {
-      ...dailyMoney(date, await store.bookingsOnDate(date), {
+      ...dailyMoney(date, bookings, await dayMoney(bookings), {
         agents: await store.agentRecords(), markets: await store.listMarkets(), routes: await store.listRoutes(), vans: await store.listVans(),
         rates: await store.vanRates(), areas: await store.listPickupAreas(), settings: await store.dailyReportSettings(),
       }),

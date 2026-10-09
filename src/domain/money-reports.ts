@@ -6,9 +6,10 @@
  * - Travel Summary's totals (`renderTravelSum`, `tsRows`, `tsSaleList`, `tsMoneyOf`);
  * - the Daily Report's money pane (`drData`, `drPaneFi`, `drVanReal`, `dr_cfg`).
  *
- * Parts whose source is not here yet are left out, not guessed: pier payments, on-tour sales, the
- * cash-on-tour and no-show decisions (Money slices 3 and 4), the longtail and other trip costs (the
- * cost model, with Fleet). Pure, so both stores decide identically.
+ * They read the pier's money and the decisions after the trip (Money slices 3 and 4, `pier-money.ts`,
+ * `after-trip.ts`) through the same rules the pier screens use. Parts whose source is not here yet are
+ * left out, not guessed: the longtail and other trip costs (the cost model, with Fleet). Pure, so both
+ * stores decide identically.
  */
 import { refuse } from './booking-actions.js';
 import { todayInThailand } from './calendar.js';
@@ -23,6 +24,8 @@ import { countsOf, partPax, type Counts } from './van-groups.js';
 import type { Van } from './vans.js';
 import { lostByType, summaryNoShow } from './aboard.js';
 import { noRateSet, vanGroupKey, vanRate, type VanRate } from './van-bills.js';
+import { livePier, pierMoney, saleCollected, saleTotal, tourSaleView, type MoneyBooking, type StoredPierPayment, type StoredTourSale } from './pier-money.js';
+import type { StoredCotDecision, StoredNoshowCharge } from './after-trip.js';
 
 const cents = (n: number): number => Math.round(n * 100) / 100;
 const sum = (xs: readonly number[]): number => cents(xs.reduce((s, x) => s + x, 0));
@@ -33,6 +36,8 @@ const DAY_MS = 86_400_000;
 
 export type AccountingDashboard = {
   as_of: string; outstanding: number; paid_this_month: number; credit_exposure: number; overdue_invoices: number; deposits_held: number;
+  /** Legacy `acctExtrasMonthTotal` ("Extras · cash · month"): every on-tour sale made this Bangkok month, whatever its method. */
+  extras_this_month: number;
   aging: { not_due: number; days_1_30: number; days_31_60: number; days_60_plus: number };
   collections: { month: string; amount: number }[];
   top_outstanding: { agent_id: string | null; name: string | null; balance: number }[];
@@ -48,6 +53,8 @@ const received = (p: StoredPayment): boolean => !p.deleted_at && p.method !== 'c
 export function accountingDashboard(input: {
   invoices: readonly InvoiceView[]; payments: readonly StoredPayment[]; agents: readonly Pick<StoredAgent, 'id' | 'name'>[];
   credit_exposure: number; deposits_held: number; now: Date;
+  /** On-tour sales; only those sold this month count. */
+  sales?: readonly Pick<StoredTourSale, 'sold_at' | 'qty' | 'unit_price'>[];
 }): AccountingDashboard {
   const { now } = input;
   const live = input.invoices.filter((i) => i.status !== 'void');
@@ -67,7 +74,8 @@ export function accountingDashboard(input: {
   const names = new Map(input.agents.map((a) => [a.id, a.name]));
   return {
     as_of: todayInThailand(now), outstanding: sum(live.map((i) => i.balance)), paid_this_month: collections[collections.length - 1].amount,
-    credit_exposure: cents(input.credit_exposure), overdue_invoices: overdue, deposits_held: cents(input.deposits_held), aging, collections,
+    credit_exposure: cents(input.credit_exposure), overdue_invoices: overdue, deposits_held: cents(input.deposits_held),
+    extras_this_month: sum((input.sales ?? []).filter((x) => todayInThailand(new Date(x.sold_at)).slice(0, 7) === months[months.length - 1]).map(saleTotal)), aging, collections,
     top_outstanding: [...byAgent].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))).slice(0, 5)
       .map(([id, balance]) => ({ agent_id: id, name: id ? names.get(id) ?? null : null, balance })),
   };
@@ -114,47 +122,148 @@ export function dayRows(date: string, bookings: readonly Booking[]): DayRow[] {
 
 // ── Travel Summary totals ────────────────────────────────────────────────────────────────────────
 
+/** The money a day's reports read beside its bookings (Money slices 3 and 4): on-tour sales, pier payments, the decisions after the trip. */
+export type DayMoneyInput = {
+  sales: readonly StoredTourSale[]; payments: readonly StoredPierPayment[];
+  cot: readonly StoredCotDecision[]; noshow: readonly StoredNoshowCharge[];
+};
+export const NO_DAY_MONEY: DayMoneyInput = { sales: [], payments: [], cot: [], noshow: [] };
+type ByMethod = { cash: number; transfer: number; card: number };
+const byMethod = (by: Readonly<Record<string, number>>): ByMethod => ({ cash: cents(by.cash ?? 0), transfer: cents(by.transfer ?? 0), card: cents(by.card ?? 0) });
+
+/**
+ * Legacy `tsSaleList`: what was sold on the day, beside the booking: its on-tour sales of that day (one
+ * with no day counts every day, legacy's older ones) and its upgrades (they have no day; legacy counts
+ * them on every date the booking travels). A collected item counts by its method with its fee and
+ * commission, and is "waiting for slip" when it is not cash and has none; the rest is still to collect.
+ */
+export function saleList(b: Pick<Booking, 'upgrades'>, date: string, sales: readonly StoredTourSale[]) {
+  const by: Record<string, number> = { cash: 0, transfer: 0, card: 0 };
+  let got = 0, due = 0, fee = 0, comm = 0, noSlip = 0, n = 0;
+  const add = (amt: number, done: boolean, method: string, f: number, c: number, slips: number) => {
+    n += 1;
+    if (!done) { due += amt; return; }
+    by[method] = (by[method] ?? 0) + amt; got += amt; fee += f; comm += c;
+    if (method !== 'cash' && !slips) noSlip += 1;
+  };
+  for (const s of sales) {
+    if (s.trip_date && s.trip_date !== date) continue;
+    const amt = saleTotal(s);
+    if (amt) add(amt, saleCollected(s), s.method, s.fee, tourSaleView(s).commission, s.slips.length);
+  }
+  for (const u of b.upgrades) if (u.sell_price) add(u.sell_price, !!u.collected, u.method || 'cash', u.fee ?? 0, u.commission, u.slips.length);
+  return { by: byMethod(by), got: cents(got), due: cents(due), fee: cents(fee), comm: cents(comm), no_slip: noSlip, total: cents(got + due), n };
+}
+
+/**
+ * Legacy `tsMoneyOf`: what the pier has to collect from one booking that day (`target`: its cash on tour,
+ * Love Kingdom balance and upgrades still owed, less what a paid invoice already cleared, §tsInvPaid),
+ * what it took (`paid`, live pier payments) and what is left (`due`). On-tour sales are not in `target`,
+ * as legacy: their money is counted apart.
+ */
+export function collectOf(b: Booking, date: string, sales: readonly StoredTourSale[], payments: readonly StoredPierPayment[]) {
+  const M = pierMoney(b as MoneyBooking, date, sales, payments, null);
+  const by: Record<string, number> = {};
+  for (const p of livePier(payments, date)) by[p.method] = (by[p.method] ?? 0) + p.amount;
+  const billed = b.invoice?.status === 'paid' ? cents(M.cot + M.b2c_balance) : 0;
+  const target = Math.max(0, cents(M.cot + M.b2c_balance + M.upgrades_due - billed));
+  return { M, by: byMethod(by), billed, target, paid: M.paid, due: Math.max(0, cents(target - M.paid)) };
+}
+
+/** Legacy `tsNoCollect` (§tsCxlNoCount): nobody travelled and nothing was taken: shown, not counted as owed. Money already taken is a refund's matter (§paid). */
+export const noCollect = (r: Pick<DayRow, 'travelled' | 'cxl' | 'ns' | 'no_show'>, paid: number): boolean =>
+  !(paid > 0) && r.travelled <= 0 && (r.cxl > 0 || r.ns > 0 || r.no_show > 0);
+
+export type CollectRow = {
+  booking_id: string; voucher_ref: string | null; route_id: string;
+  cot: number; b2c_balance: number; upgrades_due: number; billed: number; target: number; paid: number; due: number;
+  /** Legacy `tsNoCollect`: not counted in `to_collect` and `due`; `cxl` when cancelled at the pier, else `no_show`. */
+  not_counted: 'cxl' | 'no_show' | null;
+  received: ByMethod; fees: number; no_slip: number;
+  sales: { total: number; got: number; due: number; count: number; commission: number; fees: number; no_slip: number };
+};
 export type TravelSummary = {
   date: string; bookings: number; booked: number; travelled: number; no_show: number; cxl: number;
   money: {
-    cash: number; transfer: number; card: number; fees: number; sales: number; sales_due: number; sales_count: number; commission: number;
-    cash_on_tour: number; to_collect: number; to_collect_bookings: number;
+    /** Taken that day by method: pier payments, and on-tour sales and upgrades collected (legacy `sumCash`, `sumTf`, `sumCard`). */
+    cash: number; transfer: number; card: number; received: number;
+    /** Card fees: the pier's and the sales'. The bank keeps them; they are not income. */
+    fees: number;
+    pier: ByMethod & { total: number; fees: number; no_slip: number };
+    sales: number; sales_due: number; sales_count: number; commission: number; sales_fees: number; sales_by: ByMethod; sales_no_slip: number;
+    /** Non-cash money with no slip yet, pier payments and sales (legacy "ขาดสลิป"). */
+    no_slip: number;
+    cash_on_tour: number; to_collect: number; to_collect_bookings: number; due: number;
+    /** `received − cot.payout` (legacy `sumNet`, §tsCommOut: commission is not taken off here). */
+    net: number;
   };
+  cot: { total: number; deduct: number; payout: number; not_collected: number; not_collected_bookings: number; undecided_bookings: number };
+  noshow: { cases: number; pending: number; decided: number; postponed: number; charged: number };
+  collect_rows: CollectRow[];
 };
-/** Legacy `tsSaleList` for upgrades: collected by method, the fee, commission; not collected is still due. */
-function upgradeMoney(b: Booking) {
-  const by: Record<string, number> = { cash: 0, transfer: 0, card: 0 };
-  let got = 0, due = 0, fee = 0, comm = 0, n = 0;
-  for (const u of b.upgrades) {
-    const amt = u.sell_price;
-    if (!amt) continue;
-    n += 1;
-    if (u.collected) { const m = u.method || 'cash'; by[m] = cents((by[m] ?? 0) + amt); got += amt; fee += u.fee ?? 0; comm += u.commission; } else due += amt;
-  }
-  return { by, got: cents(got), due: cents(due), fee: cents(fee), comm: cents(comm), n };
-}
-export function travelSummary(date: string, bookings: readonly Booking[]): TravelSummary {
+
+/**
+ * Legacy `renderTravelSum`'s figures. The collect rows (§tsSaleCol) are the bookings with something to
+ * collect, something taken or something sold. A no-show case (§tsIssueReal) is a booking someone did not
+ * travel on, or one already decided.
+ */
+export function travelSummary(date: string, bookings: readonly Booking[], money: DayMoneyInput = NO_DAY_MONEY): TravelSummary {
   const rows = dayRows(date, bookings);
-  const m = { cash: 0, transfer: 0, card: 0, fees: 0, sales: 0, sales_due: 0, sales_count: 0, commission: 0, cash_on_tour: 0, to_collect: 0, to_collect_bookings: 0 };
+  const of = <T extends { booking_id: string }>(list: readonly T[], id: string) => list.filter((x) => x.booking_id === id);
+  const m = {
+    cash: 0, transfer: 0, card: 0, received: 0, fees: 0, pier: { cash: 0, transfer: 0, card: 0, total: 0, fees: 0, no_slip: 0 },
+    sales: 0, sales_due: 0, sales_count: 0, commission: 0, sales_fees: 0, sales_by: { cash: 0, transfer: 0, card: 0 }, sales_no_slip: 0, no_slip: 0,
+    cash_on_tour: 0, to_collect: 0, to_collect_bookings: 0, due: 0, net: 0,
+  };
+  const cot = { total: 0, deduct: 0, payout: 0, not_collected: 0, not_collected_bookings: 0, undecided_bookings: 0 };
+  const collect: CollectRow[] = [];
   for (const r of rows) {
-    const b = r.booking, S = upgradeMoney(b);
-    // Legacy `pckMoney`: an overnight return leg's money was settled on the way out.
-    const cot = !r.ovn_back && (b.cash_on_tour_amount ?? 0) > 0 ? b.cash_on_tour_amount! : 0;
-    const upDue = r.ovn_back ? 0 : S.due;
-    // §tsInvPaid: a paid invoice already cleared the cash on tour.
-    const billed = b.invoice?.status === 'paid' ? cot : 0;
-    const target = Math.max(0, cot + upDue - billed);
-    if (!(target > 0 || S.got + S.due > 0)) continue;
-    m.cash += S.by.cash ?? 0; m.transfer += S.by.transfer ?? 0; m.card += S.by.card ?? 0;
-    m.fees += S.fee; m.sales += S.got + S.due; m.sales_due += S.due; m.sales_count += S.n; m.commission += S.comm; m.cash_on_tour += cot;
-    // §tsCxlNoCount: nobody travelled and nothing was collected: still shown, not counted as owed.
-    const noCollect = r.travelled <= 0 && (r.cxl > 0 || r.ns > 0 || r.no_show > 0);
-    if (!noCollect) { m.to_collect += target; if (target > 0) m.to_collect_bookings += 1; }
+    const b = r.booking, sales = of(money.sales, b.id), payments = of(money.payments, b.id);
+    const S = saleList(b, date, sales), C = collectOf(b, date, sales, payments);
+    if (!(C.target > 0 || C.paid > 0 || S.total > 0)) continue;
+    const skip = noCollect(r, C.paid);
+    for (const k of ['cash', 'transfer', 'card'] as const) { m[k] += C.by[k] + S.by[k]; m.pier[k] += C.by[k]; m.sales_by[k] += S.by[k]; }
+    m.pier.total += C.paid; m.pier.fees += C.M.fees; m.pier.no_slip += C.M.no_slip;
+    m.fees += C.M.fees + S.fee; m.sales_fees += S.fee; m.sales += S.total; m.sales_due += S.due; m.sales_count += S.n; m.commission += S.comm;
+    m.sales_no_slip += S.no_slip; m.no_slip += C.M.no_slip + S.no_slip;
+    if (!skip) { m.to_collect += C.target; m.due += C.due; m.to_collect_bookings += 1; }
+    // §tsCashNet: the cash-on-tour decisions; one not decided yet, or deciding more than there was, is still open.
+    if (C.M.cot > 0) {
+      m.cash_on_tour += C.M.cot; cot.total += C.M.cot;
+      const d = money.cot.find((x) => x.booking_id === b.id && x.service_date === date);
+      if (!d) cot.undecided_bookings += 1;
+      else if (d.mode === 'nocol') { cot.not_collected += C.M.cot; cot.not_collected_bookings += 1; }
+      else if (d.deduct + d.payout > C.M.cot) cot.undecided_bookings += 1;
+      else { cot.deduct += d.deduct; cot.payout += d.payout; }
+    }
+    collect.push({
+      booking_id: b.id, voucher_ref: b.voucher_ref ?? null, route_id: r.trip.route_id,
+      cot: C.M.cot, b2c_balance: C.M.b2c_balance, upgrades_due: C.M.upgrades_due, billed: C.billed, target: C.target, paid: C.paid, due: C.due,
+      not_counted: skip ? (r.cxl > 0 ? 'cxl' : 'no_show') : null,
+      received: byMethod({ cash: C.by.cash + S.by.cash, transfer: C.by.transfer + S.by.transfer, card: C.by.card + S.by.card }),
+      fees: cents(C.M.fees + S.fee), no_slip: C.M.no_slip + S.no_slip,
+      sales: { total: S.total, got: S.got, due: S.due, count: S.n, commission: S.comm, fees: S.fee, no_slip: S.no_slip },
+    });
   }
-  for (const k of Object.keys(m) as (keyof typeof m)[]) if (k !== 'sales_count' && k !== 'to_collect_bookings') m[k] = cents(m[k]);
+  for (const k of ['cash', 'transfer', 'card', 'fees', 'sales', 'sales_due', 'commission', 'sales_fees', 'cash_on_tour', 'to_collect', 'due'] as const) m[k] = cents(m[k]);
+  m.pier = { ...byMethod(m.pier), total: cents(m.pier.total), fees: cents(m.pier.fees), no_slip: m.pier.no_slip };
+  m.sales_by = byMethod(m.sales_by);
+  m.received = cents(m.cash + m.transfer + m.card);
+  for (const k of ['total', 'deduct', 'payout', 'not_collected'] as const) cot[k] = cents(cot[k]);
+  m.net = Math.max(0, cents(m.received - cot.payout));
+  // §tsIssueReal: a case is a booking someone did not travel on, or one already decided; `charged` adds what the decided ones charge.
+  const noshow = { cases: 0, pending: 0, decided: 0, postponed: 0, charged: 0 };
+  for (const r of rows) {
+    const d = money.noshow.find((x) => x.booking_id === r.booking.id && x.service_date === date);
+    if (!(r.no_show > 0 || r.ns + r.cxl > 0 || d)) continue;
+    noshow.cases += 1;
+    if (!d) { noshow.pending += 1; continue; }
+    noshow.decided += 1;
+    if (d.decision === 'postpone') noshow.postponed += 1; else noshow.charged = cents(noshow.charged + d.amount);
+  }
   return {
     date, bookings: rows.length, booked: rows.reduce((s, r) => s + r.booked, 0), travelled: rows.reduce((s, r) => s + r.travelled, 0),
-    no_show: rows.reduce((s, r) => s + r.ns, 0), cxl: rows.reduce((s, r) => s + r.cxl, 0), money: m,
+    no_show: rows.reduce((s, r) => s + r.ns, 0), cxl: rows.reduce((s, r) => s + r.cxl, 0), money: m, cot, noshow, collect_rows: collect,
   };
 }
 
@@ -210,8 +319,10 @@ export type DailyMoney = {
   by_route: { route_id: string; name: string; bookings: number; pax: number; revenue: number; per_pax: number; share_pct: number }[];
   by_market: { id: string; name: string; color: string | null; bookings: number; pax: number; revenue: number }[];
   by_channel: Record<'invoice' | 'proforma' | 'cot' | 'transfer' | 'other', number>;
-  by_agent: { key: string; agent_id: string | null; name: string; market_id: string; pay_type: string | null; bookings: number; ad: number; chd: number; inf: number; foc: number; pax: number; revenue: number; docs: Record<string, number> }[];
+  by_agent: { key: string; agent_id: string | null; name: string; market_id: string; pay_type: string | null; bookings: number; ad: number; chd: number; inf: number; foc: number; pax: number; revenue: number; due: number; docs: Record<string, number> }[];
   upgrades: { collected: number; due: number };
+  /** Legacy `pckMoney` summed over the day: still to collect at the pier, taken there (pier payments), their payments waiting for a slip, and the day's on-tour sales. */
+  due: number; got: number; no_slip: number; extras: number;
   van_cost: { total: number; estimated: boolean; vans: number; default_rate_vans: number; per_van_fallback: number; by_van: Record<string, number> };
 };
 const pct = (a: number, b: number): number => (b > 0 ? Math.round((a / b) * 1000) / 10 : 0);
@@ -261,7 +372,7 @@ export function dailyVanCost(rows: readonly DayRow[], ctx: { vans: ReadonlyMap<s
   return { total: estimated ? used.size * ctx.vanCost : total, estimated, vans: used.size, default_rate_vans: defaulted.size, per_van_fallback: ctx.vanCost, by_van: byVan };
 }
 
-export function dailyMoney(date: string, bookings: readonly Booking[], ctx: {
+export function dailyMoney(date: string, bookings: readonly Booking[], money: Pick<DayMoneyInput, 'sales' | 'payments'>, ctx: {
   agents: readonly StoredAgent[]; markets: readonly Market[]; routes: readonly Pick<Route, 'id' | 'name'>[];
   vans: readonly Van[]; rates: readonly VanRate[]; areas: readonly PickupArea[]; settings: DailySettings | undefined;
 }): DailyMoney {
@@ -269,7 +380,7 @@ export function dailyMoney(date: string, bookings: readonly Booking[], ctx: {
   const agents = new Map(ctx.agents.map((a) => [a.id, a])), markets = new Map(ctx.markets.map((m) => [m.id, m]));
   const routeName = new Map(ctx.routes.map((r) => [r.id, r.name]));
   const pax = { ad: 0, chd: 0, inf: 0, foc: 0, total: 0 };
-  let rev = 0, ovnPax = 0, upGot = 0, upDue = 0;
+  let rev = 0, ovnPax = 0, upGot = 0, upDue = 0, due = 0, got = 0, noSlip = 0, extras = 0;
   const routes = new Map<string, DailyMoney['by_route'][number]>();
   const mkts = new Map<string, DailyMoney['by_market'][number]>();
   const channel: DailyMoney['by_channel'] = { invoice: 0, proforma: 0, cot: 0, transfer: 0, other: 0 };
@@ -290,11 +401,14 @@ export function dailyMoney(date: string, bookings: readonly Booking[], ctx: {
     channel[channelOf(ag?.pay_type)] = cents(channel[channelOf(ag?.pay_type)] + amt);
     const key = b.agent_id || '_walk-in';
     const a = byAgent.get(key) ?? byAgent.set(key, { key, agent_id: b.agent_id ?? null, name: ag ? ag.name || ag.code || key : b.agent_id ?? 'Walk-in',
-      market_id: m.id, pay_type: ag?.pay_type ?? null, bookings: 0, ad: 0, chd: 0, inf: 0, foc: 0, pax: 0, revenue: 0, docs: {} }).get(key)!;
+      market_id: m.id, pay_type: ag?.pay_type ?? null, bookings: 0, ad: 0, chd: 0, inf: 0, foc: 0, pax: 0, revenue: 0, due: 0, docs: {} }).get(key)!;
     a.bookings += 1; for (const k of PAX_CATEGORIES) a[k] += c[k]; a.pax += n; a.revenue = cents(a.revenue + amt);
     a.docs[b.doc_check_status] = (a.docs[b.doc_check_status] ?? 0) + 1;
-    // Legacy `pckMoney`: upgrades, not on an overnight return leg.
-    if (!r.ovn_back) for (const u of b.upgrades) { if (u.collected) upGot += u.sell_price; else upDue += u.sell_price; }
+    // Legacy `pckMoney`: what the pier collects and took; an overnight return leg's was settled on the way out.
+    const M = pierMoney(b as MoneyBooking, date, money.sales.filter((s) => s.booking_id === b.id), money.payments.filter((p) => p.booking_id === b.id), null);
+    upGot += M.upgrades_got; upDue += M.upgrades_due;
+    due += M.due; got += M.paid; noSlip += M.no_slip; extras += M.tour_sales_got + M.tour_sales_due;
+    a.due = cents(a.due + M.due);
   }
   rev = cents(rev);
   for (const ro of routes.values()) { ro.per_pax = ro.pax ? cents(ro.revenue / ro.pax) : 0; ro.share_pct = pct(ro.revenue, rev); }
@@ -307,6 +421,7 @@ export function dailyMoney(date: string, bookings: readonly Booking[], ctx: {
     by_channel: channel,
     by_agent: [...byAgent.values()].sort((a, b) => b.revenue - a.revenue),
     upgrades: { collected: cents(upGot), due: cents(upDue) },
+    due: cents(due), got: cents(got), no_slip: noSlip, extras: cents(extras),
     van_cost: dailyVanCost(rows, { vans: new Map(ctx.vans.map((v) => [v.id, v])), rates: ctx.rates, areas: new Map(ctx.areas.map((a) => [a.id, a])), vanCost: settings.van_cost }),
   };
 }

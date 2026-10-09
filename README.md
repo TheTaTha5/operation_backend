@@ -2535,7 +2535,8 @@ a van).
 
 Legacy's accounting dashboard, agent statement, Travel Summary totals and the Daily Report's money
 pane (todo/money-model.md slice 6, `src/domain/money-reports.ts`). **Computed on every read; nothing is
-stored.** A login tied to an agent gets `403` on the reports and reads only its own statement.
+stored.** They read the pier's money and the decisions after the trip ("Pier money", "After the trip")
+through the same rule as those screens (`pierMoney`). A login tied to an agent gets `403` on the reports and reads only its own statement.
 
 | Method + path | Legacy |
 |---|---|
@@ -2547,7 +2548,7 @@ stored.** A login tied to an agent gets `403` on the reports and reads only its 
 
 ```jsonc
 // GET /v1/reports/accounting
-{ "as_of": "2026-10-09", "outstanding": 427700, "paid_this_month": 283100, "credit_exposure": 17273133, "overdue_invoices": 54, "deposits_held": 0,
+{ "as_of": "2026-10-09", "outstanding": 427700, "paid_this_month": 283100, "credit_exposure": 17273133, "overdue_invoices": 54, "deposits_held": 0, "extras_this_month": 18450,
   "aging": { "not_due": 82000, "days_1_30": 236000, "days_31_60": 17400, "days_60_plus": 92300 },
   "collections": [ { "month": "2026-05", "amount": 0 }, "…", { "month": "2026-10", "amount": 283100 } ],
   "top_outstanding": [ { "agent_id": "amrlvm41bp8an5", "name": "ASIATIC ADVENTURES", "balance": 162500 } ] }
@@ -2558,29 +2559,50 @@ stored.** A login tied to an agent gets `403` on the reports and reads only its 
   `collections` (six Bangkok months) are live payments by `paid_on`, credit spent left out (legacy
   counted `type: payment` only). `credit_exposure` is every agent's credit `used`; `deposits_held`
   every agent's credit balance (weather credits). `top_outstanding` is the five largest balances.
+  `extras_this_month` is legacy's "Extras · cash · month" (`acctExtrasMonthTotal`): every on-tour
+  sale made this Bangkok month (by `sold_at`), whatever its method or trip day.
 - **Statement** `{ agent_id, name, code, pay_type, invoiced, paid, outstanding, credit_balance, credit,
   invoices, credits }`: live invoices newest first, `paid` net of what refunds and credits took back,
   `credits` the agent's weather credits.
-- **Travel Summary** `{ date, bookings, booked, travelled, no_show, cxl, money: { cash, transfer, card,
-  fees, sales, sales_due, sales_count, commission, cash_on_tour, to_collect, to_collect_bookings } }`:
+- **Travel Summary** `{ date, bookings, booked, travelled, no_show, cxl, money, cot, noshow, collect_rows }`:
   `travelled` is booked less the last count (the pier's, else the van's); `no_show` and `cxl` are the
-  check-in events; the money is the upgrades (collected by method, card fee, commission, not yet
-  collected) and the cash on tour; `to_collect` is cash on tour plus upgrades still due, less a cash on
-  tour a paid invoice already cleared, leaving out bookings where nobody travelled.
+  check-in events.
+  - `money` (legacy `tsMoneyOf`, `tsSaleList`), over the bookings with something to collect, taken or
+    sold: `cash`, `transfer`, `card` and `received` are what was taken that day, pier payments plus
+    on-tour sales and upgrades collected; `fees` the card fees of both (the bank's, not income);
+    `pier { cash, transfer, card, total, fees, no_slip }` the live pier payments alone; `sales`,
+    `sales_due`, `sales_count`, `commission`, `sales_fees`, `sales_by`, `sales_no_slip` the day's
+    on-tour sales and the upgrades; `no_slip` counts non-cash money still waiting for its slip.
+    `to_collect` is each booking's cash on tour, Love Kingdom balance and upgrades still owed, less
+    what a paid invoice already cleared; `due` is `to_collect` less what the pier took; both leave
+    out a booking nobody travelled on that paid nothing (`tsNoCollect`: one that paid counts, a
+    refund's matter), and `to_collect_bookings` counts the rest. On-tour sales left to collect are in
+    `sales_due`, not `to_collect`, as legacy. `net` is `received` less the cash-on-tour payouts
+    (commission is not taken off, legacy §tsCommOut).
+  - `cot { total, deduct, payout, not_collected, not_collected_bookings, undecided_bookings }`: the
+    cash-on-tour decisions; one not made yet, or deducting and paying out more than the cash on tour,
+    counts as undecided.
+  - `noshow { cases, pending, decided, postponed, charged }`: a case is a booking someone did not
+    travel on, or one already decided; `charged` adds the decided amounts, a postponement charges 0.
+  - `collect_rows`: per booking, `cot`, `b2c_balance`, `upgrades_due`, `billed`, `target`, `paid`,
+    `due`, `not_counted` (`cxl`, `no_show` or `null`), `received` by method, `fees`, `no_slip` and its
+    `sales`.
 - **Daily** `{ date, bookings, pax, paying_pax, revenue, revenue_per_pax, by_route, by_market,
-  by_channel, by_agent, upgrades, van_cost, settings }`: a trip's revenue is its own price on a
+  by_channel, by_agent, upgrades, due, got, no_slip, extras, van_cost, settings }`: a trip's revenue is its own price on a
   multi-trip booking, else the booking's total, 0 on an overnight return leg (legacy `tsTripAmount`);
   markets are the agent's, else staff, walk-in or not set; channels follow the agent's pay type.
+  `due`, `got`, `no_slip` and `extras` are legacy `pckMoney` over the day: still owed at the pier
+  (cash on tour, Love Kingdom balance, upgrades and on-tour sales still due, less pier payments), taken
+  by pier payments, those waiting for a slip, and the day's on-tour sales; each `by_agent` row has
+  its `due`.
   `van_cost` (legacy `drVanReal`) prices each van's day from the van rates by route and pickup zone,
   shared by heads when one van took two routes; with no van cost at all it is the vans × `van_cost`
   (`estimated: true`). `default_rate_vans` counts vans priced by the default, with no rate set.
 - **Settings** `{ van_cost, van_quota, target_per_pax, set, updated_at, updated_by }`: `PUT` takes
   whole numbers; 0 or `null` goes back to legacy's default (1,200, 6, 130). Writes: `operations` or
   `accounting`.
-- **Not here yet** (their sources are Money slices 3–4): pier payments, on-tour sales, the
-  cash-on-tour and no-show decisions, and so Travel Summary's collected and still-due amounts, the
-  Daily Report's due and collected, and the accounting dashboard's "Extras · cash · month". The Trip
-  P&L, the longtail cost and the cost model wait for Fleet.
+- **Not here yet:** the Trip P&L, the longtail cost (and so the Daily Report's "net before boat
+  costs") and the cost model wait for Fleet.
 ### Proforma (Daily PFM)
 
 Legacy's Daily PFM (todo/money-model.md slice 2, migration 110): a proforma agent pays before travel,
