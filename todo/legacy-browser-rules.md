@@ -28,9 +28,9 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 
 ## Summary
 
-823 rules. **494 are owned here** (307 as legacy, 187 differently), 23 were decided against, and
-**306 are missing**: 9 change seats, 62 change money, 68 the day's operations, 75 data quality, and
-92 are warnings, conveniences or dashboard figures.
+824 rules. **498 are owned here** (307 as legacy, 191 differently), 23 were decided against, and
+**303 are missing**: 9 change seats, 60 change money, 68 the day's operations, 75 data quality, and
+91 are warnings, conveniences or dashboard figures.
 
 | Area | Built | Built differently | Decided not to copy | Missing |
 |---|---:|---:|---:|---:|
@@ -51,15 +51,15 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 | Money: pier money | 13 | 2 | 0 | 10 |
 | Money: cash on tour and after the trip | 5 | 2 | 0 | 1 |
 | Money: van bills | 9 | 3 | 1 | 0 |
-| Money: reports | 7 | 3 | 0 | 16 |
+| Money: reports | 7 | 4 | 0 | 15 |
 | Money: costing (waits for Fleet) | 0 | 0 | 1 | 28 |
 | Sales, agents and contracts | 26 | 11 | 1 | 20 |
 | Catalogue | 15 | 11 | 1 | 3 |
-| Fleet | 61 | 36 | 4 | 38 |
+| Fleet | 61 | 39 | 4 | 36 |
 | Users and permissions | 12 | 7 | 5 | 3 |
 | B2C sync | 1 | 2 | 2 | 2 |
 | Misc | 1 | 4 | 2 | 3 |
-| **Total** | **307** | **187** | **23** | **306** |
+| **Total** | **307** | **191** | **23** | **303** |
 
 A row is one rule; the same check repeated in several functions is one row. Counts come from the
 tables below (`missing?` counted as missing).
@@ -240,8 +240,7 @@ holds its rows.
 
 30. Dashboard, Action Board and Sales Board figures (`renderDash`, `abRender`, `renderSalesBoard`,
     `_dashBoardData`), market intelligence and sales analytics (`md*`, `pmap*`, `b2d*`), the
-    cancellation report, the Ops and Fleet decks (`repOpsGather`, `repFleetGather`), fleet
-    analytics (cost, fuel intelligence, insights, project hub), rate expiry scan (`rtExpScan`),
+    cancellation report, the Ops deck (`repOpsGather`), the fleet project hub, rate expiry scan (`rtExpScan`),
     agent health flags and contract-expiry alerts, seat-lock coverage and KPIs, Travel Summary
     scopes (pier, route, VAT) and the cancelled/moved lists, slip packs, the Daily Report's
     operations side and email settings, deployment templates, Daily Availability templates,
@@ -861,7 +860,7 @@ On-tour sales, pier payments, and the pier petty-cash book (`pc*`, `po_cash_*`).
 | Dashboard KPIs | `renderDash` (core) | computed | missing | [ux] |
 | Agent's recent bookings by month and route | `agSumRows`, `agSumBlock` (app) | computed | missing | [ux] |
 | Ops deck: real heads, fill, trips run, B2B/B2C, deltas | `repOpsGather` (app) | computed | missing | [ux] |
-| Fleet deck: availability, repairs, memo spend, hours, stock | `repFleetGather` (app) | computed | missing | memo-spend only [ux] |
+| Fleet deck: availability, repairs, memo spend, hours, stock | `repFleetGather` (app) | computed | built differently | `GET /v1/fleet/reports/fleet`: repairs are jobs' computed cost by close date (legacy: the stored cost by start date); total spend counts a job's memos once |
 | B2B dashboard: windows, classes, revenue bridge | `b2dLines`, `b2dCls`, `b2dBridge` (app) | computed | missing | [ux] |
 | Market intelligence import and analytics | `mdIngest`, `mdTabSales`, `pmapAgg` (app) | computed / sweep | missing | `sb_market_*` no home [data] |
 
@@ -1137,9 +1136,10 @@ already records are cited; "not flagged" means it does not.
 | `loc` from a fixed list | `fmtLoc`, `parseLoc` (core) | computed | missing | stored as sent [data] |
 | Project boat hold sync; stuck-boat self-heal | flLoad hooks (fleet) | sweep | built differently | computed from open work (part A) |
 | Dashboard counts and fleet score | `renderDash` (core) | computed | built differently | statuses built; score the client's |
-| Cost analytics | `costAggregate`, `laMemoDirectShare` (fleet) | computed | missing | Open part B 3 [money] |
-| Fuel intelligence; fuel budget | `_fuelAgg`, `fuelSetBudget` (fleet) | computed | missing | Open part B 3 [money] |
-| Insights; projects hub and YoY | `flRenderInsights`, `flProjYoYStats` (fleet) | computed | missing | [ux] |
+| Cost analytics | `costAggregate`, `laMemoDirectShare` (fleet) | computed | built differently | `GET /v1/fleet/reports/cost`: a done job by its close date, a job in progress in every period (`fleet-maintenance-model.md` Flagged) |
+| Fuel intelligence; fuel budget | `_fuelAgg`, `fuelSetBudget` (fleet) | computed | built differently | `GET /v1/fleet/reports/fuel`, `PUT /v1/fleet/fuel-budgets/{month}` (budget stored, legacy kept it in one browser) |
+| Insights | `flRenderInsights` (fleet) | computed | built differently | `GET /v1/fleet/insights`: job cost by close date, service due since the last service against the engine's interval (legacy mixed start dates and modulo) |
+| Projects hub and YoY | `flProjYoYStats` (fleet) | computed | missing | [ux] |
 | Safety matrix | `flRenderSafetyList` (eng) | computed | missing | [ux] |
 | Fleet Deployment planning board | `flRenderDeployment`, `fd*` (fleet) | warning | decided not to copy | decision 12 |
 | Data-integrity warnings on load | `flValidateDataIntegrity` (fleet) | sweep | built differently | numbers checked on create |

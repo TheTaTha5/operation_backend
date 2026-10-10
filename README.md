@@ -4186,15 +4186,67 @@ project is `400`.
 **Fuel budget.** `GET /v1/fleet/fuel-budgets` → `{budgets: [{month, amount, set_at, set_by}]}`; `PUT
 /v1/fleet/fuel-budgets/{YYYY-MM} {amount}` (baht, more than 0; `null` removes it) → the month.
 
-**Reports.**
+**Reports.** Every fleet report reads the same two definitions (decided 2026-10-10;
+`todo/fleet-maintenance-model.md`, "Design — insights"):
+
+- **A job's cost** is what `GET /v1/fleet/jobs/{id}` answers (parts from stock not already paid by one of
+  its parts memos, plus its approved, received and paid memos), **dated by the job's close date**. An
+  open job has no date: it is in no period's spend, and reports show its cost so far as open or in
+  progress, as of today. A job's duration is start to close with both days counted.
+- **Service due** is hours since the engine's last service (else since the hours it came with) against
+  its own `service_interval`; an engine with no interval is never due.
 
 | `GET` | What (legacy) |
 |---|---|
-| `/v1/fleet/reports/cost?period=all\|ytd\|last30\|month` | `costAggregate`: jobs done or in progress, each costed as `GET /v1/fleet/jobs` does and split equally over the categories of its assets (`hull`, `engine`, `gearbox`, `propeller`, `other`); memos with a boat and no job as `memo` (the share not bought into stock, `directShare`); `central` (no boat, or the stock share) apart from the total. `{total, done, proc, n_done, n_proc, n_jobs, boats_serviced, average_per_job, central, categories, by_type, outcomes, months (12), boats, units (top 10), rows}`. A job's date is its end date, else its start |
-| `/v1/fleet/reports/upkeep?month=YYYY-MM` | `renderConsumables`: per boat `repairs` (jobs started that month, any status) + `consumables` (`qty × unit_cost`, rounded) = `upkeep`; `draws`, `oil_drawn` |
+| `/v1/fleet/reports/cost?period=all\|ytd\|last30\|month` | `costAggregate`: jobs done or in progress, each costed as `GET /v1/fleet/jobs` does and split equally over the categories of its assets (`hull`, `engine`, `gearbox`, `propeller`, `other`); memos with a boat and no job as `memo` (the share not bought into stock, `directShare`); `central` (no boat, or the stock share) apart from the total. `{total, done, proc, n_done, n_proc, n_jobs, boats_serviced, average_per_job, central, categories, by_type, outcomes, months (12), boats, units (top 10), rows}`. A done job is in the period it closed in (with no close date: `all` only); a job in progress has `date: null` and counts as `proc` in every period. `months[]`: done jobs by close month; `proc` there is the direct memos not yet paid |
+| `/v1/fleet/reports/upkeep?month=YYYY-MM` | `renderConsumables`: per boat `repairs` (jobs closed that month) + `consumables` (`qty × unit_cost`, rounded) = `upkeep`; `draws`, `oil_drawn` |
 | `/v1/fleet/reports/fuel?month=YYYY-MM` | `renderFuelIntel`: company boats' days that ran (booked pax, a route, or fuel); cost = fuel × the boat's, else its home pier's, price that day (no other fallback: `price_missing`). `{cost, fuel, pax, trip_days, cost_per_pax, previous, change_pct, projection, budget, over_budget, anomalies (a day above 1.3 × the boat's month average, 3+ fuel days), missing (ran, no fuel), logged_pct, boats (with routes), efficiency (L per engine hour from the `normal` meters, best/thirsty), efficiency_median, families (fuel, cost, pax, revenue, % of revenue), weekly (W1–W5), trend (per boat: base month, weeks, 6 months)}` |
-| `/v1/fleet/dashboard?date=` | `flRenderDashboard`: `piers` (company boats by pier that day), `board` (open jobs not parked by lane, `boats_down`, `money_tied`, `silent_over_60`, `no_owner`, `parked`), `pending_work` per boat, `engines` by model, `spares`, `low_stock`, `memos`, `incidents`, `service_due` (500 h, ≥ 70 % of the way), `cost_trend` (6 months) |
+| `/v1/fleet/dashboard?date=` | `flRenderDashboard`: `piers` (company boats by pier that day), `board` (open jobs not parked by lane, `boats_down`, `money_tied`, `silent_over_60`, `no_owner`, `parked`), `pending_work` per boat, `engines` by model, `spares`, `low_stock`, `memos`, `incidents`, `service_due` (engines on a boat with an interval, listed from 70 % of the way: `{count, engines (top 5): [{engine_id, boat_id, boat_name, model, hours, interval, since, remaining, pct, overdue, critical (≥ 95 %)}]}`), `cost_trend` (6 months: jobs closed each month, their cost) |
 | `/v1/fleet/repair-history?boat_id=` | the boat's done jobs in legacy's `repairHistory` shape, latest first: legacy wrote a copy at every close and read none; here it is computed |
+| `/v1/fleet/insights?period=month\|quarter\|ytd\|all` | `flRenderInsights` (below) |
+| `/v1/fleet/reports/fleet?from=&to=` | the Fleet Report, `repFleetGather` (below) |
+
+**Fleet Insights** (`GET /v1/fleet/insights?period=`, default `month`; the period runs from its first
+day to today; `400` for another period). Computed, nothing stored. A login tied to an agent gets `403`.
+
+| Field | What |
+|---|---|
+| `fleet` | company boats (not charter, not retired): `company_boats`, `available`/`fixing`/`unavailable` (effective status today), `piers` (today's pier; a boat held at a shop is at none) |
+| `kpis` | `incidents` (dated in the period), `incidents_critical` (priority ≥ 4), `jobs_closed`, `spent` (their cost), `average_per_job`, `active_jobs`, `pending_jobs`, `open_cost` (open jobs now) |
+| `boats[]` | per company boat, by cost: `jobs` (closed in the period, plus still open and opened in it), `jobs_closed`, `jobs_active`, `cost` (closed in the period), `open_cost`, `incidents`, `status`, `health` (`critical`: 3+ jobs or ฿100,000+; `watch`: 1+ job; else `healthy`) |
+| `alert_boat` | the first boat with cost or jobs |
+| `trend` | `months` (6: cost and count of jobs closed, incidents), `cost_delta_pct`, `incidents_delta_pct` (this month against last), `top_boat` (this month's) |
+| `by_supplier` | memos approved, ordered, received or paid, dated in the period, by supplier (the memo's; else the one most of its stock items name; else read from `ref_note`; else `Other`): `{memos, suppliers, amount, rows}` |
+| `by_type` | jobs closed in the period by type: cost and count |
+| `healthy` | company boats with no jobs and available today |
+| `service_due` | engines on a boat within 20 % of their interval or overdue, soonest first: `{engine_id, serial, model, brand, boat_id, boat_name, hours, since, interval, left, overdue}` |
+| `memos` | `pending`, `pending_amount`, `pending_nos` (first 3), `received`, `received_amount`, `approval_rate` (approved or later of all memos; null under 3 memos) |
+| `awaiting_invoice` | done jobs marked awaiting the invoice that no memo names, `days_since` the close |
+| `documents` | each type's current certificate on company boats expiring within 60 days or expired: `expired`, `critical` (≤ 14 days), `warning`, `items` |
+| `closing_speed` | average days (start to close) of the jobs closed in the period against those closed before it; null under 3 done jobs |
+| `recurring_incidents` | boats with 2+ incidents in the period |
+| `long_running` | jobs in progress started 14+ days ago |
+| `cost_concentration` | the top boat when it took over half the period's spend, else null |
+
+**The Fleet Report** (`GET /v1/fleet/reports/fleet?from=YYYY-MM-DD&to=YYYY-MM-DD`; both required, `to` not
+before `from`, at most 366 days, else `400`; agent logins `403`). `{from, to, days, current, previous,
+stock, data_gaps}`: `current` is the range, `previous` the same number of days just before it, each:
+
+| Field | What |
+|---|---|
+| `availability` | every boat not retired (charter boats too), day by day, by the effective status: `boats_registered`, `boats_in_service` (available at least one day), `idle_boats` (never; left out of the rate), `down_days`, `availability_pct`, `down_by_boat` (`days`, `available_pct`) |
+| `incidents` | dated in the range: `count`, `open`, `serious` (critical or major), `by_severity`, `by_boat` |
+| `jobs` | `closed` (in the range), `opened` (started in it), `average_days`, `cost` (of the closed), `with_cost`, `open_list` (open jobs started by `to`, `age` in days at `to`, oldest first) |
+| `spend` | `repairs` (= `jobs.cost`), `purchasing` (memos), `total` (repairs plus the memos that name no job, so a job's memo counts once) |
+| `engine_hours` | per boat, last minus first meter reading (above 0) per engine in the range, every trip type: `total`, `reads`, `by_boat` (`hours`, `per_day`) |
+| `projects` | overlapping the range, cancelled ones left out: `active`, `completed`, `late` (past the planned end, not completed), `list` (`late_days`) |
+| `memos` | dated in the range, not cancelled, after discount (before VAT): `count`, `amount`, `pending`, `pending_amount`, `by_supplier`, `by_type` |
+
+`stock` is now: `items`, `at_zero`, `in_stock`, `with_min`, `below_min`, `value` (qty × cost), `uniform_min`
+(the minimum when every item that has one shares it), `out` (items at zero, dearest first). `data_gaps`
+lists legacy's "where the data is thin" as `{code, level, …numbers}`: `jobs_without_cost`,
+`no_project_budget`, `safety_default_pm` (still on 2026-01-01), `few_consumables` (under 10),
+`idle_boats`, `uniform_min`. The headline, agenda and "what needs a decision" are the screen's text.
 
 **Import.** `import:fleet` also copies `boats__assignments` (legacy's id; `cancelled` kept; legacy kept
 no creator).
