@@ -85,7 +85,9 @@ test('insights: the period, spend by close date, boat health, trend, suppliers, 
   assert.deepEqual(r.kpis, { incidents: 2, incidents_critical: 1, jobs_closed: 3, spent: 1200, average_per_job: 400, active_jobs: 2, pending_jobs: 1, open_cost: 500 },
     'j1 started in April but closed in May: May\'s (rule 1); the open job is not spend');
   assert.deepEqual(r.boats.map((b) => [b.boat_id, b.jobs, b.jobs_active, b.cost, b.open_cost, b.incidents, b.health]),
-    [['b1', 2, 0, 1200, 0, 0, 'watch'], ['b2', 3, 2, 0, 500, 2, 'critical'], ['b5', 0, 0, 0, 0, 0, 'healthy']], 'jobs = closed in the period + open now (rule 4)');
+    [['b1', 2, 0, 1200, 0, 0, 'watch'], ['b2', 2, 1, 0, 0, 2, 'watch'], ['b5', 0, 0, 0, 0, 0, 'healthy']], 'jobs = closed in the period + still open and opened in it (rule 4): j3, open since April, is not May\'s');
+  assert.deepEqual(insights({ ...input, period: 'all' }).boats.map((b) => [b.boat_id, b.jobs, b.jobs_active, b.open_cost, b.health]),
+    [['b1', 3, 0, 0, 'critical'], ['b2', 3, 2, 500, 'critical'], ['b5', 0, 0, 0, 'healthy']]);
   assert.deepEqual(r.alert_boat, { boat_id: 'b1', name: 'Alpha', jobs: 2, cost: 1200, incidents: 0 });
   assert.deepEqual(r.trend.months.map((m) => [m.month, m.cost, m.jobs, m.incidents]),
     [['2029-12', 0, 0, 0], ['2030-01', 0, 0, 0], ['2030-02', 0, 0, 0], ['2030-03', 0, 0, 0], ['2030-04', 300, 1, 1], ['2030-05', 1200, 3, 2]], 'by close month');
@@ -312,7 +314,9 @@ test('Fleet Insights through the API: a boat\'s jobs, cost, alerts, service due 
   const r = ok(await call(sales, 'GET', '/v1/fleet/insights'));
   assert.deepEqual([r.period, r.from, r.to], ['month', `${today.slice(0, 7)}-01`, today]);
   const mine = r.boats.find((b: { boat_id: string }) => b.boat_id === boat.id);
-  assert.deepEqual([mine.jobs, mine.jobs_closed, mine.jobs_active, mine.cost, mine.incidents, mine.health], [3, 1, 2, 300, 2, 'critical'], 'closed this month + open now');
+  const longIn = addDays(today, -20) >= r.from ? 1 : 0;
+  assert.deepEqual([mine.jobs, mine.jobs_closed, mine.jobs_active, mine.cost, mine.incidents, mine.health], [2 + longIn, 1, 1 + longIn, 300, 2, longIn ? 'critical' : 'watch'],
+    'closed this month + still open and opened this month');
   assert.ok(!r.healthy.some((b: { boat_id: string }) => b.boat_id === boat.id));
   assert.deepEqual(r.awaiting_invoice.jobs.find((j: { job_id: string }) => j.job_id === closed.id)?.days_since, 0);
   assert.equal(r.long_running.find((j: { job_id: string }) => j.job_id === long.id)?.days, 20);

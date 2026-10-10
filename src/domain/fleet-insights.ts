@@ -104,9 +104,11 @@ export function insights(input: InsightsInput) {
   const incs = input.incidents.filter((i) => inPeriod(i.date));
   const spent = closed.reduce((s, j) => s + cost(j), 0);
 
-  // Per company boat. Rule 4: its jobs are those closed in the period plus those open now.
+  // Per company boat. Rule 4: its jobs are those closed in the period, and those still open that were
+  // opened in it (an open job has no close date; its start is its only date). Spend stays rule 1.
+  const openIn = open.filter((j) => from === null || inPeriod(j.start_date));
   const stats = company.map((b) => {
-    const mineClosed = closed.filter((j) => j.boat_id === b.id), mineOpen = open.filter((j) => j.boat_id === b.id);
+    const mineClosed = closed.filter((j) => j.boat_id === b.id), mineOpen = openIn.filter((j) => j.boat_id === b.id);
     return {
       boat_id: b.id, name: b.name, pier: b.pier, status: b.status,
       jobs: mineClosed.length + mineOpen.length, jobs_closed: mineClosed.length, jobs_active: mineOpen.length,
