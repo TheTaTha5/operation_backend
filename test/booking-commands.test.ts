@@ -83,7 +83,7 @@ test('a PATCH that changes the status or a server-set field is refused, naming t
   const booking = await booked('2038-01-06');
   const status = await request('PATCH', `/v1/bookings/${booking.id}`, { status: 'pending_approval' });
   assert.equal(status.statusCode, 400);
-  assert.match(status.json().message, /^status cannot be changed with PATCH: use POST \/v1\/bookings\/\{id\}\/confirm, \/approve, \/reject, \/cancel, \/cancel-weather or \/restore$/);
+  assert.match(status.json().message, /^status cannot be changed with PATCH: use POST \/v1\/bookings\/\{id\}\/confirm, \/approve, \/reject, \/unconfirm, \/cancel, \/cancel-weather or \/restore$/);
   assert.equal((await request('PATCH', `/v1/bookings/${booking.id}`, { confirmedBy: 'boss' })).statusCode, 400);
   assert.equal((await request('PATCH', `/v1/bookings/${booking.id}`, { bookedAt: '2020-01-01T00:00:00Z' })).statusCode, 400);
   assert.equal((await request('GET', `/v1/bookings/${booking.id}`)).json().status, 'confirmed', 'nothing changed');

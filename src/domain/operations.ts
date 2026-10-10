@@ -2,7 +2,7 @@ import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, is
 import { byCreated, matchesLock, poolLocks, type GroupRow, type LockEvent, type LockQuery, type LockRow, type NewLockEvent } from './seat-locks.js';
 import { formatPaxGrid, paxKey, paxTotal, retargetPax, type PaxGrid, type PaxRow } from './pax.js';
 import { holdsSeats, SEAT_RELEASING_STATUSES, type BookingStatus } from './booking-status.js';
-import { assertDayFits, capacityNumbers, dayCapacity, licenceShortfall, weighDay, type Capacity, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
+import { assertDayFits, capacityNumbers, charterDisplacement, dayCapacity, licenceShortfall, sellsUngated, weighDay, type Capacity, type CharterDisplacement, type DayDemand, type DayState, type HeldTrip } from './capacity.js';
 import { applyBookingHeader, type BookingHeader, type BookingHeaderPatch } from './booking-header.js';
 import { withSeq, type BookingPassenger, type BookingPassengerInput } from './booking-passengers.js';
 import type { BookingAddOn, BookingAddOnInput } from './booking-addons.js';
@@ -13,7 +13,7 @@ import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
 import type { Change, ChangeInput } from './changes.js';
 import { docCheckStatus, docCheckView, copyDocCheck, type DocCheck, type DocCheckView } from './doc-check.js';
 import type { AttachmentRef, BookingDocument, DocumentRow, StoredFile } from './attachments.js';
-import { bookingIdsOf, bookingInvoice, copyInvoice, returnedOf, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment, type StoredRefund } from './invoices.js';
+import { bookingIdsOf, bookingInvoice, copyInvoice, invoiceMonth, returnedOf, type BookingInvoice, type InvoiceBrief, type PaymentState, type StoredInvoice, type StoredPayment, type StoredRefund } from './invoices.js';
 import { matchesClosureQuery, planClose, sortClosures, type ClosureListQuery, type WeatherCase, type WeatherClosure } from './weather.js';
 import type { PfmEvent } from './pfm.js';
 import type { StoredHandover, StoredPayout, StoredPierPayment, StoredTourSale } from './pier-money.js';
@@ -23,7 +23,7 @@ import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
   confirmationStamp, externalIdTaken, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelRequest, type HistoryEntry, type HistoryLine,
-  type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
+  type PartialCancelRequest, type RescheduleRequest, type RestoreWarning, type SeatsShortWarning, displacedLines,
 } from './booking-actions.js';
 import {
   agentSummary, agentView, latestActivity, selectAgents, sortMarkets, sortSalesPeople,
@@ -35,10 +35,11 @@ import {
   type CatalogueRoute, type RateType, type RateTypeCreate, type RateTypeListQuery, type RateTypePatch, type RateTypeRows, type RateTypeSummary, type RouteBlock,
 } from './rate-types.js';
 import {
-  bookingHoldsSeats, decidedRecord, decideStatus, discountOf, focCountOf, pendingApproval, reweigh, sortApprovalDays,
-  type ApprovalDay, type ApprovalKind, type ApprovalWarning, type BookingApproval, type Intent, type NewApproval,
+  bookingHoldsSeats, decidedRecord, decideStatus, discountOf, focCountOf, pendingApproval, reweigh, settleEdit, sortApprovalDays, stillOverAsQuote,
+  type ApprovalDay, type EditFacts, type ApprovalKind, type ApprovalWarning, type BookingApproval, type Intent, type NewApproval,
 } from './booking-approvals.js';
 import { pickupFields, type PickupWindow } from './pickup.js';
+import { bookingCode, codeSequence } from './booking-code.js';
 import { usernameTaken, type NewUser, type StoredUser, type UserPatch } from './users.js';
 import { clearedOnMove, dispatchView, EMPTY_DISPATCH, type StoredDispatch, type TripDispatch } from './dispatch.js';
 import { rebalanceParts, vanPartsView, type StoredVanPart, type VanGroup } from './van-groups.js';
@@ -120,7 +121,13 @@ export type TripDetails = PickupWindow & { zone?: string; ovn?: OvnMode; ovn_ret
 export type OvnMode = 'return' | 'self';
 /** `ovn_of` is an index into the same trip list, on input and on the wire. */
 export type BookingTripInput = TripDetails & { id?: string; route_id: string; service_date: string; booking_mode?: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws?: LockDraw[]; ovn_of?: number };
-export type BookingTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number>; ovn_leg: boolean; ovn_of?: number;
+/**
+ * Ops' acknowledgement that a charter took a boat with seats already sold (`displace_anyway`, legacy
+ * `charterDisplacementAck`; migration 221): when, and who. Server-owned: stamped by the create or edit
+ * that let it through, never taken from a trip sent.
+ */
+export type DisplacementAck = { charter_displaced_at?: string; charter_displaced_by?: string };
+export type BookingTrip = TripDetails & DisplacementAck & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxGrid; pax_total: number; charter_boat_id?: string; lock_draws: Record<string, number>; ovn_leg: boolean; ovn_of?: number;
   /** Day-of-operations dispatch (src/domain/dispatch.ts): always present, empty when nothing is set. */
   operations: TripDispatch;
 };
@@ -155,6 +162,8 @@ export type BookingInput = {
   attachments?: DocumentRow[];
   /** Who can't eat what, for the kitchen (`allergies.ts`). Defaults to none. */
   allergy_list?: Allergy[];
+  /** Charter a boat whose seats the day has sold, knowingly (legacy's displacement dialog). Not stored: the trip's acknowledgement is. */
+  displace_anyway?: boolean;
   /**
    * Original booking payload retained for operations, reconciliation, and audit import.
    *
@@ -165,7 +174,10 @@ export type BookingInput = {
 };
 
 export type Booking = BookingHeader & {
+  /** `booking_<uuid>`: the key every other record names. */
   id: string;
+  /** The readable number staff and agents see, `BK-YYMMNNNN` (`booking-code.ts`); legacy's own on an imported booking. Server-owned. */
+  code: string;
   status: BookingStatus;
   /** 1 on create, +1 on every write. Send it back as `If-Match` to refuse a stale save. */
   version: number;
@@ -268,7 +280,7 @@ export type BookingListQuery = {
   order?: 'asc' | 'desc';
   /** Any of these statuses. Absent means every status. */
   statuses?: BookingStatus[];
-  /** Already lower-cased: a substring of the id, `voucher_ref` or `lead_pax`, compared lower-cased. */
+  /** Already lower-cased: a substring of the id, `code`, `voucher_ref` or `lead_pax`, compared lower-cased. */
   q?: string;
   /** Already lower-cased: the whole `voucher_ref`, compared lower-cased. */
   voucherRef?: string;
@@ -284,7 +296,7 @@ export type RouteDay = DayState & { route_id: string; service_date: string };
 
 /** A booking exactly as it is stored: trips as rows, nothing derived. Both stores hydrate into this. */
 /** Stored, `ovn_of` is the outbound trip's id rather than its index, so it survives a reorder. */
-export type StoredTrip = TripDetails & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
+export type StoredTrip = TripDetails & DisplacementAck & { id: string; seq: number; route_id: string; service_date: string; booking_mode: string; pax: PaxRow[]; charter_boat_id?: string; lock_draws: LockDraw[]; ovn_leg: boolean; ovn_of?: string };
 export type StoredBooking = Omit<Booking, 'trips' | 'route_id' | 'service_date' | 'booking_mode' | 'pax' | 'allocated_pax' | 'reconfirm' | 'upgrades' | 'attachments' | 'allergy_count' | 'special_request' | 'doc_check' | 'doc_check_status' | 'invoice' | 'payment_state'> & { trips: StoredTrip[]; upgrades: StoredUpgrade[]; attachments: DocumentRow[] };
 
 /**
@@ -1024,6 +1036,8 @@ export class OperationsStore {
   private invoices = new Map<string, StoredInvoice>();
   private payments = new Map<string, StoredPayment>();
   private invoiceCounters = new Map<string, number>();
+  /** The last booking code given per Bangkok month (migration 220's `booking_code_counters`). */
+  private bookingCodeCounters = new Map<string, number>();
   /** As PostgreSQL's: the invoices naming the booking on a line not taken off. */
   private invoiceBriefs(bookingId: string): InvoiceBrief[] {
     return [...this.invoices.values()].filter((i) => i.lines.some((l) => l.booking_id === bookingId && !l.removed_at)).map((i) => ({
@@ -1497,7 +1511,7 @@ export class OperationsStore {
   }
 
   /** `exclude` leaves a lock out of the seats it is weighed against: a whole-boat hold being converted into this booking. */
-  createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Booking {
+  createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Booking & { warnings?: CharterDisplacement[] } {
     if (input.external_id !== undefined) {
       const taken = [...this.bookings.values()].find((booking) => booking.external_id === input.external_id);
       if (taken) externalIdTaken(input.external_id, taken.id);
@@ -1506,22 +1520,23 @@ export class OperationsStore {
     this.assertRoutes(input.trips);
     this.assertOpen(tripsToCheckOpen(input.external_id, [], planned));
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
+    const displaced: CharterDisplacement[] = [];
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
-      overDays: this.weighTrips(input.trips, exclude, input.agent_id),
+      overDays: this.weighTrips(input.trips, exclude, input.agent_id, { anyway: input.displace_anyway === true, found: displaced }),
     }, actor);
     const status = decision.status;
     const now = this.now();
     const id = this.id('booking');
     // The header is flattened onto the booking, not nested under a `header` key: these are columns
     // in PostgreSQL, and a store that held them one level down would answer a different shape.
-    const { trips, header, passengers, add_ons, adjustments, alt_pickups, upgrades, attachments, allergy_list, intent: _intent, ...rest } = input;
+    const { trips, header, passengers, add_ons, adjustments, alt_pickups, upgrades, attachments, allergy_list, intent: _intent, displace_anyway: _displace, ...rest } = input;
     // `booking_data` is what PostgreSQL's create writes: the input's blob if it carries one, otherwise
     // the column's `{}`. Nothing sends one since the blob stopped being written (2026-09-22), so both
     // stores answer `{}` for a new booking rather than one answering `{}` and the other nothing.
     const booking: StoredBooking = {
-      ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}),
-      booking_data: rest.booking_data ?? {}, id, status, version: 1, created_at: now, updated_at: now, trips: planned,
+      ...rest, ...header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}), code: this.nextBookingCode(now),
+      booking_data: rest.booking_data ?? {}, id, status, version: 1, created_at: now, updated_at: now, trips: stampDisplaced(planned, displaced, actor, now),
       passengers: withSeq(passengers ?? []), add_ons: withSeq(add_ons ?? []), adjustments: withSeq(adjustments ?? []), alt_pickups: (alt_pickups ?? []).map((a) => ({ ...a })),
       upgrades: storedUpgrades(upgrades ?? [], [], now, actor ?? null).upgrades, attachments: (attachments ?? []).map((d) => ({ ...d })), allergy_list: (allergy_list ?? []).map((a) => ({ ...a })), reschedules: [], partial_cancels: [], fee_items: [], approvals: [],
     };
@@ -1530,14 +1545,30 @@ export class OperationsStore {
     this.log(id, createdLine(actor));
     for (const line of decision.history) this.log(id, line);
     for (const line of storedUpgrades(upgrades ?? [], [], now, actor ?? null).history) this.log(id, line);
-    return this.view(booking);
+    for (const line of displacedLines(actor, displaced)) this.log(id, line);
+    return withWarnings(this.view(booking), displaced);
   }
 
-  /** The days the trips put over the allotment (`weighDay`), after refusing what legacy refuses. */
-  private weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, agentId?: string | null): ApprovalDay[] {
+  /** The next `BK-YYMMNNNN` of the Bangkok month: past the counter and every code already given (`bookingCode`). */
+  private nextBookingCode(now: string): string {
+    const month = invoiceMonth(new Date(now));
+    const n = Math.max(this.bookingCodeCounters.get(month) ?? 0, ...[...this.bookings.values()].map((b) => codeSequence(b.code, month))) + 1;
+    this.bookingCodeCounters.set(month, n);
+    return bookingCode(month, n);
+  }
+
+  /**
+   * The days the trips put over the allotment (`weighDay`), after refusing what legacy refuses. A
+   * charter that takes seats already sold is refused unless `displace.anyway`; it is then collected
+   * in `displace.found`.
+   */
+  private weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, agentId?: string | null, displace?: DisplaceCheck): ApprovalDay[] {
     const over: ApprovalDay[] = [];
     for (const demand of demandByDay(trips, agentId)) {
-      const weight = weighDay(this.day(demand.route_id, demand.service_date, exclude), demand);
+      const day = this.day(demand.route_id, demand.service_date, exclude);
+      const displaced = charterDisplacement(day, demand);
+      const weight = weighDay(day, demand, displace?.anyway === true);
+      if (displaced) displace?.found.push(displaced);
       if (weight) over.push({ route_id: demand.route_id, service_date: demand.service_date, ...weight });
     }
     return over;
@@ -1604,7 +1635,7 @@ export class OperationsStore {
       .filter((b) => !query.statuses || query.statuses.includes(b.status))
       .filter((b) => query.voucherRef === undefined || lower(b.voucher_ref) === query.voucherRef)
       .filter((b) => query.updatedSince === undefined || b.updated_at >= query.updatedSince)
-      .filter((b) => query.q === undefined || [b.id, b.voucher_ref, b.lead_pax].some((field) => lower(field).includes(query.q!)))
+      .filter((b) => query.q === undefined || [b.id, b.code, b.voucher_ref, b.lead_pax].some((field) => lower(field).includes(query.q!)))
       .filter((b) => b.trips.some((t) => (!query.routeId || t.route_id === query.routeId)
         && (!query.serviceDate || t.service_date === query.serviceDate)
         && (!query.from || t.service_date >= query.from)
@@ -1617,24 +1648,26 @@ export class OperationsStore {
   booking(id: string): Booking | undefined { const value = this.bookings.get(id); return value && this.view(value); }
 
   /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
-  amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine): Booking | undefined {
+  amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine, flags: AmendFlags = {}): (Booking & { warnings?: CharterDisplacement[] }) | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
-    assertEditable(booking.status);
+    assertEditable(booking.status, flags.editAnyway);
     const changes = stripServerOwned(requested, booking as unknown as Record<string, unknown> & { status: BookingStatus });
     const replacement = nextTrips(booking.trips, changes);
     const planned = planTrips(booking.trips, replacement, () => this.id('trip'));
     this.assertRoutes(replacement);
     this.assertOpen(tripsToCheckOpen(booking.external_id, booking.trips, planned));
+    const displaced: CharterDisplacement[] = [];
     const reweighed = reweighs(booking, changes, claimsMoreSeats(booking.trips, planned))
-      ? reweigh(booking, this.weighTrips(replacement, { bookingId: id }, booking.agent_id), actor) : undefined;
+      ? reweigh(booking, this.weighTrips(replacement, { bookingId: id }, booking.agent_id, { anyway: flags.displaceAnyway === true, found: displaced }), actor) : undefined;
+    const decided = settleEdit(booking, reweighed, editFacts(booking, changes, planned), actor);
     const line = entry ?? editedLine(actor, changes, booking.status);
-    this.retrip(booking, planned);
-    if (reweighed) {
-      if (reweighed.request) this.requestApprovals(booking, [reweighed.request]);
-      else this.replacePending(booking, 'approval');
-      if (reweighed.status === 'confirmed' && !booking.confirmed_at) Object.assign(booking, confirmationStamp(actor, this.now()));
-      booking.status = reweighed.status;
+    this.retrip(booking, stampDisplaced(planned, displaced, actor, this.now()));
+    if (decided) {
+      if (decided.clearApproval) this.replacePending(booking, 'approval');
+      this.requestApprovals(booking, decided.requests);
+      if (decided.status === 'confirmed' && !booking.confirmed_at) Object.assign(booking, confirmationStamp(actor, this.now()));
+      booking.status = decided.status;
     }
     // Applied after the capacity check, so a refused amendment leaves the header as it was too.
     if (changes.header) applyBookingHeader(booking as Record<string, unknown>, changes.header);
@@ -1651,8 +1684,9 @@ export class OperationsStore {
     booking.version += 1;
     this.log(id, line);
     for (const extra of sold ? sold.history : []) this.log(id, extra);
-    for (const extra of reweighed?.history ?? []) this.log(id, extra);
-    return this.view(booking);
+    for (const extra of decided?.history ?? []) this.log(id, extra);
+    for (const extra of displacedLines(actor, displaced)) this.log(id, extra);
+    return withWarnings(this.view(booking), displaced);
   }
 
   cancelBooking(id: string, request: CancelRequest, actor?: string): Booking | undefined {
@@ -1680,33 +1714,36 @@ export class OperationsStore {
     if (!booking) return undefined;
     const plan = planStatusCommand(command, booking, request, actor);
     const warnings = plan.claims ? licenceWarnings(booking.trips, (routeId, date) => this.day(routeId, date, { bookingId: id })) : [];
+    const still = plan.weigh_again ? stillOverAsQuote(this.weighTrips(inputsOf(booking.trips), { bookingId: id }, booking.agent_id), actor) : undefined;
     const now = this.now();
     if (plan.decide) {
       const pending = pendingApproval(booking.approvals, plan.decide.kind);
       if (pending) Object.assign(pending, { status: plan.decide.status, decided_by: actor ?? null, decided_at: now, note: plan.decide.note });
       else booking.approvals.push(decidedRecord(plan.decide.kind, plan.decide.status, plan.status, focCountOf(booking.trips), actor, now, plan.decide.note));
     }
-    this.requestApprovals(booking, plan.request);
-    booking.status = plan.status;
+    for (const kind of plan.withdraw ?? []) this.replacePending(booking, kind);
+    this.requestApprovals(booking, [...plan.request, ...(still ? [still.request] : [])]);
+    booking.status = still?.status ?? plan.status;
     if (plan.confirms) {
       booking.confirmed_at = now;
       if (actor === undefined) delete booking.confirmed_by; else booking.confirmed_by = actor;
     }
     if (plan.cancellation_reason !== undefined) booking.cancellation_reason = plan.cancellation_reason;
     this.touch(booking, actor);
-    for (const line of plan.history) this.log(id, line);
+    for (const line of [...plan.history, ...(still?.history ?? [])]) this.log(id, line);
     return { booking: this.view(booking), warnings };
   }
 
-  /** Back to `confirmed`, lock seats redrawn as far as the locks allow. See `restoreTrips`. */
-  restoreBooking(id: string, actor?: string): { booking: Booking; warnings: LockShortWarning[] } | undefined {
+  /** Back to `confirmed`, always, with warnings for what it could not get back. See `restoreTrips`. */
+  restoreBooking(id: string, actor?: string): { booking: Booking; warnings: RestoreWarning[] } | undefined {
     const booking = this.bookings.get(id);
     if (!booking) return undefined;
     assertRestorable(booking.status);
     const days = new Map(booking.trips.map((trip) => [dayKey(trip.route_id, trip.service_date), this.day(trip.route_id, trip.service_date, { bookingId: id })]));
-    const { trips, warnings } = restoreTrips(booking.trips, days);
+    const restored = restoreTrips(booking.trips, days);
+    const { trips } = restored;
+    const warnings = [...restored.warnings, ...restoreShortfalls(trips, days, booking.agent_id)];
     this.assertOpen(booking.trips);
-    this.assertTrips(trips, { bookingId: id }, booking.agent_id);
     this.retrip(booking, planTrips(booking.trips, trips, () => this.id('trip')));
     booking.status = 'confirmed';
     delete booking.cancellation;
@@ -1788,7 +1825,9 @@ export function nextTrips(current: readonly StoredTrip[], changes: BookingChange
   return next;
 }
 
-/** The input a stored trip would have come from, id included, so an edit derived from it stays that trip. */
+/** The inputs the stored trips would have come from, ids included: what to weigh a stored itinerary again with. */
+export const inputsOf = (trips: readonly StoredTrip[]): BookingTripInput[] => trips.map((trip) => asInput(trip, trips));
+
 /** The itinerary with one trip on another route, everything else as it is: a route upgrade. */
 export const retargetTrip = (current: readonly StoredTrip[], tripId: string, routeId: string): BookingTripInput[] =>
   current.map((trip) => ({ ...asInput(trip, current), ...(trip.id === tripId ? { route_id: routeId } : {}) }));
@@ -1853,14 +1892,20 @@ export function planTrips(current: readonly StoredTrip[], next: readonly Booking
   };
   // Ids first, so a leg's `ovn_of` index can become its outbound's id whichever comes first.
   const ids = next.map((trip) => trip.id ?? byDay(trip) ?? newId());
+  const before = new Map(current.map((trip) => [trip.id, trip]));
   return next.map((trip, seq) => {
     const charter = trip.booking_mode === 'charter';
+    // Ops' acknowledgement of a charter that displaced sold seats stays while the trip keeps that boat on that day.
+    const old = before.get(ids[seq]);
+    const acked = charter && old?.charter_displaced_at && old.booking_mode === 'charter' && old.charter_boat_id === trip.charter_boat_id
+      && old.route_id === trip.route_id && old.service_date === trip.service_date ? old : undefined;
     return {
       id: ids[seq], seq, route_id: trip.route_id, service_date: trip.service_date, booking_mode: charter ? 'charter' : 'seat', pax: trip.pax.map((row) => ({ ...row })),
       ...(charter && trip.charter_boat_id ? { charter_boat_id: trip.charter_boat_id } : {}),
       lock_draws: charter ? [] : sortedDraws(trip.lock_draws ?? []),
       ...tripDetails(trip), ovn_leg: trip.ovn_leg === true,
       ...(trip.ovn_of === undefined || ids[trip.ovn_of] === undefined ? {} : { ovn_of: ids[trip.ovn_of] }),
+      ...(acked ? { charter_displaced_at: acked.charter_displaced_at, ...(acked.charter_displaced_by ? { charter_displaced_by: acked.charter_displaced_by } : {}) } : {}),
     };
   });
 }
@@ -2053,22 +2098,61 @@ export function rescheduleTrips(trips: readonly StoredTrip[], from: string, to: 
 
 export const dayKey = (routeId: string, serviceDate: string): string => `${routeId} ${serviceDate}`;
 
+/** What an amendment's caller said yes to, legacy's dialogs (decided 2026-10-10): editing a closed booking, chartering a boat with seats sold. */
+export type AmendFlags = { editAnyway?: boolean; displaceAnyway?: boolean };
+/** Whether a charter may take seats already sold (`displace_anyway`), and where the displacements it let through are collected. */
+export type DisplaceCheck = { anyway: boolean; found: CharterDisplacement[] };
+
+/**
+ * The trips with ops' acknowledgement stamped on each charter that took a boat with seats sold
+ * (legacy `charterDisplacementAck`; who and when here). A trip that keeps its charter boat and day
+ * keeps an earlier acknowledgement (`planTrips`).
+ */
+export function stampDisplaced(planned: readonly StoredTrip[], displaced: readonly CharterDisplacement[], actor: string | undefined, now: string): StoredTrip[] {
+  return planned.map((trip) => {
+    const hit = trip.booking_mode === 'charter' && trip.charter_boat_id
+      && displaced.some((d) => d.route_id === trip.route_id && d.service_date === trip.service_date && d.boat_ids.includes(trip.charter_boat_id!));
+    if (!hit) return trip;
+    const { charter_displaced_by: _by, ...rest } = trip;
+    return { ...rest, charter_displaced_at: now, ...(actor === undefined ? {} : { charter_displaced_by: actor }) };
+  });
+}
+
+/** A create's or edit's answer, with the charters it let displace sold seats as `warnings`. */
+export const withWarnings = <B extends Booking>(booking: B, displaced: readonly CharterDisplacement[]): B & { warnings?: CharterDisplacement[] } =>
+  (displaced.length ? { ...booking, warnings: displaced.map((d) => ({ ...d, boat_ids: [...d.boat_ids] })) } : booking);
+
+/** The facts `settleEdit` weighs: FOC passengers and the discount, before and after the edit. */
+export function editFacts(stored: StoredBooking, changes: BookingChanges, planned: readonly StoredTrip[]): EditFacts {
+  const header = changes.header ?? {};
+  return {
+    focBefore: focCountOf(stored.trips), focAfter: focCountOf(planned),
+    focReason: header.foc_reason !== undefined ? header.foc_reason : stored.foc_reason,
+    discountBefore: discountOf(stored), discountAfter: header.price_discount !== undefined ? discountOf({ price_discount: header.price_discount }) : discountOf(stored),
+  };
+}
+
 /**
  * The trips a restored booking asks for, from each day's state read with the booking excluded.
  *
- * Lock seats are redrawn best-effort, as legacy does (`booking.js:12376-12385`): a lock that has
- * since been used by others gives back what it still has, and the rest of the trip falls to general
- * seats — the caller's capacity check then decides whether those exist. A charter wants its boat
- * whole again; if another charter took it meanwhile, the restore is refused rather than leaving two
- * charters on one boat, which legacy allowed and asked staff to sort out by hand.
+ * A restore always restores (legacy `bkV2RestoreBooking`, decided 2026-10-10); what it could not get
+ * back is answered as warnings and written in its history line:
+ *
+ * - Lock seats are redrawn best-effort (`booking.js:12376-12385`): a lock that has since been used by
+ *   others gives back what it still has (`lock_short`), and the rest of the trip falls to general seats.
+ * - A charter whose boat another booking took meanwhile stays a charter with no boat, to re-plan
+ *   (`charter_boat_taken`), rather than two charters on one boat.
+ * - Seats are not checked: a day the restore oversells is `seats_short` (`restoreShortfalls`).
  */
-export function restoreTrips(trips: readonly StoredTrip[], days: ReadonlyMap<string, DayState>): { trips: BookingTripInput[]; warnings: LockShortWarning[] } {
-  const warnings: LockShortWarning[] = [];
+export function restoreTrips(trips: readonly StoredTrip[], days: ReadonlyMap<string, DayState>): { trips: BookingTripInput[]; warnings: RestoreWarning[] } {
+  const warnings: RestoreWarning[] = [];
   const left = new Map<string, number>();
   const next = trips.map((trip) => {
     const day = days.get(dayKey(trip.route_id, trip.service_date));
     if (trip.booking_mode === 'charter' && trip.charter_boat_id && day?.boats.find((boat) => boat.boat_id === trip.charter_boat_id)?.chartered) {
-      refuse(`Boat ${trip.charter_boat_id} is chartered by another booking on ${trip.service_date}`, 409, 'charter_boat_taken');
+      warnings.push({ code: 'charter_boat_taken', trip_id: trip.id, boat_id: trip.charter_boat_id, route_id: trip.route_id, service_date: trip.service_date });
+      const { charter_boat_id: _taken, ...unclaimed } = asInput(trip, trips);
+      return unclaimed;
     }
     const draws = trip.lock_draws.map((draw) => {
       const remaining = left.get(draw.lock_id) ?? day?.locks.find((lock) => lock.id === draw.lock_id)?.remaining ?? 0;
@@ -2080,6 +2164,27 @@ export function restoreTrips(trips: readonly StoredTrip[], days: ReadonlyMap<str
     return { ...asInput(trip, trips), lock_draws: draws };
   });
   return { trips: next, warnings };
+}
+
+/**
+ * The days a restore oversells, from each day read with the booking left out: what its trips need
+ * from the pool (seats not drawn from a lock, and a charter's whole boat, or its passengers when it
+ * has no boat there) beyond what the day has. A day sold ungated never falls short.
+ */
+export function restoreShortfalls(trips: readonly BookingTripInput[], days: ReadonlyMap<string, DayState>, agentId?: string | null): SeatsShortWarning[] {
+  const short: SeatsShortWarning[] = [];
+  for (const demand of demandByDay(trips, agentId)) {
+    const day = days.get(dayKey(demand.route_id, demand.service_date));
+    if (!day || sellsUngated(day)) continue;
+    const drawn = [...demand.draws.values()].reduce((sum, qty) => sum + qty, 0);
+    let need = Math.max(demand.seat - drawn, 0);
+    for (const charter of demand.charters) {
+      const boat = charter.boat_id ? day.boats.find((b) => b.boat_id === charter.boat_id) : undefined;
+      need += boat ? boat.sellable : charter.pax;
+    }
+    if (need > day.available_seats) short.push({ code: 'seats_short', route_id: demand.route_id, service_date: demand.service_date, short_by: need - Math.max(day.available_seats, 0) });
+  }
+  return short;
 }
 
 /**

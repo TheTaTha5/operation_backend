@@ -91,7 +91,10 @@ const baht = (amount: number): string => `฿${Math.round(amount).toLocaleString
  *   need an FOC approval first; confirming FOC passengers needs an FOC reason.
  * - Over the allotment on any day (within the licence; over it was refused before this) → the
  *   booking waits in `pending_approval`, holding no seats.
- * - A discount on a confirm → `pending_approval` too, approved by the agent's salesperson.
+ * - A discount → `pending_approval` too, approved by the agent's salesperson, but only when the save
+ *   would otherwise be `confirmed` (legacy `bkV2CommitBooking`, `status==='confirmed' && _discAmt>0`;
+ *   decided 2026-10-10). A booking with FOC passengers goes to `pending_foc` and is not asked for its
+ *   discount; approving the FOC confirms it.
  * - When an approval is asked for, it remembers where the booking would otherwise have gone
  *   (`target_status`); approving moves it there.
  */
@@ -105,10 +108,10 @@ export function decideStatus(intent: Intent, facts: StatusFacts, by: string | un
   const asker = by ?? null;
 
   if (intent === 'confirm' && facts.focCount > 0) {
-    approvals.push({ kind: 'foc', reason: null, over_capacity: false, over_total: null, discount: null, foc_count: facts.focCount, target_status: 'confirmed', requested_by: asker, days: [] });
+    approvals.push(focRequest(facts.focCount, asker));
   }
   const overCapacity = facts.overDays.length > 0;
-  const discount = intent === 'confirm' && facts.discount > 0;
+  const discount = base === 'confirmed' && facts.discount > 0;
   if (overCapacity || discount) {
     const overTotal = facts.overDays.reduce((sum, day) => sum + day.over_by, 0);
     approvals.push({
@@ -126,6 +129,9 @@ export function decideStatus(intent: Intent, facts: StatusFacts, by: string | un
   return { status: base, approvals, history };
 }
 
+const focRequest = (count: number, asker: string | null): NewApproval =>
+  ({ kind: 'foc', reason: null, over_capacity: false, over_total: null, discount: null, foc_count: count, target_status: 'confirmed', requested_by: asker, days: [] });
+
 /**
  * What an amendment that changes the itinerary does to the status, given the days now over the
  * allotment. `undefined` when nothing changes.
@@ -136,9 +142,8 @@ export function decideStatus(intent: Intent, facts: StatusFacts, by: string | un
  *   a new approval replaces the old one; fits now → it goes where it was going, unless a discount
  *   still needs approving.
  *
- * A discount on the waiting approval is carried over: an edit does not re-ask for it, and does not
- * clear it either. (Legacy re-asks on every "Confirm" save of a discounted booking; this service
- * weighs the discount when the booking is created or confirmed.)
+ * A discount on the waiting approval is carried over: the reweigh does not re-ask for it, and does
+ * not clear it either. An edit that raises the discount or the FOC count is `settleEdit`'s.
  */
 export function reweigh(
   current: { status: BookingStatus; approvals?: readonly BookingApproval[] }, overDays: readonly ApprovalDay[], by: string | undefined,
@@ -166,6 +171,98 @@ export function reweigh(
       days: overDays.map((day) => ({ ...day })),
     },
     history: [line(by, 'approval', 'Approval', `Waiting for approval · over the allotment by ${overTotal} (${overDays.map((d) => `${d.route_id} ${d.service_date} +${d.over_by}`).join(', ')})`)],
+  };
+}
+
+/** What an edit decides about the status: where it goes, the approvals it asks for, whether the waiting `approval` is closed, and the history. */
+export type EditDecision = { status: BookingStatus; requests: NewApproval[]; clearApproval: boolean; history: HistoryLine[] };
+/** The FOC count and the discount before and after an edit, and the FOC reason it would be asked with. */
+export type EditFacts = { focBefore: number; focAfter: number; focReason?: string | null; discountBefore: number; discountAfter: number };
+
+/** The most a decided approval of `kind` granted, by `pick`: what an edit may keep without asking again. */
+const granted = (approvals: readonly BookingApproval[] | undefined, kind: ApprovalKind, pick: (a: BookingApproval) => number | null): number =>
+  Math.max(0, ...(approvals ?? []).filter((a) => a.kind === kind && (a.status === 'approved' || a.status === 'pending')).map((a) => pick(a) ?? 0));
+
+/**
+ * What an amendment decides about the status (decided 2026-10-10): the reweigh's answer (`reweigh`),
+ * then the approvals the edit raises. Only a booking on its way to `confirmed` is asked:
+ *
+ * - **More FOC passengers** than the booking had, and than any FOC approval granted or asked → an FOC
+ *   approval for the new count: `confirmed` goes to `pending_foc`; a booking already waiting asks
+ *   again with the new count. Confirming FOC passengers needs an FOC reason (`400`), as on create.
+ * - **A bigger discount** than the booking had, and than any approval granted or asked → the
+ *   discount approval, when the save would otherwise be `confirmed` (decision 5): `confirmed` goes to
+ *   `pending_approval`; one waiting over the allotment has its discount added to that approval.
+ *
+ * An edit that leaves both alone, or lowers them, asks for nothing: an unchanged booking is not
+ * re-asked. `undefined` when nothing changes. Legacy re-runs its whole save on Update; this asks again
+ * only for what was not approved.
+ */
+export function settleEdit(
+  current: { status: BookingStatus; approvals?: readonly BookingApproval[] }, reweighed: ReturnType<typeof reweigh>, facts: EditFacts, by: string | undefined,
+): EditDecision | undefined {
+  const base: EditDecision | undefined = reweighed && { status: reweighed.status, requests: reweighed.request ? [reweighed.request] : [], clearApproval: !reweighed.request, history: [...reweighed.history] };
+  if (!(['confirmed', 'pending_foc', 'pending_approval'] as BookingStatus[]).includes(current.status)) return base;
+  const focRaised = facts.focAfter > Math.max(facts.focBefore, granted(current.approvals, 'foc', (a) => a.foc_count));
+  const discountRaised = facts.discountAfter > Math.max(facts.discountBefore, granted(current.approvals, 'approval', (a) => a.discount));
+  if (!focRaised && !discountRaised) return base;
+
+  const asker = by ?? null;
+  let status = base?.status ?? current.status;
+  const requests = [...(base?.requests ?? [])];
+  const history = [...(base?.history ?? [])];
+  let clearApproval = base?.clearApproval ?? false;
+  // The over-allotment approval standing after the reweigh: a new one, else the one still waiting.
+  const waiting = status === 'pending_approval' ? requests.find((r) => r.kind === 'approval') ?? asNew(pendingApproval(current.approvals, 'approval')) : undefined;
+  let approval = waiting && { ...waiting };
+
+  if (focRaised) {
+    if (!facts.focReason?.trim()) refuse('foc_reason is required to confirm FOC (free) passengers', 400);
+    requests.push(focRequest(facts.focAfter, asker));
+    history.push(line(by, 'foc', 'FOC', `Waiting for FOC approval · ${facts.focAfter} FOC pax`));
+    if (status === 'confirmed') status = 'pending_foc';
+    else if (approval && approval.target_status === 'confirmed') approval.target_status = 'pending_foc';
+  }
+  const wouldConfirm = status === 'confirmed' || (status === 'pending_approval' && approval?.target_status === 'confirmed');
+  if (discountRaised && wouldConfirm) {
+    approval = approval
+      ? { ...approval, discount: facts.discountAfter, reason: approvalReason(approval.over_capacity, true) }
+      : { kind: 'approval', reason: approvalReason(false, true), over_capacity: false, over_total: null, discount: facts.discountAfter, foc_count: null, target_status: 'confirmed', requested_by: asker, days: [] };
+    status = 'pending_approval';
+    clearApproval = false;
+    history.push(line(by, 'approval', 'Approval', `Waiting for approval · discount ${baht(facts.discountAfter)}`));
+  }
+  // A changed approval is asked again, replacing the one waiting (`requestApprovals` replaces by kind).
+  if (approval && (approval.target_status !== waiting?.target_status || approval.discount !== waiting?.discount)) {
+    const at = requests.findIndex((r) => r.kind === 'approval');
+    if (at >= 0) requests[at] = approval; else requests.push(approval);
+  }
+  return { status, requests, clearApproval, history };
+}
+
+/** A waiting approval asked again as it is. */
+const asNew = (a: BookingApproval | undefined): NewApproval | undefined => a && {
+  kind: a.kind, reason: a.reason, over_capacity: a.over_capacity, over_total: a.over_total, discount: a.discount, foc_count: a.foc_count,
+  target_status: a.target_status, requested_by: a.requested_by, days: a.days.map((d) => ({ ...d })),
+};
+
+const overText = (days: readonly ApprovalDay[]): string =>
+  `over the allotment by ${days.reduce((sum, day) => sum + day.over_by, 0)} (${days.map((d) => `${d.route_id} ${d.service_date} +${d.over_by}`).join(', ')})`;
+
+/**
+ * `/unconfirm` of a booking that waited over the allotment, holding no seats: weighed again as the
+ * quote it becomes. Still over → it waits on, for an approval whose target is `quote` (a quote save
+ * over the allotment asks the same in legacy). `undefined` when it fits now.
+ */
+export function stillOverAsQuote(overDays: readonly ApprovalDay[], by: string | undefined): { status: BookingStatus; request: NewApproval; history: HistoryLine[] } | undefined {
+  if (overDays.length === 0) return undefined;
+  return {
+    status: 'pending_approval',
+    request: {
+      kind: 'approval', reason: approvalReason(true, false), over_capacity: true, over_total: overDays.reduce((sum, day) => sum + day.over_by, 0), discount: null,
+      foc_count: null, target_status: 'quote', requested_by: by ?? null, days: overDays.map((day) => ({ ...day })),
+    },
+    history: [line(by, 'approval', 'Approval', `Waiting for approval · ${overText(overDays)}`)],
   };
 }
 

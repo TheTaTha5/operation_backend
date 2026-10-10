@@ -88,7 +88,8 @@ test('the booking guard: a staff booking names a member; free seats over the yea
   const h = await login();
   const member = ok(await call(h, 'POST', '/v1/staff', { name: 'Captain Som', dept: 'Marine' }), 201) as Member;
   ok(await call(h, 'PUT', `/v1/staff/${member.id}/quotas/${Y}`, { free_seats: 2 }));
-  const trip = (date: string, pax: Record<string, number>) => ({ routeId: 'r5', date, zone: 'PK', pax });
+  // No zone: the staff agent here has no rate type, and a zone it has no rate for is refused (`no_rate`).
+  const trip = (date: string, pax: Record<string, number>) => ({ routeId: 'r5', date, pax });
   const book = (body: object) => call(h, 'POST', '/v1/bookings', { agent_id: 'a_staff', foc_reason: 'Staff welfare', ...body });
 
   assert.match(refused(await book({ trips: [trip(`${Y}-02-01`, { ad_fr: 1 })] }), 400), /staff_id is required/);

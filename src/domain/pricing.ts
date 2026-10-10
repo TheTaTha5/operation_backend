@@ -55,6 +55,39 @@ export type Quote = {
   warnings: QuoteWarning[];
 };
 
+// ── A save with no price (decided 2026-10-10) ──
+
+/**
+ * Refuses a booking save the price cannot cover, as legacy's booking screen does. `POST /v1/quote`
+ * never calls this: a quote answers the same problems as warnings.
+ *
+ * - **No rate** (`409 no_rate`): a seat trip with a zone whose rate has no price for its route and
+ *   zone, or that has no rate at all (legacy `bkV2NoRateTrips`, `bkV2RenderSubmitButton`: "⚠ No rate
+ *   · N trips · cannot save"). A trip with no zone yet, and an overnight return leg, are not priced
+ *   and not refused, as in legacy.
+ * - **No charter price** (`409 no_charter_price`): a charter whose boat type has no charter rate and
+ *   no agreed price, saved at ฿0 only when the caller says it is really free (`free_anyway: true`,
+ *   legacy `bkV2SubmitBooking` §chManualNoRate's OK).
+ *
+ * A booking priced by hand (`price_mode: manual`) answers no warnings, so is never refused; a B2C
+ * booking is not priced here at all (its caller skips this).
+ */
+export function assertPriced(trips: readonly QuoteTrip[], quote: Quote, freeAnyway: boolean): void {
+  const warned = (i: number, ...codes: QuoteWarning['code'][]) => quote.warnings.some((w) => w.trip === i && codes.includes(w.code));
+  const where = (i: number) => `trips[${i}] (${trips[i].route_id} ${trips[i].service_date}${trips[i].zone ? ` zone ${trips[i].zone}` : ''})`;
+  const noRate = trips.map((t, i) => i).filter((i) => trips[i].booking_mode !== 'charter' && !trips[i].ovn_leg && trips[i].zone && warned(i, 'no_rate', 'not_offered'));
+  if (noRate.length) {
+    refuse(`No rate · ${noRate.length} trip${noRate.length === 1 ? '' : 's'} · cannot save: the rate type doesn't cover ${noRate.map(where).join(', ')}. `
+      + 'Fix the rate type, or change the route or zone', 409, 'no_rate');
+  }
+  const noCharter = trips.map((t, i) => i).filter((i) => trips[i].booking_mode === 'charter' && warned(i, 'no_charter_price'));
+  if (noCharter.length && !freeAnyway) {
+    refuse(`Charter trip will be saved at 0 THB: ${noCharter.map((i) => `${where(i)} boat ${trips[i].charter_boat_id}`).join(', ')}. `
+      + "This boat type has no charter rate in the agent's rate type and no agreed price was entered. "
+      + 'Send the agreed price (charter_price_mode manual, charter_price_manual), or free_anyway: true if this charter is really free', 409, 'no_charter_price');
+  }
+}
+
 // ── Who may be priced by hand (legacy `bkV2ApplyAgentRules`) ──
 
 const isCompany = (a?: PricingAgent) => !!a && (a.code === 'COMPANY' || a.id === 'a_company');

@@ -177,7 +177,7 @@ test('a quote holds its seats; a released status reserves none', async () => {
   assert.equal((await app.inject({ method: 'POST', url: '/v1/bookings', payload: { route_id: 'r8', service_date: date, pax: 1, status: 'shipped' } })).statusCode, 400);
 });
 
-test('reopening a cancelled booking is capacity-checked, even with an unchanged itinerary', async () => {
+test('reopening a cancelled booking is weighed, even with an unchanged itinerary: a restore that oversells says so', async () => {
   const date = '2030-06-02';
   await app.inject({ method: 'POST', url: '/operations/deployments', payload: { boat_id: 'boat-transition', route_id: 'r9', service_date: date, capacity: 10 } });
 
@@ -190,14 +190,19 @@ test('reopening a cancelled booking is capacity-checked, even with an unchanged 
   assert.equal((await app.inject({ method: 'PATCH', url: `/v1/bookings/${shelved.id}`, payload: { status: 'confirmed' } })).statusCode, 409);
 
   // Nothing about the itinerary moved, but the booking is asking for eight seats it was not holding
-  // and only four remain. Checking only on a trip change would have let this through.
-  assert.equal((await app.inject({ method: 'POST', url: `/v1/bookings/${shelved.id}/restore` })).statusCode, 409);
-  assert.equal((await app.inject({ method: 'GET', url: `/v1/bookings/${shelved.id}` })).json().status, 'cancelled', 'a refused restore leaves the status alone');
-
-  // Free the room and the same request succeeds.
-  await app.inject({ method: 'POST', url: `/v1/bookings/${sold.id}/cancel` });
+  // and only four remain. Legacy restores anyway (`bkV2RestoreBooking`, decided 2026-10-10): so does
+  // this, and the answer says the day is now oversold by four.
   const reinstated = await app.inject({ method: 'POST', url: `/v1/bookings/${shelved.id}/restore` });
   assert.equal(reinstated.statusCode, 200);
   assert.equal(reinstated.json().allocated_pax, 8);
+  assert.deepEqual(reinstated.json().warnings, [{ code: 'seats_short', route_id: 'r9', service_date: date, short_by: 4 }]);
+  assert.equal((await app.inject({ method: 'GET', url: `/v1/availability?route_id=r9&date=${date}` })).json().available_seats, -4);
+
+  // With the room free, the same restore oversells nothing.
+  await app.inject({ method: 'POST', url: `/v1/bookings/${shelved.id}/cancel` });
+  await app.inject({ method: 'POST', url: `/v1/bookings/${sold.id}/cancel` });
+  const again = await app.inject({ method: 'POST', url: `/v1/bookings/${shelved.id}/restore` });
+  assert.equal(again.statusCode, 200);
+  assert.deepEqual(again.json().warnings, []);
   assert.equal((await app.inject({ method: 'GET', url: `/v1/availability?route_id=r9&date=${date}` })).json().available_seats, 2);
 });

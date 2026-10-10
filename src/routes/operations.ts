@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
-import { assertItinerary, OperationsStore, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw } from '../domain/operations.js';
+import { assertItinerary, OperationsStore, withWarnings, type Booking, type OvnMode, type BookingChanges, type BookingInput, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw } from '../domain/operations.js';
 import { SeatLockService } from '../domain/seat-lock-service.js';
 import { BoatHoldService } from '../domain/boat-hold-service.js';
 import { assertConverts, convertBody } from '../domain/boat-holds.js';
@@ -16,7 +16,8 @@ import { assertMayDecide, assertMayWrite, hashPassword, parseNewUser, parseUserP
 import { eachDate, isIsoDate, isIsoTime, isRouteKind, routeCalendar, todayInThailand, type CalendarKind, type Route, type RouteDayOverride, type RouteSeason } from '../domain/calendar.js';
 import { parsePaxGrid, paxRowsFromTotal, paxTotal, type PaxRow } from '../domain/pax.js';
 import { BOOKING_STATUSES, SEAT_RELEASING_STATUSES, holdsSeats, isBookingStatus, type BookingStatus } from '../domain/booking-status.js';
-import { checkStaffBooking, isStaffAgent } from '../domain/staff.js';
+import { checkCompanyPurpose, checkStaffBooking, isStaffAgent } from '../domain/staff.js';
+import { assertCodeEcho, assertNoCode } from '../domain/booking-code.js';
 import { capacityNumbers } from '../domain/capacity.js';
 import { bookingHeader, bookingHeaderPatch, type BookingHeader, type BookingHeaderPatch } from '../domain/booking-header.js';
 import { parseBookingPassengers } from '../domain/booking-passengers.js';
@@ -81,7 +82,7 @@ import {
   assertOpenClosure, closedLine, closureView, followUps, notifiedLine, parseClosureListQuery, parseClosurePatch, parseNewClosure, parseUndo, parseWeatherCancel,
   planClose, planNotify, planUndo, reopenedLine, resolvedRows, type CaseOutcome, type FollowUp, type WeatherClosure,
 } from '../domain/weather.js';
-import { enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
+import { assertPriced, enforcedPriceMode, priceBooking, type Quote, type QuoteTrip } from '../domain/pricing.js';
 import type { RateType } from '../domain/rate-types.js';
 import { parseRateTypeCreate, parseRateTypePatch, parseRouteBlock, rateTypeNotFound, type RateTypeListQuery } from '../domain/rate-types.js';
 import {
@@ -974,6 +975,9 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   async function planBooking(request: FastifyRequest, body: unknown) {
     const actor = actorOf(request.user);
     const { viaStatus, ...input } = bookingInput(body);
+    // The server numbers the booking (`booking-code.ts`).
+    assertNoCode(record(body));
+    const flags = saveFlags(body);
     const agent = request.user?.user?.agent_id;
     if (agent) {
       if (input.agent_id !== undefined && input.agent_id !== agent) forbidden(`This login books for agent ${agent} only`);
@@ -983,7 +987,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     // log says who still sends it.
     if (viaStatus) request.log.warn({ status: (body as Record<string, unknown>).status, intent: input.intent }, 'deprecated: POST /v1/bookings with status; send intent');
     // A deactivated agent takes no new bookings (todo/sales-editing-model.md, decision 1).
-    if (input.agent_id) assertAgentBookable(await store.agent(input.agent_id));
+    const agentRow = input.agent_id ? await store.agent(input.agent_id) : undefined;
+    if (input.agent_id) assertAgentBookable(agentRow);
+    // A company booking says why it was made (legacy `bkV2Save`).
+    checkCompanyPurpose(agentRow && { id: agentRow.id, code: agentRow.code ?? null }, input.header?.company_purpose);
     await assertStaffRules(request.body, {
       agentId: input.agent_id, staffId: input.header?.staff_id ?? null, staffIdSent: input.header?.staff_id !== undefined,
       staffPurpose: input.header?.staff_purpose ?? null, purpose: input.header?.purpose ?? null,
@@ -993,12 +1000,15 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     await fillPickups(input.header?.pickup_area_id, input.header?.dropoff_area_id, input.trips);
     const priced = isB2C(input) ? undefined : await priceFor({ agentId: input.agent_id, header: input.header ?? {}, trips: input.trips,
       add_ons: input.add_ons ?? [], adjustments: input.adjustments ?? [], rateTypeRef: input.rate_type_ref, rate: 'agent' });
+    // A trip with no price is refused, as legacy's Save is (decided 2026-10-10); B2C keeps its own price. A booking with no
+    // agent has no rate type to fix (legacy cannot make one): it is saved with the warnings, as before.
+    if (priced && input.agent_id) assertPriced(input.trips, priced.quote, flags.freeAnyway);
     // A manual total is kept only when the booking is priced by hand (legacy).
     const { manual_total: manualTotal, ...priceHeader } = priced?.header ?? {};
     const { manual_total: sentManual, ...sentHeader } = input.header ?? {};
     const manual = priced ? manualTotal ?? undefined : sentManual;
     const header = createHeader({ ...sentHeader, ...(priceHeader as BookingHeader), ...(manual === undefined ? {} : { manual_total: manual }) }, actor, new Date().toISOString());
-    return { actor, input, header, priced };
+    return { actor, input: { ...input, ...(flags.displaceAnyway ? { displace_anyway: true } : {}) }, header, priced };
   }
   /** The create's writes, inside the caller's transaction. `exclude` leaves a hold being converted out of the seats. */
   async function writeBooking(request: FastifyRequest, body: unknown, plan: Awaited<ReturnType<typeof planBooking>>, exclude: Exclusion = {}): Promise<Booking> {
@@ -1010,17 +1020,23 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       ...(priced ? { rate_type_ref: priced.rateTypeRef ?? undefined } : {}),
       ...(q ? { add_ons: (input.add_ons ?? []).map((a, i) => ({ ...a, amount: q.add_ons[i].amount })) } : {}),
     }, actor, exclude);
+    // The charters a `displace_anyway` let take sold seats, answered as `warnings`.
+    const displaced = booking.warnings ?? [];
     await syncAltParts(booking);
     // Love Kingdom resent an order it had held, and now it books: the held one is settled.
     if (isB2CPush(request.user?.user) && booking.external_id) await resolveHeldCreates(booking.external_id, booking.id, actor);
-    if (!q) return (await store.booking(booking.id))!;
-    await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
-    return (await store.booking(booking.id))!;
+    if (q) await store.setPrices(booking.id, { trips: q.trips, add_ons: q.add_ons.map((a) => a.amount) });
+    return withWarnings((await store.booking(booking.id))!, displaced);
   }
   function bookingAnswer(request: FastifyRequest, plan: Awaited<ReturnType<typeof planBooking>>, created: Booking) {
     const { input, priced } = plan;
     const warnings = priced ? [...replacedPrices(input.header, priced.header), ...priced.quote.warnings] : [];
     return withIssues(request, warnings.length ? { ...created, price_warnings: warnings } : created);
+  }
+  /** The `*_anyway` answers a booking save may carry (decided 2026-10-10): legacy's dialogs, said yes to. */
+  function saveFlags(body: unknown): { freeAnyway: boolean; displaceAnyway: boolean; editAnyway: boolean } {
+    const b = isRecord(body) ? body : {};
+    return { freeAnyway: anywayFlag(b.free_anyway, 'free_anyway'), displaceAnyway: anywayFlag(b.displace_anyway, 'displace_anyway'), editAnyway: anywayFlag(b.edit_anyway, 'edit_anyway') };
   }
 
   /**
@@ -1079,6 +1095,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   async function amendBooking(request: FastifyRequest) {
     const actor = actorOf(request.user);
     const { version: _version, rate, ...body } = record(request.body);
+    const flags = saveFlags(body);
     const changes = bookingChanges(body);
     // An edit re-prices only when it changes something the price reads (decided 2026-10-09).
     const repricing = rate === 'agent' || ['trips', 'route_id', 'service_date', 'pax', 'add_ons', 'addOns', 'adjustments'].some((key) => body[key] !== undefined)
@@ -1102,6 +1119,13 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       assertDocCheckEcho(body.doc_check, stored.doc_check);
       assertInsuranceEcho(body.passengers, stored.passengers);
       assertPaymentEcho(body, stored);
+      assertCodeEcho(body, stored.code);
+      // A company booking keeps its reason: legacy's every save asks for it (`bkV2Save`).
+      if (changes.header?.company_purpose !== undefined || stored.agent_id) {
+        const agentRow = stored.agent_id ? await store.agent(stored.agent_id) : undefined;
+        checkCompanyPurpose(agentRow && { id: agentRow.id, code: agentRow.code ?? null },
+          changes.header?.company_purpose !== undefined ? changes.header.company_purpose : stored.company_purpose);
+      }
       await fillPickups(changes.header?.pickup_area_id === undefined ? stored.pickup_area_id : changes.header.pickup_area_id ?? undefined,
         changes.header?.dropoff_area_id ?? undefined, changes.trips, changes.header?.pickup_area_id !== undefined);
       let header = changes.header;
@@ -1111,10 +1135,13 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
         const sent = header && Object.fromEntries(PRICE_FIELDS.filter((f) => header![f] !== undefined).map((f) => [f, header![f]]));
         header = header && Object.fromEntries(Object.entries(header).filter(([key]) => !(PRICE_FIELDS as readonly string[]).includes(key)));
         if (repricing) {
+          const trips = changes.trips ?? stored.trips.map(pricedTripOf);
           priced = await priceFor({
-            agentId: stored.agent_id, header: header ?? {}, trips: changes.trips ?? stored.trips.map(pricedTripOf),
+            agentId: stored.agent_id, header: header ?? {}, trips,
             add_ons: changes.add_ons ?? stored.add_ons, adjustments: changes.adjustments ?? stored.adjustments, rate: rateOf(rate, stored), stored,
           });
+          // A price-changing edit with a trip that has no price is refused, as on create (decided 2026-10-10).
+          if (stored.agent_id) assertPriced(trips, priced.quote, flags.freeAnyway);
           header = { ...(header ?? {}), ...priced.header };
           warnings = [...replacedPrices(sent, priced.header), ...priced.quote.warnings];
         } else {
@@ -1123,16 +1150,22 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
       }
       const attachments = await bookingFiles(body, stored.attachments, actor, changes.upgrades);
       const signed = { ...changes, header: stampActor(header, actor), ...(attachments ? { attachments } : {}) };
-      let amended = (await store.amendBooking(bookingId(request), signed, actor)) ?? notFound('Booking not found');
+      const written = (await store.amendBooking(bookingId(request), signed, actor, undefined, { editAnyway: flags.editAnyway, displaceAnyway: flags.displaceAnyway }))
+        ?? notFound('Booking not found');
+      // The charters a `displace_anyway` let take sold seats, answered as `warnings`.
+      const displaced = written.warnings ?? [];
+      let amended: Booking = written;
       // A trip whose pickup zone changed leaves its van group, which holds one zone.
       const rezoned = rezonedParts(stored, amended);
       for (const [tripId, parts] of rezoned) await store.setVanParts(tripId, parts);
       if (rezoned.size) amended = (await store.booking(amended.id))!;
       if (await syncAltParts(amended)) amended = (await store.booking(amended.id))!;
-      if (!priced) return warnings.length ? { ...amended, price_warnings: warnings } : amended;
-      await store.setPrices(amended.id, { trips: priced.quote.trips, add_ons: priced.quote.add_ons.map((a) => a.amount) });
-      const booking = (await store.booking(amended.id))!;
-      return warnings.length ? { ...booking, price_warnings: warnings } : booking;
+      if (priced) {
+        await store.setPrices(amended.id, { trips: priced.quote.trips, add_ons: priced.quote.add_ons.map((a) => a.amount) });
+        amended = (await store.booking(amended.id))!;
+      }
+      const { warnings: _stale, ...answer } = amended as Booking & { warnings?: unknown };
+      return withWarnings(warnings.length ? { ...answer, price_warnings: warnings } : answer, displaced);
     });
   }
   for (const command of STATUS_COMMANDS.filter((c) => c !== 'cancel-weather')) {
