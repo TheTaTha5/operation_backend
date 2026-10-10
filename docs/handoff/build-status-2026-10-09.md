@@ -75,14 +75,10 @@ Merged into `main`: the deploy runbook (rehearsed end to end on a copy of the im
 pier office (petty cash and the office lists, migrations 170–171) and whole-boat hold commands
 (migration 180). 526 tests pass on both stores.
 
-Still on branches in agent worktrees, not merged (check `git log main..<branch>`; finish or merge):
-
-| Task | Branch | Migrations |
-|---|---|---|
-| Trip P&L, cost model, refund payouts, deposits | `feat/money-remainder` | 160–169 |
-| Fleet extras | `feat/fleet-extras` | 190–199 |
-| Promo contracts, sales targets, staff quotas, seed-only contracts | `feat/sales-extras` | 200–209 |
-| Reschedule fee tops up the invoice; the charter-split seat bug; 8 booking differences written up | `fix/booking-rules` | 210–219 |
+Merged later on 2026-10-10: fleet extras (190), sales extras (200–202), the booking fixes (the reschedule
+fee tops up the invoice; a split charter takes every boat; a held boat stays put) and the rest of Money
+(Trip P&L and the cost model, refund payouts, deposits: 160–161). After the last merge: 562 tests on
+both stores, 74 migrations, 15 change kinds. Nothing is on a branch waiting.
 
 Next: the second wave from `todo/legacy-browser-rules.md` "Missing" (pier operations, check-in
 counting, required booking fields, deployment checks).
