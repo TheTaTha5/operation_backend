@@ -4,6 +4,7 @@
  * "Design — extras" 4). Pure: the routes gather rows, these decide every number, so both stores agree.
  */
 import { addDays, dayGap, round2 } from './fleet-common.js';
+import { engineService } from './fleet-assets.js';
 import { jobCost, jobLane, silentDays, type Incident, type Job, type LinkedMemo } from './fleet-jobs.js';
 import type { Memo } from './fleet-memos.js';
 import type { Consumable, StockView } from './fleet-stock.js';
@@ -19,6 +20,17 @@ export function monthsEnding(month: string, n: number): string[] {
 }
 const daysIn = (month: string): number => { const [y, m] = month.split('-').map(Number); return new Date(Date.UTC(y, m, 0)).getUTCDate(); };
 const r0 = (n: number) => Math.round(n);
+
+// ── The definitions every fleet figure uses (todo/fleet-maintenance-model.md, "Design — insights") ──
+
+/**
+ * Rule 1 (developer, 2026-10-10): a job's cost (`jobCost`) is dated by its close date. A done job is
+ * dated by its `end_date`; an open job has no date, so it is in no period's spend.
+ */
+export const closedOn = (j: Pick<Job, 'status' | 'end_date'>): string | null => (j.status === 'done' ? j.end_date : null);
+/** Rule 3: a done job's duration, start to close with both days counted (legacy's Fleet Report). */
+export const jobDays = (j: Pick<Job, 'status' | 'start_date' | 'end_date'>): number | null =>
+  (j.status === 'done' && j.start_date && j.end_date ? dayGap(j.start_date, j.end_date) + 1 : null);
 
 // ── Cost analytics (`costAggregate`) ──
 
@@ -44,14 +56,16 @@ const OUTCOME_ORDER = ['success', 'limited', 'rework', 'decommission', 'cancelle
 /**
  * `GET /v1/fleet/reports/cost`: jobs done or in progress, their cost split equally over the categories
  * of the assets they touch; memos with a boat and no job as "direct memo" (the share not bought into
- * stock); the rest is "central" (no boat, or stock purchases), kept out of the total.
+ * stock); the rest is "central" (no boat, or stock purchases), kept out of the total. A done job is in
+ * the period it closed in (rule 1; a done job with no close date only in `all`); a job in progress has
+ * no date and counts, as its cost so far, in every period.
  */
 export function costReport(input: { jobs: readonly Job[]; memos: readonly Memo[]; memosOf: (jobId: string) => LinkedMemo[]; boats: readonly BoatLite[]; today: string; period: CostPeriod }) {
   const { today, period } = input;
   const boatName = new Map(input.boats.map((b) => [b.id, b.name]));
   const l30 = addDays(today, -30), ytd = `${today.slice(0, 4)}-01-01`, thisMonth = today.slice(0, 7);
   const inScope = (d: string) => period === 'all' || (period === 'ytd' ? d >= ytd : period === 'month' ? d.startsWith(thisMonth) : d >= l30);
-  type Row = { kind: 'job' | 'memo'; id: string; no: string; boat_id: string | null; title: string; type: string; status: string; date: string; cost: number; parts: number; memo: number; cats: string[]; done: boolean; outcome: string | null };
+  type Row = { kind: 'job' | 'memo'; id: string; no: string; boat_id: string | null; title: string; type: string; status: string; date: string | null; cost: number; parts: number; memo: number; cats: string[]; done: boolean; outcome: string | null };
   const all: Row[] = [];
   const units = new Map<string, { asset_id: string; cat: string; boat_id: string; label: string; cost: number; n: number }>();
   const unitShares: { row: Row; uid: string; cat: string; label: string; share: number }[] = [];
@@ -60,7 +74,7 @@ export function costReport(input: { jobs: readonly Job[]; memos: readonly Memo[]
     const c = jobCost(j.parts, input.memosOf(j.id));
     const cats = j.assets.length ? j.assets.map((a) => catOf(a.type)) : ['other'];
     const row: Row = {
-      kind: 'job', id: j.id, no: j.no, boat_id: j.boat_id, title: j.title, type: j.type, status: j.status, date: j.end_date ?? j.start_date ?? '', cost: c.cost,
+      kind: 'job', id: j.id, no: j.no, boat_id: j.boat_id, title: j.title, type: j.type, status: j.status, date: closedOn(j), cost: c.cost,
       parts: c.parts_cost, memo: c.memo_cost, cats, done: j.status === 'done', outcome: j.status === 'done' ? j.outcome ?? 'success' : null,
     };
     all.push(row);
@@ -79,7 +93,7 @@ export function costReport(input: { jobs: readonly Job[]; memos: readonly Memo[]
     if (!m.boat_id || amt <= 0) continue;
     all.push({ kind: 'memo', id: m.id, no: m.no, boat_id: m.boat_id, title: m.title, type: m.memo_type, status: m.status, date, cost: amt, parts: 0, memo: amt, cats: ['memo'], done: m.status === 'paid', outcome: null });
   }
-  const rows = all.filter((r) => inScope(r.date));
+  const rows = all.filter((r) => (r.kind === 'job' && !r.done ? true : r.date === null ? period === 'all' : inScope(r.date)));
   const inRows = new Set(rows);
   const total = { done: 0, proc: 0, n_done: 0, n_proc: 0 };
   const byCat = new Map<string, { done: number; proc: number; n: number }>(COST_CATS.map((c) => [c.k, { done: 0, proc: 0, n: 0 }]));
@@ -111,7 +125,8 @@ export function costReport(input: { jobs: readonly Job[]; memos: readonly Memo[]
     return { outcome: o, count: list.length, cost: round2(cost), average: list.length ? round2(cost / list.length) : 0 };
   });
   const months = monthsEnding(thisMonth, 12).map((month) => {
-    const list = all.filter((r) => monthOf(r.date) === month);
+    // A job in progress has no month (rule 1): `proc` is the direct memos not yet paid.
+    const list = all.filter((r) => r.date !== null && monthOf(r.date) === month);
     return { month, done: round2(list.filter((r) => r.done).reduce((s, r) => s + r.cost, 0)), proc: round2(list.filter((r) => !r.done).reduce((s, r) => s + r.cost, 0)) };
   });
   const sum = total.done + total.proc;
@@ -125,15 +140,15 @@ export function costReport(input: { jobs: readonly Job[]; memos: readonly Memo[]
     by_type: [...byType].map(([type, x]) => ({ type, done: round2(x.done), proc: round2(x.proc), total: round2(x.done + x.proc), n: x.n })),
     outcomes, months, boats: boatList,
     units: [...units.values()].map((u) => ({ ...u, cost: round2(u.cost) })).sort((a, b) => b.cost - a.cost).slice(0, 10),
-    rows: rows.map(({ outcome: _o, ...r }) => ({ ...r, cost: round2(r.cost) })).sort((a, b) => b.cost - a.cost || b.date.localeCompare(a.date)),
+    rows: rows.map(({ outcome: _o, ...r }) => ({ ...r, cost: round2(r.cost) })).sort((a, b) => b.cost - a.cost || (b.date ?? '').localeCompare(a.date ?? '')),
   };
 }
 
 // ── Upkeep (`renderConsumables`) ──
 
-/** Legacy `flBoatRepairCostMonth`: a boat's jobs started that month, any status. */
+/** Legacy `flBoatRepairCostMonth`, on rule 1: a boat's jobs closed that month (legacy: started). */
 const repairsOf = (jobs: readonly Job[], memosOf: (id: string) => LinkedMemo[], boatId: string, month: string): number =>
-  r0(jobs.filter((j) => j.boat_id === boatId && monthOf(j.start_date ?? j.end_date) === month).reduce((s, j) => s + jobCost(j.parts, memosOf(j.id)).cost, 0));
+  r0(jobs.filter((j) => j.boat_id === boatId && closedOn(j) !== null && monthOf(closedOn(j)) === month).reduce((s, j) => s + jobCost(j.parts, memosOf(j.id)).cost, 0));
 
 /** `GET /v1/fleet/reports/upkeep?month=`: per boat, the month's repairs plus what was drawn for it. */
 export function upkeepReport(input: { month: string; consumables: readonly Consumable[]; jobs: readonly Job[]; memosOf: (id: string) => LinkedMemo[]; boats: readonly BoatLite[] }) {
@@ -322,13 +337,12 @@ export type DashboardInput = {
   date: string; today: string;
   boats: readonly (BoatLite & { pier_on_date: string | null; blocked: boolean })[];
   jobs: readonly Job[]; incidents: readonly Incident[]; memos: readonly Memo[]; memosOf: (id: string) => LinkedMemo[];
-  engines: readonly { id: string; boat_id: string | null; model: string | null; brand: string | null; hours: number }[];
+  engines: readonly { id: string; boat_id: string | null; model: string | null; brand: string | null; hours: number; service_interval: number | null; last_service_hours: number | null; base_hours: number }[];
   gearboxes: readonly { id: string; status: string; spare_location: string | null }[];
   propellers: readonly { id: string; status: string; spare_location: string | null }[];
   stock: readonly StockView[];
 };
 const MEMO_RANK: Record<string, number> = { paid: 4, received: 3, approved: 2, pending_approval: 1 };
-export const SERVICE_INTERVAL = 500;
 
 /** `GET /v1/fleet/dashboard?date=`: every tile legacy's dashboard draws. */
 export function dashboard(input: DashboardInput) {
@@ -388,12 +402,17 @@ export function dashboard(input: DashboardInput) {
   const spares = [...input.gearboxes.map((g) => ({ ...g, kind: 'gearbox' })), ...input.propellers.map((p) => ({ ...p, kind: 'propeller' }))].filter((x) => x.spare_location || x.status === 'spare');
   const onBoard = spares.filter((x) => (x.spare_location ?? '').startsWith('boat:'));
   const low = input.stock.filter((i) => !i.deleted_at && !i.merged_into && i.below_min).sort((a, b) => a.total_qty / (a.min_qty || 1) - b.total_qty / (b.min_qty || 1));
-  const service = input.engines.filter((e) => e.boat_id && boatById.has(e.boat_id)).map((e) => {
-    const pct = ((e.hours % SERVICE_INTERVAL) / SERVICE_INTERVAL) * 100;
-    return { engine_id: e.id, boat_id: e.boat_id, boat_name: boatById.get(e.boat_id!)!.name, model: e.model, hours: round2(e.hours), remaining: round2((Math.floor(e.hours / SERVICE_INTERVAL) + 1) * SERVICE_INTERVAL - e.hours), pct: r0(pct), critical: pct >= 95 };
-  }).filter((e) => e.pct >= 70).sort((a, b) => b.pct - a.pct);
+  // Rule 2: hours since the last service against the engine's own interval (legacy's tile: 500 h by modulo).
+  const service = input.engines.filter((e) => e.boat_id && boatById.has(e.boat_id) && (e.service_interval ?? 0) > 0).map((e) => {
+    const s = engineService(e, e.hours);
+    return {
+      engine_id: e.id, boat_id: e.boat_id, boat_name: boatById.get(e.boat_id!)!.name, model: e.model, hours: round2(e.hours), interval: s.interval,
+      since: round2(s.since), remaining: s.left!, pct: r0(s.pct), overdue: s.overdue, critical: s.pct >= 95,
+    };
+  }).filter((e) => e.pct >= 70).sort((a, b) => b.pct - a.pct || a.remaining - b.remaining);
+  // Rule 1: the jobs closed each month and their cost (legacy: started, any status).
   const trend = monthsEnding(date.slice(0, 7), 6).map((month) => {
-    const list = input.jobs.filter((j) => monthOf(j.start_date ?? j.end_date) === month);
+    const list = input.jobs.filter((j) => closedOn(j) !== null && monthOf(closedOn(j)) === month);
     return { month, cost: round2(list.reduce((s, j) => s + costOf(j), 0)), jobs: list.length };
   });
   const pendingMemos = input.memos.filter((m) => m.status === 'pending_approval');
@@ -411,7 +430,7 @@ export function dashboard(input: DashboardInput) {
       chips: [...pendingMemos.map((m) => ({ id: m.id, no: m.no, status: m.status, amount: m.amount })), ...ordered.map((m) => ({ id: m.id, no: m.no, status: m.status, amount: m.amount }))].slice(0, 2) },
     incidents: { open: openIncidents.length, top: [...openIncidents].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 3)
       .map((i) => ({ id: i.id, no: i.no, boat_id: i.boat_id, title: i.title, date: i.date, severity: i.severity, job_id: i.job_id })) },
-    service_due: { interval: SERVICE_INTERVAL, count: service.length, engines: service.slice(0, 5) },
+    service_due: { count: service.length, engines: service.slice(0, 5) },
     cost_trend: { months: trend, total: round2(trend.reduce((s, m) => s + m.cost, 0)), jobs: trend.reduce((s, m) => s + m.jobs, 0) },
   };
 }

@@ -290,7 +290,7 @@ test('cost, upkeep, dashboard and repair history read jobs, memos and draws', as
   assert.equal(typeof dash.board.open, 'number');
   assert.ok(Object.keys(dash.board.lanes).every((k) => ['decide', 'wait', 'doing', 'close'].includes(k)));
   assert.ok(dash.piers.panwa >= 1);
-  assert.equal(dash.service_due.interval, 500);
+  assert.ok(dash.service_due.engines.every((e: { interval: number }) => e.interval > 0), 'each engine against its own interval');
 
   refused(await call(sales, 'GET', '/v1/fleet/repair-history'), 400);
   refused(await call(sales, 'GET', '/v1/fleet/repair-history?boat_id=nope'), 404);
