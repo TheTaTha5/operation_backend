@@ -160,9 +160,11 @@ const booking = {
   type: 'object',
   description: 'Header fields come back in snake_case. A field never sent is absent, not `null`.',
   properties: {
-    id: { type: 'string' },
+    id: { type: 'string', description: '`booking_<uuid>`, the key; an imported legacy booking is `lg_<legacy id>`' },
+    code: { type: 'string', readOnly: true, description: `${SERVER_SET} The readable number, \`BK-YYMMNNNN\` from a counter per Bangkok month; an imported booking keeps legacy's (its legacy id). Refused on create; on PATCH only an echo.` },
     external_id: { type: 'string' },
     agent_id: { type: 'string' },
+    company_purpose: { type: 'string', enum: ['company_guest', 'pr_foc', 'company_special'], description: 'Why a company booking was made; required on agent `a_company`' },
     status: { type: 'string', enum: STATUSES, readOnly: true, description: `${SERVER_SET} Decided on create from \`intent\`, then moved by the commands and re-weighed by edits.` },
     foc_reason: { type: 'string' },
     job_note: { type: 'string', description: 'The special request the van job order prints. Absent = the notes; `""` = nothing. `null` on PATCH clears it.' },
@@ -177,7 +179,11 @@ const booking = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { id: { type: 'string' }, seq: { type: 'integer' }, route_id: { type: 'string' }, service_date: isoDate, booking_mode: { type: 'string' }, pax: paxGrid, pax_total: { type: 'integer' }, lock_draws: { type: 'object', additionalProperties: { type: 'integer' } } },
+        properties: {
+          id: { type: 'string' }, seq: { type: 'integer' }, route_id: { type: 'string' }, service_date: isoDate, booking_mode: { type: 'string' }, pax: paxGrid, pax_total: { type: 'integer' }, lock_draws: { type: 'object', additionalProperties: { type: 'integer' } },
+          charter_displaced_at: { type: 'string', format: 'date-time', readOnly: true, description: `${SERVER_SET} When ops chartered this boat with seats already sold on the day (\`displace_anyway\`)` },
+          charter_displaced_by: { type: 'string', readOnly: true, description: `${SERVER_SET} Who did` },
+        },
       },
     },
     passengers: { type: 'array', items: passenger },
@@ -229,6 +235,12 @@ const COMMAND_DOCS: Record<string, { summary: string; description: string }> = {
   reject: {
     summary: 'Reject a booking waiting for approval',
     description: 'From `pending_approval` or `pending_foc`. Becomes `rejected` and gives its seats back. Optional `note` is kept on the approval and in the history.',
+  },
+  unconfirm: {
+    summary: 'Turn a live booking back into a quote (legacy Save Draft)',
+    description: 'From `confirmed`, `pending_foc` or `pending_approval`. Becomes `quote`: off the van and boat job sheets; a quote still holds its seats. '
+      + 'Approvals still waiting are closed (`replaced`). A booking that waited over the allotment is weighed again as the quote: still over, it stays '
+      + '`pending_approval` with an approval whose `target_status` is `quote`. Who confirmed it and when are kept. Optional `note` goes in the history line.',
   },
   'cancel-weather': {
     summary: 'Cancel a booking because the trip was called off for weather',
@@ -323,7 +335,7 @@ export const docs = {
       properties: {
         agent_id: { type: 'string' }, route_id: { type: 'string' }, date: isoDate, from: isoDate, to: isoDate,
         status: { type: 'string', description: 'Comma-separated statuses' },
-        voucher_ref: { type: 'string' }, q: { type: 'string', description: 'Matches id, voucher_ref or lead passenger name' },
+        voucher_ref: { type: 'string' }, q: { type: 'string', description: 'Matches id, code, voucher_ref or lead passenger name' },
         limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 }, cursor: { type: 'string' }, order: { type: 'string', enum: ['asc', 'desc'] },
         updated_since: { type: 'string', format: 'date-time', description: 'Bookings changed at or after this instant (Love Kingdom\'s reconciliation read)' },
       },
@@ -338,11 +350,13 @@ export const docs = {
     tags: ['Bookings'], summary: 'Create a booking', security: BEARER,
     description: 'Seats are weighed and the status decided in one transaction. A trip that fits takes its seats. Over the allotment but within the boats\' '
       + 'registered seats, the booking is still created (`201`) as `pending_approval`, holding no seats until `/approve`. Seats held by other agents\' locks, '
-      + 'or past the registered seats, are `409` and nothing is written. Read `status` from the response; it is the server\'s.',
+      + 'or past the registered seats, are `409` and nothing is written. Read `status` from the response; it is the server\'s. '
+      + 'A rate-priced trip with no rate for its route and zone is `409 no_rate`; a charter with no charter price `409 no_charter_price` unless `free_anyway: true`. '
+      + 'Chartering a boat with seats sold on it is `409 charter_displaces_seats` unless `displace_anyway: true`, which answers `warnings` (`charter_displaced`).',
     body: bookingIn,
     response: {
-      201: booking, ...HELD, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, or FOC passengers confirmed without `focReason`'),
-      409: err('A trip on a day its route does not run (`route_closed`), seats held by seat locks, the registered seats full, lock short, boat already chartered, or `external_id` already used (`duplicate_external_id`)'), ...UNAUTHORIZED,
+      201: booking, ...HELD, 400: err('Invalid input, unknown route/lock, `intent`/`status` not accepted, `code` sent, a company booking without `company_purpose`, or FOC passengers confirmed without `focReason`'),
+      409: err('A trip on a day its route does not run (`route_closed`), no price (`no_rate`, `no_charter_price`), seats held by seat locks, the registered seats full, lock short, boat already chartered, a charter displacing sold seats (`charter_displaces_seats`), or `external_id` already used (`duplicate_external_id`)'), ...UNAUTHORIZED,
     },
   },
   amendBooking: {
@@ -350,11 +364,14 @@ export const docs = {
     description: 'Header fields merge (absent keeps, `null`/`""` clears). `trips`, `passengers` and `addOns` replace outright when sent. '
       + 'Asking for more seats is weighed like a create: over the allotment the booking moves to `pending_approval` (holding none); a waiting booking that fits again '
       + 'goes back to where it was. '
-      + 'The status is not changed here: use the commands. A cancelled, rejected, weather-cancelled or completed booking cannot be edited (`409 booking_closed`).',
+      + 'An edit that raises the FOC passengers or the discount above what was approved asks for that approval again. '
+      + 'The status is not changed here: use the commands. A cancelled, rejected or completed booking is edited only with `edit_anyway: true` (`409 booking_closed`); '
+      + 'a weather-cancelled one freely. A price-changing edit is refused as a create is (`no_rate`, `no_charter_price` unless `free_anyway`), and so is a charter '
+      + 'displacing sold seats unless `displace_anyway`.',
     body: bookingPatchIn,
     response: {
-      200: booking, ...HELD, 400: err('Invalid input, or a different value for `status` or a server-set field (the message names the command to use)'),
-      404: err('Booking not found'), 409: err('An added or moved trip on a day its route does not run (`route_closed`), over capacity, or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
+      200: booking, ...HELD, 400: err('Invalid input, or a different value for `status`, `code` or a server-set field (the message names the command to use)'),
+      404: err('Booking not found'), 409: err('An added or moved trip on a day its route does not run (`route_closed`), no price (`no_rate`, `no_charter_price`), over capacity, a charter displacing sold seats (`charter_displaces_seats`), or the booking is closed (`booking_closed`)'), ...UNAUTHORIZED,
     },
   },
   statusCommand: (command: string) => ({

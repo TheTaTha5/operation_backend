@@ -10,6 +10,7 @@
 import { holdsSeats, type BookingStatus } from '../domain/booking-status.js';
 import { cancelGroup, isCancelCategory } from '../domain/booking-actions.js';
 import { parsePaxGrid, formatPaxGrid } from '../domain/pax.js';
+import { COMPANY_PURPOSES } from '../domain/staff.js';
 
 type Row = Record<string, unknown>;
 export type Report = { skip(kind: string, id: string, reason: string): void; note(what: string): void };
@@ -124,4 +125,23 @@ export function historyRows(rows: readonly Row[], bookingId: string, fallbackAt:
     if (!at) report.note('history lines with no readable time (given the booking\'s)');
     return { booking_id: bookingId, at: at ?? fallbackAt, by: str(row.by) || null, kind: str(row.kind) || 'note', tag: str(row.tag) || null, text: str(row.text) };
   });
+}
+
+/**
+ * Why a company booking was made (migration 222). Legacy keeps no `companyPurpose` column: its save
+ * writes the reason into `purpose` for a company booking (`bkV2CommitBooking`), so that is where it
+ * is read from. Any other purpose is no company reason.
+ */
+export function companyPurposeOf(booking: Row): string | null {
+  const purpose = str(booking.purpose);
+  return (COMPANY_PURPOSES as readonly string[]).includes(purpose) ? purpose : null;
+}
+
+/**
+ * Ops' acknowledgement of a charter that displaced sold seats (migration 221): legacy's
+ * `charterDisplacementAck: true` on the trip, which kept no time and no name. The time is the
+ * booking's last change, the latest it can be; the name stays empty.
+ */
+export function displacementAckOf(trip: Row, charter: boolean, fallbackAt: string): { charter_displaced_at: string | null; charter_displaced_by: null } {
+  return { charter_displaced_at: charter && trip.charterdisplacementack === true ? fallbackAt : null, charter_displaced_by: null };
 }

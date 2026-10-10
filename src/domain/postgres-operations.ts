@@ -10,7 +10,8 @@ import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import type { Change, ChangeInput } from './changes.js';
 import {
   assertKnownLocks, assertKnownRoutes, bookingView, claimsMoreSeats, dayKey, demandByDay, drawnLockIds, movedTripIds, nextTrips, paxChangedTripIds, retargetTrip,
-  licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreTrips, reweighs, tripsToCheckOpen,
+  editFacts, inputsOf, licenceWarnings, partialCancelByKey, partialCancelTrips, planTrips, rescheduleTrips, restoreShortfalls, restoreTrips, reweighs, stampDisplaced, tripsToCheckOpen, withWarnings,
+  type AmendFlags, type DisplaceCheck,
   type Boat, type Booking, type BookingChanges, type BookingInput, type BookingPrices, type BookingListQuery, type BookingTripInput, type Deployment, type Exclusion, type LockDraw, type OvnMode, type RouteDay, type StoredBooking, type StoredTrip,
   decodeBookingCursor, encodeBookingCursor,
 } from './operations.js';
@@ -19,10 +20,10 @@ import {
   assertEditable, assertOpen, assertRestorable, createdLine, editedLine, movedLine, partialCancelLine, partialCancelRecord, partialCountLine, planCancel, planRescheduleRecord,
   confirmationStamp, externalIdTaken, planStatusCommand, refuse, restoredLine, stripServerOwned, totalAfterRefund, type StatusCommand, type StatusCommandRequest,
   type BookingCancellation, type BookingFeeItem, type BookingPartialCancel, type BookingReschedule, type CancelGroup, type CancelRequest, type ChargeType, type Collect,
-  type HistoryEntry, type HistoryLine, type LockShortWarning, type PartialCancelRequest, type RescheduleRequest,
+  type HistoryEntry, type HistoryLine, type PartialCancelRequest, type RescheduleRequest, type RestoreWarning, displacedLines,
 } from './booking-actions.js';
 import { SEAT_RELEASING_STATUSES } from './booking-status.js';
-import { assertDayFits, capacityNumbers, dayCapacity, weighDay, type Capacity, type DayDeployment, type DayState, type HeldTrip } from './capacity.js';
+import { assertDayFits, capacityNumbers, charterDisplacement, dayCapacity, weighDay, type Capacity, type CharterDisplacement, type DayDeployment, type DayState, type HeldTrip } from './capacity.js';
 import { poolLocks, type GroupRow, type HolderType, type LockEvent, type LockQuery, type LockRow, type NewLockEvent } from './seat-locks.js';
 import { applyCalendarChange, assertCloseAllowed, assertRoutesOpen, eachDate, routeCalendar, todayInThailand, type CalendarChange, type CalendarHold, type Route, type RouteDate, type RouteDayOverride, type RouteKind, type RouteSeason } from './calendar.js';
 import {
@@ -39,7 +40,8 @@ import type { StoredReconfirm } from './reconfirm.js';
 import type { AltPickup } from './alt-pickups.js';
 import type { Allergy } from './allergies.js';
 import type { PickupArea, PickupCell, TimeProfile } from './pickup-areas.js';
-import type { InvoiceBrief, InvoiceLine, StoredInvoice, StoredPayment, StoredRefund } from './invoices.js';
+import { invoiceMonth, type InvoiceBrief, type InvoiceLine, type StoredInvoice, type StoredPayment, type StoredRefund } from './invoices.js';
+import { bookingCode } from './booking-code.js';
 import type { PfmEvent } from './pfm.js';
 import type { PayoutItem, StoredHandover, StoredPayout, StoredPierPayment, StoredTourSale, Takings } from './pier-money.js';
 import type { StoredCotDecision, StoredNoshowCharge } from './after-trip.js';
@@ -76,7 +78,7 @@ import {
 } from './rate-types.js';
 import { BOAT_MEASURES, BOAT_TEXT_FIELDS, sortFamilies, type BoatRecord, type RouteFamily, type RouteFields, type RouteUsage, type StoredOverride } from './catalogue.js';
 import {
-  decidedRecord, decideStatus, discountOf, focCountOf, reweigh,
+  decidedRecord, decideStatus, discountOf, focCountOf, reweigh, settleEdit, stillOverAsQuote,
   type ApprovalDay, type ApprovalKind, type ApprovalStatus, type ApprovalWarning, type BookingApproval, type NewApproval,
 } from './booking-approvals.js';
 import { sortAssets, type AssetKind, type AssetOf, type AssetQuery } from './fleet-assets.js';
@@ -175,6 +177,7 @@ const BOOKING_SELECT = `SELECT b.*, ${HEADER_DATE_SELECT}, COALESCE((
       'zone', t.zone, 'pickup_time', t.pickup_time, 'pickup_time_end', t.pickup_time_end, 'pickup_at_pier', t.pickup_at_pier, 'ovn', t.ovn, 'ovn_return_date', t.ovn_return_date::text, 'ovn_leg', t.ovn_leg, 'ovn_of', t.ovn_of,
       'ovn_charge', t.ovn_charge, 'charter_price_mode', t.charter_price_mode, 'charter_price_manual', t.charter_price_manual, 'charter_price_note', t.charter_price_note,
       'subtotal', t.subtotal, 'rate_type_id', t.rate_type_id, 'promo_id', t.promo_id,
+      'charter_displaced_at', t.charter_displaced_at, 'charter_displaced_by', t.charter_displaced_by,
       'dispatch', (SELECT jsonb_build_object('boat_id', o.boat_id, 'pickup_time_final', o.pickup_time_final, 'pickup_time_final_end', o.pickup_time_final_end,
           'pickup_final_at_pier', o.pickup_final_at_pier, 'return_same_van', o.return_same_van, 'pier_note', o.pier_note, 'pier_note_at', o.pier_note_at, 'pier_note_by', o.pier_note_by)
         FROM booking_trip_operations o WHERE o.booking_trip_id = t.id),
@@ -302,7 +305,7 @@ const header = (row: QueryResultRow): BookingHeader => {
 
 const stored = (row: QueryResultRow): StoredBooking => ({
   ...header(row),
-  id: String(row.id), status: row.status as Booking['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
+  id: String(row.id), code: String(row.code), status: row.status as Booking['status'], version: Number(row.version), created_at: asIso(row.created_at), updated_at: asIso(row.updated_at),
   cancellation_reason: row.cancellation_reason ?? undefined, external_id: row.external_id ?? undefined, agent_id: row.agent_id ?? undefined,
   voucher_ref: row.voucher_ref ?? undefined, rate_type_ref: row.rate_type_ref ?? undefined, booking_data: row.booking_data ?? undefined,
   trips: (row.trips as Record<string, unknown>[]).map((trip) => ({
@@ -323,6 +326,8 @@ const stored = (row: QueryResultRow): StoredBooking => ({
     ...(trip.ovn_return_date ? { ovn_return_date: String(trip.ovn_return_date) } : {}),
     ovn_leg: trip.ovn_leg === true,
     ...(trip.ovn_of ? { ovn_of: String(trip.ovn_of) } : {}),
+    ...(trip.charter_displaced_at ? { charter_displaced_at: jsonInstant(trip.charter_displaced_at) } : {}),
+    ...(trip.charter_displaced_by ? { charter_displaced_by: String(trip.charter_displaced_by) } : {}),
   })),
   passengers: (row.passengers as Record<string, unknown>[]).map((passenger) => ({
     seq: Number(passenger.seq), name: String(passenger.name),
@@ -825,18 +830,19 @@ export class PostgresOperationsStore {
         trip.zone ?? null, trip.pickup_time ?? null, trip.ovn ?? null, trip.ovn_return_date ?? null, trip.ovn_leg, trip.ovn_of ?? null,
         trip.pickup_time_end ?? null, trip.pickup_at_pier === true,
         trip.ovn_charge ?? null, trip.charter_price_mode ?? null, trip.charter_price_manual ?? null, trip.charter_price_note ?? null,
-        trip.subtotal ?? null, trip.rate_type_id ?? null, trip.promo_id ?? null];
+        trip.subtotal ?? null, trip.rate_type_id ?? null, trip.promo_id ?? null, trip.charter_displaced_at ?? null, trip.charter_displaced_by ?? null];
       if (existing.has(trip.id)) {
         await this.client().query(`UPDATE booking_trips SET seq = $3, route_id = $4, service_date = $5, booking_mode = $6, charter_boat_id = $7,
           zone = $8, pickup_time = $9, ovn = $10, ovn_return_date = $11, ovn_leg = $12, ovn_of = $13, pickup_time_end = $14, pickup_at_pier = $15,
-          ovn_charge = $16, charter_price_mode = $17, charter_price_manual = $18, charter_price_note = $19, subtotal = $20, rate_type_id = $21, promo_id = $22
+          ovn_charge = $16, charter_price_mode = $17, charter_price_manual = $18, charter_price_note = $19, subtotal = $20, rate_type_id = $21, promo_id = $22,
+          charter_displaced_at = $23, charter_displaced_by = $24
           WHERE id = $1 AND booking_id = $2`, values);
         await this.client().query('DELETE FROM booking_trip_pax WHERE booking_trip_id = $1', [trip.id]);
         await this.client().query('DELETE FROM booking_trip_lock_draws WHERE booking_trip_id = $1', [trip.id]);
       } else {
         await this.client().query(`INSERT INTO booking_trips (id, booking_id, seq, route_id, service_date, booking_mode, charter_boat_id, zone, pickup_time, ovn, ovn_return_date, ovn_leg, ovn_of,
-          pickup_time_end, pickup_at_pier, ovn_charge, charter_price_mode, charter_price_manual, charter_price_note, subtotal, rate_type_id, promo_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, values);
+          pickup_time_end, pickup_at_pier, ovn_charge, charter_price_mode, charter_price_manual, charter_price_note, subtotal, rate_type_id, promo_id, charter_displaced_at, charter_displaced_by)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, values);
       }
       for (const cell of trip.pax) {
         await this.client().query('INSERT INTO booking_trip_pax (booking_trip_id, category, residency, count) VALUES ($1,$2,$3,$4)', [trip.id, cell.category, cell.residency, cell.count]);
@@ -985,17 +991,32 @@ export class PostgresOperationsStore {
    * over it (`weighDay`). The same pool locks, in the same order, so the answer cannot go stale before
    * the write.
    */
-  private async weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = [], agentId?: string | null): Promise<ApprovalDay[]> {
+  private async weighTrips(trips: readonly BookingTripInput[], exclude: Exclusion = {}, vacating: readonly { route_id: string; service_date: string }[] = [], agentId?: string | null,
+    displace?: DisplaceCheck): Promise<ApprovalDay[]> {
     const days = demandByDay(trips, agentId);
     const pools = new Map<string, { route_id: string; service_date: string }>();
     for (const day of [...days, ...vacating]) pools.set(`${day.route_id} ${day.service_date}`, { route_id: day.route_id, service_date: day.service_date });
     for (const key of [...pools.keys()].sort()) { const pool = pools.get(key)!; await this.lockPool(pool.route_id, pool.service_date); }
     const over: ApprovalDay[] = [];
     for (const demand of days) {
-      const weight = weighDay(await this.day(demand.route_id, demand.service_date, exclude), demand);
+      const day = await this.day(demand.route_id, demand.service_date, exclude);
+      const displaced = charterDisplacement(day, demand);
+      const weight = weighDay(day, demand, displace?.anyway === true);
+      if (displaced) displace?.found.push(displaced);
       if (weight) over.push({ route_id: demand.route_id, service_date: demand.service_date, ...weight });
     }
     return over;
+  }
+
+  /** The next `BK-YYMMNNNN` of the Bangkok month. The counter row serializes two creates at once; the highest code already given keeps it ahead of an import. */
+  private async nextBookingCode(): Promise<string> {
+    const month = invoiceMonth(new Date());
+    const { rows: [r] } = await this.client().query(`WITH given AS (
+        SELECT COALESCE(max((regexp_match(code, '^BK-[0-9]{4}([0-9]+)'))[1]::int), 0) AS n FROM bookings WHERE code LIKE 'BK-' || $1 || '%')
+      INSERT INTO booking_code_counters (year_month, last) SELECT $1, n + 1 FROM given
+      ON CONFLICT (year_month) DO UPDATE SET last = GREATEST(booking_code_counters.last, (SELECT n FROM given)) + 1
+      RETURNING last`, [month]);
+    return bookingCode(month, Number(r.last));
   }
 
   /** One approval waits per kind: a new request replaces a pending one of its kind. */
@@ -1068,7 +1089,7 @@ export class PostgresOperationsStore {
   }
 
   /** `exclude` leaves a lock out of the seats it is weighed against: a whole-boat hold being converted into this booking. */
-  async createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Promise<Booking> {
+  async createBooking(input: BookingInput, actor?: string, exclude: Exclusion = {}): Promise<Booking & { warnings?: CharterDisplacement[] }> {
     if (input.external_id !== undefined) {
       const { rows: [taken] } = await this.client().query('SELECT id FROM bookings WHERE external_id = $1', [input.external_id]);
       if (taken) externalIdTaken(input.external_id, String(taken.id));
@@ -1077,18 +1098,20 @@ export class PostgresOperationsStore {
     await this.assertRoutes(input.trips);
     await this.assertOpen(tripsToCheckOpen(input.external_id, [], planned));
     // Weighed first, then decided: the days over the allotment are a fact the status depends on.
+    const displaced: CharterDisplacement[] = [];
     const decision = decideStatus(input.intent ?? 'confirm', {
       focCount: focCountOf(input.trips), focReason: input.header?.foc_reason, discount: discountOf(input.header ?? {}),
-      overDays: await this.weighTrips(input.trips, exclude, [], input.agent_id),
+      overDays: await this.weighTrips(input.trips, exclude, [], input.agent_id, { anyway: input.displace_anyway === true, found: displaced }),
     }, actor);
     const status = decision.status;
-    const head: BookingHeader = { ...input.header, ...(status === 'confirmed' ? confirmationStamp(actor, new Date().toISOString()) : {}) };
+    const now = new Date().toISOString();
+    const head: BookingHeader = { ...input.header, ...(status === 'confirmed' ? confirmationStamp(actor, now) : {}) };
     const id = `booking_${randomUUID()}`;
     // Only the header columns the caller actually supplied are written, so a NULL keeps meaning
     // "never given" rather than "explicitly blanked". The column list is generated rather than
     // typed out: a statement maintained by hand is one that silently stops writing a new field.
-    const columns = ['id', 'status', 'external_id', 'agent_id', 'voucher_ref', 'rate_type_ref', 'booking_mode'];
-    const values: unknown[] = [id, status, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null];
+    const columns = ['id', 'code', 'status', 'external_id', 'agent_id', 'voucher_ref', 'rate_type_ref', 'booking_mode'];
+    const values: unknown[] = [id, await this.nextBookingCode(), status, input.external_id ?? null, input.agent_id ?? null, input.voucher_ref ?? null, input.rate_type_ref ?? null, input.trips[0]?.booking_mode ?? null];
     for (const column of BOOKING_HEADER_COLUMNS) {
       const value = head[column];
       if (value === undefined) continue;
@@ -1108,7 +1131,7 @@ export class PostgresOperationsStore {
       if (e.code === '23505' && e.constraint === 'bookings_external_id_unique') externalIdTaken(input.external_id!);
       throw error;
     }
-    await this.writeTrips(id, [], planned);
+    await this.writeTrips(id, [], stampDisplaced(planned, displaced, actor, now));
     await this.writePassengers(id, input.passengers ?? []);
     await this.writeAddOns(id, input.add_ons ?? []);
     await this.writeAdjustments(id, input.adjustments ?? []);
@@ -1121,7 +1144,8 @@ export class PostgresOperationsStore {
     await this.log(id, createdLine(actor));
     for (const line of decision.history) await this.log(id, line);
     for (const line of sold.history) await this.log(id, line);
-    return (await this.booking(id))!;
+    for (const line of displacedLines(actor, displaced)) await this.log(id, line);
+    return withWarnings((await this.booking(id))!, displaced);
   }
 
   async listBookings(query: BookingListQuery) {
@@ -1140,7 +1164,7 @@ export class PostgresOperationsStore {
         AND ($5::text IS NULL OR b.agent_id = $5)
         AND ($6::text[] IS NULL OR b.status = ANY($6))
         AND ($7::text IS NULL OR lower(b.voucher_ref) = $7)
-        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)
+        AND ($8::text IS NULL OR position($8 IN lower(b.id)) > 0 OR position($8 IN lower(b.code)) > 0 OR position($8 IN lower(COALESCE(b.voucher_ref, ''))) > 0 OR position($8 IN lower(COALESCE(b.lead_pax, ''))) > 0)
         AND ($9::timestamptz IS NULL OR b.updated_at >= $9)`;
     const params = [query.routeId ?? null, query.serviceDate ?? null, query.from ?? null, query.to ?? null, query.agentId ?? null, query.statuses ?? null, query.voucherRef ?? null, query.q ?? null, query.updatedSince ?? null];
     const [{ rows }, { rows: [{ total }] }] = await Promise.all([
@@ -1158,25 +1182,27 @@ export class PostgresOperationsStore {
   private async storedBooking(id: string): Promise<StoredBooking | undefined> { const { rows: [row] } = await this.client().query(`${BOOKING_SELECT} WHERE b.id = $1`, [id]); return row && stored(row); }
 
   /** `entry` replaces the default `Edited · …` line, for the older reschedule body that comes through here. */
-  async amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine): Promise<Booking | undefined> {
+  async amendBooking(id: string, requested: BookingChanges, actor?: string, entry?: HistoryLine, flags: AmendFlags = {}): Promise<(Booking & { warnings?: CharterDisplacement[] }) | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
-    assertEditable(current.status);
+    assertEditable(current.status, flags.editAnyway);
     const changes = stripServerOwned(requested, current as unknown as Record<string, unknown> & { status: Booking['status'] });
     const replacement = nextTrips(current.trips, changes);
     const planned = planTrips(current.trips, replacement, newTripId);
     await this.assertRoutes(replacement);
     await this.assertOpen(tripsToCheckOpen(current.external_id, current.trips, planned));
+    const displaced: CharterDisplacement[] = [];
     const reweighed = reweighs(current, changes, claimsMoreSeats(current.trips, planned))
-      ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips, current.agent_id), actor) : undefined;
-    const status = reweighed?.status ?? current.status;
+      ? reweigh(current, await this.weighTrips(replacement, { bookingId: id }, current.trips, current.agent_id, { anyway: flags.displaceAnyway === true, found: displaced }), actor) : undefined;
+    const decided = settleEdit(current, reweighed, editFacts(current, changes, planned), actor);
+    const status = decided?.status ?? current.status;
     await this.log(id, entry ?? editedLine(actor, changes, current.status));
-    await this.writeTrips(id, current.trips, planned);
+    await this.writeTrips(id, current.trips, stampDisplaced(planned, displaced, actor, new Date().toISOString()));
     // Only the columns the amendment mentions are in the SET list, so an unmentioned one keeps its
     // value; a mentioned one carrying null is set to NULL. Built from BOOKING_HEADER_COLUMNS for
     // the same reason the INSERT is — a statement typed out by hand stops writing new fields.
     const assignments = ['booking_mode = $2', 'status = $3', 'updated_at = now()', 'version = version + 1'];
     const values: unknown[] = [id, replacement[0]?.booking_mode ?? null, status];
-    if (status === 'confirmed' && reweighed && !current.confirmed_at) { values.push(actor ?? null); assignments.push(`confirmed_at = now(), confirmed_by = ${values.length}`); }
+    if (status === 'confirmed' && decided && !current.confirmed_at) { values.push(actor ?? null); assignments.push(`confirmed_at = now(), confirmed_by = $${values.length}`); }
     for (const column of BOOKING_HEADER_COLUMNS) {
       const value = changes.header?.[column];
       if (value === undefined) continue;
@@ -1197,10 +1223,12 @@ export class PostgresOperationsStore {
       await this.writeUpgrades(id, sold.upgrades);
       for (const line of sold.history) await this.log(id, line);
     }
-    if (reweighed?.request) await this.requestApprovals(id, [reweighed.request]);
-    else if (reweighed) await this.replacePending(id, 'approval');
-    for (const line of reweighed?.history ?? []) await this.log(id, line);
-    return this.booking(id);
+    if (decided?.clearApproval) await this.replacePending(id, 'approval');
+    await this.requestApprovals(id, decided?.requests ?? []);
+    for (const line of decided?.history ?? []) await this.log(id, line);
+    for (const line of displacedLines(actor, displaced)) await this.log(id, line);
+    const amended = await this.booking(id);
+    return amended && withWarnings(amended, displaced);
   }
 
   async cancelBooking(id: string, request: CancelRequest, actor?: string): Promise<Booking | undefined> {
@@ -1237,6 +1265,7 @@ export class PostgresOperationsStore {
       }
       warnings = licenceWarnings(current.trips, (routeId, date) => days.get(dayKey(routeId, date))!);
     }
+    const still = plan.weigh_again ? stillOverAsQuote(await this.weighTrips(inputsOf(current.trips), { bookingId: id }, [], current.agent_id), actor) : undefined;
     if (plan.decide) {
       const { rowCount } = await this.client().query(
         "UPDATE booking_approvals SET status = $3, decided_by = $4, decided_at = now(), note = $5 WHERE booking_id = $1 AND kind = $2 AND status = 'pending'",
@@ -1249,14 +1278,15 @@ export class PostgresOperationsStore {
           [id, record.kind, record.status, record.foc_count, record.target_status, record.decided_by, record.note]);
       }
     }
-    await this.requestApprovals(id, plan.request);
+    for (const kind of plan.withdraw ?? []) await this.replacePending(id, kind);
+    await this.requestApprovals(id, [...plan.request, ...(still ? [still.request] : [])]);
     // `touch` binds $1 (id) and $2 (actor); these extra assignments follow from $3.
-    const values: unknown[] = [plan.status];
+    const values: unknown[] = [still?.status ?? plan.status];
     const sets = [', status = $3'];
     if (plan.confirms) { values.push(actor ?? null); sets.push(`, confirmed_at = now(), confirmed_by = $${values.length + 2}`); }
     if (plan.cancellation_reason !== undefined) { values.push(plan.cancellation_reason); sets.push(`, cancellation_reason = $${values.length + 2}`); }
     await this.touch(id, actor, sets.join(''), values);
-    for (const line of plan.history) await this.log(id, line);
+    for (const line of [...plan.history, ...(still?.history ?? [])]) await this.log(id, line);
     return { booking: (await this.booking(id))!, warnings };
   }
 
@@ -1264,7 +1294,7 @@ export class PostgresOperationsStore {
    * Back to `confirmed`, lock seats redrawn as far as the locks allow (`restoreTrips`). The pools are
    * locked before the days are read, so the lock remainders it decides on cannot move underneath it.
    */
-  async restoreBooking(id: string, actor?: string): Promise<{ booking: Booking; warnings: LockShortWarning[] } | undefined> {
+  async restoreBooking(id: string, actor?: string): Promise<{ booking: Booking; warnings: RestoreWarning[] } | undefined> {
     const current = await this.storedBooking(id); if (!current) return undefined;
     assertRestorable(current.status);
     const days = new Map<string, DayState>();
@@ -1273,9 +1303,10 @@ export class PostgresOperationsStore {
       await this.lockPool(trip.route_id, trip.service_date);
       days.set(key, await this.day(trip.route_id, trip.service_date, { bookingId: id }));
     }
-    const { trips, warnings } = restoreTrips(current.trips, days);
+    const restored = restoreTrips(current.trips, days);
+    const { trips } = restored;
+    const warnings = [...restored.warnings, ...restoreShortfalls(trips, days, current.agent_id)];
     await this.assertOpen(current.trips);
-    await this.assertTrips(trips, { bookingId: id }, [], current.agent_id);
     await this.writeTrips(id, current.trips, planTrips(current.trips, trips, newTripId));
     await this.touch(id, actor, ", status = 'confirmed', cancellation_reason = NULL");
     await this.client().query('DELETE FROM booking_cancellations WHERE booking_id = $1', [id]);

@@ -18,6 +18,8 @@
 export type BookingHeader = {
   schema_ver?: number;
   sold_by?: string; purpose?: string; staff_id?: string; staff_purpose?: string;
+  /** Why a company booking was made (legacy `companyPurpose`, migration 222): required on agent `a_company` (`staff.ts`). */
+  company_purpose?: string;
   lead_pax?: string; lead_nationality?: string; lead_type?: string; lead_foc?: boolean;
   lead_phone?: string; lead_email?: string;
   /** The lead's insurance fields (migration 093): set by PUT /v1/bookings/{id}/insurance only. */
@@ -70,7 +72,7 @@ export type BookingHeaderPatch = { [K in keyof BookingHeader]?: BookingHeader[K]
  */
 export const BOOKING_HEADER_COLUMNS = [
   'schema_ver',
-  'sold_by', 'purpose', 'staff_id', 'staff_purpose',
+  'sold_by', 'purpose', 'staff_id', 'staff_purpose', 'company_purpose',
   'lead_pax', 'lead_nationality', 'lead_type', 'lead_foc', 'lead_phone', 'lead_email',
   'lead_age', 'lead_insurance_reviewed_at', 'lead_insurance_reviewed_by',
   'pickup_area_id', 'pickup_self', 'pickup_area', 'pickup_zone', 'hotel_name', 'room_number',
@@ -183,6 +185,7 @@ function fields(document: Record<string, unknown>): readonly Field[] {
     ['purpose', text, own('purpose')],
     ['staff_id', text, own('staffId', 'staff_id')],
     ['staff_purpose', text, own('staffPurpose', 'staff_purpose')],
+    ['company_purpose', text, own('companyPurpose', 'company_purpose')],
 
     ['lead_pax', text, own('leadPax', 'lead_pax')],
     ['lead_nationality', text, own('leadNationality', 'lead_nationality')],

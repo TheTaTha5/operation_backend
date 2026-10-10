@@ -208,29 +208,44 @@ test('restore redraws what a lock still has and takes the rest from general seat
   assert.match((await history(booking.id)).at(-1)!.text, new RegExp(`^Restored · seat lock ${lock.id}: 1/3 seats back$`));
 });
 
-test('restore is refused when general seats cannot take the rest either', async () => {
+// Restore always restores, as legacy's (`bkV2RestoreBooking`, decided 2026-10-10): what it could not
+// get back is a warning and a history line, never a refusal. These two were refusals before.
+test('restore restores even when general seats cannot take the rest, and says by how much the day is oversold', async () => {
   const day = '2037-01-14';
   await deploy('r3', day, 6);
   const lock = (await request('POST', '/v1/seat-locks', { route_id: 'r3', service_date: day, pax: 3 })).json();
   const booking = await create({ trips: [{ route_id: 'r3', date: day, pax: 3, lock_draws: { [lock.id]: 3 } }] });
   await request('POST', `/v1/bookings/${booking.id}/cancel`, { category: 'sick' });
   await create({ trips: [{ route_id: 'r3', date: day, pax: 6, lock_draws: { [lock.id]: 3 } }] });
-  const refused = await request('POST', `/v1/bookings/${booking.id}/restore`);
-  assert.equal(refused.statusCode, 409);
-  assert.equal((await request('GET', `/v1/bookings/${booking.id}`)).json().status, 'cancelled', 'nothing changed');
+  const restored = await request('POST', `/v1/bookings/${booking.id}/restore`);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json().status, 'confirmed');
+  assert.deepEqual(restored.json().warnings, [
+    { code: 'lock_short', trip_id: booking.trips[0].id, lock_id: lock.id, wanted: 3, got: 0 },
+    { code: 'seats_short', route_id: 'r3', service_date: day, short_by: 3 },
+  ]);
+  assert.equal(await seatsLeft('r3', day), -3, 'the day is oversold, knowingly');
+  assert.equal((await history(booking.id)).at(-1)!.text, `Restored · seat lock ${lock.id}: 0/3 seats back · r3 ${day} oversold by 3`);
 });
 
-test('restoring a charter whose boat another charter now holds is refused', async () => {
+test('restoring a charter whose boat another charter now holds leaves it a charter with no boat, to re-plan', async () => {
   const day = '2037-01-15';
   await deploy('r2', day, 20, 'boat-act-charter');
   const charter = { trips: [{ route_id: 'r2', date: day, booking_mode: 'charter', charter_boat_id: 'boat-act-charter', pax: 6 }] };
   const first = await create(charter);
   await request('POST', `/v1/bookings/${first.id}/cancel`, { category: 'agent_error' });
-  await create(charter);
-  const refused = await request('POST', `/v1/bookings/${first.id}/restore`);
-  assert.equal(refused.statusCode, 409);
-  assert.equal(refused.json().code, 'charter_boat_taken');
-  assert.equal(refused.json().message, `Boat boat-act-charter is chartered by another booking on ${day}`);
+  const second = await create(charter);
+  const restored = await request('POST', `/v1/bookings/${first.id}/restore`);
+  assert.equal(restored.statusCode, 200, restored.body);
+  assert.equal(restored.json().status, 'confirmed');
+  assert.equal(restored.json().trips[0].booking_mode, 'charter');
+  assert.equal(restored.json().trips[0].charter_boat_id, undefined, 'the boat stays with the booking that took it');
+  assert.deepEqual(restored.json().warnings, [
+    { code: 'charter_boat_taken', trip_id: first.trips[0].id, boat_id: 'boat-act-charter', route_id: 'r2', service_date: day },
+    { code: 'seats_short', route_id: 'r2', service_date: day, short_by: 6 },
+  ], 'a charter with no boat takes its passengers from a pool the other charter emptied');
+  assert.equal((await history(first.id)).at(-1)!.text, `Restored · charter boat boat-act-charter on ${day} was taken by another booking: re-plan · r2 ${day} oversold by 6`);
+  assert.equal((await request('GET', `/v1/bookings/${second.id}`)).json().trips[0].charter_boat_id, 'boat-act-charter');
 });
 
 test('a partial cancel takes named passengers off one trip of several, lock seats first', async () => {

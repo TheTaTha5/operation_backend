@@ -37,6 +37,11 @@ are done.*
 10. Live updates come from `GET /v1/changes/stream`. The 30 s, 60 s and 120 s polls go.
 11. Programs, the boat form, Boat Status and the day-seats dialog save to `/v1/routes`,
     `/v1/route-families` and `/v1/boats` (§3.14). Routes and boats are the API's now.
+12. Legacy's booking dialogs become flags (decided 2026-10-10, §2.2): "No rate · cannot save" is
+    `409 no_rate`; "charter saved at 0 THB?" is `free_anyway`; the displacement dialog is
+    `displace_anyway`; "Edit anyway?" is `edit_anyway`; Save Draft on a live booking is
+    `POST /v1/bookings/{id}/unconfirm`. The booking shows the server's `code`; a company booking sends
+    `company_purpose`. Restore never refuses (§2.6).
 
 ## How to read this
 
@@ -221,6 +226,9 @@ copies.**
 | `t.subtotal` | `trips[].subtotal` |
 | `t.ovnCharge` | `trips[].ovn_charge` |
 | `t.charterPriceMode` / `Manual` / `Note` | `trips[].charter_price_mode` / `charter_price_manual` / `charter_price_note` |
+| `bk.code` (shown wherever legacy shows `voucherRef \|\| code \|\| id`) | `code`: the server's `BK-YYMMNNNN`; an imported booking's is its legacy id. `id` stays the key (`booking_<uuid>`, `lg_<legacy id>`) |
+| `bk.companyPurpose` | `company_purpose` (`company_guest`, `pr_foc`, `company_special`) |
+| `t.charterDisplacementAck` | `!!trips[].charter_displaced_at` (also `charter_displaced_by`: who) |
 
 - **`mergeInto` keeps only what the API does not hold:** `history` (until `refreshDetail` replaces
   it), `rebook`, `b2cOverride`, `createdAt`. (`invoiceId` and `paymentStatus` now come from the
@@ -265,6 +273,28 @@ client id (a retry is `409 duplicate_external_id` naming the booking).
 - **Do not send** `doc_check`, `reconfirm`, `special_meals_pier_at`/`_by` or `operations`. A `PATCH`
   may echo them unchanged; a different value is `400`. They have their own commands (§3).
 - **`upgrades`**: send only from the on-tour sale dialog (§3.9), not on every save.
+- **`companyPurpose`** (or `company_purpose`) on a company booking (agent `a_company`): required,
+  `400` without it. Drop `bkV2Save`'s alert; keep the select. Legacy also wrote it into `purpose`;
+  keep doing that if reports read `purpose`.
+- **Do not send `code`**: the server numbers the booking. A `PATCH` may echo it; a create with one,
+  or a different one, is `400`. `external_id` stays the client id, as now.
+- **Legacy's dialogs, answered** (decided 2026-10-10). Each refusal below is legacy's dialog; the
+  user's yes resends the same request with the flag:
+  - Save while a trip has no rate (`bkV2RenderSubmitButton`'s "⚠ No rate · cannot save"): the server
+    answers `409 no_rate`; keep the disabled button as the hint.
+  - A charter with no charter rate and no agreed price (`bkV2SubmitBooking` §chManualNoRate's
+    "saved at 0 THB" confirm): `409 no_charter_price`; OK resends with `free_anyway: true`.
+  - Chartering a boat with seats sold on it (`bkV2SetTripCharterBoat`'s displacement dialog): the
+    server answers `409 charter_displaces_seats` with the numbers in its `message`; Confirm resends
+    with `displace_anyway: true`, and the answer's `warnings` (`charter_displaced`) are the toast.
+    **Delete** `t.charterDisplacementAck = true` in `bkV2ConfirmCharter`: the server stamps it.
+  - Editing a cancelled, rejected or completed booking (`bkV2EditBooking`'s "Edit anyway?"): the save
+    sends `edit_anyway: true` once the user said yes (else `409 booking_closed`). A weather-cancelled
+    booking needs nothing.
+- **Save Draft on a live booking** (`bkV2SaveDraft`): keep its confirm dialog, then call
+  `POST /v1/bookings/{id}/unconfirm` (with `If-Match`) instead of saving `status: quote`, and send the
+  edit itself with `PATCH` as usual. **Behaviour change:** none; the server now records it as a
+  status move (`Back to quote · was confirmed`).
 - **Add-on `amount`:** the server computes it on non-B2C bookings. Keep sending `type`, `label`,
   `qty`, `note`, `jAd`, `jChd`; `amount` may stay (it is replaced).
 - **Prices:** see §2.3.
@@ -279,8 +309,13 @@ each trip's `subtotal` / `rate_type_id` / `promo_id`, each add-on's `amount`, an
 only repeat the stored value on `PATCH`. A different value is `400`, e.g.:
 
 ```
-status cannot be changed with PATCH: use POST /v1/bookings/{id}/confirm, /approve, /reject, /cancel, /cancel-weather or /restore
+status cannot be changed with PATCH: use POST /v1/bookings/{id}/confirm, /approve, /reject, /unconfirm, /cancel, /cancel-weather or /restore
 ```
+
+**An edit asks again only for what it raises.** More FOC passengers than were approved send a
+`confirmed` booking to `pending_foc`; a bigger discount than was approved sends it to
+`pending_approval`. An unchanged save stays `confirmed`, as legacy's "FOC already approved → keep
+Confirmed".
 
 **Pickup areas must exist.** `pickup_area_id` and `dropoff_area_id` must be areas in
 `GET /v1/pickup-areas` (`400` otherwise). Today the picker reads the seed `SB_PICKUP_AREAS`
@@ -305,10 +340,15 @@ does):
 | `400` | — | a field or rule, named (`trips[0] …`, `addOns[2].amount must be a number`, `adjustments[1].value must be a number above 0`, unknown pickup area, a `price_mode` that contradicts the agent) |
 | `400` | — | `foc_reason is required to confirm FOC (free) passengers` |
 | `400` | — | `staff_id is required: a staff booking names the staff member` (the guard `bkV2Save` had: drop its alert), or a `staff_id` that is no staff member |
+| `400` | — | `company_purpose is required: choose a reason for this company booking (…)`, or one not of the three |
+| `400` | — | `code cannot be set` / `code cannot be changed` |
+| `409` | `no_rate` | a rate-priced trip with no rate for its route and zone: `No rate · 1 trip · cannot save: …` |
+| `409` | `no_charter_price` | a charter with no charter price: legacy's "saved at 0 THB" confirm; resend with `free_anyway: true` |
+| `409` | `charter_displaces_seats` | a charter on a boat with seats sold: legacy's displacement dialog; resend with `displace_anyway: true` |
 | `409` | `over_quota` | a welfare booking's free seats over the staff member's quota: legacy's "Save anyway?" confirm; resend with `quota_anyway: true` |
 | `409` | `route_closed` | a new or moved trip on a closed day: `Route Day Trip - Se La Va (r7) does not run on 2027-01-04` |
 | `409` | — | no seats: locks in the way, or past the boats' registered seats |
-| `409` | `booking_closed` | editing a `cancelled`, `rejected`, `cancelled_weather` or `completed` booking |
+| `409` | `booking_closed` | editing a `cancelled`, `rejected` or `completed` booking without `edit_anyway: true` (a `cancelled_weather` one is edited freely) |
 | `409` | `stale_version` | someone saved it meanwhile |
 | `409` | `duplicate_external_id` | a retried create; read the named booking instead |
 
@@ -400,7 +440,7 @@ list when sent, and are left alone when absent.
 - Every booking has `version`: `1` on create, `+1` on every write. Responses also send it as `ETag`
   (`"7"`).
 - Send it as `If-Match: "7"` (or `"version": 7` in the body) on `PATCH /v1/bookings/{id}` and every
-  command and action: `/confirm`, `/approve`, `/reject`, `/cancel-weather`, `/cancel`, `/restore`,
+  command and action: `/confirm`, `/approve`, `/reject`, `/unconfirm`, `/cancel-weather`, `/cancel`, `/restore`,
   `/partial-cancel`, `/reschedule`, and `PUT /v1/bookings/{id}/meals`.
 - `409 stale_version` → show the message ("…reload and try again"), refetch the booking, redraw.
   Nothing was written.
@@ -421,9 +461,10 @@ restore, partial cancel and reschedule are commands; `over_licence` and `lock_sh
 | `POST /v1/bookings/{id}/confirm` | `draft`, `quote`, `pending` | `confirmed`, or `pending_foc` / `pending_approval` |
 | `POST /v1/bookings/{id}/approve` | `pending_approval`, `pending_foc` | the approval's `target_status` |
 | `POST /v1/bookings/{id}/reject` | `pending_approval`, `pending_foc` | `rejected` |
+| `POST /v1/bookings/{id}/unconfirm` | `confirmed`, `pending_foc`, `pending_approval` | `quote` (legacy Save Draft; one waiting over the allotment stays `pending_approval`, its target `quote`) |
 | `POST /v1/bookings/{id}/cancel-weather` | any status that holds seats | `cancelled_weather` |
 | `POST /v1/bookings/{id}/cancel` | any status that holds seats | `cancelled` |
-| `POST /v1/bookings/{id}/restore` | `cancelled`, `rejected`, `cancelled_weather` | `confirmed` |
+| `POST /v1/bookings/{id}/restore` | `cancelled`, `rejected`, `cancelled_weather` | `confirmed`, always: what it could not get back is in `warnings` |
 
 ```json
 { "category": "customer_cancel", "note": "changed plan", "charge_type": "partial", "charge_amount": 1500 }
@@ -433,8 +474,12 @@ restore, partial cancel and reschedule are commands; `over_licence` and `lock_sh
 - Add `If-Match` to every command (§2.5). The `tx` wrapper and `laOpsBookingAction` are the two
   places.
 - Handle the codes: `wrong_status`, `already_cancelled`, `booking_closed`, `not_cancelled`,
-  `charter_boat_taken`, `route_closed` (restore), `stale_version`, and `403` (§1.3). All are already
+  `route_closed` (restore), `stale_version`, and `403` (§1.3). All are already
   shown by `O.fail`; add the refetch on `stale_version`.
+- **Restore never refuses for a taken boat or short seats** (decided 2026-10-10, as
+  `bkV2RestoreBooking`). Show its `warnings` as legacy's toast: `lock_short` (as now),
+  `charter_boat_taken` (`boat_id`, `service_date`: "เรือเหมา … วันถูกจองแล้ว ต้องจัดใหม่"; the trip
+  comes back a charter with no boat) and `seats_short` (`short_by`). `409 charter_boat_taken` is gone.
 - Partial cancel: `{ trip_id, pax, category, note, charged: {count, amount}, waived: {count, amount}
   }`. A trip is never emptied this way (`400`). Reschedule: `{ from_date, to_date, reason,
   charge_type, charge_amount, collect }` moves every trip on `from_date`.

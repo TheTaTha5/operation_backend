@@ -9,14 +9,19 @@ import type { Booking, Deployment } from './operations.js';
 
 export type DeploymentWarning = { code: 'boat_pulled' | 'oversold'; route_id: string; service_date: string; boat_id: string; bookings: number; pax: number };
 
-/** The bookings that hold seats and are placed on the boat on that route and day: on it whole, or in a split. */
+/**
+ * The bookings that hold seats and are placed on the boat on that route and day: on it whole, or in a split.
+ * `charter` is the booking that claims the boat in Boat Operation. A quote does not (legacy
+ * `bkV2CommitBooking` writes the charter lock only when `status !== 'quote'`; decided 2026-10-10), so
+ * the boat can still be pulled off its route, though the seat pool still counts it as chartered.
+ */
 export function placedOn(bookings: readonly Booking[], boatId: string, routeId: string, date: string): { bookings: number; pax: number; charter: string | null } {
   let count = 0, pax = 0, charter: string | null = null;
   for (const b of bookings) {
     if ((SEAT_RELEASING_STATUSES as readonly string[]).includes(b.status)) continue;
     for (const t of b.trips) {
       if (t.route_id !== routeId || t.service_date !== date) continue;
-      if (t.booking_mode === 'charter' && t.charter_boat_id === boatId) charter = b.id;
+      if (t.booking_mode === 'charter' && t.charter_boat_id === boatId && b.status !== 'quote') charter = b.id;
       const whole = t.operations.boat_id === boatId;
       const split = t.operations.boat_splits.find((s) => s.boat_id === boatId);
       if (whole || split) { count += 1; pax += whole ? t.pax_total : split!.ad + split!.chd + split!.inf + split!.foc; }

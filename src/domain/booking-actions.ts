@@ -13,6 +13,7 @@ import { formatPaxGrid, parsePaxGrid, paxTotal, type PaxGrid, type PaxRow } from
 import type { BookingChanges } from './operations.js';
 import type { BookingHeader, BookingHeaderPatch } from './booking-header.js';
 import type { WeatherCancelOutcome } from './refunds.js';
+import type { CharterDisplacement } from './capacity.js';
 import {
   decideStatus, discountOf, focCountOf, pendingApproval, type ApprovalKind, type BookingApproval, type NewApproval,
 } from './booking-approvals.js';
@@ -207,10 +208,25 @@ export function planCancel(booking: { status: BookingStatus; total?: number; fee
 /** A lock that could not give back every seat the booking had drawn from it before it was cancelled. */
 export type LockShortWarning = { code: 'lock_short'; trip_id: string; lock_id: string; wanted: number; got: number };
 
-export function restoredLine(by: string | undefined, warnings: readonly LockShortWarning[]): HistoryLine {
-  const shorts = warnings.map((w) => ` · seat lock ${w.lock_id}: ${w.got}/${w.wanted} seats back`).join('');
-  return line(by, 'edit', 'Confirmed', `Restored${shorts}`);
+/**
+ * A charter boat another booking took while this one was cancelled: the restore leaves the trip a
+ * charter with no boat, to re-plan (legacy `bkV2RestoreBooking`: "เรือเหมา … วันถูกจองแล้ว ต้องจัดใหม่").
+ */
+export type CharterTakenWarning = { code: 'charter_boat_taken'; trip_id: string; boat_id: string; route_id: string; service_date: string };
+/** A day the restored booking oversells: legacy restores without checking seats; this says by how much. */
+export type SeatsShortWarning = { code: 'seats_short'; route_id: string; service_date: string; short_by: number };
+export type RestoreWarning = LockShortWarning | CharterTakenWarning | SeatsShortWarning;
+
+export function restoredLine(by: string | undefined, warnings: readonly RestoreWarning[]): HistoryLine {
+  const text = warnings.map((w) => w.code === 'lock_short' ? ` · seat lock ${w.lock_id}: ${w.got}/${w.wanted} seats back`
+    : w.code === 'charter_boat_taken' ? ` · charter boat ${w.boat_id} on ${w.service_date} was taken by another booking: re-plan`
+      : ` · ${w.route_id} ${w.service_date} oversold by ${w.short_by}`).join('');
+  return line(by, 'edit', 'Confirmed', `Restored${text}`);
 }
+
+/** `Chartered anyway · boat-x on r2 2037-01-15 · 12 seats sold, oversold by 4` (legacy's displacement dialog, confirmed). */
+export const displacedLines = (by: string | undefined, displaced: readonly CharterDisplacement[]): HistoryLine[] =>
+  displaced.map((d) => line(by, 'edit', 'Edited', `Chartered anyway · ${d.boat_ids.join(', ')} on ${d.route_id} ${d.service_date} · ${d.seats_sold} seats sold, oversold by ${d.oversold_by}`));
 
 // ── Partial cancel ───────────────────────────────────────────────────────────────────────────────
 
@@ -371,7 +387,7 @@ type OwnedField = typeof SERVER_OWNED_HEADER[number] | 'status';
 
 /** What to do instead, for each refusal. */
 const INSTEAD: Record<OwnedField, string> = {
-  status: 'use POST /v1/bookings/{id}/confirm, /approve, /reject, /cancel, /cancel-weather or /restore',
+  status: 'use POST /v1/bookings/{id}/confirm, /approve, /reject, /unconfirm, /cancel, /cancel-weather or /restore',
   confirmed_by: 'it is stamped from the login by /confirm or /approve',
   confirmed_at: 'it is stamped by /confirm or /approve',
   created_by: 'it is the logged-in user who created the booking',
@@ -446,10 +462,14 @@ export const confirmationStamp = (actor: string | undefined, now: string): Pick<
 export const externalIdTaken = (externalId: string, bookingId?: string): never =>
   refuse(`external_id ${externalId} is already ${bookingId ? `booking ${bookingId}` : 'used by another booking'}`, 409, 'duplicate_external_id');
 
-/** Statuses a booking can no longer be edited in (legacy `bkV2EditBooking`: "Cannot edit a … booking"). */
-const CLOSED: readonly BookingStatus[] = ['cancelled', 'completed', 'rejected', 'cancelled_weather'];
-export function assertEditable(status: BookingStatus): void {
-  if (CLOSED.includes(status)) refuse(`Cannot edit a ${status} booking`, 409, 'booking_closed');
+/**
+ * Statuses an edit must confirm (legacy `bkV2EditBooking`: "This booking is cancelled. Edit anyway?";
+ * decided 2026-10-10). `edit_anyway: true` is legacy's OK; without it, `409 booking_closed`. A
+ * weather-cancelled booking is edited without asking, as in legacy. The edit's own checks still apply.
+ */
+const CLOSED: readonly BookingStatus[] = ['cancelled', 'completed', 'rejected'];
+export function assertEditable(status: BookingStatus, editAnyway = false): void {
+  if (CLOSED.includes(status) && !editAnyway) refuse(`This booking is ${status}. Edit anyway? Send edit_anyway: true to save the edit`, 409, 'booking_closed');
 }
 
 // ── Status commands ──────────────────────────────────────────────────────────────────────────────
@@ -461,7 +481,7 @@ export function assertEditable(status: BookingStatus): void {
  * `bkV2FocReject`, `bkV2WeatherResolveOne`), except that the approver is the logged-in user, not a
  * typed name (legacy's FOC approval even hard-coded `RM`).
  */
-export const STATUS_COMMANDS = ['confirm', 'approve', 'reject', 'cancel-weather'] as const;
+export const STATUS_COMMANDS = ['confirm', 'approve', 'reject', 'unconfirm', 'cancel-weather'] as const;
 export type StatusCommand = typeof STATUS_COMMANDS[number];
 /**
  * `weather` is `/cancel-weather`'s money (`refunds.ts`): what was done with what the booking had paid,
@@ -479,18 +499,21 @@ export function parseStatusCommandRequest(body: Record<string, unknown>): Status
  * lines. `decide` closes the pending approval of that kind (or records a decided one, for a booking
  * that never had a record — legacy's imported `pending_approval` bookings). `request` asks for new
  * approvals. `claims` says the booking starts holding seats it was not holding: an approval of an
- * over-allotment booking.
+ * over-allotment booking. `withdraw` closes the approvals of those kinds still waiting (`replaced`):
+ * a quote waits for nothing. `weigh_again` says the booking was waiting over the allotment, holding
+ * no seats, and must be weighed again before it may hold them as a quote (`stillOverAsQuote`).
  */
 export type StatusPlan = {
   status: BookingStatus; confirms: boolean; cancellation_reason?: string; history: HistoryLine[];
   decide?: { kind: ApprovalKind; status: 'approved' | 'rejected'; note: string | null };
-  request: NewApproval[]; claims: boolean;
+  request: NewApproval[]; claims: boolean; withdraw?: ApprovalKind[]; weigh_again?: boolean;
 };
 
 const FROM: Record<StatusCommand, readonly BookingStatus[] | 'open'> = {
   confirm: ['draft', 'quote', 'pending'],
   approve: ['pending_approval', 'pending_foc'],
   reject: ['pending_approval', 'pending_foc'],
+  unconfirm: ['confirmed', 'pending_foc', 'pending_approval'],
   'cancel-weather': 'open',
 };
 
@@ -520,6 +543,15 @@ export function planStatusCommand(
     const to = decision.status;
     const own = to === 'confirmed' ? [line(by, 'edit', 'Confirmed', `Confirmed${note}`)] : decision.history.map((h) => ({ ...h, text: `${h.text}${note}` }));
     return { status: to, confirms: confirming(to), history: own, request: decision.approvals, claims: false };
+  }
+  if (command === 'unconfirm') {
+    // Legacy's Save Draft on a live booking (`bkV2SaveDraft` → `bkV2CommitBooking('quote')`): back to a
+    // quote, off the van and boat job sheets; who confirmed it and when are kept, as legacy keeps them.
+    const waitingOver = booking.status === 'pending_approval' && Boolean(pendingApproval(booking.approvals, 'approval')?.over_capacity);
+    return {
+      status: 'quote', confirms: false, history: [line(by, 'edit', 'Quote', `Back to quote · was ${booking.status}${note}`)], request: [], claims: false,
+      withdraw: ['approval', 'foc'], weigh_again: waitingOver,
+    };
   }
   const kind: ApprovalKind = booking.status === 'pending_foc' ? 'foc' : 'approval';
   const tag = kind === 'foc' ? 'FOC' : 'Approval';

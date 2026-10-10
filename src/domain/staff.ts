@@ -80,6 +80,20 @@ export function assertStaffDeletable(member: StaffMember, bookings: number): voi
 
 /** Legacy `isStaff`: the house account staff bookings are made on. */
 export const isStaffAgent = (agent: { id: string; code: string | null } | undefined): boolean => !!agent && (agent.code === 'STAFF' || agent.id === 'a_staff');
+
+/** The reasons legacy's company booking form offers (`companyPurpose`): company guest, PR / influencer, special price. */
+export const COMPANY_PURPOSES = ['company_guest', 'pr_foc', 'company_special'] as const;
+const isCompanyAgent = (agent: { id: string; code: string | null } | undefined): boolean => !!agent && (agent.code === 'COMPANY' || agent.id === 'a_company');
+
+/**
+ * Legacy `bkV2Save`'s company guard (decided 2026-10-10): a booking on the company account says why it
+ * was made, one of `COMPANY_PURPOSES` ("Please choose a reason for this company booking"), on every
+ * save. `company_purpose` is a client fact; a value that is not one of the three is `400` too.
+ */
+export function checkCompanyPurpose(agent: { id: string; code: string | null } | undefined, purpose: string | null | undefined): void {
+  if (purpose !== undefined && purpose !== null && !(COMPANY_PURPOSES as readonly string[]).includes(purpose)) bad(`company_purpose must be one of ${COMPANY_PURPOSES.join(', ')}`);
+  if (isCompanyAgent(agent) && !purpose) bad(`company_purpose is required: choose a reason for this company booking (${COMPANY_PURPOSES.join(', ')})`);
+}
 const isInspection = (b: { staff_purpose?: string | null; purpose?: string | null }) => b.staff_purpose === 'inspection' || b.purpose === 'staff_inspection';
 const holds = (b: Booking) => !(SEAT_RELEASING_STATUSES as readonly string[]).includes(b.status);
 const focOf = (pax: Record<string, number>): number => (pax.foc ?? 0) + (pax.foc_fr ?? 0) + (pax.foc_th ?? 0);

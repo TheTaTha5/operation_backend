@@ -279,6 +279,7 @@ booking can span several days.
 erDiagram
   bookings {
     text id PK
+    text code UK "BK-YYMMNNNN, or legacy's id; server-set"
     text status "one of 10, see notes"
     text external_id UK "caller's own reference"
     text agent_id "no FK"
@@ -310,6 +311,12 @@ erDiagram
     date ovn_return_date
     boolean ovn_leg "this trip is a return leg"
     text ovn_of FK "the leg's outbound trip"
+    timestamptz charter_displaced_at "ops chartered over sold seats"
+    text charter_displaced_by
+  }
+  booking_code_counters {
+    text year_month PK "YYMM, Bangkok"
+    integer last "last sequence given"
   }
   booking_trip_pax {
     text booking_trip_id PK, FK
@@ -412,13 +419,20 @@ erDiagram
   `pending_approval` booking has no approval row, and holds its seats.
 - **Deleting a booking deletes everything under it.** Its trips, pax, passengers, add-ons,
   approvals and action records all cascade.
+- **`code` is the readable number** (migration 220): `BK-` + the Bangkok month + a sequence from
+  `booking_code_counters`, which continues past every code of the month already given. An imported
+  booking's is legacy's id. `UNIQUE`, `NOT NULL`, set by the server only. The migration numbered the
+  bookings already here by `created_at` within their month.
+- **`charter_displaced_at`/`_by`** (migration 221) are ops' acknowledgement that a charter took a
+  boat with seats already sold (`displace_anyway`): a charter only (`CHECK`), and `_by` only with
+  `_at`. Legacy's `charterDisplacementAck` is imported with the booking's last change as the time.
 
 The `bookings` box shows the structural columns. The other 57 columns are the header: values the
 booking form writes, one column each. `foc_reason` came in migration 023, the rest in 011.
 
 | Group | Columns |
 | --- | --- |
-| Sale | `schema_ver` `sold_by` `purpose` `staff_id` `staff_purpose` `booking_date` `booked_at` `created_by` `updated_by` `confirmed_at` `confirmed_by` |
+| Sale | `schema_ver` `sold_by` `purpose` `staff_id` `staff_purpose` `company_purpose` (222: `company_guest`, `pr_foc`, `company_special`) `booking_date` `booked_at` `created_by` `updated_by` `confirmed_at` `confirmed_by` |
 | Lead passenger | `lead_pax` `lead_nationality` `lead_type` `lead_foc` `lead_phone` `lead_email` |
 | Pickup and drop-off | `pickup_area_id` `pickup_self` `pickup_area` `pickup_zone` `hotel_name` `room_number` `dropoff_same` `dropoff_area_id` `dropoff_area` `dropoff_hotel_name` |
 | Guides | `guide_english` `guide_russian` `guide_chinese` `guide_other_lang` |

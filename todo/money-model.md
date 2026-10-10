@@ -44,7 +44,7 @@ Not in Money:
     booking cannot go on a second invoice while the topped-up one is live, `409
     booking_already_invoiced`), and without it a void and re-issue, or a restore after a cancel, would
     drop the fee, and the `full` charge and credit `used` would leave it out. Test:
-    `test/invoices.test.ts` "a reschedule fee is billed once". Say if the fee item should go.
+    `test/invoices.test.ts` "a reschedule fee is billed once". **Decided 2026-10-10: keep, as built.**
   - Fee invoices remain for cancellation charges only; `fee_type: "reschedule"` comes from the import.
 
 ## Slices 5 and 6: what is left

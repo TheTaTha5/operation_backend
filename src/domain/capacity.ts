@@ -232,14 +232,61 @@ function assertDrawable(day: DayState, demand: DayDemand, lockId: string, qty: n
 }
 
 /**
+ * A charter that takes a boat whose seats the day has already sold (legacy `bkV2SetTripCharterBoat`'s
+ * displacement dialog: seats sold, available after, oversold by). Answered when ops charter it anyway
+ * (`displace_anyway: true`, decided 2026-10-10), and stored on the trip as their acknowledgement.
+ */
+export type CharterDisplacement = {
+  code: 'charter_displaced'; route_id: string; service_date: string; boat_ids: string[];
+  /** Seat passengers already sold on the day (legacy `getSeatsConsumed`), this booking's own left out. */
+  seats_sold: number;
+  /** Seats left on the day once the boat is gone, never below 0. */
+  available_after: number;
+  /** How many sold seats no longer have a seat. */
+  oversold_by: number;
+};
+
+/** The boats a demand's charters take whole that the day can give (deployed and free), and the seats they take out of the pool. */
+function charterTake(day: DayState, demand: DayDemand): { boats: BoatDay[]; seats: number } {
+  const boats: BoatDay[] = [];
+  for (const charter of demand.charters) {
+    const boat = charter.boat_id ? day.boats.find((b) => b.boat_id === charter.boat_id) : undefined;
+    if (boat && !boat.chartered && !boats.includes(boat)) boats.push(boat);
+  }
+  return { boats, seats: boats.reduce((sum, boat) => sum + boat.sellable, 0) };
+}
+
+/**
+ * The seats a demand's charters would take that the day has already sold, or `undefined` when the
+ * pool can lose their boats. The refusal it explains is `assertDayFits`'s and `weighDay`'s.
+ */
+export function charterDisplacement(day: DayState, demand: DayDemand): CharterDisplacement | undefined {
+  if (sellsUngated(day)) return undefined;
+  const take = charterTake(day, demand);
+  if (take.seats === 0 || day.available_seats >= take.seats) return undefined;
+  return {
+    code: 'charter_displaced', route_id: demand.route_id, service_date: demand.service_date, boat_ids: take.boats.map((b) => b.boat_id),
+    seats_sold: day.booked_pax, available_after: Math.max(0, day.available_seats - take.seats), oversold_by: take.seats - day.available_seats,
+  };
+}
+
+/** The refusal of a charter that would strand sold seats, naming legacy's numbers and the flag that charters it anyway. */
+function refuseDisplacement(day: DayState, demand: DayDemand): never {
+  const d = charterDisplacement(day, demand)!;
+  return refuse(`Insufficient available seats on ${demand.route_id} ${demand.service_date}: chartering ${d.boat_ids.join(', ')} takes seats already sold `
+    + `(${d.seats_sold} sold, ${d.available_after} available after, oversold by ${d.oversold_by}). Send displace_anyway: true to charter it anyway`, 409, 'charter_displaces_seats');
+}
+
+/**
  * Throws unless `demand` fits `day`. `day` must be read with the booking being amended excluded, or
  * it competes with its own seats.
  *
  * A seat drawn from a lock is already held, so only the undrawn part of a seat trip needs the pool.
  * A charter needs its boat to be deployed and free, its passengers to fit that boat's licence, and
- * the pool to survive losing the boat: taking a boat must not strand seats already sold on the day.
+ * the pool to survive losing the boat: taking a boat must not strand seats already sold on the day,
+ * unless `displaceAnyway` (`charterDisplacement`).
  */
-export function assertDayFits(day: DayState, demand: DayDemand): void {
+export function assertDayFits(day: DayState, demand: DayDemand, displaceAnyway = false): void {
   const where = `on ${demand.route_id} ${demand.service_date}`;
   let drawn = 0;
   for (const [lockId, qty] of demand.draws) {
@@ -259,6 +306,13 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
     need += boat.sellable;
   }
   if (sellsUngated(day)) return;
+  if (charterDisplacement(day, demand)) {
+    if (!displaceAnyway) refuseDisplacement(day, demand);
+    // Chartered anyway, the day is oversold knowingly; the rest of the demand still needs seats of its own.
+    const taken = charterTake(day, demand).seats;
+    if (need - taken > 0) refuse('Insufficient available seats', 409);
+    return;
+  }
   if (need > 0 && day.available_seats < need) refuse('Insufficient available seats', 409);
 }
 
@@ -276,7 +330,7 @@ export function assertDayFits(day: DayState, demand: DayDemand): void {
  *   for an approval to decide;
  * - it is over the licensed seats too → refused (`409`): there is no registered seat left.
  */
-export function weighDay(day: DayState, demand: DayDemand): { need: number; over_by: number; licensed_free: number } | undefined {
+export function weighDay(day: DayState, demand: DayDemand, displaceAnyway = false): { need: number; over_by: number; licensed_free: number } | undefined {
   const where = `on ${demand.route_id} ${demand.service_date}`;
   let drawn = 0;
   for (const [lockId, qty] of demand.draws) {
@@ -296,6 +350,12 @@ export function weighDay(day: DayState, demand: DayDemand): { need: number; over
     charterLicensed += boat.licensed;
   }
   if (sellsUngated(day)) return undefined;
+  if (charterDisplacement(day, demand)) {
+    if (!displaceAnyway) refuseDisplacement(day, demand);
+    // Chartered anyway, the day is oversold knowingly: no seat is left for the rest of the demand.
+    if (charterSeats > charterTake(day, demand).seats || demand.seat - drawn > 0) refuse('Insufficient available seats', 409);
+    return undefined;
+  }
   if (charterSeats > 0 && day.available_seats < charterSeats) refuse('Insufficient available seats', 409);
 
   const available = day.available_seats - charterSeats;

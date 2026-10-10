@@ -62,7 +62,7 @@ import { assertItinerary, type BookingTripInput, type OvnMode } from '../domain/
 import type { PickupWindow } from '../domain/pickup.js';
 import { legacyPickup } from './legacy-pickup.js';
 import { isPayType, isVatMode, PAY_TYPES } from '../domain/agents.js';
-import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
+import { cancellationRow, companyPurposeOf, displacementAckOf, feeItemRows, historyRows, partialCancelRows, rescheduleRow } from './legacy-records.js';
 import { LEGACY_HOLDS, mapLegacyRateTypes } from './legacy-rate-types.js';
 import { approvalRows, focReason, type ApprovalDayRow } from './legacy-approvals.js';
 import { mapLegacyLocks } from './legacy-locks.js';
@@ -660,7 +660,10 @@ async function main() {
           charter_price_mode: str(t.charterpricemode) === 'manual' ? 'manual' : str(t.charterpricemode) === 'rate' ? 'rate' : null,
           charter_price_manual: amountOrNull(t.charterpricemanual), charter_price_note: str(t.charterpricenote) || null,
           ovn_of: of === undefined ? null : `trip_${id}_${of}`,
+          // Legacy's `charterDisplacementAck` (migration 221), at the booking's last change.
+          ...displacementAckOf(t, charter, instant(b.updatedat) ?? instant(b.bookedat) ?? instant(b.createdat) ?? new Date().toISOString()),
         });
+        if (charter && t.charterdisplacementack === true) note('charter displacement acknowledgements (time: the booking\'s last change)');
         for (const r of rows) myPax.push({ booking_trip_id: tripId, category: r.category, residency: r.residency, count: r.count });
         myVanTrips.push({ t, tripId, counts: countsOf(rows) });
 
@@ -698,6 +701,9 @@ async function main() {
       // The FOC reason confirming free passengers needs: the booking's own, else its FOC approval's.
       const foc = focReason(b, report);
       if (foc) doc.foc_reason = foc;
+      // A company booking's reason, which legacy keeps in `purpose` (migration 222).
+      const companyPurpose = companyPurposeOf(b);
+      if (companyPurpose) doc.company_purpose = companyPurpose;
       const header: Record<string, unknown> = { ...bookingHeader(doc) };
       // A booking points at the area catalogue (migration 043); an id legacy no longer has is dropped, its name kept.
       for (const field of ['pickup_area_id', 'dropoff_area_id'] as const) {
@@ -709,7 +715,8 @@ async function main() {
       const created = instant(b.bookedat) ?? instant(b.createdat) ?? new Date().toISOString();
       bookings.push({
         ...header,
-        id, status, external_id: legacyId, job_note: jobNoteOf.get(legacyId) ?? null,
+        // Legacy's booking code is its id (`bkV2GenerateBookingCode`): kept as the code (migration 220).
+        id, code: legacyId, status, external_id: legacyId, job_note: jobNoteOf.get(legacyId) ?? null,
         agent_id: str(b.agentid) || null, voucher_ref: str(b.voucherref) || null, rate_type_ref: str(b.ratetyperef) || null,
         booking_mode: myTrips[0]!.booking_mode,
         cancellation_reason: str(b.cancellation_reason) || str(b.cancelreason) || null,
