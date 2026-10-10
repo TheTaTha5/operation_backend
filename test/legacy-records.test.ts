@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { Pool } from 'pg';
 import { buildApp } from '../src/app.js';
-import { cancellationRow, feeItemRows, historyRows, partialCancelRows, rescheduleRow, type Report } from '../src/tools/legacy-records.js';
+import { cancellationRow, companyPurposeOf, displacementAckOf, feeItemRows, historyRows, partialCancelRows, rescheduleRow, type Report } from '../src/tools/legacy-records.js';
 
 // Fixture rows in the shape of legacy's `sb_bookings` and its child tables
 // (`operation_frontend/data-model/tables/sb_bookings.js`).
@@ -81,6 +81,15 @@ test('fee items and history are carried as they are', () => {
   ]);
   assert.deepEqual(skipped, ['fee item lg_b1#1: no type']);
   assert.deepEqual(notes, ['history lines with no readable time (given the booking\'s)']);
+});
+
+test('a company booking\'s reason comes from legacy\'s purpose; a charter\'s displacement acknowledgement gets the booking\'s time', () => {
+  assert.equal(companyPurposeOf({ purpose: 'company_special' }), 'company_special');
+  assert.equal(companyPurposeOf({ purpose: 'staff_welfare' }), null, 'not a company reason');
+  assert.equal(companyPurposeOf({}), null);
+  assert.deepEqual(displacementAckOf({ charterdisplacementack: true }, true, AT), { charter_displaced_at: AT, charter_displaced_by: null });
+  assert.deepEqual(displacementAckOf({ charterdisplacementack: false }, true, AT), { charter_displaced_at: null, charter_displaced_by: null });
+  assert.deepEqual(displacementAckOf({ charterdisplacementack: true }, false, AT), { charter_displaced_at: null, charter_displaced_by: null }, 'only a charter carries one');
 });
 
 // The rows must also fit the tables, through the same `jsonb_populate_recordset` the import uses,
