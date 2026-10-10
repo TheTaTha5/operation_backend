@@ -109,3 +109,14 @@ test('a login tied to one agent books for it, sees only its bookings, and change
   assert.equal((await app.inject({ method: 'POST', url: `/v1/bookings/${other.json().id}/cancel`, headers: lk, payload: {} })).statusCode, 404);
   assert.equal((await app.inject({ method: 'POST', url: '/v1/seat-locks', headers: lk, payload: { route_id: 'r1', service_date: '2041-01-05', pax: 1 } })).statusCode, 403);
 });
+
+test('a login tied to one agent may not read the fleet', async () => {
+  await seedAgents(store, ['perm_s2'], { perm_a3: 'perm_s2' });
+  const lk = await as('perm.lk2', { edit_areas: ['operations'], agent_id: 'perm_a3' });
+  const staff = await as('perm.fleetreader', { edit_areas: [] });
+  for (const url of ['/v1/fleet/engines', '/v1/fleet/jobs', '/v1/fleet/stock-items', '/v1/fleet/insights']) {
+    const refused = await app.inject({ method: 'GET', url, headers: lk });
+    assert.equal(refused.statusCode, 403, url);
+    assert.equal((await app.inject({ method: 'GET', url, headers: staff })).statusCode, 200, `${url}: any staff login reads it`);
+  }
+});
