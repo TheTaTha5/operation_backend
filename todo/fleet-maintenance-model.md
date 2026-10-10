@@ -505,13 +505,90 @@ handoff §6.9). `import:fleet` copies the assignments. Rehearsed 2026-10-10 on a
 boat rows sit under Panwa by their assignment instead of the home pier. `invLostScan`/`invLostFix`
 are not built: a repair for legacy's colliding stock ids, which cannot happen here.
 
+## Design — insights (decided 2026-10-10)
+
+Fleet Insights (`flRenderInsights`, 05-fleet.js) and the Fleet Report (`rep-fleet`, `repFleetGather` /
+`repFleetSlides`, 08-app.js) as two computed `GET`s. Nothing is stored and nothing new is written: every
+field below is **computed**, no migration. Any login reads them except a login tied to an agent (`403`,
+as `/v1/money-reports`).
+
+### The definitions every fleet figure uses
+
+1. **A job's cost** (developer, 2026-10-10) is what `GET /v1/fleet/jobs/{id}` already answers
+   (`jobCost`): parts taken from stock (labour is a parts line, `ค่าแรง`) not already paid by one of its
+   parts memos, plus its approved, received and paid memos. **It is dated by the job's close date**
+   (`end_date` of a done job). An open job (pending, in progress) has no date: it is in no period's
+   spend; the screens show its cost so far as "open" or "in progress", as of today. A done job with no
+   `end_date` counts only in "all time".
+2. **Service due** (developer, 2026-10-10) is `engineService`: hours since the engine's last service
+   (else since the hours it came with) against its own `service_interval`. An engine with no interval
+   has no countdown and is never due.
+3. **A job's duration** (mine): `end_date − start_date + 1` days, both days counted (the Fleet Report's
+   count; Insights' "closing speed" left out the first day). Done jobs with both dates.
+4. **A boat's jobs in a period** (mine, for Insights' health): the jobs closed in the period plus the
+   jobs open now. Legacy counted jobs started in the period, any status; with rule 1 an open job belongs
+   to "now", and a boat with open work must not read healthy.
+
+### `GET /v1/fleet/insights?period=month|quarter|ytd|all`
+
+`period` defaults to `month` (legacy `_insightsTimeFilter`). The period runs from its first day to today.
+
+| Field | What | Legacy |
+|---|---|---|
+| `fleet` | company boats (not charter, not retired), `available`/`fixing`/`unavailable` today (effective status), `piers` (today's pier) | same |
+| `kpis` | `incidents` (incident date in the period), `incidents_critical` (priority ≥ 4), `jobs_closed`, `spent` (their cost), `average_per_job`, `active_jobs`/`pending_jobs` (now), `open_cost` | jobs and spend by **start** date |
+| `boats` | per company boat: `jobs` (rule 4), `jobs_active`, `cost` (closed in the period), `open_cost`, `incidents`, `status`, `health` (`critical`: jobs ≥ 3 or cost ≥ ฿100,000; `watch`: jobs ≥ 1; else `healthy`), sorted by cost | by start date |
+| `alert_boat` | the first boat with cost or jobs | same |
+| `trend` | last 6 months: cost of jobs **closed** that month, incidents; `cost_delta_pct`, `incidents_delta_pct`; `top_boat` of the current month | by start date; caption's top boat from the period |
+| `by_supplier` | memos approved, ordered, received or paid, memo date in the period, by supplier (the memo's, else its stock items' most common, else legacy's `ref_note` reading, else `Other`), `memos`, `suppliers` | same (memo date: a purchase, not a job cost) |
+| `by_type` | cost of jobs closed in the period by type | by start date |
+| `healthy` | company boats with no jobs (rule 4) and available today | same |
+| `service_due` | engines on a boat with an interval and `left ≤ 20 %` of it (overdue included), soonest first | the "Upcoming" card (rule 2); the "Engine service" card used `hours % interval` |
+| `memos` | pending approval (count, amount, first numbers), received (count, amount), `approval_rate` (approved or later of all memos, with at least 3) | same |
+| `awaiting_invoice` | done jobs marked awaiting invoice with no memo at all, days since close, oldest first | same |
+| `documents` | the **current** certificate of each type on company boats expiring within 60 days or expired: `expired`, `critical` (≤ 14), `warning` (≤ 60) | read every row, renewed ones too |
+| `closing_speed` | average duration (rule 3) of jobs closed in the period against those closed before it (at least 3 done jobs) | `end − start` |
+| `recurring_incidents` | boats with 2+ incidents in the period | same |
+| `long_running` | jobs in progress started 14+ days ago | same |
+| `cost_concentration` | the top boat when it took over half the period's spend | same |
+
+### `GET /v1/fleet/reports/fleet?from=&to=`
+
+Both dates required, `to ≥ from`, at most 366 days. The answer has `current` and `previous` (the same
+number of days just before, legacy `repPrevRange`), each with:
+
+| Field | What | Legacy |
+|---|---|---|
+| `availability` | per boat not retired (charter boats too), per day, the effective status (`availability`, the dashboard's): `boats_registered`, `boats_in_service` (available at least one day), `idle_boats`, `down_days`, `availability_pct`, `down_by_boat` | same |
+| `incidents` | dated in the range: `count`, `open`, `serious` (critical + major), `by_severity`, `by_boat` | same |
+| `jobs` | `closed` (closed in the range), `opened` (started in the range), `average_days` (rule 3, closed in the range), `cost` (rule 1), `with_cost`, `open_list` (every open job started by `to`, its age at `to`) | cost = the stored `cost`, only jobs started in the range with one; "closed" = started in the range and done; "opened" = started in the range and not done |
+| `spend` | `repairs` (= `jobs.cost`), `purchasing` (memos), `total` = repairs + memos in the range that name no job | repairs + purchasing (a job's memos counted twice) |
+| `engine_hours` | per boat: last − first meter reading (above 0) in the range per engine, every trip type; `total`, `reads` | same |
+| `projects` | overlapping the range (start = actual else planned; a completed one planned to end before `from` left out): `active`, `completed`, `late` (planned end before `to`, not completed: days behind) | a cancelled project counted as active |
+| `memos` | memo date in the range, not cancelled, amount after discount (before VAT, legacy): `count`, `amount`, `pending`, `pending_amount`, `by_supplier`, `by_type` | same |
+
+Beside them, once: `stock` (now: `items`, `at_zero`, `in_stock`, `with_min`, `below_min` (min > 0 and
+qty < min), `value`, `uniform_min`, `out` (items at zero, dearest first)) and `data_gaps` (legacy's
+"where the data is thin": jobs closed with no cost, no project budget, safety items still on the default
+1 Jan 2026 inspection date, fewer than 10 consumable draws, idle boats, one minimum on every item), as
+codes with their numbers. The headline, agenda and "what needs a decision" are text the screen builds
+from these figures.
+
+### The existing reports, brought onto the same definitions
+
+- **`/v1/fleet/reports/cost`:** a done job is dated by its close date (was close else start); a job in
+  progress has `date: null` and counts as `proc` (in progress, cost so far) in every period. The monthly
+  chart counts done jobs by close month only: `months[].proc` is removed.
+- **`/v1/fleet/reports/upkeep`:** a boat's repairs are its jobs **closed** that month (was started).
+- **`/v1/fleet/dashboard`:** `cost_trend` counts jobs closed each month (was started, any status, and
+  `jobs` is the closed count); `service_due` is rule 2 with each engine's own interval (was 500 h by
+  modulo): each engine carries `interval`, `since`, `remaining`, `overdue`, and the top-level
+  `interval: 500` is removed. Its thresholds stay legacy's (listed from 70 %, critical from 95 %).
+- Repair history, Trip P&L and project cost already read rule 1.
+
 ## Open (extras)
 
-1. **Fleet Insights (`flRenderInsights`) and the Fleet Report (`rep-fleet`) are not built.** Both are
-   reads over the same data, but legacy's screens disagree with each other: five definitions of a
-   job's cost and date, three rules for "service due" (500 h fixed, the engine's interval by modulo,
-   hours since the last service). Decide which definitions the API answers before building them.
-2. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
+1. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
    `boats[].docs` (renewal), `repairHistory`, `fleet_fuelbudget` and the memo / project log lines once
    fleet cuts over (handoff §6.9).
 
