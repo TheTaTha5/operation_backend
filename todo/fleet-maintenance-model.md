@@ -1,6 +1,6 @@
 # Fleet maintenance, legacy read
 
-**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09. Both parts and the extras are built: part A
+**Status:** legacy read (wt-lk-inbox@658298d, 2026-10-09); decided 2026-10-09 and 2026-10-10. Both parts, the extras and insights are built: part A
 (availability, assets, incidents, jobs) and part B (stock, memos, Daily Fleet Log, projects, safety);
 see the end. Data counted on 2026-10-09 through `ORIGINAL_DATABASE_URL`, read-only.
 
@@ -74,7 +74,7 @@ All computed in the browser:
 - **Cost analytics** (`costAggregate`): job cost split across hull, engine, gearbox, propeller and
   other. Memos without a job are counted as `memo` or "central".
 - **Upkeep** (`renderConsumables`): job cost plus consumables, per month.
-- **Fuel intelligence, insights, dashboard.**
+- **Fuel intelligence, insights, dashboard, the Fleet Report.**
 
 ### Crew
 
@@ -507,11 +507,7 @@ are not built: a repair for legacy's colliding stock ids, which cannot happen he
 
 ## Open (extras)
 
-1. **Fleet Insights (`flRenderInsights`) and the Fleet Report (`rep-fleet`) are not built.** Both are
-   reads over the same data, but legacy's screens disagree with each other: five definitions of a
-   job's cost and date, three rules for "service due" (500 h fixed, the engine's interval by modulo,
-   hours since the last service). Decide which definitions the API answers before building them.
-2. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
+1. **Legacy must stop writing** `boats[].assignments`, `boats[].pier` (a permanent move),
    `boats[].docs` (renewal), `repairHistory`, `fleet_fuelbudget` and the memo / project log lines once
    fleet cuts over (handoff §6.9).
 
@@ -571,3 +567,75 @@ My decisions:
   `register` movement; brand and model default to the old item's (the wizard's prefilled fields).
 - Memo lines: create also writes the job a line dated the memo's date (legacy); a per-asset job create
   under a project writes one `+ Created MJ` line per job.
+
+## Insights: built (branch `feat/fleet-insights`)
+
+Fleet Insights (`GET /v1/fleet/insights?period=`) and the Fleet Report (`GET /v1/fleet/reports/fleet?from=&to=`),
+computed on read, no migration (`src/domain/fleet-insights.ts`; README "Reports"; handoff §6.9). Every
+fleet figure now reads the developer's two definitions (2026-10-10): **a job's cost is `jobCost`, dated by
+its close date** (an open job has no date and is in no period's spend), and **service due is hours since
+the last service against the engine's own interval**. The cost report, upkeep and the dashboard were
+moved onto them. Checked 2026-10-10 on a throwaway import of legacy (read-only): see Flagged below.
+
+## Open (insights)
+
+1. **Other fleet reads are open to agent logins.** The two new reads refuse a login tied to an agent
+   (`403`, as `/v1/money-reports`); every other `GET /v1/fleet/…` (dashboard, cost, jobs, memos…) does
+   not. One line in the `preHandler` would close them all.
+2. **A meter typo makes three Zeus engines read 59,158 h.** Legacy's Daily Log holds `59158.0` on
+   2026-09-07 (the days around read 5,9xx), so engine hours, service due (3 engines "overdue by 53,263 h")
+   and July–September engine hours (162,458 h) are wrong here and in legacy alike. Fix the reading in the
+   Daily Log.
+3. **Charter boats count in the Fleet Report's availability** (legacy): a charter boat's days outside
+   its charter read as out of service. Here they mostly make the boat "idle" (left out of the rate), but
+   a boat chartered for part of the range adds down days. Ask whether not-chartered days should be
+   left out.
+
+## Flagged (insights)
+
+Where the decided definitions change a legacy figure (rehearsal: legacy imported read-only into a
+throwaway database on 2026-10-10, figures compared with legacy's formula on the same rows):
+
+- **Insights spend is by close date.** October 1–10: ฿283.55 from 3 closed jobs; legacy's screen
+  (jobs started in October, cost computed) ฿22,479 from 5. All time: ฿450,146 from 79 closed jobs;
+  legacy ฿1,337,906 from all 122 (open ones included, ฿887,760 of it still open: `kpis.open_cost`).
+  The monthly trend moves the same way (May ฿92,418 here, ฿878,015 by start).
+- **The dashboard's cost trend and the cost report's months** count jobs closed that month (legacy: by
+  start, any status); a job in progress is `proc` in every cost-report period with `date: null` (legacy
+  dated it by its start); `months[].proc` is now unpaid direct memos only. Upkeep repairs are jobs closed
+  that month (legacy: started).
+- **Service due:** 9 engines (all overdue, 3 of them the Zeus typo) on Insights and the dashboard.
+  Legacy's dashboard tile (500 h modulo, ≥ 70 %) listed 3; its "Engine service" card (interval modulo)
+  6; its "Upcoming" card already used this rule. The dashboard's top-level `interval: 500` is gone.
+- **The Fleet Report's repairs** are the computed cost of jobs closed in the range. September: 20 closed,
+  ฿79,097 (16 with a cost); legacy: 17 "done" (started in September and done), ฿27,977 of stored cost on
+  13 of 22 started. "Opened" is every job started in the range (22; legacy counted only those not done,
+  5). Average days 8 (legacy 3, over jobs started in the range).
+- **Total spend counts a job's memo once:** repairs plus the memos that name no job. September ฿942,993;
+  legacy ฿1,400,663 (stored repair cost plus every memo, so a job's memo counted twice).
+- **Purchasing is not a job cost:** the supplier chart and the Fleet Report's memo figures stay dated by
+  the memo; Insights sums `amount` (with VAT) and the Fleet Report after discount (before VAT), each as
+  its legacy screen did.
+- **Certificates on Insights:** only each type's current row (24 alerts: 12 expired, 4 ≤ 14 days, 8 ≤ 60);
+  legacy read every row, renewed ones too (38). The severity bands (14 / 60 days) are computed here,
+  unlike the other screens' thresholds (Flagged (extras)).
+- **Insights' month starts on the 1st;** legacy's `new Date(y, m, 1).toISOString()` started it a day
+  early east of UTC. Its cost caption's top boat is this month's (legacy took the period's).
+- **A cancelled project** is left out of the Fleet Report (legacy counted it as in progress).
+
+My decisions:
+
+- **A job's duration** is start to close, both days counted (the Fleet Report's; Insights' closing speed
+  left out the first day).
+- **A boat's jobs in an Insights period** (its health): jobs closed in the period, plus jobs still open
+  that were opened in it (an open job's start is its only date). Spend stays by close date. With "open
+  now" instead, 14 of 15 boats read watch or critical in October (stale open jobs); with this rule 10 read
+  healthy, legacy 12.
+- **Agent logins get `403`** on both reads; a Fleet Report covers at most 366 days.
+- Purchases by supplier keep legacy's three-step supplier reading; the Fleet Report's supplier is the
+  memo's own (legacy's deck did not read further).
+- `data_gaps` are codes with numbers; the deck's sentences, headline and "what needs a decision" are the
+  screen's. Stock and the gaps are given once (now), not per range.
+- Kept as legacy: availability counts every boat not retired and leaves out a boat never available
+  (15 of 22 in September: September availability 50 % over 7 boats); a stock item below zero lowers the
+  value on hand; the default inspection date `2026-01-01` is legacy's literal.

@@ -1429,6 +1429,11 @@ README → "Pier office: petty cash", "Pier office lists". Writes need `pier` or
 README → "Fleet maintenance: assignments, certificates, replace wizard, reports". Boat-side writes
 take `fleet` or `config`; the rest `fleet`; reports are reads.
 
+Every fleet figure now reads one definition of a job's cost (what `GET /v1/fleet/jobs/{id}` answers),
+**dated by the job's close date**, and one of service due (hours since the engine's last service against
+its own interval). Where a screen dated a job by its start, read a stored `cost`, or counted 500 h by
+modulo, its number changes: show the API's.
+
 | Legacy | API |
 |---|---|
 | `flSaveAssignment`, `flCancelAssignment` (patched `localStorage` boats directly) | `POST /v1/boats/{id}/assignments`, `…/{asn_id}/cancel`; stop writing `boats[].assignments` and `.pier` from the browser |
@@ -1439,7 +1444,9 @@ take `fleet` or `config`; the rest `fleet`; reports are reads.
 | `swapDocExecute` (Replace wizard) | `POST /v1/fleet/safety/{id}/replace`; its two confirms become `allow_negative` (after `409 stock_short`) and `serial_anyway` (after `409 no_serial`); send the INC/MJ/MO numbers |
 | `flRenderDR` anomaly cells, `/px`, meter deltas | each Daily Log row's `flags`, `litres_per_pax`, `meter_deltas`; the day's `totals`, `anomalies` |
 | `fuelSetBudget`, `_fuelBudgetGet` (one browser only) | `PUT`/`GET /v1/fleet/fuel-budgets` |
-| `costAggregate`, `renderConsumables`, `_fuelAgg`/`_fuelWkAgg`, `flRenderDashboard` | `GET /v1/fleet/reports/cost`, `/upkeep`, `/fuel`, `GET /v1/fleet/dashboard` |
+| `costAggregate`, `renderConsumables`, `_fuelAgg`/`_fuelWkAgg`, `flRenderDashboard` | `GET /v1/fleet/reports/cost`, `/upkeep`, `/fuel`, `GET /v1/fleet/dashboard`. Cost: a job in progress has `date: null` and is `proc` in every period, `months[].proc` holds unpaid direct memos only. Dashboard: `service_due.interval` is gone, each engine carries its own `interval`, `since`, `remaining`, `overdue` |
+| `flRenderInsights` (all its tiers and cards) | `GET /v1/fleet/insights?period=month\|quarter\|ytd\|all`; the card texts are the screen's, the numbers the API's |
+| `repFleetGather` (the Fleet Report deck) | `GET /v1/fleet/reports/fleet?from=&to=`: `current`, `previous` (legacy `repPrevRange`), `stock`, `data_gaps` as codes; the slides' text is the screen's |
 | `flMaintClose`'s `repairHistory` row, boat detail "recent repairs" | `GET /v1/fleet/repair-history?boat_id=` (computed); stop writing `repairHistory` |
 | `flPushLog` from `flSaveMemo`/`moLiveSave`/`flCancelMemo`, `_projCreateForId`, `flMaintLinkProjectPick`, `flMaintUnlinkProject`, `flSplitExistingJob` | written by the server: don't push these lines yourself |
 | `invLostScan`/`invLostFix` | not built (a repair for legacy's colliding ids): use `adjust` and `receive` |
@@ -1457,8 +1464,6 @@ work for the session only and save nowhere** (see "The one thing to know first")
 | Booking payment slips not tied to a payment | `paymentSlips` | `booking-extras-model.md` open 1 |
 | Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
 | Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
-| Fleet Insights and the Fleet Report (`flRenderInsights`, `rep-fleet`) | `05-fleet.js`, `08-app.js` | `fleet-maintenance-model.md` "Open (extras)" (the other fleet screens: §3.15, §6.7, §6.9) |
-| Fleet reports beyond memo spend (cost analytics, upkeep, fuel intelligence, dashboard); the safety replace wizard | `05-fleet.js`, `06-engine-assign.js` | `fleet-maintenance-model.md` (part A: §3.15; part B: §6.7) |
 | The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
 | B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |

@@ -178,7 +178,9 @@ export function registerFleetExtrasRoutes(app: FastifyInstance, deps: { store: S
         return { ...boatLite(b), pier_on_date: pierOn(b, date, assignments), blocked: s === 'fixing' || s === 'unavailable' };
       }),
       jobs: await store.fleetJobs({}), incidents: await store.fleetIncidents({}), memos: await fleet().memos(), memosOf: await memosLoader(store),
-      engines: (await store.fleetAssets('engine')).map((e) => ({ id: e.id, boat_id: e.boat_id, model: e.model, brand: e.brand, hours: hoursOf(e) })),
+      engines: (await store.fleetAssets('engine')).map((e) => ({
+        id: e.id, boat_id: e.boat_id, model: e.model, brand: e.brand, hours: hoursOf(e), service_interval: e.service_interval, last_service_hours: e.last_service_hours, base_hours: e.base_hours,
+      })),
       gearboxes: await store.fleetAssets('gearbox'), propellers: await store.fleetAssets('propeller'),
       stock: items.map((i) => stockView(i, moves.get(i.id) ?? [])),
     });
