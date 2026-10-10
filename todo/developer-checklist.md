@@ -19,11 +19,18 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - 070 drops the `capacity <= license_pax` check;
    - 080 drops `van_days.sent_at` (each mark moves onto that van's groups);
    - 048 turns a lock naming no agent into an office lock.
-2. **Push `main`.** Deploying applies migrations 039–180 (`preDeployCommand`), and 220–222 (the
-   booking decisions of 2026-10-10). 220 gives every booking already there a `code`: an imported one
-   its legacy id, any other `BK-YYMMNNNN` by its creation time, after legacy's highest of the month.
-   Rehearsed on a full import plus an API booking: 5,398 legacy codes kept, the API booking numbered
-   `BK-26100455` after legacy's `BK-26100454-AYKE`. 221 and 222 add nullable columns.
+2. **Push `main`.** Deploying applies migrations 039–222 (`preDeployCommand`). Two of the later ones
+   rewrite rows:
+   - 180 marks every whole-boat hold `boat_deal = 'fixed'` (legacy reads a missing deal as fixed);
+   - 220 gives every booking already there a `code`: an imported one its legacy id, any other
+     `BK-YYMMNNNN` by its creation time, after legacy's highest of the month. Rehearsed on a full
+     import plus an API booking: 5,398 legacy codes kept, the API booking numbered `BK-26100455`
+     after legacy's `BK-26100454-AYKE`.
+
+   The rest of 160–222 add tables and nullable columns. Rehearsed 2026-10-10 on a copy of the 048
+   rehearsal database taken to 143: all 12 applied; bookings, trips, seat locks, invoices, payments
+   and agents unchanged (5,377 / 5,389 / 1,455 / 473 / 391 / 836); 5,377 legacy codes kept, none
+   numbered; the 8 holds `fixed`.
 3. **Copy the files:** `npm run import:attachments -- --commit` (about 6,000 files, about 660 MB, about
    18 min; re-runnable). Run it before the imports, so slips, documents and project photos link.
 4. **Seed the catalogue once:** `npm run seed:routes -- --commit`, then `npm run seed:boats -- --commit`.
