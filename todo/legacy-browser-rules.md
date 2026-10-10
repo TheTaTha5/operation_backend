@@ -28,8 +28,8 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 
 ## Summary
 
-823 rules. **492 are owned here** (305 as legacy, 187 differently), 23 were decided against, and
-**308 are missing**: 11 change seats, 62 change money, 68 the day's operations, 75 data quality, and
+823 rules. **494 are owned here** (307 as legacy, 187 differently), 23 were decided against, and
+**306 are missing**: 9 change seats, 62 change money, 68 the day's operations, 75 data quality, and
 92 are warnings, conveniences or dashboard figures.
 
 | Area | Built | Built differently | Decided not to copy | Missing |
@@ -38,8 +38,8 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 | Pricing | 15 | 12 | 0 | 12 |
 | Seat locks | 11 | 8 | 1 | 4 |
 | Availability and capacity | 12 | 4 | 1 | 13 |
-| Deployments and boats | 15 | 13 | 0 | 17 |
-| Charters | 4 | 7 | 0 | 3 |
+| Deployments and boats | 16 | 13 | 0 | 16 |
+| Charters | 5 | 7 | 0 | 2 |
 | Vans and dispatch | 38 | 16 | 1 | 9 |
 | Check-in and pier | 9 | 6 | 1 | 35 |
 | Check-in and pier: Pier Office, park tickets, roster, licences, job sheet | 0 | 1 | 0 | 48 |
@@ -59,7 +59,7 @@ scheme and load-time sweep in legacy's browser code, and whether this API owns i
 | Users and permissions | 12 | 7 | 5 | 3 |
 | B2C sync | 1 | 2 | 2 | 2 |
 | Misc | 1 | 4 | 2 | 3 |
-| **Total** | **305** | **187** | **23** | **308** |
+| **Total** | **307** | **187** | **23** | **306** |
 
 A row is one rule; the same check repeated in several functions is one row. Counts come from the
 tables below (`missing?` counted as missing).
@@ -70,7 +70,7 @@ Checked 2026-10-10 with `git branch --no-merged main`. When one merges, move its
 
 | Branch | What it adds | Missing items it covers |
 |---|---|---|
-| `feat/boat-holds-commands` | whole-boat holds created, edited, released and converted; the deployment guard refuses a held boat (`409 boat_held`) | 2; Findings 3 |
+| `feat/boat-holds-commands` | whole-boat holds created, edited, released and converted; the deployment guard refuses a held boat (`409 boat_held`, also built on `fix/booking-rules` with the same code) | 2 |
 | `feat/sales-extras` | promo contracts written (add, edit, void, legacy's checks); staff and welfare quotas, the booking form's staff guard; sales targets, follow-up marks, the Sales Board | 7, part of 12, part of 30 |
 | `feat/pier-office` | the pier petty-cash book with its longtail and park-fee sheets, and the Pier Office lists (`todo/pier-office-model.md`) | part of 14 and 22 |
 | `feat/money-remainder` | design only: cost model, Trip P&L, refund payout, deposits | design for 11, 15 |
@@ -93,36 +93,17 @@ Things the inventory turned up that are not just "build X".
    check-in and pier money. `feat/pier-office` (unmerged) covers the petty cash and the office
    lists. Gear stock moves, the roster and pay, the job sheet, guide orders and PR/PO are still on
    no branch.
-2. **`README.md` is wrong about legacy's reschedule fee.** It says "Legacy left this fee unbilled".
-   `bkV2RescheduleBooking` (app) adds the fee as a line onto the booking's existing invoice and
-   raises its subtotal, net and total ("Booking already invoiced → top up that same invoice"). This
-   API issues a separate fee invoice instead, which is a reasonable choice, but the README line
-   should say so.
-3. **`deployment-guards-model.md` Open 1 is stale.** It says seat locks are per route and day, so
-   there is no boat hold to check. Whole-boat holds exist since migration 047, and on `main`
-   `src/domain/deployment-guards.ts` still lets a held boat be moved or removed
-   (`feat/boat-holds-commands` fixes it).
-4. **Booking rules built differently with no note recording it.** Each needs a yes or a fix:
-   - a trip whose route has no rate saves at ฿0 with a `not_offered`/`no_rate` warning; legacy
-     disables Save (`bkV2NoRateTrips`, `bkV2RenderSubmitButton`);
-   - `/restore` refuses (`409 charter_boat_taken`, capacity); legacy always restores and only warns;
-   - chartering a boat on a day with seats sold is refused; legacy warns, stores
-     `charterDisplacementAck` and lets you oversell (`bkV2ConfirmCharter`);
-   - a quote holds its charter boat; legacy's quote does not;
-   - the discount approval is asked alongside FOC; legacy asks it only when the save would
-     otherwise be `confirmed`;
-   - an edit does not re-ask FOC or discount approval (`reweigh` weighs over-allotment only); legacy
-     re-runs the whole save. The discount part is only in a code comment in `booking-approvals.ts`;
-   - `PATCH` refuses a cancelled, completed, rejected or weather-cancelled booking
-     (`409 booking_closed`); legacy asks "Edit anyway?" and lets a weather-cancelled one through;
-   - Save Draft turning a confirmed booking back into a quote has no command;
-   - booking ids are `booking_<uuid>`, not legacy's `BK-YYMMNNNN-XXXX`.
-5. **Other unflagged differences:** a PFM invoice can be voided with payments on it (legacy's PFM
+2. **Nine booking rules built differently** (a trip with no rate, restore, chartering over sold
+   seats, a quote's charter boat, a discount with FOC, re-asking approval on an edit, editing a closed
+   booking, Save Draft back to a quote, booking ids): each is written up, with what legacy does and
+   a recommendation, in `booking-model.md` "Differences from legacy to confirm". Each needs a yes or
+   a fix.
+3. **Other unflagged differences:** a PFM invoice can be voided with payments on it (legacy's PFM
    screen refuses, Accounting does not); an upgrade's card fee may be up to 100% (on-tour sales are
    capped at 5%, as legacy caps both); the pier note writes no history line and a `pier`-only login
    cannot set it; reconfirm needs `operations` (legacy also `accounting`); a pickup-time profile
    overlapping another is not warned about; several fleet ones (see Fleet, "not flagged").
-6. **Two legacy oddities to ask ops about:** `flLoad`'s one-time fleet hooks are guarded only by
+4. **Two legacy oddities to ask ops about:** `flLoad`'s one-time fleet hooks are guarded only by
    `_app_hooks` in each browser's `localStorage`, so a fresh browser may re-run them (one
    bulk-approves pending memos; unverified). And `getSeatsConsumed` takes van and pier no-shows off
    seats sold, so a no-show's seat is sold again on the day; confirm that is wanted before copying.
@@ -135,18 +116,15 @@ holds its rows.
 
 ### Seats
 
-1. **A charter split over several boats takes only its `charter_boat_id` out of the pool.** Legacy
-   charters every boat in `ops.boatSplits` (`baCharterBoatMap`, `baCharterBoatIds`, `_calTripsFor`).
-   `capacity.ts dayCapacity` reads only `charter_boat_id`, and `dispatch.ts` accepts `boat_splits`
-   on a charter trip, so the second boat's seats are still sold. (Charters)
-2. **Whole-boat holds: create, edit, swap, convert to charter, and protect from deployment
-   changes.** Holds come only from the import; every command but a full release is `400 boat_hold`.
+2. **Whole-boat holds: create, edit, swap and convert to charter.** Holds come only from the import;
+   every command but a full release is `400 boat_hold`. (A held boat is already kept on its route:
+   `409 boat_held`.)
    Legacy `bkV2CreateBoatLock`, `bkV2BoatLockBlockers`, `bkV2BoatLockEdit`, `bkV2BoatLockSwap`,
    `bkV2BoatLockOnConvert`, and `opLocked` in Boat Operation. (Availability/capacity,
    Deployments) *Built on `feat/boat-holds-commands`, unmerged.*
 3. **Van and pier no-shows and on-site cancels free their seats** (`getSeatsConsumed` via
    `ckLostByType`, also `_abAgentSplit`). `aboard.ts lostByType` exists but capacity does not use
-   it. Confirm first (Findings 6). (Availability/capacity)
+   it. Confirm first (Findings 4). (Availability/capacity)
 4. **A Boat Operation slot typed `charter` with no booking takes the boat out of the pool**
    (`isBoatChartered`, `getCellType`). Deployments have no type here. `missing?`: check whether any
    such slots exist in legacy data. (Availability/capacity)
@@ -288,10 +266,10 @@ holds its rows.
 | Soft-missing data asks once, then saves an `incomplete` flag list | `bkV2CommitBooking` `_missSoft` (app) | warning / auto-change | missing | no `incomplete` on bookings [data] |
 | Possible duplicate: same voucher, or same lead name on a shared route and date | `bkV2FindDuplicateBookings`, `bkV2VoucherDupHtml` (app) | warning | built differently | `GET /v1/bookings?voucher_ref=` only; the name match is missing [ux] |
 | Self-arrive ticked while a hotel is entered: asks | `bkV2CommitBooking` (app) | warning | missing | [ux] |
-| Save Draft on a live booking turns it back into a quote | `bkV2SaveDraft` (app) | warning / auto-change | built differently | no command does it; `PATCH` can't change status. Not flagged |
+| Save Draft on a live booking turns it back into a quote | `bkV2SaveDraft` (app) | warning / auto-change | built differently | no command does it; `PATCH` can't change status. Flagged: `booking-model.md` Differences 8 |
 | Status from the button and the facts: quote, confirmed, pending_foc, pending_approval | `bkV2SubmitBooking`, `bkV2CommitBooking` (app) | computed | built | `decideStatus` (`booking-approvals.ts`), README "intent" |
-| Discount approval asked only when the save would otherwise be confirmed | `bkV2CommitBooking` (app) | computed | built differently | asked on any confirm intent, FOC included. Not flagged |
-| An edit re-runs FOC and discount approval (an approved FOC stays confirmed) | `bkV2SubmitBooking`, `bkV2CommitBooking` (app) | auto-change | built differently | `PATCH` re-weighs over-allotment only; discount noted in a code comment, FOC nowhere |
+| Discount approval asked only when the save would otherwise be confirmed | `bkV2CommitBooking` (app) | computed | built differently | asked on any confirm intent, FOC included. Flagged: `booking-model.md` Differences 5 |
+| An edit re-runs FOC and discount approval (an approved FOC stays confirmed) | `bkV2SubmitBooking`, `bkV2CommitBooking` (app) | auto-change | built differently | `PATCH` re-weighs over-allotment only. Flagged: `booking-model.md` Differences 6 |
 | FOC passengers need a reason to confirm | `bkV2SubmitBooking` (app) | refusal | built | `400 foc_reason is required` |
 | Approval record: reason, days over, discount, target status, requester; kept once decided | `bkV2CommitBooking` (app) | computed | built | `approvals[]` (README "Approving") |
 | A pending_approval booking with no record gets one made up | `bkV2EnsureApproval`, `bkV2PendReason` (app) | auto-change | built | import makes a decided entry; reasons `closed_day`/`b2c_hold` kept |
@@ -312,7 +290,7 @@ holds its rows.
 | A route outside the agent's programmes asks; the picker offers only those | `bkV2CommitBooking` §contract-scope, `bkV2BookableRoutes` (app) | warning | missing | server only prices it at ฿0 `not_offered` [ux] |
 | Changing the agent clears agent-scoped form data | `bkV2ResetAgentScopedData` (app) | auto-change | missing | client form [ux] |
 | Inactive agents can't be picked | `bkV2PickAgentByText` (app) | refusal | built | `409 agent_inactive` |
-| Booking id `BK-YYMMNNNN-XXXX` (month sequence + random) | `bkV2GenerateBookingCode` (app) | numbering | built differently | `booking_<uuid>`. Not documented [data] |
+| Booking id `BK-YYMMNNNN-XXXX` (month sequence + random) | `bkV2GenerateBookingCode` (app) | numbering | built differently | `booking_<uuid>`. Flagged: `booking-model.md` Differences 9 [data] |
 | An edit keeps history, invoice, ops, upgrades, fees, reschedules, cancellation | `bkV2CommitBooking` (app) | auto-change | built | per-table storage; `PATCH` keeps what it doesn't send |
 | Hotel name snapped to an existing spelling; a near match (≥82%) asks | `bkV2CanonicalHotel`, `bkV2HotelNear` (app) | auto-change / warning | missing | [data] |
 | Hotel-name merge rewrites `hotelName`/`pickup` on every matching booking, with history | `psuHotelGroups`, `psuHotelMerge` (app) | auto-change | missing | no bulk rename [data] |
@@ -327,14 +305,14 @@ holds its rows.
 | Cash on tour defaults to THB, handling deduct | `bkV2ToggleCashOnTour` (app) | computed | built differently | applied on read (`pier-money.ts`, `after-trip.ts suggestedCotMode`) |
 | Adjustments of 0 or less are dropped | `bkV2CommitBooking` (app) | auto-change | built differently | `400` (README "Adjustments") |
 | Advisory edit lock: someone else opened it in the last 5 minutes | `bkV2EditLockActive`, `bkV2SetEditLock` (app) | warning | built differently | `version` / `If-Match`, `409 stale_version` (README "Edit conflicts") |
-| Editing a cancelled, completed or rejected booking asks "Edit anyway?"; weather-cancelled passes | `bkV2EditBooking` (app) | warning | built differently | `409 booking_closed` for all four. Not flagged |
+| Editing a cancelled, completed or rejected booking asks "Edit anyway?"; weather-cancelled passes | `bkV2EditBooking` (app) | warning | built differently | `409 booking_closed` for all four. Flagged: `booking-model.md` Differences 7 |
 | Cancel: refused when cancelled, completed, rejected; category; "other" needs a note; charge none/full/partial | `bkV2DetailCancel`, `bkV2CancelConfirm`, `bkV2CancelBooking` (app) | refusal | built | `POST /v1/bookings/{id}/cancel` |
 | Cancel voids the live invoice, raises a fee invoice, returns lock draws, frees the charter boat | `bkV2CancelBooking` (app) | auto-change | built | same |
 | A cancel reason suggests a default charge | `bkV2CancelPickReason` (app) | auto-change | missing | UI hint [ux] |
-| Restore from cancelled, weather-cancelled or rejected; voids the fee invoice; redraws locks; a taken charter boat only warns | `bkV2RestoreBooking` (app) | auto-change | built differently | `/restore` refuses `409 charter_boat_taken` and over capacity. Not flagged |
+| Restore from cancelled, weather-cancelled or rejected; voids the fee invoice; redraws locks; a taken charter boat only warns | `bkV2RestoreBooking` (app) | auto-change | built differently | `/restore` refuses `409 charter_boat_taken` and over capacity. Flagged: `booking-model.md` Differences 2 |
 | Reschedule refused for closed statuses or no date; new date ≠ old; reason; partial fee > 0 | `bkV2DetailReschedule`, `bkV2RescheduleConfirm` (app) | refusal | built | `POST …/reschedule` |
 | Reschedule moves the from-date's trips, returns lock draws, carries the charter boat, clears the day's ops | `bkV2RescheduleBooking` (app) | auto-change | built | README "reschedule" |
-| Reschedule fee "on invoice": added as a line onto the booking's existing invoice | `bkV2RescheduleBooking` (app) | computed | built differently | a separate fee invoice. README says legacy left it unbilled, which is wrong (Findings 2) |
+| Reschedule fee "on invoice": added as a line onto the booking's existing invoice | `bkV2RescheduleBooking` (app) | computed | built differently | tops up the live booking/prepay invoice as legacy, VAT worked out again by its VAT mode; the fee item is kept (`money-model.md` Decided 2026-10-10) |
 | Partial cancel: reason, note for "other", ≥ 1 head, charged + waived = removed, refund lowers total, lock draws first | `bkV2PartialConfirm`, `bkV2PartialCancel` (app) | refusal / auto-change | built | `POST …/partial-cancel` (also refuses emptying a trip) |
 | Partial cancel suggests amounts = heads × seat price per head | `bkV2PartialRecalc` (app) | computed | missing | client facts [ux] |
 | Partial cancel flags the booking's invoice `needsAdjustment` | `bkV2PartialCancel` (app) | auto-change | missing | the invoice keeps the old total [money] |
@@ -370,7 +348,7 @@ holds its rows.
 | Total = seats + add-ons − discounts + extras + OVN, never below 0; manual; B2C kept | `_bkV2CalcQuoteRun` (app) | computed | built | `pricing.ts`; B2C exception (README "Prices") |
 | Adjustment rows | `bkV2AddAdjustment` (app) | computed | built | README "Adjustments" |
 | Company booking always manual; staff inspection manual ฿0; welfare at the rate | `bkV2GetRT`, `laManualRT`, `bkV2ApplyAgentRules` (app) | computed | built | `enforcedPriceMode` |
-| A trip with no rate can't be saved; zones with no seat rate disabled | `bkV2NoRateTrips`, `bkV2RenderSubmitButton` (app) | refusal | built differently | saves at ฿0 with `not_offered`/`no_rate`. Not flagged (Findings 4) |
+| A trip with no rate can't be saved; zones with no seat rate disabled | `bkV2NoRateTrips`, `bkV2RenderSubmitButton` (app) | refusal | built differently | saves at ฿0 with `not_offered`/`no_rate`. Flagged: `booking-model.md` Differences 1 |
 | A charter with no price asks "saved at 0 THB, really free?" | `bkV2SubmitBooking` (app) | warning | built differently | `no_charter_price` warning after save |
 | A private-van add-on moves that route's seat to NoTransfer | `bkV2ToggleAddOn` (app) | auto-change | missing | zone priced as sent [money] |
 | Longtail join locked out under a bundled route | `bkV2RenderAddOnsSection` (app) | refusal | built differently | accepted, `counted: false` |
@@ -430,7 +408,7 @@ holds its rows.
 |---|---|---|---|---|
 | Pool = unchartered deployed boats (with overrides) − sold − locked | `getAllotment`, `_calTripsFor` (core) | computed | built differently | `capacity.ts dayCapacity`; clamped to licence; oversold goes negative (README "What available_seats subtracts") |
 | Seats sold: all tiers on live seat trips; charters excluded | `getSeatsConsumed`, `getTripPaxTotal` (core) | computed | built | `capacity.ts`, `SEAT_RELEASING_STATUSES` |
-| Van and pier no-shows and on-site cancels come off seats sold | `getSeatsConsumed` (`ckLostByType`), `_abAgentSplit` (core, ab) | computed | missing | `aboard.ts lostByType` not used by capacity (Findings 6) [seats] |
+| Van and pier no-shows and on-site cancels come off seats sold | `getSeatsConsumed` (`ckLostByType`), `_abAgentSplit` (core, ab) | computed | missing | `aboard.ts lostByType` not used by capacity (Findings 4) [seats] |
 | Over-allotment pending holds no seats; pending for another reason does | `bkPendHoldsSeat` (core) | computed | built | `bookingHoldsSeats` |
 | Three tiers: locked seats refused, past licence refused, over allotment → approval | `bkV2CommitBooking` (app) | refusal / warning | built | `capacity.ts weighDay` |
 | Real seats left = licensed unchartered seats − sold | `getAllotment` `licenseAvailable` (core) | computed | built | `licensed_free` |
@@ -465,7 +443,7 @@ holds its rows.
 |---|---|---|---|---|
 | No change to a past day's deployment | `bop2GuardPast` (core) | refusal | built differently | `409 past_date`, an admin may correct (`deployment-guards-model.md`) |
 | A boat held by a charter can't be unassigned or moved | `opLocked`, `bop2AssignBoat` (core) | refusal | built | `409 charter_boat` |
-| A boat held whole for an agent can't be unassigned, moved or swapped | `opLocked`, `opHoldOnly`, `bop2ApplySwap` (core) | refusal | missing | Findings 3 [seats] |
+| A boat held whole for an agent can't be unassigned, moved or swapped | `opLocked`, `opHoldOnly`, `bop2ApplySwap` (core) | refusal | built | `409 boat_held` (`deployment-guards.ts`); a swap is two moves, each refused |
 | Moving a boat with bookings on it asks, then flags them "boat pulled" | `bop2AssignBoat`, `bop2UnassignBoat` (core) | warning | built | `409 seats_sold` / `remove_anyway`, `boat_pulled` |
 | Only boats at the route's pier are offered | `bop2AssignBoatOptsFor`, `openPortal` (core) | refusal | missing | [ops] |
 | No boat on a day the route is closed | `bop2OpenCellPopover` (core) | refusal | missing | `route_closed` covers bookings and locks only [ops] |
@@ -513,12 +491,12 @@ holds its rows.
 
 | Rule | Legacy (file) | Kind | Status | Here / note |
 |---|---|---|---|---|
-| A charter takes every boat it is split over; all leave the pool | `baCharterBoatMap`, `baCharterBoatIds`, `_calTripsFor` (app, core) | computed | missing | `dayCapacity` reads `charter_boat_id` only; verified [seats] |
+| A charter takes every boat it is split over; all leave the pool | `baCharterBoatMap`, `baCharterBoatIds`, `_calTripsFor` (app, core) | computed | built | `capacity.ts charterBoatsOf`: the charter boat and every boat in the trip's `boat_splits` |
 | Overnight charter holds its boat every day of the span | `bkOvnHoldMap`, `bkOvnHoldOn` (app) | computed | built differently | not held between (decided, README) |
 | On load: move return legs, make them charters, claim span cells | `bkOvnHealSpans` (app) | sweep | built differently | wrong leg date is `400` |
 | Charter boat picker: deployed boats, chartered ones disabled | `bkV2RenderTripsSection` (app) | refusal | built | `400`, `409` (`capacity.ts`) |
-| Chartering over sold seats: shows the oversell, ack, may go ahead | `bkV2SetTripCharterBoat`, `bkV2ConfirmCharter` (app) | warning | built differently | `409`. Not flagged |
-| A quote does not hold the charter boat | `bkV2CommitBooking` (app) | computed | built differently | a quote holds it (README "Status"). Not flagged [seats] |
+| Chartering over sold seats: shows the oversell, ack, may go ahead | `bkV2SetTripCharterBoat`, `bkV2ConfirmCharter` (app) | warning | built differently | `409`. Flagged: `booking-model.md` Differences 3 |
+| A quote does not hold the charter boat | `bkV2CommitBooking` (app) | computed | built differently | a quote holds it (README "Status"). Flagged: `booking-model.md` Differences 4 [seats] |
 | A whole-boat hold converts into the charter booking | `bkV2BoatLockOnConvert`, `bkV2BoatLockToCharter` (app) | auto-change | missing | `legacy-replacement.md` §5 [seats] |
 | Changing the charter boat moves `ops.boatId` | `bkV2CommitBooking` §chOpsSync, `bkV2CharterBoatHeal` (app) | auto-change | built | `dispatch.ts charterSynced` |
 | Overnight return leg: dates in order, no duplicate, copies route/pax/zone, ฿0, charter on the same boat | `bkV2CreateOvnReturnLeg` (app) | refusal / auto-change | built | README overnight rules |
@@ -1221,7 +1199,7 @@ already records are cited; "not flagged" means it does not.
 | Whole-state sync, graft, save guards, export, reset | `save`, `_laGraftLocalOnly`, `_laBlobUsable`, `exportHTML` (auth, core) | sweep | decided not to copy | `CLAUDE.md` out of scope |
 | Live refresh by SSE and polling | `_laSoftRefresh`, `_laStartSSE` (auth) | auto-change | built differently | `GET /v1/changes`, `/stream`; vans, stops, areas, users, agents not in the feed |
 | Duplicate audit of bookings, agents, boats, pier payments | `LA_DUP_SETS`, `laDupClean` (fleet) | sweep | built differently | ids unique |
-| One-time hooks guarded by browser `localStorage` | `flLoad` `_app_hooks` (fleet) | sweep | decided not to copy | `legacy-replacement.md` "Not replaced" (Findings 6) |
+| One-time hooks guarded by browser `localStorage` | `flLoad` `_app_hooks` (fleet) | sweep | decided not to copy | `legacy-replacement.md` "Not replaced" (Findings 4) |
 | Admin-only System Log | `devlogAdd`, `devlogDelete` (app) | permission | missing | [ux] |
 | B2C channels and campaigns screen | `renderB2C` (app) | computed | missing | looks like a mock-up [ux] |
 

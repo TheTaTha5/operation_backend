@@ -462,7 +462,9 @@ Accounting screen and the Daily PFM payment dialogs move from `SB_INVOICES`/`SB_
 
 - **Delete client-side:** `acctCreateFeeInvoice` and the void in `bkV2CancelBooking` and
   `bkV2RestoreBooking`. `/cancel` voids the booking's invoice and issues the cancellation fee
-  invoice; `/restore` voids it.
+  invoice; `/restore` voids it. Also the invoice top-up in `bkV2RescheduleBooking` (the
+  "Booking already invoiced" block): `/reschedule` with `collect: "invoice"` adds the fee line to the
+  booking's live invoice itself, with VAT worked out again, and still adds the fee item.
 - **Refusals to show as they are:**
   - `409 booking_already_invoiced`, `409 booking_cancelled` and `400 booking_not_agents` on issue;
   - `409 invoice_has_payments` on a discount;

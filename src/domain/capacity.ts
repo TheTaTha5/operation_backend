@@ -71,8 +71,18 @@ export type Capacity = {
 
 /** A boat deployed on the route that day, with its per-day override if it has one. */
 export type DayDeployment = DeploymentLimits & { boat_id: string };
-/** A trip on the route that day, from a booking that holds seats. The caller applies any exclusion. */
-export type HeldTrip = { booking_mode: string; pax: number; charter_boat_id?: string };
+/**
+ * A trip on the route that day, from a booking that holds seats. The caller applies any exclusion.
+ * `split_boat_ids`: the boats its dispatch splits it over (`boat_splits`), which a charter takes too.
+ */
+export type HeldTrip = { booking_mode: string; pax: number; charter_boat_id?: string; split_boat_ids?: readonly string[] };
+
+/**
+ * Every boat a charter trip takes: its charter boat and each boat it is split over (legacy
+ * `baCharterBoatMap` via `bkBoatIdsOn`). A seat trip takes none.
+ */
+export const charterBoatsOf = (trip: HeldTrip): string[] => trip.booking_mode !== 'charter' ? []
+  : [...new Set([...(trip.charter_boat_id ? [trip.charter_boat_id] : []), ...(trip.split_boat_ids ?? [])])];
 /**
  * A holding lock on the route that day (`poolLocks` in seat-locks.ts picks them), and how many of its
  * seats holding bookings have drawn. `pax` is what it still has: asked, less released.
@@ -112,9 +122,10 @@ export const sellsUngated = (day: DayState): boolean => day.unlimited || day.boa
  * the check before a sale cannot come to different answers.
  *
  * - A charter takes its whole boat: a chartered boat's sellable seats leave the pool, however few
- *   passengers the charter carries. A charter whose boat is unknown (recorded before
- *   `charter_boat_id` existed, on a day with more than one boat) or no longer deployed cannot take a
- *   boat, so its passengers come out of the pool instead — an undercount, but never an overcount.
+ *   passengers the charter carries. A charter split over several boats takes every one of them
+ *   (`charterBoatsOf`). A charter whose boat is unknown (recorded before `charter_boat_id` existed,
+ *   on a day with more than one boat) or no longer deployed cannot take a boat, so its passengers
+ *   come out of the pool instead — an undercount, but never an overcount.
  * - A lock holds only what bookings have not yet drawn from it. The drawn seats are already in
  *   `booked_pax`; counting the whole lock as well would hold them twice.
  * - A whole-boat hold (a lock with `boat_id`) takes its boat exactly as a charter does, and holds
@@ -127,7 +138,7 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
   const deployedIds = new Set(deployments.map((d) => d.boat_id));
   const holding = new Set(locks.filter((l) => l.boat_id && deployedIds.has(l.boat_id)).map((l) => l.id));
   const chartered = new Set([
-    ...trips.filter((trip) => trip.booking_mode === 'charter' && trip.charter_boat_id).map((trip) => trip.charter_boat_id),
+    ...trips.flatMap(charterBoatsOf),
     ...locks.filter((l) => holding.has(l.id)).map((l) => l.boat_id),
   ]);
   // Sorted here so both stores list a day's boats in the same order; SQL alone would promise none.
@@ -140,7 +151,7 @@ export function dayCapacity(deployments: readonly DayDeployment[], trips: readon
   for (const trip of trips) {
     if (trip.booking_mode !== 'charter') { booked_pax += trip.pax; continue; }
     charter_pax += trip.pax;
-    if (!trip.charter_boat_id || !deployed.has(trip.charter_boat_id)) unplaced += trip.pax;
+    if (!charterBoatsOf(trip).some((boat) => deployed.has(boat))) unplaced += trip.pax;
   }
   const lockDays = lockNumbers(locks, holding);
   const locked_pax = lockDays.reduce((sum, l) => sum + l.held, 0);

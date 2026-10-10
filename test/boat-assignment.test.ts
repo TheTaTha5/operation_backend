@@ -81,3 +81,25 @@ test('a charter rides its charter boat, which takes no seat booking', async () =
   assert.equal(moved.statusCode, 200, moved.body);
   assert.equal(moved.json().trips[0].operations.boat_id, 'ba-ch-2', 'follows a new charter boat');
 });
+
+test('a charter split over several boats takes every one of them out of the pool', async () => {
+  const date = '2058-01-12';
+  for (const boat of ['ba-sp-1', 'ba-sp-2', 'ba-sp-3']) await send('POST', '/operations/deployments', { boat_id: boat, route_id: 'r1', service_date: date, capacity: 20 });
+  const charter = await book(date, 15, { booking_mode: 'charter', charter_boat_id: 'ba-sp-1' });
+  const split = await assign(charter.trips[0].id, { boat_splits: [{ boat_id: 'ba-sp-1', ad: 8 }, { boat_id: 'ba-sp-2', ad: 7 }] });
+  assert.equal(split.statusCode, 200, split.body);
+
+  const day = (await send('GET', `/v1/availability?route_id=r1&from=${date}&to=${date}`)).json().days[0];
+  assert.deepEqual(day.deployments.map((d: { boat_id: string; chartered: boolean }) => [d.boat_id, d.chartered]), [['ba-sp-1', true], ['ba-sp-2', true], ['ba-sp-3', false]]);
+  assert.deepEqual([day.available_seats, day.licensed_free], [20, 20], 'only the third boat is for sale, sellable and licensed alike');
+
+  const seat = await book(date, 2);
+  const onSplit = await assign(seat.trips[0].id, { boat_id: 'ba-sp-2' });
+  assert.deepEqual([onSplit.statusCode, onSplit.json().code], [409, 'boat_chartered'], 'a seat sale does not land on the second boat');
+  assert.equal((await assign(seat.trips[0].id, { boat_id: 'ba-sp-3' })).statusCode, 200);
+
+  const tooMany = await send('POST', '/v1/bookings', { trips: [{ route_id: 'r1', date, pax: { ad: 19 } }] });
+  assert.equal(tooMany.statusCode, 409, 'the 18 seats left on the third boat are all the registered seats left');
+  const second = await send('POST', '/v1/bookings', { trips: [{ route_id: 'r1', date, pax: { ad: 4 }, booking_mode: 'charter', charter_boat_id: 'ba-sp-2' }] });
+  assert.equal(second.statusCode, 409, 'nor does another charter');
+});

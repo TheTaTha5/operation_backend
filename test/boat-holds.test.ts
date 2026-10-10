@@ -40,6 +40,21 @@ test('a hold takes its whole boat, as a charter does, whatever it promised', asy
   assert.equal(big.statusCode, 409, 'past the open boat\'s licence: refused, not sent to approval');
 });
 
+test('a boat a hold takes stays on its route: it cannot be removed or moved (legacy opHoldOnly)', async () => {
+  const date = '2059-02-03';
+  await send('POST', '/operations/deployments', { boat_id: 'hb-keep', route_id: 'r1', service_date: date, capacity: 30 });
+  await hold(date, 10, 'hb-keep');
+  const removed = await send('DELETE', `/operations/deployments/${date}/hb-keep?remove_anyway=true`);
+  assert.deepEqual([removed.statusCode, removed.json().code], [409, 'boat_held']);
+  assert.match(removed.json().message, /Release the hold on the Seat Locks page first/);
+  const moved = await send('POST', '/operations/deployments', { boat_id: 'hb-keep', route_id: 'r2', service_date: date, capacity: 30, remove_anyway: true });
+  assert.deepEqual([moved.statusCode, moved.json().code], [409, 'boat_held']);
+  const resized = await send('POST', '/operations/deployments', { boat_id: 'hb-keep', route_id: 'r1', service_date: date, capacity: 32 });
+  assert.equal(resized.statusCode, 201, 'staying on its route is allowed');
+  assert.equal((await send('POST', '/operations/deployments', { boat_id: 'hb-free', route_id: 'r1', service_date: date, capacity: 30 })).statusCode, 201);
+  assert.equal((await send('DELETE', `/operations/deployments/${date}/hb-free`)).statusCode, 204, 'a boat no hold takes leaves');
+});
+
 test('a hold whose boat is not deployed holds its seats as a plain lock', async () => {
   const date = '2059-02-02';
   await send('POST', '/operations/deployments', { boat_id: 'hb-only', route_id: 'r1', service_date: date, capacity: 40 });

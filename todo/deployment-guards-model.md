@@ -1,8 +1,9 @@
 # Deployment guards: what is still open
 
 Built (decided 2026-10-09; `src/domain/deployment-guards.ts`, README → "Deployments"): past dates for
-an admin only, a chartered boat stays, a boat held whole stays (`409 boat_held`, 2026-10-10),
-`remove_anyway` for a boat with bookings placed on it, and `license_pax` from the boat catalogue.
+an admin only, a chartered boat stays, a boat a whole-boat hold takes stays (`409 boat_held`, legacy
+`opHoldOnly`; holds exist since migration 047), `remove_anyway` for a boat with bookings placed on it,
+and `license_pax` from the boat catalogue.
 
 ## Open
 

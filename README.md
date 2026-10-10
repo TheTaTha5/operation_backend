@@ -976,7 +976,7 @@ Validation errors are `400` and name the path, for example:
 - **Guards** (legacy `bop2GuardPast`, `bop2UnassignBoat`; decided 2026-10-09):
   - a date before today (Asia/Bangkok) is `409 past_date`, except for an admin correcting history;
   - a boat a charter booking holds can't leave its route: `409 charter_boat` ("Cancel the charter booking first");
-    nor can one an active whole-boat hold takes: `409 boat_held` ("Release the hold on the Seat Locks page first");
+  - nor can a boat an active whole-boat hold takes on its route that day: `409 boat_held` ("Release the hold on the Seat Locks page first"; legacy `opHoldOnly`);
   - removing a boat, moving it to another route, or shrinking it below the passengers **placed on it** that day (as legacy counts: not the whole route-day) is `409 seats_sold` ("N booking(s) (P pax) on it"), unless `remove_anyway: true` (legacy's confirm dialog). Then the answer carries `warnings: [{code: "boat_pulled" | "oversold", route_id, service_date, boat_id, bookings, pax}]`, and those bookings read `boat_pulled: true`.
   - a catalogue boat that is not ready that day (fixing, unavailable or retired in its log, held by a
     started job, or a charter boat not chartered that day: `GET /v1/fleet/availability`) is
@@ -1048,7 +1048,10 @@ available_seats = sellable seats on boats not chartered
 ```
 
 - **A charter takes its whole boat.** The chartered boat's sellable seats leave the pool, however
-  few passengers the charter carries; `deployments[].chartered` marks it. `charter_pax` is reported
+  few passengers the charter carries; `deployments[].chartered` marks it. A charter trip split over
+  several boats (its dispatch `boat_splits`) takes every one of them, as legacy (`baCharterBoatMap`):
+  each leaves the sellable and the licensed seats, and takes no seat booking (`409 boat_chartered`)
+  or other charter. `charter_pax` is reported
   for information and is not subtracted again. A charter recorded before boats were tracked, on a
   day with more than one boat, cannot say which boat it took, so its passengers come out of the
   pool instead — the last line above.
@@ -1629,8 +1632,9 @@ this works on multi-trip bookings.
   one-trip-per-route-per-day rule are checked too (`400`).
 - **The price stands; a charge is extra.** `collect` is `invoice` (default) or `separate`. With
   `invoice` and a charge above 0, a fee item `{ type: "reschedule", label: "Reschedule fee · <from> →
-  <to> · <reason>", amount }` is added. With `separate`, the charge is kept on the reschedule record
-  only. The recorded `collect` is `none` whenever the charge is 0.
+  <to> · <reason>", amount }` is added, and a booking already on a live invoice has that invoice
+  topped up with the same line (see "Invoices and payments"). With `separate`, the charge is kept on
+  the reschedule record only. The recorded `collect` is `none` whenever the charge is 0.
 
 The older body `{ route_id, service_date, pax? }` still works. It moves a single-trip booking
 anywhere and writes no reschedule record (it does write a history line).
@@ -2417,10 +2421,18 @@ refused with `400`; an unchanged echo is accepted.
   - no VAT, due now, whole baht;
   - only when the booking's agent is in the catalogue.
 - **Restore** voids that fee invoice.
-- **A reschedule fee** collected on the invoice (`collect: "invoice"`):
-  - booking not invoiced yet: a fee item, billed by its next invoice;
-  - booking already on a live invoice: a fee invoice of its own (`fee_type: "reschedule"`, no VAT, due
-    now), and no fee item, so it is never billed twice. Legacy left this fee unbilled.
+- **A reschedule fee** collected on the invoice (`collect: "invoice"`) is always a fee item on the
+  booking, as legacy (`bkV2RescheduleBooking`):
+  - booking not invoiced yet: the fee item is billed by its next invoice;
+  - booking already on a live booking or prepay invoice: **that invoice is topped up**, as legacy does.
+    It gets a line `Reschedule fee · <from> → <to> · <reason>` for the booking, and its subtotal, net,
+    VAT and total are worked out again with the invoice's own VAT mode (as a discount is). Legacy
+    added the fee to subtotal, net and total alike, which left its VAT wrong; this does not. A paid
+    invoice takes the fee too and then reads `partial`. The history line says `on invoice <number>`.
+  - **Billed once:** while that invoice is live the booking cannot go on another
+    (`409 booking_already_invoiced`); once it is voided, the next invoice bills the fee item once.
+  - No separate fee invoice is issued for a reschedule; `fee_type: "reschedule"` comes only from
+    legacy's import.
 
 **The agent's credit** (legacy `agCreditState`):
 - **Where:** `GET /v1/agents/{id}` carries `credit: { limit, used, available, pct, over }`. (Its

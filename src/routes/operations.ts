@@ -63,10 +63,11 @@ import { registerPierOfficeRoutes } from './pier-office.js';
 import { cotDeductions } from '../domain/after-trip.js';
 import { assertAgentBookable } from '../domain/agent-writes.js';
 import { assertInsuranceEcho } from '../domain/insurance.js';
-import { refuse as refuseWith } from '../domain/booking-actions.js';
+import { refuse as refuseWith, rescheduleFeeLabel } from '../domain/booking-actions.js';
 import {
   assertPaymentEcho, bangkokDay, bookingIdsOf, correctPayments, creditOf, feeInvoice, invoiceLines, invoiceMonth, invoiceNumber, invoiceView, issuedLine, issueInvoice,
-  parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, returnedOf, voided, voidedLine, withDiscounts,
+  liveBookingInvoiceOf, parseInvoiceListQuery, parseInvoicePatch, parseNewInvoice, parsePayment, parseVoid, PAYMENT_METHODS, recordPayment, returnedOf, voided, voidedLine,
+  withDiscounts, withFeeLine,
   type PaymentMethod, type StoredInvoice,
 } from '../domain/invoices.js';
 import {
@@ -1475,17 +1476,14 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return wrote;
   }
   /**
-   * A reschedule charged on a booking already invoiced gets a fee invoice of its own (decided
-   * 2026-10-09; legacy left it unbilled). The record just written says what was charged.
+   * A reschedule charged on the invoice of a booking already invoiced tops up that invoice (legacy
+   * `bkV2RescheduleBooking`; decided 2026-10-10, with VAT worked out again). The record just written
+   * says what was charged. True when it wrote.
    */
-  async function invoiceRescheduleFee(booking: Booking, by: string | null): Promise<boolean> {
+  async function topUpRescheduleFee(booking: Booking, invoice: StoredInvoice | undefined): Promise<boolean> {
     const record = booking.reschedules[booking.reschedules.length - 1];
-    if (!record || record.collect !== 'invoice' || !(record.charge_amount > 0) || !booking.agent_id || !(await store.agent(booking.agent_id))) return false;
-    const now = new Date();
-    const fee = feeInvoice({ id: newInvoiceId(), number: await nextNumber(now), agent_id: booking.agent_id, booking_id: booking.id, fee_type: 'reschedule',
-      label: `Reschedule fee · ${record.from_date} → ${record.to_date} · ${record.reason}`, amount: record.charge_amount, now: now.toISOString(), by });
-    if (!fee) return false;
-    await store.putInvoice(fee);
+    if (!invoice || !record || record.collect !== 'invoice' || !(record.charge_amount > 0)) return false;
+    await store.putInvoice(withFeeLine(invoice, booking.id, rescheduleFeeLabel(record.from_date, record.to_date, record.reason), record.charge_amount));
     return true;
   }
   /** Restore voids the cancellation's fee invoice (legacy `bkV2RestoreBooking`). */
@@ -1903,9 +1901,10 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     return store.transaction(async () => {
       await assertBookingFresh(request);
       const before = (await store.booking(bookingId(request))) ?? notFound('Booking not found');
-      const invoiced = reschedule.kind === 'record' && before.invoice !== null;
-      let moved = (await store.rescheduleBooking(before.id, invoiced ? { ...reschedule, invoiced } : reschedule, actorOf(request.user))) ?? notFound('Booking not found');
-      if (invoiced && await invoiceRescheduleFee(moved, actorOf(request.user) ?? null)) moved = (await store.booking(moved.id))!;
+      const invoice = reschedule.kind === 'record' ? liveBookingInvoiceOf(before.id, await store.invoicesOfBookings([before.id])) : undefined;
+      let moved = (await store.rescheduleBooking(before.id, invoice && reschedule.kind === 'record' ? { ...reschedule, invoice_number: invoice.number } : reschedule, actorOf(request.user)))
+        ?? notFound('Booking not found');
+      if (await topUpRescheduleFee(moved, invoice)) moved = (await store.booking(moved.id))!;
       // Moving a booking off a weather-closed trip resolves its follow-up there (decision 5).
       await resolveWeather(before, moved, 'reschedule', reschedule.kind === 'record' ? reschedule.to_date : reschedule.service_date, false, actorOf(request.user) ?? null);
       return (await syncAltParts(moved)) ? (await store.booking(moved.id))! : moved;
