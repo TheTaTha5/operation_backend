@@ -65,6 +65,11 @@ flowchart LR
   daymoney -. "a COT deduct is a minus line" .-> money
   pieroffice["Pier office<br/>pier_cash_rows, pier_cash_longtail, pier_cash_park,<br/>pier_cash_settings, pier_item_kinds, pier_items,<br/>pier_attendance_codes, pier_sections, pier_staff,<br/>pier_license_types, pier_license_classes"]
   pieroffice -- "boat_id" --> catalogue
+  costing["Cost model, trip actuals, deposits<br/>cost_settings, cost_lines, cost_plans, boat_rents,<br/>meal_venues, trip_actuals, trip_meal_overnight,<br/>deposits, deposit_slips, refund_payouts, refund_payout_slips"]
+  costing -- "boat_id, routes.meal_venue_id" --> catalogue
+  costing -- "trip_meal_overnight.booking_id" --> bookings
+  costing -- "deposits.agent_id" --> sales
+  costing -- "refund_payouts.refund_id" --> weather
 ```
 
 ## 1. Catalogue and seat pool
@@ -1695,6 +1700,137 @@ erDiagram
 - **An assignment's status** (planned, active, completed) is computed from its dates, never stored.
 - **A boat's pier on a day** (`pierOn` in `src/domain/fleet-assignments.ts`) reads the assignments,
   the boat's status log and its home `pier`; the Daily Log's day lock follows it.
+## 14. Cost model, trip actuals, deposits and refund payouts
+
+Legacy's costing menu, the pier's meal order and the Trip P&L's close (migration 160), and an agent's
+deposits and refund payouts (migration 161); `todo/money-model.md`, "Design: the rest of Money". The
+rules are in `src/domain/costing.ts`, `src/domain/trip-pl.ts` and `src/domain/credit.ts`; rows are
+`store.moneyRepo`'s. **The Trip P&L itself is not stored:** it is worked out on every read; a close
+freezes its money into `trip_actuals`.
+
+```mermaid
+erDiagram
+  cost_settings {
+    boolean id PK "one row; none = legacy's default template"
+    numeric vat_rate
+    timestamptz updated_at
+    text updated_by
+  }
+  cost_lines {
+    text id PK "legacy's line id (park, fuel, …)"
+    int sort
+    text group_name
+    text label
+    boolean vat "input VAT claimed back"
+    jsonb parts "[{kind fix|var|step, per, qty, qty_4en, unit, unit_4en, unit_th, unit_ch, unit_ch_th, fuel, mode, every, min, over, add}]"
+    boolean on_demand "priced per item ordered"
+    numeric on_demand_qty
+  }
+  cost_plans {
+    text id PK
+    int sort
+    text name
+    text route_key "a route or a route family (no key)"
+    text engines "3EN or 4EN"
+    int boats
+    int capacity
+    int pax
+    int pax_th
+    numeric price
+    numeric price_child "NULL = the adult price"
+    numeric child_pct
+    numeric commission_pct
+    numeric fuel_price
+    text boat_id FK "pinned boat"
+    boolean rent_off
+    jsonb overrides "{line: {off, parts}}"
+    jsonb groups "{group: {off, pct}}"
+    jsonb on_demand "{line: {agent_qty, agent_rev, upsell_qty, upsell_rev}}"
+    jsonb itinerary
+    jsonb tiers
+  }
+  boat_rents {
+    text boat_id PK, FK
+    boolean rented "false = only the fuel factor"
+    text mode "lump or seat"
+    numeric amount
+    numeric per_seat
+    int days
+    int days_off
+    int trips_per_day
+    boolean vat
+    date from_date "NULL = open"
+    date to_date
+    numeric fuel_pct "NULL = 100"
+    text_array owner_pays "line ids the owner pays"
+  }
+  meal_venues {
+    text id PK
+    bigint sort
+    text name
+    numeric price_adult
+    numeric price_child
+    boolean active
+  }
+  trip_actuals {
+    date service_date PK
+    text boat_id PK, FK
+    text venue_id FK "the day's restaurant; NULL = the route's"
+    boolean no_meal
+    text meal_venue_id "frozen with the order (no key)"
+    int meal_adults
+    int meal_children
+    numeric meal_amount "frozen"
+    timestamptz meal_at
+    text meal_note
+    boolean ran
+    timestamptz closed_at
+    numeric closed_revenue
+    numeric closed_cost
+    numeric closed_profit
+    jsonb closed_rows "[{id, label, amount, actual}]"
+  }
+  trip_meal_overnight {
+    date service_date PK, FK
+    text boat_id PK, FK
+    text booking_id PK, FK "ON DELETE CASCADE"
+    text include "in or out"
+  }
+  deposits {
+    text id PK "dep_…"
+    text agent_id FK
+    numeric amount "> 0"
+    text method "transfer, cash or card"
+    date received_on
+    timestamptz voided_at "with void_reason"
+  }
+  deposit_slips { text deposit_id PK, FK  int seq PK  text attachment_id FK }
+  refund_payouts {
+    text refund_id PK, FK
+    date paid_on
+    text method "transfer, cash or cheque"
+    text ref
+    text paid_out_by
+  }
+  refund_payout_slips { text refund_id PK, FK  int seq PK  text attachment_id FK }
+  routes { text id PK  text meal_venue_id FK }
+  boats { text id PK }
+  refunds { text id PK }
+  meal_venues |o--o{ routes : "the route's restaurant"
+  boats ||--o| boat_rents : "rented"
+  boats |o--o{ cost_plans : "pinned"
+  boats ||--o{ trip_actuals : "a day"
+  trip_actuals ||--o{ trip_meal_overnight : "overnight choices"
+  deposits ||--o{ deposit_slips : "slips"
+  refunds ||--o| refund_payouts : "paid out"
+  refund_payouts ||--o{ refund_payout_slips : "slips"
+```
+
+- **A line's parts and a plan's overrides are JSON**: small records whose fields depend on their
+  kind, checked by `costing.ts` on every write.
+- **A deposit has no "remaining":** the agent's balance is one pool (`creditBalance` in `refunds.ts`):
+  weather credits plus live deposits, less live `credit` payments. A voided deposit stays.
+- **Every amount is `NUMERIC(12,2)`.**
 
 ## Ids with no foreign key
 
@@ -1723,6 +1859,9 @@ gives a reason, it is quoted; otherwise the table says what happened.
 | `commission_payout_items.booking_id`, `item_id` | `booking_tour_sales`, `booking_upgrades` | An upgrade list is rewritten whole on every save, and an import replaces bookings (111). |
 | `pier_handovers.pier` | `routes.pier` | A pier is a route's text field, `other` when none (111). |
 | `pier_staff.default_code` | `pier_attendance_codes.code` | Typed free in legacy, matched by code; a code may be renamed (171). |
+| `cost_plans.route_key` | `routes` or `route_families` | Either one: legacy's older plans name a family (160). |
+| `trip_actuals.meal_venue_id` | `meal_venues` | A frozen copy of the order sent, with the venue's name and prices (160). |
+| `boat_rents.owner_pays`, `cost_lines.id` in plans' `overrides` | `cost_lines` | The template is replaced whole; a line taken out leaves old overrides harmless (160). |
 
 There is also no users table. Every `by` and `*_by` column is a username stored as plain text. On a
 write through the API, `updated_by` and the action records' `by` come from the caller's Bearer

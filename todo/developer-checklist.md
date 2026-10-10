@@ -50,6 +50,12 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
      4 classes; nothing skipped. Panwa's balance on 2026-10-09 reads ฿10,100, as legacy's. A re-run
      left every count the same.
    - Legacy must stop writing petty cash and the seven lists at the same moment (§6.8 of the handoff).
+6c. **Costing and trip actuals:** `npm run import:costing -- --commit` (migration 160), after step 5:
+   the overnight meal choices name the imported `lg_` bookings.
+   - Rehearsal 2026-10-10: 22 template lines, 10 plans, 2 rented boats, 3 restaurants, 6 routes
+     linked, 92 boat-days (90 meal orders, ฿774,730, as legacy), nothing skipped; a re-run identical.
+   - Replaying legacy's own `ctCalc` and `ctBreakEven` on the 94 imported trips: all 1,778 cost lines
+     and every break-even matched.
 7. **Validate the booking area keys:**
    `ALTER TABLE bookings VALIDATE CONSTRAINT bookings_pickup_area_fk; ALTER TABLE bookings VALIDATE CONSTRAINT bookings_dropoff_area_fk;`
 8. **Check:** `npm run verify:import`. Expected differences:
@@ -65,6 +71,8 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - the fleet records;
    - van rates and the daily report settings;
    - the pier office (step 6b): its lists whole, legacy's petty cash rows and every sheet cell.
+   - the cost template, plans and rented boats (replaced whole by `import:costing`), and the pier's
+     meal orders, notes and overnight choices (a close or "ran" made here is kept).
 
    So decide when legacy stops writing each of these (`money-model.md`, `fleet-maintenance-model.md`).
 10. **Railway variables:**
@@ -134,6 +142,8 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
     - fleet (§3.13, §3.15, §6.7);
     - the pier office: petty cash, its sheets and certificate, and the office lists (§6.8; a deleted
       petty cash row is kept, out of the totals; `n` and a code's `bg` are the server's).
+    - costing, the meal order, Trip P&L, deposits and refund payouts (§2.11: the P&L is read from
+      the server; close and "ran" are commands; `credit_balance` gains `deposited`).
 
     Each screen stops writing legacy's blob for its area.
   - **Legacy sync per area** (decided): keep saving to legacy only the areas that have not moved.
@@ -193,6 +203,8 @@ So, in this order:
 - **Pier office** (`pier-office-model.md`): which part of the rest comes next: the sheets' booked side
   (expected park fees need the cost plans), the roster and pay, stock moves and sign-out sheets, or
   licences.
+- **Money, the rest** (`money-model.md`, "Flagged"): who sends the meal order (legacy: operations,
+  not pier); whether a deposit should be spendable by one agent only (it is a pool per agent here).
 - **Fleet stock:** 18 duplicate items to merge (`POST /v1/fleet/stock-items/{id}/merge`), and 7
   stock lines whose history did not add up (item i25 most of all: 44 between Tub Lamu and Panwa),
   from the `import:fleet-stock` report. Legacy's 7 cancelled memos have no reason (it was never kept).

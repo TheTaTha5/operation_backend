@@ -85,16 +85,18 @@ export function weatherMoney(input: {
 
 // ── The agent's credit balance ───────────────────────────────────────────────────────────────────
 
-export type CreditBalance = { credited: number; used: number; available: number };
+export type CreditBalance = { credited: number; deposited: number; used: number; available: number };
 
 /**
- * Legacy `acctAgentDepositAvail`: the agent's credits less what its live `credit` payments spent.
- * `payments` are the payments on the agent's invoices; others are ignored.
+ * Legacy `acctAgentDepositAvail`: the agent's credits and live deposits (`credit.ts`) less what its
+ * live `credit` payments spent. `payments` are the payments on the agent's invoices; others are ignored.
  */
-export function creditBalance(refunds: readonly Pick<StoredRefund, 'kind' | 'amount'>[], payments: readonly StoredPayment[]): CreditBalance {
+export function creditBalance(refunds: readonly Pick<StoredRefund, 'kind' | 'amount'>[], payments: readonly StoredPayment[],
+  deposits: readonly { amount: number; voided_at: string | null }[] = []): CreditBalance {
   const credited = cents(returnedOf(refunds.filter((r) => r.kind === 'credit')));
+  const deposited = cents(deposits.filter((d) => !d.voided_at).reduce((s, d) => s + d.amount, 0));
   const used = cents(livePayments(payments).filter((p) => p.method === 'credit').reduce((s, p) => s + p.amount, 0));
-  return { credited, used, available: cents(credited - used) };
+  return { credited, deposited, used, available: cents(credited + deposited - used) };
 }
 
 /** A `credit` payment spends the invoice agent's balance, never more than it holds (legacy `acctPayUseDeposit`). */

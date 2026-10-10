@@ -1,35 +1,12 @@
 # Money, modelled
 
-**Status:** slices 1–6 are built, except Trip P&L and the cost model, which wait for Fleet. Slice 1
-(invoices and payments): README → "Invoices and payments", migration 045. Slices 2–4 (proforma, pier
-money, after the trip): README → "Proforma (Daily PFM)", "Pier money", "After the trip", migrations
-110–112. Slices 5–6 (partner van bills, money reports): migration 120, `src/routes/money-reports.ts`.
-
-- **Source:** wt-lk-inbox `allotment_v2/js/08-app.js`, read on 2026-10-09:
-  - accounting block `acctCreateInvoice`, `acctRecordPayment`, `acctInvoiceState`, `acctVoidInvoice` and
-    `acctCreateFeeInvoice`;
-  - Daily PFM `pfm*`;
-  - pier check-in `pck*`;
-  - Travel Summary `ts*`;
-  - on-tour sales `bkV2Extra*`;
-  - partner van bill `vb*`;
-  - reports `px*`, `dr*`, `acct*`.
-- **Data counts:** read-only, from `ORIGINAL_DATABASE_URL`, 2026-10-09.
-- **Already here:**
-  - `agents.pay_type`, `vat_mode`, `credit_days` and `credit_limit` (migration 017);
-  - booking `cash_on_tour_*` and `payment_*` columns (migration 011);
-  - `booking_fee_items`, from cancel and reschedule charges (migration 020; `amountOwed` in `src/domain/booking-actions.ts`);
-  - upgrades with `customer_paid`, `commission` and slips (migrations 038 and 040);
-  - the `attachments` table;
-  - `npm run import:attachments`, which already copies the slips of `sb_payments`, `pierpayments`,
-    `paymentslips`, `sb_extras` and `ts_cot`.
-- **Not here yet:** Trip P&L and the cost model (they wait for Fleet's fuel and meals).
-
-## What legacy does, in short (slices 5–6)
-
-**Reports not built yet**
-- Trip P&L with close/freeze (`trip_actuals.closed`, none closed yet).
-- Operations and Fleet reports.
+**Status:** built. Slice 1 (invoices and payments): README "Invoices and payments", migration 045.
+Slices 2–4 (proforma, pier money, after the trip): README "Proforma (Daily PFM)", "Pier money",
+"After the trip", migrations 110–112. Slices 5–6 (partner van bills, money reports): migration 120.
+The rest (cost model and Trip P&L, refund payouts, deposits; decided 2026-10-10): README "Cost model
+and Trip P&L", "Deposits and refund payouts", migrations 160–161, `src/domain/costing.ts`,
+`trip-pl.ts`, `credit.ts`, `src/routes/costing.ts`, `credit.ts`, `npm run import:costing`. What is
+left is under "Open"; what was decided without asking, or differs from legacy, under "Flagged".
 
 **Not money, and corrections to `todo/legacy-replacement.md`**
 - `sb_market_stats` and `sb_market_monthly` are imported Phuket arrival figures, not "computed from
@@ -38,21 +15,9 @@ money, after the trip): README → "Proforma (Daily PFM)", "Pier money", "After 
 - `ts_cot` is the COT settlement, not commission.
 - `travel_sum` is the no-show charge decision, not an approval.
 
-## The plan: six slices, each approved and built in turn
-
-| # | Slice | What the server decides |
-|---|---|---|
-| 1 | **Invoices and payments** (built) | totals, VAT, number, due date, status, balance, the booking's payment state, credit used |
-| 2 | **Proforma** (built) | who is in scope, the deadline, the travel/hold decision and who may make it |
-| 3 | **Pier money** (built) | pier payments, on-tour sales, the amount owed at the pier, fees, commission |
-| 4 | **After the trip** (built) | cash-on-tour decisions, no-show charge decisions, the invoice's COT deduction |
-| 5 | **Partner van bills** (built) | the rows, the amounts and the overview |
-| 6 | **Reports** (built but Trip P&L) | the accounting dashboard, agent statement, Travel Summary totals, Daily Report and Trip P&L, as computed `GET`s |
-
 Not in Money:
 - **Pier petty cash** (`po_cash_*`): a cash box per pier, so it belongs with pier operations.
 - **Fleet memos, fuel and maintenance cost:** these belong to Fleet.
-- **Cost template and plans:** these belong to Reports (slice 6) or Fleet.
 - **Market stats:** these are data, not money.
 
 
@@ -88,14 +53,11 @@ Built 2026-10-09 (branch `feat/money-van-bills-and-reports`, migration 120): REA
 bills" and "Money reports", `src/domain/van-bills.ts`, `src/domain/money-reports.ts`,
 `src/domain/aboard.ts`, `src/routes/money-reports.ts`, `src/tools/legacy-van-bills.ts`. Still open:
 
-1. **Trip P&L with close/freeze, the longtail cost and the cost model** wait for Fleet (fuel, meals,
-   `cost_plans`, `trip_actuals`). The Daily Report's `ltCost` and its "net before boat costs" line are
-   left out until then.
-2. **Operations and Fleet reports** (`px*` beyond money) are not in Money.
-3. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
+1. **Operations and Fleet reports** (`px*` beyond money) are not in Money.
+2. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
    updates; append to `changes_kind_check` as migration 100 does.
 
-## Flagged
+## Flagged (slices 5–6, built 2026-10-09)
 
 Decisions made here without asking, behaviour that differs from legacy, and side effects. Each
 defaults to legacy unless it says otherwise.
@@ -165,24 +127,23 @@ settings methods; `users.ts` `writeNeed` gains three paths; `routes/operations.t
 
 ## Open
 
-1. **Deposits and refunds.** The weather outcomes are built (migration 061, README "Weather closures,
-   refund and credit"): a `refunds` row of kind `refund` (owed to the agent) or `credit` (the agent's
-   balance, spent as a payment with method `credit`). Still open:
-   - legacy's manual deposit ("รับมัดจำ", `acctDepositSubmit`): money received with no invoice. It fits
-     as a `credit` with no invoice, which `refunds.invoice_id NOT NULL` does not allow yet;
-   - paying a refund out (method, date, slip): legacy had no step either;
-   - the agent statement's "Deposit held" (slice 6) reads `credit_balance`.
-
-2. **An invoice left overpaid by a cash-on-tour deduction** (slice 4). A proforma agent pays before
-   the trip, so a `deduct` decided afterwards leaves its invoice paid above the new total: the read
-   says `overpaid` and the decision warns `invoice_overpaid`. Nothing turns that into a refund or the
-   agent's credit yet (open 1's refund payout and a `credit` with no weather reason would). Until then
-   accounting decides by hand.
+1. **Operations and Fleet reports** (`px*` beyond money: `pxAnalysis`'s agent contribution, the
+   cost-structure fit) are not built. The Trip P&L serves trip, day and month figures; legacy's
+   analysis tab can be computed from `GET /v1/reports/trip-pl` days, or added as an endpoint.
+2. **Van bills in the change feed:** not added (no kind `van_bill`). Add one if a screen needs live
+   updates; append to `changes_kind_check` as migration 100 does.
 3. **Love Kingdom's payment state** (`payment_paid`, `payment_paid_status`, `payment_deposit`,
    `payment_balance`) is stored as sent. Love Kingdom must send it on every update
    (`docs/love-kingdom-integration.md`), or the pier collects a stale balance.
 4. **When legacy stops writing** `pierPayments`, `SB_EXTRAS`, `TS_COT` and `travel_sum`: until then the
    import replaces what was recorded here on imported bookings, as for invoices.
+5. **When legacy stops writing the cost model and trip actuals** (`cost_template`, `cost_plans`,
+   `boat_rent`, `meal_venues`, `routes.mealVenueId`, `trip_actuals`, `pier_job.mv`): until then
+   `import:costing` replaces the template, plans and rents made here, and legacy's meal orders replace
+   ours on the same boat and day.
+6. **Not ported from the costing screen:** the rent's idle cost and monthly fact sheet (`ctRentIdle`,
+   `ctRentSpan`, `ctFactLong`, the high/low season table) and the profit chart. They are reads on the
+   rent and plan figures served here; build them if the screen needs them from the server.
 
 ## Flagged (slices 2–4, built 2026-10-09 without a second stop)
 
@@ -259,3 +220,78 @@ Each is legacy's behaviour unless it says otherwise; say if one should change.
   booking whose COT was since removed, and on a day the booking no longer travels; legacy's `—`
   author is none.
 - Love Kingdom's `paymentSnapshot` paid, status, deposit and balance now import onto the booking.
+
+## Flagged (the rest of Money, built 2026-10-10 without a second stop)
+
+Each is legacy's behaviour unless it says otherwise; say if one should change.
+
+**Decisions made here**
+- **Rights:** costing (template, plans, rents, restaurants, a route's restaurant) is `accounting`:
+  legacy's costing menu sits under Accounting & Finance and its writes had no guard; a route's
+  restaurant was saved with the catalogue. Close and "ran" are `accounting` (legacy). The meal
+  order, note and overnight choices are `operations` (legacy); the day's restaurant is `pier` (legacy's
+  pier job sheet) or `operations`. Deposits and payouts are `accounting`.
+- **Close and "ran" are commands** (legacy toggled one button). `ran` on a boat with passengers or
+  bookings is `409 trip_not_empty`, close on a boat that did not sail `409 trip_not_sailed`, and a
+  boat with no deployment that day `404`: legacy only hid those buttons, so the screens behave the same.
+- **No plan is made on a read:** legacy's `ctPlans` saved a blank "เส้นทางที่ 1" on first open; here the
+  list is empty until one is created.
+- **A saved template's `dropped`** is the default lines it lacks (legacy kept a list of deleted ids):
+  a default line added to the code later does not appear in a template saved before. Production's
+  template carries all 18. The unsaved default has the on-demand seed applied (legacy's first unsaved
+  read did not, which priced a longtail charter at 0 instead of ฿600 a boat).
+- **A deposit is part of one pool** per agent (legacy tracked which deposit each payment used). Void
+  needs a reason and is refused below 0. Deposit methods are legacy's (transfer, cash, card); payout
+  methods are mine (transfer, cash, cheque, as van bills), and a payout can be undone.
+- **`deposits_held`** on the dashboard is every agent's credit left (weather credits and deposits, less
+  credit spent), not deposits alone; legacy had deposits only, and never saved one.
+- **Change kinds** `trip_actual` (`{date}:{boat_id}`), `deposit` and `refund` (a payout).
+- **The month report** is each day's totals to today (legacy `pxDaysOf`). It costs about 0.5 s a
+  day on the rehearsal copy.
+
+**Behaviour that differs from legacy**
+- **A trip split over boats** counts on each by its share of heads (legacy had no split; none in data).
+- **On board** sums the pier's counts of the trip's records (legacy read the main record only); the
+  same on every imported trip.
+- **Break-even's seats** are the deployment's capacity (legacy `boatCapFor`, the boat's seats with the
+  day's override).
+- **Vans** are each van part's, with the overnight return van, as the Daily Report's van cost
+  (legacy: the booking's main van).
+- **An upgrade's commission** is worked out (`sell_price − to_company`), as everywhere here; legacy
+  read the stored one.
+
+**Kept from legacy, probably bugs (not fixed)**
+- A plan's group ±% does not mark its lines `plan` (legacy read `G.mul`, which is never set).
+- The meal order takes the pier's no-show count off after everyone lost (`pckMealCount`:
+  `expect − ck.noShow`): a no-show recorded both as a pier event and in the pier's count comes off
+  twice.
+- The Daily Report's join heads are the booked heads; the Trip P&L's are those on board, capped by
+  the add-on's join count. The two differ when someone did not come.
+- An upgrade counts on the booking's first trip only in the P&L's on-tour money, but a longtail
+  charter upgrade counts on every day of the booking (legacy's "known limitation").
+- A rented boat is charged its rent per trip run, so the rent of days it did not run is not on any
+  trip (legacy shows it apart, `ctRentIdle`, not ported).
+
+**Not ported**
+- A trip's own Longtail bundle (`tr.bundle`, `tr.longtailManual`): legacy stores neither; the rate
+  type's bundle is read.
+
+**Import** (`legacy-costing.ts`)
+- The template, plans and rents are replaced whole on every run (legacy is master): an edit made
+  here is lost. Venues are upserted; a route's restaurant is set to legacy's.
+- Overnight choices name imported `lg_` bookings, so a booking re-import (which deletes `lg_` bookings)
+  takes them with it: run `import:costing` after every `import-legacy.ts`.
+- A close or "ran" made here survives a re-run; legacy's `ran` has no who or when.
+- Rehearsal 2026-10-10 (fresh database: routes, boats, `import-legacy --rate-types --sales`, fleet,
+  fleet stock, then this): 22 lines, 10 plans (7 with a route, 1 with a boat), 2 rents, 3 venues,
+  6 routes linked, 92 boat-days (90 meals ฿774,730 as legacy, 36 notes, 2 overnight choices, 1 day
+  venue), nothing skipped; a re-run identical. Legacy's own `ctCalc` and `ctBreakEven`, extracted from
+  `08-app.js` and run on each imported trip's inputs (2026-08-15 to 2026-10-09, 94 trips): all 1,778
+  cost lines and every break-even equal; 83 fuel actuals equal litres × price; heads on board equal
+  legacy's pier counts on 69 of 70 fully counted boat-days (the other has a booking cancelled at the
+  van that legacy's `pckVoidInfo` drops too).
+
+**Side effects:** both stores gain `moneyRepo` and `setRouteMealVenue`; routes read `meal_venue_id`;
+`creditBalance` gains `deposited`; the route form's `meal_venue_id` refusal names the new command;
+`writeNeed` gains the paths above; the Daily Report, accounting dashboard, statement and
+`GET /v1/refunds` gain fields.

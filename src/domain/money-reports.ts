@@ -15,6 +15,8 @@ import { refuse } from './booking-actions.js';
 import { todayInThailand } from './calendar.js';
 import type { StoredAgent, Market } from './agents.js';
 import type { CreditBalance } from './refunds.js';
+import type { refundsToPay, StoredDeposit } from './credit.js';
+type RefundsToPay = ReturnType<typeof refundsToPay>;
 import type { Credit, InvoiceView, StoredPayment, StoredRefund } from './invoices.js';
 import type { Booking, BookingTrip } from './operations.js';
 import type { PickupArea } from './pickup-areas.js';
@@ -39,6 +41,8 @@ export type AccountingDashboard = {
   /** Legacy `acctExtrasMonthTotal` ("Extras · cash · month"): every on-tour sale made this Bangkok month, whatever its method. */
   extras_this_month: number;
   aging: { not_due: number; days_1_30: number; days_31_60: number; days_60_plus: number };
+  /** Refunds owed to agents and not paid out yet (todo/money-model.md, "Design: the rest of Money"). */
+  refunds_to_pay: RefundsToPay;
   collections: { month: string; amount: number }[];
   top_outstanding: { agent_id: string | null; name: string | null; balance: number }[];
 };
@@ -52,7 +56,7 @@ const received = (p: StoredPayment): boolean => !p.deleted_at && p.method !== 'c
 
 export function accountingDashboard(input: {
   invoices: readonly InvoiceView[]; payments: readonly StoredPayment[]; agents: readonly Pick<StoredAgent, 'id' | 'name'>[];
-  credit_exposure: number; deposits_held: number; now: Date;
+  credit_exposure: number; deposits_held: number; now: Date; refunds_to_pay?: RefundsToPay;
   /** On-tour sales; only those sold this month count. */
   sales?: readonly Pick<StoredTourSale, 'sold_at' | 'qty' | 'unit_price'>[];
 }): AccountingDashboard {
@@ -75,6 +79,7 @@ export function accountingDashboard(input: {
   return {
     as_of: todayInThailand(now), outstanding: sum(live.map((i) => i.balance)), paid_this_month: collections[collections.length - 1].amount,
     credit_exposure: cents(input.credit_exposure), overdue_invoices: overdue, deposits_held: cents(input.deposits_held),
+    refunds_to_pay: input.refunds_to_pay ?? { count: 0, amount: 0, items: [] },
     extras_this_month: sum((input.sales ?? []).filter((x) => todayInThailand(new Date(x.sold_at)).slice(0, 7) === months[months.length - 1]).map(saleTotal)), aging, collections,
     top_outstanding: [...byAgent].sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0]))).slice(0, 5)
       .map(([id, balance]) => ({ agent_id: id, name: id ? names.get(id) ?? null : null, balance })),
@@ -88,10 +93,12 @@ export type Statement = {
   invoiced: number; paid: number; outstanding: number; credit_balance: CreditBalance; credit: Credit;
   invoices: { id: string; number: string; kind: string; issued_at: string; due_at: string; total: number; paid: number; balance: number; status: string }[];
   credits: { id: string; invoice_id: string; invoice_number: string; booking_id: string | null; amount: number; reason: string; created_at: string }[];
+  /** Money the agent paid with no invoice, in its credit balance (legacy "Deposits"); voided ones are not listed. */
+  deposits: { id: string; amount: number; method: string; received_on: string; ref: string | null; note: string | null }[];
 };
 /** Legacy `acctStatementOpen`: live invoices; `paid` is net of what refunds and credits took back. */
 export function agentStatement(agent: Pick<StoredAgent, 'id' | 'name' | 'code' | 'pay_type'>, invoices: readonly InvoiceView[], refunds: readonly StoredRefund[],
-  balance: CreditBalance, credit: Credit): Statement {
+  balance: CreditBalance, credit: Credit, deposits: readonly StoredDeposit[] = []): Statement {
   const live = invoices.filter((i) => i.status !== 'void').sort((a, b) => (a.issued_at === b.issued_at ? (a.id < b.id ? 1 : -1) : a.issued_at < b.issued_at ? 1 : -1));
   const numbers = new Map(invoices.map((i) => [i.id, i.number]));
   const netPaid = (i: InvoiceView) => cents(i.paid - i.refunded - i.credited);
@@ -100,6 +107,7 @@ export function agentStatement(agent: Pick<StoredAgent, 'id' | 'name' | 'code' |
     invoiced: sum(live.map((i) => i.total)), paid: sum(live.map(netPaid)), outstanding: sum(live.map((i) => i.balance)), credit_balance: balance, credit,
     invoices: live.map((i) => ({ id: i.id, number: i.number, kind: i.kind, issued_at: i.issued_at, due_at: i.due_at, total: i.total, paid: netPaid(i), balance: i.balance, status: i.status })),
     credits: refunds.filter((r) => r.kind === 'credit').map((r) => ({ id: r.id, invoice_id: r.invoice_id, invoice_number: numbers.get(r.invoice_id) ?? r.invoice_id, booking_id: r.booking_id, amount: r.amount, reason: r.reason, created_at: r.created_at })),
+    deposits: deposits.filter((d) => !d.voided_at).map((d) => ({ id: d.id, amount: d.amount, method: d.method, received_on: d.received_on, ref: d.ref, note: d.note })),
   };
 }
 

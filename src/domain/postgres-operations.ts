@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { PostgresFleetRepo } from './fleet-postgres.js';
 import { PostgresPierOfficeRepo } from './pier-office-postgres.js';
+import { PostgresMoneyRepo } from './money-postgres.js';
 import { randomUUID } from 'node:crypto';
 import { readdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -581,6 +582,8 @@ export class PostgresOperationsStore {
   readonly fleetRepo = new PostgresFleetRepo(() => this.client());
   /** The pier office (todo/pier-office-model.md), in the same transaction as everything else. */
   readonly pierOfficeRepo = new PostgresPierOfficeRepo(() => this.client());
+  /** The rest of Money (migrations 160–161), in the same transaction as everything else. */
+  readonly moneyRepo = new PostgresMoneyRepo(() => this.client());
   constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
   private client(): Pool | PoolClient { return this.context.getStore() ?? this.pool; }
   async close(): Promise<void> {
@@ -1429,10 +1432,15 @@ export class PostgresOperationsStore {
 
   /** Reference data. Dates are cast in SQL so the driver never hands back a Date to re-render. */
   async listRoutes(): Promise<Route[]> {
-    const { rows } = await this.client().query(`SELECT r.id, r.name, r.kind, r.ext_id, r.pier, r.family_id, r.color, r.islands, r.sort,
+    const { rows } = await this.client().query(`SELECT r.id, r.name, r.kind, r.ext_id, r.pier, r.family_id, r.color, r.islands, r.sort, r.meal_venue_id,
       COALESCE((SELECT array_agg(t.departs_at ORDER BY t.idx) FROM route_times t WHERE t.route_id = r.id), '{}') AS times
       FROM routes r ORDER BY r.sort NULLS LAST, r.id`);
-    return rows.map((row) => ({ id: String(row.id), name: String(row.name), kind: row.kind, ext_id: row.ext_id ?? undefined, pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [] }));
+    return rows.map((row) => ({ id: String(row.id), name: String(row.name), kind: row.kind, ext_id: row.ext_id ?? undefined, pier: row.pier ?? undefined, family_id: row.family_id ?? undefined, color: row.color ?? undefined, islands: row.islands ?? undefined, sort: row.sort === null ? undefined : Number(row.sort), times: row.times ?? [],
+      ...(row.meal_venue_id ? { meal_venue_id: String(row.meal_venue_id) } : {}) }));
+  }
+  /** The route's restaurant for costing (migration 160); null clears it. */
+  async setRouteMealVenue(id: string, venueId: string | null): Promise<void> {
+    await this.client().query('UPDATE routes SET meal_venue_id = $2, updated_at = now() WHERE id = $1', [id, venueId]);
   }
   /**
    * The boat catalogue. `license_pax` stays undefined for a boat with no licence on file rather

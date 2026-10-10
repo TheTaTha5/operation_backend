@@ -132,12 +132,12 @@ const withAliases = (body: Record<string, unknown>, aliases: Record<string, stri
   return out;
 };
 
-/** `daily_cap`, `code`, `meal_venue_id` are not kept here (decision 7): an empty one is fine, a real one is said. */
+/** `daily_cap`, `code` are not kept here (decision 7), and `meal_venue_id` has its own command: an empty one is fine, a real one is said. */
 function refuseUnkept(body: Record<string, unknown>): void {
   const cap = body.daily_cap;
   if (!unset(cap) && cap !== 0) bad('daily_cap is not kept here: a land route sells without a limit (decided 2026-10-09)');
   if (!unset(body.code)) bad('code is not kept here (decided 2026-10-09)');
-  if (!unset(body.meal_venue_id)) bad('meal_venue_id is not kept here yet: it moves with costing (decided 2026-10-09)');
+  if (!unset(body.meal_venue_id)) bad('meal_venue_id belongs to costing: set it with PUT /v1/routes/{id}/meal-venue');
 }
 
 const timesOf = (value: unknown): string[] => {

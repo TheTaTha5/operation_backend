@@ -5,7 +5,7 @@
  */
 import type { Booking } from './operations.js';
 
-export const CHANGE_KINDS = ['booking', 'seat_lock', 'deployment', 'route', 'invoice', 'b2c_held_order', 'weather_closure', 'boat', 'pier_handover', 'commission_payout', 'pier_cash', 'pier_office'] as const;
+export const CHANGE_KINDS = ['booking', 'seat_lock', 'deployment', 'route', 'invoice', 'b2c_held_order', 'weather_closure', 'boat', 'pier_handover', 'commission_payout', 'pier_cash', 'pier_office', 'trip_actual', 'deposit', 'refund'] as const;
 export type ChangeKind = typeof CHANGE_KINDS[number];
 export type RouteDay = { route_id: string; service_date: string };
 export type ChangeInput = { kind: ChangeKind; entity_id: string; action: 'created' | 'updated' | 'deleted'; route_days: RouteDay[] | null; changed_by: string | null };
