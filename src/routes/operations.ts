@@ -461,6 +461,8 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
     const user = caller.user!;
     if (isWrite) assertMayWrite(user, path);
     else if ((path === '/v1/users' || path.startsWith('/v1/users/')) && user.role !== 'admin') forbidden('Only an admin may do this');
+    // A login tied to one agent reads its bookings, not the company's fleet.
+    else if (user.agent_id !== null && path.startsWith('/v1/fleet/')) forbidden(`This login books for agent ${user.agent_id} and may not read the fleet`);
     // A login tied to one agent sees that agent's bookings only; another booking is not found.
     const own = user.agent_id === null ? undefined : /^\/v1\/bookings\/([^/]+)/.exec(path);
     if (own && (await store.booking(decodeURIComponent(own[1])))?.agent_id !== user.agent_id) notFound('Booking not found');

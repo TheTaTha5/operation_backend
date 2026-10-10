@@ -212,7 +212,8 @@ bookings, any other booking is `404`, and every write outside `/v1/bookings` is 
 kept beside a booking: its PFM decisions, pier payments, on-tour sales and after-trip decisions), with one
 exception: Love Kingdom's login (`a_b2c`) may also create routes, `POST /v1/routes`, without the
 `config` area (see "Editing routes"). The `a_b2c` login's bad input is held for ops rather than
-refused (`202`, see [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)).
+refused (`202`, see [Love Kingdom's push](#love-kingdoms-push-held-orders-and-b2c-issues)). It may
+not read the fleet either: every `GET /v1/fleet/…` is `403` for it.
 
 ### Love Kingdom's API key
 
