@@ -56,6 +56,7 @@ import { registerFleetStockRoutes } from './fleet-stock.js';
 import { registerMoneyReportRoutes } from './money-reports.js';
 import { boatsAvailableToday, openWork, registerFleetRoutes } from './fleet.js';
 import { registerFleetExtrasRoutes } from './fleet-extras.js';
+import { registerFleetInsightsRoutes } from './fleet-insights.js';
 import { pierOn, shopOf } from '../domain/fleet-assignments.js';
 import { availability, checkBoatReady, planAhead, type ReadinessWarning } from '../domain/fleet-availability.js';
 import { registerMoneyRoutes } from './money.js';
@@ -1999,6 +2000,7 @@ export function registerOperationsRoutes(app: FastifyInstance, options: { store?
   registerFleetRoutes(app, { store });
   /** Fleet maintenance, the extras: pier assignments, certificates, the replace wizard, fuel budget, reports (`fleet-extras.ts`). */
   registerFleetExtrasRoutes(app, { store });
+  registerFleetInsightsRoutes(app, { store });
   registerMoneyRoutes(app, { store, assertBookingFresh });
   /** The pier office: petty cash and the office lists (`pier-office.ts`, todo/pier-office-model.md). */
   registerPierOfficeRoutes(app, { store });
