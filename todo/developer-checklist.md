@@ -19,7 +19,11 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
    - 070 drops the `capacity <= license_pax` check;
    - 080 drops `van_days.sent_at` (each mark moves onto that van's groups);
    - 048 turns a lock naming no agent into an office lock.
-2. **Push `main`.** Deploying applies migrations 039–180 (`preDeployCommand`).
+2. **Push `main`.** Deploying applies migrations 039–180 (`preDeployCommand`), and 220–222 (the
+   booking decisions of 2026-10-10). 220 gives every booking already there a `code`: an imported one
+   its legacy id, any other `BK-YYMMNNNN` by its creation time, after legacy's highest of the month.
+   Rehearsed on a full import plus an API booking: 5,398 legacy codes kept, the API booking numbered
+   `BK-26100455` after legacy's `BK-26100454-AYKE`. 221 and 222 add nullable columns.
 3. **Copy the files:** `npm run import:attachments -- --commit` (about 6,000 files, about 660 MB, about
    18 min; re-runnable). Run it before the imports, so slips, documents and project photos link.
 4. **Seed the catalogue once:** `npm run seed:routes -- --commit`, then `npm run seed:boats -- --commit`.
@@ -117,6 +121,16 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
       - A boat under repair is `409 boat_not_ready`; resend with `deploy_anyway: true`.
     - **Deployments:** removing or shrinking a boat with bookings on it is `409 seats_sold`; resend
       with `remove_anyway: true`.
+    - **Booking dialogs as flags** (decided 2026-10-10, handoff §2.2 and §2.6):
+      - "⚠ No rate · cannot save" is now the server's `409 no_rate`;
+      - a charter "saved at 0 THB?" is `409 no_charter_price`; OK resends with `free_anyway: true`;
+      - the charter displacement dialog is `409 charter_displaces_seats`; Confirm resends with
+        `displace_anyway: true` (stop setting `charterDisplacementAck`, the server stamps it);
+      - "Edit anyway?" on a cancelled, rejected or completed booking resends with `edit_anyway: true`;
+      - Save Draft on a live booking calls `POST /v1/bookings/{id}/unconfirm`;
+      - restore no longer refuses: show its `charter_boat_taken` and `seats_short` warnings;
+      - show the server's `code` (`BK-YYMMNNNN`) and never send one; a company booking sends
+        `companyPurpose` (`400` without).
     - **Files:** upload to `POST /v1/attachments`. Show them by fetching with the Bearer header and
       using a blob URL.
     - **Live updates:** follow `GET /v1/changes/stream` and refetch only what it names.
@@ -163,6 +177,8 @@ Run the steps in this order against Railway, with `SOURCE_DATABASE_URL=<legacy>`
     longer part of it.
   - **Monitoring:** alert on its own failed calls, and reconcile with
     `GET /v1/bookings?updated_since=`.
+  - **Booking code** (2026-10-10): every booking now carries a read-only `code` (`BK-YYMMNNNN`);
+    never send one (a create with one is held). B2C bookings are not refused for a missing rate.
 - **Ops (B2C):** held orders and the issues list are `GET /v1/b2c/issues`, legacy's orange panel.
   They resolve or dismiss held orders there.
 

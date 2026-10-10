@@ -149,8 +149,9 @@ POST /v1/bookings
 | `pickupZone`, `pickupHotel` | `trips[].zone`, `hotelName` (`pickupZone` on the header too) | |
 | `addonsSelected[{addonId,qty}]` | `addOns[{type,amount,qty}]` | `type` is the ops code (`longtail-join`, `transfer-<route>-<zone>-<vehicle>`, `b2c-…`). `amount` is the **line total**, not a unit price. |
 | `passengers[{name,nationality}]` | `passengers[{name,nationality}]` | `passport`, `dob` and `remark` have no home here and are dropped. |
-| `total` | `total` | THB, as a number. Kept as you send it: your bookings are B2C (agent `a_b2c`), which this service does not re-price, unlike staff bookings. The add-on `amount`s are kept too. |
-| private charter item | `trips[].bookingMode: "charter"` + `charterBoatId` | The boat must be deployed that day. |
+| `total` | `total` | THB, as a number. Kept as you send it: your bookings are B2C (agent `a_b2c`), which this service does not re-price, unlike staff bookings. The add-on `amount`s are kept too. For the same reason a staff booking's `409 no_rate` / `409 no_charter_price` (a trip ops' rate types have no price for, decided 2026-10-10) never applies to yours. |
+| private charter item | `trips[].bookingMode: "charter"` + `charterBoatId` | The boat must be deployed that day. A boat whose seats are already sold that day is `409 charter_displaces_seats`: only ops charter over sold seats (`displace_anyway`), so leave it to them. |
+| — | `code` (read only) | **New (2026-10-10).** Our readable booking number, `BK-YYMMNNNN`, set when the booking is made; show it to the customer or ops if you like. Never send it: a create with one is held (`400`). `id` stays our key. |
 | payment: method, amount paid, status, deposit, balance | `paymentSnapshot: { method, paid, paidStatus, deposit, balance }` (or flat `payment_method`, `payment_paid`, `payment_paid_status`, `payment_deposit`, `payment_balance`) | **New (2026-10-09).** Your facts, stored as sent. The pier collects `balance` on the travel day and reads `method`/`paidStatus` to tell staff whether the customer already paid (legacy §b2cPayOne). Send them again on every update: a balance you don't update is collected twice. |
 
 Fields not in the README's "Booking header fields" table are **dropped, not stored**. If you need
@@ -162,7 +163,7 @@ one kept, ask for it to be modelled.
 |---|---|---|
 | `confirmed` | it fitted | held |
 | `pending_foc` | it has FOC passengers; ops approve them | held |
-| `pending_approval` | it carries a discount; the salesperson approves it | held |
+| `pending_approval` | it carries a discount and no FOC passengers; the salesperson approves it | held |
 | `pending_approval` | the day's seats on sale are gone, but the boat has registered seats left; ops decide | **not held** (`allocated_pax: 0`) until approved |
 
 `approvals` on the booking says what it waits for. Show the customer "waiting for confirmation"
@@ -217,7 +218,7 @@ for example `addOns[2].amount must be a number` or `trips[0].pax.adult is not a 
 | `400` | Bad input on any other call (a lock, a list filter) | Bug in the mapping. Log the `message`, and don't retry. |
 | `401` / `403` | No token or an expired one (`401`); a call your service user may not make (`403`) | Log in again on `401`. A `403` is a bug in the mapping: log the `message`. |
 | `404` | Booking or lock id not found | |
-| `409` | The route does not run that day (`route_closed`), seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered, already cancelled | Sold out, closed, or the state changed. Show it to the user, and don't retry blindly. |
+| `409` | The route does not run that day (`route_closed`), seats held by other agents' locks, the boat's registered seats full, lock short, boat already chartered or its seats already sold (`charter_displaces_seats`), already cancelled, or an edit of a cancelled booking (`booking_closed`) | Sold out, closed, or the state changed. Show it to the user, and don't retry blindly. |
 | `5xx` | Our fault | Retry with backoff. See §7 before retrying a create. |
 
 ### 6a. Held orders: bad data is kept, not lost (since 2026-10-09)
