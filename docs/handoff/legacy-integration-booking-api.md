@@ -1,9 +1,28 @@
 # Handoff: legacy's screens on the booking API, all the way
 
-*Written 2026-10-09, from operation-backend `main` (`12b0129`) and the integration worktree at
-`386e7b5` (branch `integration/operation-backend`). For whoever works in
-`D:\projects\wt-operation-backend-integration`. It follows `integration-client.md`, whose six steps
-are done.*
+*Written 2026-10-09, brought up to date 2026-10-10 from operation-backend `main` (`296598f`): every
+area legacy owns now has its endpoints. The integration worktree was read at `386e7b5` (branch
+`integration/operation-backend`). For whoever moves legacy's screens (`allotment_v2`) onto the API,
+in `D:\projects\wt-operation-backend-integration`. It follows `integration-client.md`, whose six
+steps are done.*
+
+## Start here: finding things in operation-backend
+
+You may read the whole repo. Never change it from the client side: ask instead (§8).
+
+| You want | Look in |
+|---|---|
+| An endpoint's fields, errors and an example | `README.md` → "API", one section per area (Bookings, Dispatch, Invoices, Agent seat locks, Fleet…). Also live at `/docs` (Swagger) on a running server |
+| How to run the API locally | `README.md` → "Run locally with Docker" |
+| Logins, roles, edit areas, `act-*` rights | `README.md` → "Login and permissions" |
+| A working request and its answer | `test/<area>.test.ts`: every rule has a test calling the endpoint the way a screen would (`booking-decisions.test.ts`, `boat-assignment.test.ts`, `checkin.test.ts`, `invoices.test.ts`…) |
+| The rule behind an answer | `src/domain/<area>.ts` (pure functions, named after legacy's: search the legacy function name) |
+| Which handler serves a path | `src/routes/*.ts`; search the path, e.g. `'/operations/trip-ops/:trip_id'` |
+| Why it was built that way, what legacy did, what is still open | `todo/<area>-model.md` ("Decided", "Open") |
+| Legacy browser rules and who owns each | `todo/legacy-browser-rules.md` (each rule: built here, still missing, or left to the screen) |
+| What a change-feed kind means | `README.md` → "Live updates (the change feed)"; `src/domain/changes.ts` |
+
+When the README and this note disagree, the README wins, and tell us.
 
 - **The contract is `README.md`** in operation-backend, and live at `/docs` (Swagger). Every endpoint,
   field and error code below is spelled as the README spells it. If this note and the README
@@ -42,6 +61,10 @@ are done.*
     `displace_anyway`; "Edit anyway?" is `edit_anyway`; Save Draft on a live booking is
     `POST /v1/bookings/{id}/unconfirm`. The booking shows the server's `code`; a company booking sends
     `company_purpose`. Restore never refuses (§2.6).
+13. Every other area legacy keeps in its blob now has endpoints too: money (§2.7–2.11), the
+    catalogue and fleet (§3.13–3.15, §6.7, §6.9), sales (§6.5–6.6), the pier office (§6.8) and
+    whole-boat holds (§6.1). Each screen stops writing legacy's blob for its area once it is wired.
+14. Five more booking changes are decided and coming (§2.12); plan for them now.
 
 ## How to read this
 
@@ -74,6 +97,10 @@ Each step leaves the app working.
 | 6 | Deployments and seat-lock guards (§3.13, §6) | Small, and they only add handling for new refusals |
 | 7 | Live updates (§5) | Last, once every screen reads from the server: then a refetch is enough |
 | 8 | Sales reads: rate seasons, rate types, contracts (§6) | Display only |
+| 9 | Money: invoices and payments, weather, Daily PFM, pier money, after the trip, van bills, costing, deposits (§2.7–2.11) | Accounting needs the bookings already on the server |
+| 10 | Catalogue and sales writes: Programs, boats, agents, promos, templates, add-ons (§3.14, §6.5–6.6) | Once these move, legacy must stop writing them the same day (the import overwrites until then) |
+| 11 | Fleet, part A then B, then extras (§3.15, §6.7, §6.9) | Independent of bookings; one cutover for all of fleet |
+| 12 | Pier office: petty cash and the lists (§6.8) | Small; last |
 
 ## 0. Shared plumbing (`ops/00-ops-core.js`)
 
@@ -474,7 +501,7 @@ restore, partial cancel and reschedule are commands; `over_licence` and `lock_sh
 - Add `If-Match` to every command (§2.5). The `tx` wrapper and `laOpsBookingAction` are the two
   places.
 - Handle the codes: `wrong_status`, `already_cancelled`, `booking_closed`, `not_cancelled`,
-  `route_closed` (restore), `stale_version`, and `403` (§1.3). All are already
+  `route_closed` (restore, until §2.12 removes it), `stale_version`, and `403` (§1.3). All are already
   shown by `O.fail`; add the refetch on `stale_version`.
 - **Restore never refuses for a taken boat or short seats** (decided 2026-10-10, as
   `bkV2RestoreBooking`). Show its `warnings` as legacy's toast: `lock_short` (as now),
@@ -653,6 +680,19 @@ cost line and total** (README "Cost model and Trip P&L", "Deposits and refund pa
   `refund_not_paid_out`; `400` for a computed field sent (a plan's `calc`, `break_even`, `seats`).
 - **Writes:** costing, close/ran, deposits and payouts need `accounting`; the meal order, note and
   overnight choices `operations`; the day's restaurant `pier` or `operations`.
+
+### 2.12 Coming next: booking rules decided 2026-10-10, not built yet
+
+Decided after the rules in §2.2, and built next. They are not in `README.md` until they are built;
+plan the screen for them now.
+
+| Rule | Today | Coming | What the screen does |
+|---|---|---|---|
+| **Every booking needs an agent** | a create with no `agent_id` is saved | `400` naming `agent_id` | make the agent required before Save, as legacy's form does |
+| **Restore ignores the route calendar** | restoring onto a day the route doesn't run is `409 route_closed` | restored, as `bkV2RestoreBooking` does | drop the `route_closed` handling on restore |
+| **A trip's `subtotal` and `rate_type_id` are the server's** | a sent value is ignored without a word | replaced by the server's, and the answer lists it in `price_warnings`; the save still succeeds | keep sending them if that's easier; show `price_warnings` (§2.3) |
+| **A trip's `charter_displaced_at` / `_by`** | ignored | `400` unless the value echoes what was read: ops' acknowledgement is `displace_anyway` (§2.2) | don't send them |
+| **A charter whose agent has no rate type at all** | saved at ฿0 | refused like a charter with no charter price, unless an agreed price (`charter_price_mode: manual`) or `free_anyway: true` | same dialog as `no_charter_price` |
 
 ## 3. Day-of-operations
 
@@ -1500,19 +1540,25 @@ modulo, its number changes: show the API's.
 
 ## 7. Not in the API yet: legacy keeps doing these
 
-Checked against `README.md` and `todo/` on 2026-10-09. **With `LA_LEGACY_SYNC=false` these screens
-work for the session only and save nowhere** (see "The one thing to know first").
+Checked against `README.md` and `todo/` on 2026-10-10. Since 2026-10-09 these moved and are no
+longer on this list: deposits and refund payouts, the money reports, weather closures and their
+follow-up, promo contracts, staff and welfare quotas, sales targets, petty cash, costing and Trip P&L.
+
+**With `LA_LEGACY_SYNC=false` the screens below work for the session only and save nowhere** (see
+"The one thing to know first"). Keep them on legacy's save (per area, §8 question 12) until they
+move.
 
 | Area | Legacy data / functions | Where it is tracked |
 |---|---|---|
-| Deposits, refunds, money reports (invoices, PFM, pier money and Travel Summary decisions moved: 2.7, 2.9) | `SB_DEPOSITS`, `bk.refund`, `acctDashboardHtml`, `acctStatementOpen`, the Travel Summary totals | `todo/money-model.md` slices 5–6, open 1 |
+| The rest of the Pier Office: stock moves and sign-out sheets, the roster, duty and job sheets, crews, licences, its settings (pay rates, park ticket types), the park tickets page | `PIER_MOVES`, `PIER_SHEET`, `PIER_SHIFT`, `PIER_DUTY`, `PIER_JOB`, `PIER_TEAM`, `PIER_LICENSES`, `PIER_CFG`, §pkTk | `pier-office-model.md` open 2–3 (petty cash and the lists moved: §6.8) |
+| The petty-cash sheets' booked side (heads on board, expected park fee, "fill from bookings") | `pcPax`, `pxLongtail`, `pcParkRate` | `pier-office-model.md` open 1. Meanwhile the screen fills the counts and sends `filled_from` |
 | Booking payment slips not tied to a payment | `paymentSlips` | `booking-extras-model.md` open 1 |
-| Weather closures and their follow-up | `SB_WEATHER_CLOSURES`, `bookingV2WeatherMark`, `bk.weatherResolve`, `bk.rebook` | `legacy-replacement.md` §3 (`cancel-weather` itself is built) |
-| Promo contracts (add, edit, void); staff and welfare quotas; sales targets | `ctSaveAddPromo`, `ctVoidContract`, `staff*`, `sbEditTarget` | `contracts-model.md`; `sales-editing-model.md` open items |
-| The computed van board (pools, return alerts across routes) | `vehJobsFor` and the board's own counts | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b) |
-| B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open" |
+| The computed van board (pools, return alerts across routes, per-van fill %) | `vehJobsFor`, `_vehMatrixSummaryHTML` | `trip-ops-and-vans-model.md` 9 (job orders are built: §3.4b). The screen keeps computing it from the API's van groups |
+| B2C sync health and raw feed | `_laB2C*` | `legacy-replacement.md` "Open". Held orders and B2C issues moved: `GET /v1/b2c/issues` |
 | Approval's salesperson name | `approval.saleName` | not stored; kept from the local copy |
-| The rest of the Pier Office: stock moves and sign-out sheets, the roster, duty and job sheets, crews, licences, its settings (pay rates, park ticket types); petty cash's booked side | `PIER_MOVES`, `PIER_SHEET`, `PIER_SHIFT`, `PIER_DUTY`, `PIER_JOB`, `PIER_TEAM`, `PIER_LICENSES`, `PIER_CFG`; `pcPax`, `pxLongtail`, `pcParkRate` | `pier-office-model.md` open 1–3 (petty cash and the lists moved: §6.8) |
+| Per-agent add-on prices and custom add-on kinds | `a.addonServices`, `SB_ADDON_TYPES` | `sales-editing-model.md` open 2 (legacy never saved either) |
+| The costing screen's rent idle cost, monthly fact sheet, profit chart; the analysis tab | `ctRentIdle`, `ctRentSpan`, `ctFactLong`, `pxAnalysis` | `money-model.md` open 1, 6. Computable from `GET /v1/reports/trip-pl` |
+| Legacy browser rules still missing (second wave: pier operations, check-in counting, required booking fields, deployment checks) | see the file | `todo/legacy-browser-rules.md` "Missing". Until each is built, the screen's own check stays as a hint |
 
 ---
 
@@ -1521,9 +1567,18 @@ work for the session only and save nowhere** (see "The one thing to know first")
 1. **Which day-of-operations writes change a booking's `version`?** README says reconfirm writes do
    not. `PATCH /operations/trip-ops/{trip_id}` and the check-in calls answer `{trip}` without the
    booking's version. If they bump it, the client's next `PATCH` with `If-Match` is refused.
+   *Answer (2026-10-10): they don't. Dispatch (`PATCH /operations/trip-ops/{trip_id}`), check-in,
+   van groups, van stops and reconfirm leave the booking's `version` alone. The money writes on a
+   booking do change it: pier payments, on-tour sales, cash-on-tour and no-show decisions
+   (`src/routes/money.ts`). Keep the `version` they answer.*
 2. **Do trip-ops, check-in, van-group, upgrade and doc-check writes accept `If-Match`?** README names
    "`PATCH` or any command"; the server checks it on `PATCH`, the status commands, cancel, restore,
    partial cancel, reschedule and meals.
+   *Answer (2026-10-10): the day-of-operations writes neither need nor check it (a `version` in the
+   body is ignored), so two dispatchers' last write wins, as in legacy. The money writes above do
+   need it (`428` without, `409 stale_version` when stale), as do an upgrade's collect, insurance
+   and every seat-lock write; doc-check and the attachments don't. Each README section names the
+   writes that take `If-Match`.*
 3. **Does `operations.boat_id` follow a charter's `charter_boat_id`?** Legacy forces
    `ops.boatId = charterBoatId` on save (`§chOpsSync` in `bookingV2CommitBooking`), and every screen
    reads `ops.boatId`. Until answered, the client can show `charter_boat_id` when `boat_id` is `null`.
@@ -1538,11 +1593,27 @@ work for the session only and save nowhere** (see "The one thing to know first")
 5. **Exact keys of `van_parts[].alt`, `reinstate`, `self_add` and `undone`.** README names them
    (`pick_*`, `drop_*`, `alt_who`, `pick_time`; `undone.why`) but shows them only as `null`. Please
    add one filled example each.
+   *Answer (2026-10-10), the types are `CheckinEvent`/`StoredCheckin` in `src/domain/checkin.ts` and
+   the alt part in `src/domain/alt-pickups.ts` `altPartsPlan`; filled:*
+   ```jsonc
+   "alt":       { "pick_area_id": "pk-karon", "pick_hotel": "Hilton", "pick_zone": "PK",
+                  "drop_area_id": null, "drop_hotel": null, "drop_zone": null, "pick_time": "07:10", "alt_who": "2 kids" },
+   "reinstate": { "at": "07:42", "by": "Somchai", "ts": "2026-10-02T00:42:00.000Z" },
+   "self_add":  { "pax": 2, "ad": 2, "chd": 0, "inf": 0, "foc": 0, "at": "07:50", "by": "Somchai",
+                  "ts": "2026-10-02T00:50:00.000Z", "note": "came by taxi" },
+   "undone":    { "why": "found", "at": "07:15", "by": "Somchai", "ts": "2026-10-02T00:15:00.000Z", "note": null }
+   ```
 6. **`GET /v1/users` row shape.** Which fields, and how is a disabled user shown (`disabled`,
    `disabled_at`)?
+   *Answer (2026-10-10): every stored field but the password hash (`userView` in
+   `src/domain/users.ts`): `id, username, name, role, can_edit, edit_areas, actions, view_perms,
+   sales_id, agent_id, dept, disabled_at, legacy_id, created_at, updated_at`. Disabled is
+   `disabled_at` not `null`; to disable or re-enable, `PATCH` `disabled: true/false`.*
 7. **Files in `<img>` and OCR.** `GET /v1/attachments/{id}` needs the Bearer header, so the client
    must fetch and use a blob URL everywhere. Is that the intended way, or is a link that works
    without the header planned?
+   *Answer (2026-10-10): fetch with the Bearer header and use a blob URL. No link without the header
+   is planned: a file is a passport or a payment slip.*
 8. **Job order "sent" per round.** Legacy marks a van's job order sent per route or group
    (`VANJOB_SENT` key `date::van~route~group`); the API keeps one `sent_at` per van and day. Is losing
    the per-round mark intended?
@@ -1634,6 +1705,15 @@ Status: **Done** = on the API today; **Partial** = reads or some writes; **To do
 | Fleet pier assignments, certificate renewal, replace wizard, fuel budget, reports | `/v1/boats/{id}/assignments`, `…/documents`, `/v1/fleet/…` (§6.9) | To do |
 | Pier petty cash (ledger, longtail and park sheets, certificate) | `/v1/pier-cash/…` (§6.8) | To do |
 | Pier Office lists (kinds, items, codes, groups, staff, licence types and classes) | `/v1/pier-office…` (§6.8) | To do |
+| Weather panel: closures, follow-up, refund and credit | `/v1/weather-closures…`, `/cancel-weather` (§2.8) | To do |
+| Partner van bills, van rates, money reports | `/v1/van-bills…`, `/v1/reports/…`, `GET /v1/agents/{id}/statement` (§2.9) | To do |
+| Costing, meal order, Trip P&L, deposits, refund payouts | `/v1/costing…`, `GET /v1/reports/trip-pl`, `/v1/deposits…` (§2.11) | To do |
+| Whole-boat holds (create, edit, swap, convert to charter) | `/v1/seat-locks?kind=boat`, `…/convert` (§6.1) | To do |
+| Agents (edit), promos, templates, Sales Board, staff quotas | `/v1/agents…`, `/v1/contracts…`, `/v1/contract-templates…`, `/v1/sales-board`, staff (§6.5) | To do |
+| Add-on catalogue, nationalities, insurance | `/v1/addon-services…`, `/v1/nationalities`, `PUT …/insurance` (§6.6) | To do |
+| B2C orange panel (held orders, issues) | `GET /v1/b2c/issues`, `/v1/b2c/held-orders/{id}/resolve\|dismiss` | To do |
+| Fleet Report, insights | `GET /v1/fleet/insights`, `/v1/fleet/reports/…` (§6.9) | To do |
+| Booking rules coming next | §2.12 | Waiting on the API |
 
 ## Rules and gotchas
 
